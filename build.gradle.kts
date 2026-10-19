@@ -20,7 +20,7 @@ group = "com.xemantic.kotlin"
 
 xemantic {
     description = "Kotlin script execution with LLM-friendly diagnostics"
-    inceptionYear = "2025"
+    inceptionYear = "2026"
     applyAllConventions()
 }
 
@@ -44,7 +44,10 @@ kotlin {
         apiVersion = kotlinTarget
         languageVersion = kotlinTarget
         jvmTarget = JvmTarget.fromTarget(javaTarget)
-        freeCompilerArgs.add("-Xjdk-release=$javaTarget")
+        freeCompilerArgs.addAll(
+            "-Xjdk-release=$javaTarget",
+            "-Xcontext-sensitive-resolution"
+        )
         extraWarnings = true
         progressiveMode = true
     }
@@ -65,6 +68,9 @@ dependencies {
     implementation(libs.kotlin.scripting.common)
     implementation(libs.kotlin.scripting.jvm)
     implementation(libs.kotlin.scripting.jvm.host)
+    // the lexer, to tell the declarations of the script from its statements
+    implementation(libs.kotlin.compiler.embeddable)
+    implementation(libs.xemantic.kotlin.core)
     implementation(libs.kotlin.logging)
     // kotlin-logging 8 no longer brings SLF4J transitively
     implementation(libs.slf4j.api)

@@ -51,24 +51,45 @@ val result = executor.execute(
         import kotlinx.coroutines.delay
 
         delay(100)
-        greeting.uppercase()
-    """.trimIndent(),
-    dependencies = listOf(
-        dependency("greeting", "Hello World")
-    )
-)
+        "${'$'}greeting ${'$'}{names.joinToString()}".uppercase()
+    """.trimIndent()
+) {
+    "greeting" provides "Hello"
+    "names" provides listOf("Alice", "Bob")
+}
 when (result) {
-    is ScriptResult.Value -> println(result.value) // HELLO WORLD
+    is ScriptResult.Value -> println(result.value) // HELLO ALICE, BOB
     is ScriptResult.Error -> println(result.message)
 }
 ```
 
-* The script body runs as a suspend block with a `CoroutineScope` receiver, on `Dispatchers.IO`, in the coroutine of the caller:
+* The script body runs as a suspend block with a `CoroutineScope` receiver, in the coroutine of the caller:
   the caller awaits all the coroutines the script launches, and cancelling the caller cancels the script.
+  Cancellation cannot interrupt a blocking call of the script though, like `Thread.sleep`.
+* The script is compiled and evaluated on `Dispatchers.IO`, as both might block.
+  Another dispatcher can be given as `ScriptExecutor(dispatcher = ...)`,
+  e.g. `Dispatchers.IO.limitedParallelism(4)` to bound the threads used by scripts,
+  or `StandardTestDispatcher(testScheduler)` to run scripts in the virtual time of `runTest`.
 * Dependencies are exposed to the script as properties of the given name and type.
+  The type is inferred from the value, including its type arguments,
+  or can be given explicitly, e.g. `provide<String?>("name", null)` or `provide<Clock>("clock", fixedClock)`,
+  to make the dependency nullable, or to expose it only as its supertype.
+  A dependency list built dynamically can be passed instead, as `execute(script, listOf(dependency("greeting", "Hello")))`.
+  Invalid dependencies are rejected with `IllegalArgumentException`:
+  a name which is not a Kotlin identifier, a duplicate name, a value which is not of the type,
+  or a type which the script cannot refer to, like a private or a local class.
+* Scripts executed repeatedly, like an agent harness defined as a script, can skip the recompilation
+  with `ScriptExecutor(compilationCacheSize = ...)`, keeping that many compiled scripts, the least recently used evicted first.
+  A compiled script is reused when the script text, and the names and types of the dependencies are the same,
+  while the dependency values might differ.
 * The value of the last expression of the script becomes `ScriptResult.Value.value`, or `Unit` if there is none.
 * The script is compiled against the whole classpath of the current context,
   so any class available to the host application can be imported by the script.
+* Declarations which cannot be local to a block, like enum classes, objects, interfaces or sealed types,
+  are compiled outside of the script body, together with the types and functions they refer to.
+  Therefore, they cannot refer to the local values of the script body, only to the dependencies,
+  while an object cannot refer even to the dependencies, as they are the members of the script instance.
+  An error message will hint at this, if it happens.
 
 ### Error reporting
 
@@ -79,33 +100,42 @@ asdf
 println(foo)
 ```
 
-produces:
+produces a `ScriptResult.Error` with the `ExecutionPhase.COMPILATION` phase, and the message:
 
 ```
-<impediment phase="COMPILATION">
-[ERROR] Unresolved reference 'asdf'.
-  at line 1
+script.kts:1:1: error: Unresolved reference 'asdf'.
   | <error>asdf</error>
 
-[ERROR] Unresolved reference 'foo'.
-  at line 2
+script.kts:2:9: error: Unresolved reference 'foo'.
   | println(<error>foo</error>)
-
-</impediment>
 ```
 
-Runtime exceptions are reported with the stack frames of the script only,
-together with the source line of each frame:
+Each diagnostic follows the `file:line:column: severity: message` format of kotlinc and other compilers,
+which LLMs are familiar with.
+The offending fragment of the source line is marked with `<error>` tags instead of a caret line below,
+so that the LLM does not have to count columns.
+
+Runtime exceptions are reported in the `ExecutionPhase.EVALUATION` phase,
+with the stack frames of the script only, together with the source line of each frame,
+followed by compiler warnings, if any, as they might explain the failure:
 
 ```
-<impediment phase="EVALUATION">
 java.lang.Exception: must fail
-  at Script.invokeSuspend(script.kts:1)
+  at <script body>(script.kts:1)
   | throw Exception("must fail")
-</impediment>
 ```
 
-The name of the enclosing tag can be customized with `ScriptExecutor(errorTag = "golem:impediment")`.
+The frames are named after the functions of the script, e.g. `at Checker.check(script.kts:5)`,
+and repeated frames of a recursion are collapsed.
+
+Compiler warnings of a successful script are available as `ScriptResult.Value.warnings`.
+They might reveal a bug in a script which nevertheless succeeded,
+so it is up to the caller whether to show them to the LLM.
+It is up to the caller how to present the error to the LLM, e.g.:
+
+```kotlin
+"<impediment phase=\"${result.phase}\">\n${result.message}\n</impediment>"
+```
 
 ## Logging
 

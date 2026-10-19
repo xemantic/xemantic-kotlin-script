@@ -1,0 +1,131 @@
+/*
+ * xemantic-kotlin-script - Kotlin script execution with LLM-friendly diagnostics
+ * Copyright (C) 2026  Kazimierz Pogoda / Xemantic
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package com.xemantic.kotlin.script
+
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import org.intellij.lang.annotations.Language
+import java.lang.reflect.Modifier
+import kotlin.reflect.KClass
+import kotlin.reflect.KType
+import kotlin.reflect.typeOf
+
+/**
+ * Executes Kotlin scripts, typically written by an LLM.
+ *
+ * Failures are reported as [ScriptResult.Error], with a message
+ * which points to the offending lines of the script.
+ */
+public interface ScriptExecutor {
+
+    /**
+     * A property provided to the script.
+     *
+     * @param name the name of the property, a Kotlin identifier.
+     * @param type the type of the property as seen by the script,
+     *   including its type arguments and nullability,
+     *   where all the classes must be accessible to the script, i.e. public and not local.
+     * @param value the value of the property, of the [type].
+     */
+    public class Dependency<T>(
+        public val name: String,
+        public val type: KType,
+        public val value: T
+    ) {
+
+        init {
+            require(name.matches(identifier) && name.any { it != '_' }) {
+                "Dependency name is not a Kotlin identifier: '$name'"
+            }
+            type.inaccessibleClass()?.let {
+                throw IllegalArgumentException(
+                    "Dependency '$name' is of type ${it.name}, which is not accessible to the script - provide it as a public type"
+                )
+            }
+            if (value == null) {
+                require(type.isMarkedNullable) {
+                    "Dependency '$name' is null, while its type is not nullable: $type"
+                }
+            } else {
+                require((type.classifier as? KClass<*>)?.isInstance(value) ?: true) {
+                    "Dependency '$name' of type $type has a value of class ${value::class.java.name}"
+                }
+            }
+        }
+
+    }
+
+    /**
+     * Executes the [script] in the coroutine of the caller, with a [CoroutineScope] receiver,
+     * so the caller awaits all the coroutines it launched, and its cancellation cancels them.
+     * Note that cancellation cannot interrupt a blocking call of the script, like `Thread.sleep`.
+     */
+    public suspend fun execute(
+        @Language("kotlin") script: String,
+        dependencies: List<Dependency<*>> = emptyList(),
+    ): ScriptResult
+
+}
+
+/**
+ * Creates the default [ScriptExecutor].
+ *
+ * @param dispatcher the dispatcher of the compilation and of the script body,
+ *   [Dispatchers.IO] by default, as both might block.
+ *   The coroutines launched by the script inherit it.
+ * @param compilationCacheSize the maximal number of compiled scripts kept for reuse,
+ *   evicting the least recently used one, `0` by default, which disables the cache.
+ *   A compiled script is reused when the script text is the same,
+ *   and so are the names and types of its dependencies, while their values might differ.
+ *   A script which failed to compile is not cached.
+ */
+public fun ScriptExecutor(
+    dispatcher: CoroutineDispatcher = Dispatchers.IO,
+    compilationCacheSize: Int = 0
+): ScriptExecutor = DefaultScriptExecutor(
+    dispatcher,
+    compilationCacheSize
+)
+
+/**
+ * Creates a [ScriptExecutor.Dependency] of the reified type [T].
+ */
+public inline fun <reified T> dependency(
+    name: String,
+    value: T
+): ScriptExecutor.Dependency<T> = ScriptExecutor.Dependency(
+    name, typeOf<T>(), value
+)
+
+private val identifier = Regex("[\\p{L}\\p{Nl}_][\\p{L}\\p{Nl}\\p{Nd}_]*")
+
+/** The first class of this type, or of its type arguments, which the script cannot refer to. */
+private fun KType.inaccessibleClass(): Class<*>? =
+    (classifier as? KClass<*>)?.java?.takeUnless { it.isAccessible() }
+        ?: arguments.firstNotNullOfOrNull { it.type?.inaccessibleClass() }
+
+private fun Class<*>.isAccessible(): Boolean = if (isArray) {
+    componentType.isAccessible()
+} else {
+    !isLocalClass
+            && !isAnonymousClass
+            && Modifier.isPublic(modifiers)
+            && declaringClass?.isAccessible() ?: true
+}

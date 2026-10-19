@@ -2,11 +2,12 @@
 # libraries
 kotlinTarget = "2.4"
 javaTarget = "17"
-kotlin = "2.4.20"
+kotlin = "2.4.21"
 kotlinxCoroutines = "1.11.0"
 kotlinLogging = "8.0.4"
 slf4j = "2.0.20"
-xemanticKotlinTest = "1.17.5"
+xemanticKotlinCore = "0.9.0"
+xemanticKotlinTest = "1.18.0"
 asm = "9.10.1"
 # plugins
 versionCatalogUpdatePlugin = "1.1.1"
@@ -20,7 +21,9 @@ xemanticConventionsPlugin = "0.7.1"
 kotlin-scripting-common = { module = "org.jetbrains.kotlin:kotlin-scripting-common", version.ref = "kotlin" }
 kotlin-scripting-jvm = { module = "org.jetbrains.kotlin:kotlin-scripting-jvm", version.ref = "kotlin" }
 kotlin-scripting-jvm-host = { module = "org.jetbrains.kotlin:kotlin-scripting-jvm-host", version.ref = "kotlin" }
+kotlin-compiler-embeddable = { module = "org.jetbrains.kotlin:kotlin-compiler-embeddable", version.ref = "kotlin" }
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinxCoroutines" }
+xemantic-kotlin-core = { module = "com.xemantic.kotlin:xemantic-kotlin-core", version.ref = "xemanticKotlinCore" }
 kotlin-logging = { module = "io.github.oshai:kotlin-logging", version.ref = "kotlinLogging" }
 slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
 kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }

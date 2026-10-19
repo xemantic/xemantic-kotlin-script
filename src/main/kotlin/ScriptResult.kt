@@ -36,9 +36,11 @@ public sealed interface ScriptResult {
      *
      * @property message the LLM-friendly description of the failure,
      *   pointing to the offending lines of the script.
+     * @property phase the phase of the execution, in which the failure occurred.
      */
     public class Error(
-        public val message: String
+        public val message: String,
+        public val phase: ExecutionPhase
     ) : ScriptResult
 
     /**
@@ -46,9 +48,12 @@ public sealed interface ScriptResult {
      *
      * @property value the value of the last expression of the script,
      *   or [Unit] if the script does not end with an expression.
+     * @property warnings the compiler warnings, pointing to the offending lines of the script,
+     *   or `null` if there are none. They might reveal a bug, even if the script succeeded.
      */
     public class Value(
-        public val value: Any?
+        public val value: Any?,
+        public val warnings: String? = null
     ) : ScriptResult
 
 }
