@@ -70,6 +70,8 @@ dependencies {
     implementation(libs.kotlin.scripting.jvm.host)
     // the lexer, to tell the declarations of the script from its statements
     implementation(libs.kotlin.compiler.embeddable)
+    // the compiler brings kotlin-reflect 1.6.10, which mutates final fields, deprecated since JDK 26
+    implementation(libs.kotlin.reflect)
     implementation(libs.xemantic.kotlin.core)
     implementation(libs.kotlin.logging)
     // kotlin-logging 8 no longer brings SLF4J transitively
@@ -90,6 +92,10 @@ configurations.all {
 
 tasks.test {
     useJUnitPlatform()
+    if (JavaVersion.current().isCompatibleWith(JavaVersion.VERSION_23)) {
+        // the fast JAR file system of the compiler calls sun.misc.Unsafe, the option is unknown before JDK 23
+        jvmArgs("--sun-misc-unsafe-memory-access=allow")
+    }
 }
 
 powerAssert {
