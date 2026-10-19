@@ -18,6 +18,7 @@
 
 package com.xemantic.kotlin.script
 
+import com.xemantic.kotlin.test.assert
 import com.xemantic.kotlin.test.be
 import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
@@ -26,8 +27,12 @@ import kotlinx.coroutines.CompletableJob
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runTest
+import kotlin.reflect.typeOf
 import kotlin.test.Test
+import kotlin.time.Duration.Companion.hours
 
 class ScriptExecutorTest {
 
@@ -46,6 +51,7 @@ class ScriptExecutorTest {
         result should {
             be<ScriptResult.Value>()
             have(value == "foo")
+            have(warnings == null)
         }
     }
 
@@ -113,7 +119,7 @@ class ScriptExecutorTest {
             
             @Test
             fun test() = "test function with annotation"
-
+            
             test()
         """.trimIndent()
         val executor = ScriptExecutor()
@@ -149,6 +155,30 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should run script on the given dispatcher, in virtual time of the test`() = runTest {
+        // given
+        val script = """
+            import kotlinx.coroutines.delay
+            import kotlin.time.Duration.Companion.hours
+            delay(1.hours)
+            "done"
+        """.trimIndent()
+        val executor = ScriptExecutor(
+            dispatcher = StandardTestDispatcher(testScheduler)
+        )
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "done")
+        }
+        assert(currentTime == 1.hours.inWholeMilliseconds)
+    }
+
+    @Test
     fun `should use dependencies`() = runTest {
         // given
         val script = """
@@ -157,7 +187,7 @@ class ScriptExecutorTest {
         val dependencies = listOf(
             ScriptExecutor.Dependency(
                 name = "injected",
-                type = String::class,
+                type = typeOf<String>(),
                 value = "foo"
             )
         )
@@ -170,6 +200,93 @@ class ScriptExecutorTest {
         result should {
             be<ScriptResult.Value>()
             have(value == "FOO")
+        }
+    }
+
+    @Test
+    fun `should use dependency of generic type`() = runTest {
+        // given
+        val script = """
+            items.first().uppercase()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("items", listOf("foo"))))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "FOO")
+        }
+    }
+
+    @Test
+    fun `should give access to dependency of generic type in the declarations moved out of the script body`() = runTest {
+        // given
+        val script = """
+            import kotlin.math.max
+
+            enum class Measure { LENGTH }
+            class Longest(val measure: Measure) {
+                fun length() = items.maxOf { it.length }
+            }
+            max(Longest(Measure.LENGTH).length(), 0)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("items", listOf("a", "abc"))))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 3)
+        }
+    }
+
+    @Test
+    fun `should report error at original line in the script using dependency of generic type`() = runTest {
+        // given
+        val script = """
+            import kotlin.math.max
+
+            val first = items.first()
+            error("failure of ${'$'}first")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("items", listOf("foo"))))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IllegalStateException: failure of foo
+                  at <script body>(script.kts:4)
+                  | error("failure of ${'$'}first")
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should use dependency of nullable type`() = runTest {
+        // given
+        val script = """
+            name ?: "nobody"
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<String?>("name", null)))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "nobody")
+            have(warnings == null)
         }
     }
 
@@ -264,22 +381,16 @@ class ScriptExecutorTest {
         // then
         result should {
             be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                <impediment phase="COMPILATION">
-                [ERROR] Unresolved reference 'asdf'.
-                  at line 1
+                script.kts:1:1: error: Unresolved reference 'asdf'.
                   | <error>asdf</error>
 
-                [ERROR] Unresolved reference 'foo'.
-                  at line 2
+                script.kts:2:9: error: Unresolved reference 'foo'.
                   | println(<error>foo</error>)
 
-                [ERROR] Initializer type mismatch: expected 'Int', actual 'String'.
-                  at line 3
+                script.kts:3:17: error: Initializer type mismatch: expected 'Int', actual 'String'.
                   | val number: Int <error>=</error> ""${'"'}
-
-                </impediment>
-                
             """.trimIndent()
         }
     }
@@ -300,18 +411,13 @@ class ScriptExecutorTest {
         // then
         result should {
             be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                <impediment phase="COMPILATION">
-                [ERROR] Unresolved reference 'foo'.
-                  at line 1
+                script.kts:1:8: error: Unresolved reference 'foo'.
                   | import <error>foo</error>.Bar
 
-                [ERROR] Unresolved reference 'buzz'.
-                  at line 3
+                script.kts:3:1: error: Unresolved reference 'buzz'.
                   | <error>buzz</error>
-
-                </impediment>
-
             """.trimIndent()
         }
     }
@@ -332,14 +438,10 @@ class ScriptExecutorTest {
         // then
         result should {
             be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                <impediment phase="COMPILATION">
-                [ERROR] Syntax error: Expecting '"'.
-                  at line 3
+                script.kts:3:31: error: Syntax error: Expecting '"'.
                   | and is missing a closing quote<error></error>
-
-                </impediment>
-
             """.trimIndent()
         }
     }
@@ -358,13 +460,11 @@ class ScriptExecutorTest {
         // then
         result should {
             be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
             message sameAs """
-                <impediment phase="EVALUATION">
                 java.lang.Exception: must fail
-                  at Script.invokeSuspend(script.kts:1)
+                  at <script body>(script.kts:1)
                   | throw Exception("must fail")
-                </impediment>
-
             """.trimIndent()
         }
     }
@@ -390,20 +490,18 @@ class ScriptExecutorTest {
         // then
         result should {
             be<ScriptResult.Error>()
-            message.substringBefore("at java.lang.Class.getDeclaredField(Class.java:").trimEnd() sameAs $$"""
-                <impediment phase="EVALUATION">
+            have(phase == ExecutionPhase.EVALUATION)
+            message.substringBefore("at java.lang.Class.getDeclaredField(Class.java:").trimEnd() sameAs """
                 java.lang.Exception: must fail
-                  at Script.invokeSuspend(script.kts:7)
+                  at <script body>(script.kts:7)
                   |     throw Exception("must fail", e)
                 Caused by: java.lang.NoSuchFieldException: nonExistentField
             """.trimIndent()
             message.substringAfter("at java.lang.Class.getDeclaredField(Class.java:").substringAfter("\n") sameAs $$"""
-                |  at Script.invokeSuspend$willThrow(script.kts:2)
+                |  at willThrow(script.kts:2)
                 |  |     String::class.java.getDeclaredField("nonExistentField")
-                |  at Script.invokeSuspend(script.kts:5)
+                |  at <script body>(script.kts:5)
                 |  |     willThrow(1)
-                |</impediment>
-                |
             """.trimMargin()
         }
     }
@@ -427,13 +525,11 @@ class ScriptExecutorTest {
         // then
         result1 should {
             be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
             message sameAs """
-                <impediment phase="EVALUATION">
                 java.lang.Exception: must fail
-                  at Script.invokeSuspend(script.kts:1)
+                  at <script body>(script.kts:1)
                   | throw Exception("must fail")
-                </impediment>
-
             """.trimIndent()
         }
         result2 should {
@@ -462,13 +558,11 @@ class ScriptExecutorTest {
             be<ScriptResult.Value>()
             value should {
                 be<ScriptResult.Error>()
+                have(phase == ExecutionPhase.EVALUATION)
                 message sameAs """
-                    <impediment phase="EVALUATION">
                     java.lang.Exception: inner failure
-                      at Script.invokeSuspend(script.kts:1)
+                      at <script body>(script.kts:1)
                       | throw Exception("inner failure")
-                    </impediment>
-
                 """.trimIndent()
             }
         }
@@ -509,30 +603,6 @@ class ScriptExecutorTest {
     }
 
     @Test
-    fun `should enclose error message in custom error tag`() = runTest {
-        // given
-        val script = "undefinedVariable"
-        val executor = ScriptExecutor(errorTag = "golem:impediment")
-
-        // when
-        val result = executor.execute(script)
-
-        // then
-        result should {
-            be<ScriptResult.Error>()
-            message sameAs """
-                <golem:impediment phase="COMPILATION">
-                [ERROR] Unresolved reference 'undefinedVariable'.
-                  at line 1
-                  | <error>undefinedVariable</error>
-
-                </golem:impediment>
-
-            """.trimIndent()
-        }
-    }
-
-    @Test
     fun `should report single unresolved reference error on line 1 without imports`() = runTest {
         // given
         val script = "undefinedVariable"
@@ -544,14 +614,10 @@ class ScriptExecutorTest {
         // then
         result should {
             be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                <impediment phase="COMPILATION">
-                [ERROR] Unresolved reference 'undefinedVariable'.
-                  at line 1
+                script.kts:1:1: error: Unresolved reference 'undefinedVariable'.
                   | <error>undefinedVariable</error>
-
-                </impediment>
-
             """.trimIndent()
         }
     }
@@ -568,14 +634,10 @@ class ScriptExecutorTest {
         // then
         result should {
             be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                <impediment phase="COMPILATION">
-                [ERROR] Syntax error: Expecting '}'.
-                  at line 1
+                script.kts:1:2: error: Syntax error: Expecting '}'.
                   | {<error></error>
-
-                </impediment>
-
             """.trimIndent()
         }
     }
@@ -592,18 +654,13 @@ class ScriptExecutorTest {
         // then
         result should {
             be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                <impediment phase="COMPILATION">
-                [ERROR] Syntax error: Expected annotation identifier after '@'.
-                  at line 1
+                script.kts:1:4: error: Syntax error: Expected annotation identifier after '@'.
                   |    <error>@</error>
 
-                [ERROR] Syntax error: Expecting an expression.
-                  at line 1
+                script.kts:1:5: error: Syntax error: Expecting an expression.
                   |    @<error></error>
-
-                </impediment>
-
             """.trimIndent()
         }
     }
@@ -620,14 +677,10 @@ class ScriptExecutorTest {
         // then
         result should {
             be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                <impediment phase="COMPILATION">
-                [ERROR] Syntax error: Expecting an expression.
-                  at line 1
+                script.kts:1:8: error: Syntax error: Expecting an expression.
                   | val x =<error></error>
-                
-                </impediment>
-
             """.trimIndent()
         }
     }
@@ -644,14 +697,10 @@ class ScriptExecutorTest {
         // then
         result should {
             be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                <impediment phase="COMPILATION">
-                [ERROR] Syntax error: Unexpected symbol.
-                  at line 1
-                  | }<error></error>
-
-                </impediment>
-
+                script.kts:1:1: error: Syntax error: Unexpected '}' without matching '{'.
+                  | <error>}</error>
             """.trimIndent()
         }
     }
@@ -671,14 +720,10 @@ class ScriptExecutorTest {
         // then
         result should {
             be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                <impediment phase="COMPILATION">
-                [ERROR] Syntax error: Unexpected symbol.
-                  at line 2
-                  | }<error></error>
-
-                </impediment>
-
+                script.kts:2:1: error: Syntax error: Unexpected '}' without matching '{'.
+                  | <error>}</error>
             """.trimIndent()
         }
     }
@@ -695,22 +740,10 @@ class ScriptExecutorTest {
         // then
         result should {
             be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                <impediment phase="COMPILATION">
-                [ERROR] Syntax error: Unexpected symbol.
-                  at line 1
-                  | }<error>}</error>}
-
-                [ERROR] Syntax error: Unexpected symbol.
-                  at line 1
-                  | }}<error>}</error>
-
-                [ERROR] Syntax error: Unexpected symbol.
-                  at line 1
-                  | }}}<error></error>
-
-                </impediment>
-
+                script.kts:1:1: error: Syntax error: Unexpected '}' without matching '{'.
+                  | <error>}</error>}}
             """.trimIndent()
         }
     }
@@ -731,14 +764,10 @@ class ScriptExecutorTest {
         // then
         result should {
             be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                <impediment phase="COMPILATION">
-                [ERROR] Unresolved reference 'undefinedVariable'.
-                  at line 3
+                script.kts:3:1: error: Unresolved reference 'undefinedVariable'.
                   | <error>undefinedVariable</error>
-
-                </impediment>
-
             """.trimIndent()
         }
     }
@@ -755,14 +784,10 @@ class ScriptExecutorTest {
         // then
         result should {
             be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                <impediment phase="COMPILATION">
-                [ERROR] Syntax error: Unexpected symbol.
-                  at line 1
-                  | {}}<error></error>
-
-                </impediment>
-
+                script.kts:1:3: error: Syntax error: Unexpected '}' without matching '{'.
+                  | {}<error>}</error>
             """.trimIndent()
         }
     }
@@ -783,13 +808,11 @@ class ScriptExecutorTest {
         // then
         result should {
             be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
             message sameAs """
-                <impediment phase="EVALUATION">
                 java.lang.Exception: error on line 3
-                  at Script.invokeSuspend(script.kts:3)
+                  at <script body>(script.kts:3)
                   | throw Exception("error on line 3")
-                </impediment>
-
             """.trimIndent()
         }
     }
@@ -810,14 +833,10 @@ class ScriptExecutorTest {
         // then
         result should {
             be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                <impediment phase="COMPILATION">
-                [ERROR] Unresolved reference 'undefinedUnicode变量'.
-                  at line 3
+                script.kts:3:1: error: Unresolved reference 'undefinedUnicode变量'.
                   | <error>undefinedUnicode变量</error>
-
-                </impediment>
-
             """.trimIndent()
         }
     }
@@ -839,6 +858,746 @@ class ScriptExecutorTest {
                 be<ScriptResult.Value>()
                 have(value == "result-$i")
             }
+        }
+    }
+
+
+    @Test
+    fun `should report NotImplementedError thrown by TODO`() = runTest {
+        // given
+        val script = """
+            fun notYetImplemented(): Int = TODO()
+            notYetImplemented()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs $$"""
+                kotlin.NotImplementedError: An operation is not implemented.
+                  at notYetImplemented(script.kts:1)
+                  | fun notYetImplemented(): Int = TODO()
+                  at <script body>(script.kts:2)
+                  | notYetImplemented()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report StackOverflowError with collapsed recursive frames`() = runTest {
+        // given
+        val script = """
+            fun recurse(n: Int): Int = recurse(n + 1) + 1
+            recurse(0)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            // the number of frames depends on the JVM settings
+            message.replace(Regex("repeated \\d+ more times"), "repeated N more times") sameAs $$"""
+                java.lang.StackOverflowError
+                  at recurse(script.kts:1)
+                  | fun recurse(n: Int): Int = recurse(n + 1) + 1
+                  ... (the frame above repeated N more times)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should collapse frames of recursion`() = runTest {
+        // given
+        val script = """
+            fun countdown(n: Int): Int = if (n == 0) error("bottom reached") else countdown(n - 1)
+            countdown(50)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs $$"""
+                java.lang.IllegalStateException: bottom reached
+                  at countdown(script.kts:1)
+                  | fun countdown(n: Int): Int = if (n == 0) error("bottom reached") else countdown(n - 1)
+                  ... (the frame above repeated 50 more times)
+                  at <script body>(script.kts:2)
+                  | countdown(50)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should collapse frames of mutual recursion`() = runTest {
+        // given
+        val script = """
+            fun ping(n: Int): Int = if (n == 0) error("bottom reached") else pong(n - 1)
+            fun pong(n: Int): Int = ping(n)
+            ping(10)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs $$"""
+                java.lang.IllegalStateException: bottom reached
+                  at ping(script.kts:1)
+                  | fun ping(n: Int): Int = if (n == 0) error("bottom reached") else pong(n - 1)
+                  at pong(script.kts:2)
+                  | fun pong(n: Int): Int = ping(n)
+                  ... (the 2 frames above repeated 9 more times)
+                  at ping(script.kts:1)
+                  | fun ping(n: Int): Int = if (n == 0) error("bottom reached") else pong(n - 1)
+                  at <script body>(script.kts:3)
+                  | ping(10)
+            """.trimIndent()
+        }
+    }
+
+    /**
+     * The exception is not copyable by the coroutine stack trace recovery,
+     * so the outcome does not depend on whether it is enabled.
+     */
+    @Test
+    fun `should report exception caused by exception of the same class`() = runTest {
+        // given
+        val script = """
+            class Failure(val code: Int, cause: Throwable? = null) : RuntimeException("failure ${'$'}code", cause)
+            throw Failure(1, Failure(2))
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs $$"""
+                Failure: failure 1
+                  at <script body>(script.kts:2)
+                  | throw Failure(1, Failure(2))
+                Caused by: Failure: failure 2
+                  at <script body>(script.kts:2)
+                  | throw Failure(1, Failure(2))
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report the name of exception class declared in a function of the script`() = runTest {
+        // given
+        val script = """
+            fun fail(): Nothing {
+                class LocalFailure : Exception("local failure")
+                throw LocalFailure()
+            }
+            fail()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs $$"""
+                LocalFailure: local failure
+                  at fail(script.kts:3)
+                  |     throw LocalFailure()
+                  at <script body>(script.kts:5)
+                  | fail()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report suppressed exceptions`() = runTest {
+        // given
+        val script = """
+            class Resource : AutoCloseable {
+                override fun close() {
+                    throw IllegalStateException("close failed")
+                }
+            }
+            Resource().use { throw RuntimeException("body failed") }
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.RuntimeException: body failed
+                  at <script body>(script.kts:6)
+                  | Resource().use { throw RuntimeException("body failed") }
+                  Suppressed: java.lang.IllegalStateException: close failed
+                    at Resource.close(script.kts:3)
+                    |         throw IllegalStateException("close failed")
+                    at <script body>(script.kts:6)
+                    | Resource().use { throw RuntimeException("body failed") }
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report circular causes`() = runTest {
+        // given
+        val script = """
+            val first = RuntimeException("first")
+            val second = RuntimeException("second", first)
+            first.initCause(second)
+            throw first
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.RuntimeException: first
+                  at <script body>(script.kts:1)
+                  | val first = RuntimeException("first")
+                Caused by: java.lang.RuntimeException: second
+                  at <script body>(script.kts:2)
+                  | val second = RuntimeException("second", first)
+                Caused by: [CIRCULAR REFERENCE: java.lang.RuntimeException: first]
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should indent continuation lines of multiline diagnostic message`() = runTest {
+        // given
+        val script = """
+            fun twice(): Int = 1
+            fun twice(): Int = 2
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:1: error: Conflicting overloads:
+                  fun twice(): Int
+                  | <error>fun twice(): Int</error> = 1
+
+                script.kts:2:1: error: Conflicting overloads:
+                  fun twice(): Int
+                  | <error>fun twice(): Int</error> = 2
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report compiler warnings together with runtime exception`() = runTest {
+        // given
+        val script = """
+            val text = 42 as String
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.ClassCastException: class java.lang.Integer cannot be cast to class java.lang.String (java.lang.Integer and java.lang.String are in module java.base of loader 'bootstrap')
+                  at <script body>(script.kts:1)
+                  | val text = 42 as String
+
+                script.kts:1:15: warning: This cast can never succeed.
+                  | val text = 42 <error>as</error> String
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report unmatched closing brace in the middle of the script`() = runTest {
+        // given
+        val script = """
+            val a = 1
+            }
+            val b = 2
+            b
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:1: error: Syntax error: Unexpected '}' without matching '{'.
+                  | <error>}</error>
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not treat import in a multiline string as an import`() = runTest {
+        // given
+        val script = """
+            val text = ""${'"'}
+            import this is text
+            ""${'"'}
+            text.trim()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "import this is text")
+        }
+    }
+
+    @Test
+    fun `should handle indented imports, file annotations and comments`() = runTest {
+        // given
+        val script = """
+            @file:OptIn(ExperimentalStdlibApi::class)
+            // the imports
+              import kotlin.math.max
+            /* the other import */ import kotlin.math.min
+            max(1, min(2, 3))
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should report errors at original lines after file annotation and imports`() = runTest {
+        // given
+        val script = """
+            @file:OptIn(ExperimentalStdlibApi::class)
+
+            import kotlin.math.max
+
+            max(1, undefined)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                script.kts:5:8: error: Unresolved reference 'undefined'.
+                  | max(1, <error>undefined</error>)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should execute script declaring types which cannot be local`() = runTest {
+        // given
+        val script = $$"""
+            enum class Color { RED, GREEN }
+            interface Shape { val color: Color }
+            sealed class Figure : Shape
+            data class Circle(override val color: Color) : Figure()
+            object Registry {
+                val figures = mutableListOf<Figure>()
+            }
+            class Palette {
+                companion object {
+                    val default = Color.GREEN
+                }
+            }
+            typealias Figures = List<Figure>
+            @JvmInline
+            value class Name(val value: String)
+            fun interface Describer { fun describe(figure: Figure): String }
+            annotation class Marker
+
+            Registry.figures += Circle(Palette.default)
+            val figures: Figures = Registry.figures
+            val describer = Describer { figure ->
+                when (figure) {
+                    is Circle -> "circle"
+                }
+            }
+            "${Name(describer.describe(figures.single())).value} ${figures.single().color}"
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "circle GREEN")
+        }
+    }
+
+    @Test
+    fun `should execute script with top-level declarations having modifiers`() = runTest {
+        // given
+        val script = $$"""
+            import kotlinx.coroutines.delay
+
+            private val greeting = "Hello"
+            private suspend fun greet(name: String): String {
+                delay(1)
+                return "$greeting $name"
+            }
+            inline fun <reified T> typeName() = T::class.simpleName!!
+            val String.shouted get() = uppercase() + "!"
+            val answer: Int
+                get() = 42
+            "${greet(typeName<String>())} ${"x".shouted} $answer"
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "Hello String X! 42")
+        }
+    }
+
+    @Test
+    fun `should give access to dependencies in the classes declared in the script`() = runTest {
+        // given
+        val script = $$"""
+            import kotlinx.coroutines.delay
+
+            enum class Punctuation(val mark: String) { EXCLAMATION("!") }
+            class Greeter(val punctuation: Punctuation) {
+                suspend fun greet(): String {
+                    delay(1)
+                    return "Hello $name${punctuation.mark}"
+                }
+            }
+            Greeter(Punctuation.EXCLAMATION).greet()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("name", "World")))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "Hello World!")
+        }
+    }
+
+    @Test
+    fun `should report runtime error at original line of declaration moved out of the script body`() = runTest {
+        // given
+        val script = """
+            val before = 1
+            enum class Level { LOW, HIGH }
+            object Checker {
+                fun check(level: Level) {
+                    if (level == Level.HIGH) throw IllegalArgumentException("too high")
+                }
+            }
+            Checker.check(Level.HIGH)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalArgumentException: too high
+                  at Checker.check(script.kts:5)
+                  |         if (level == Level.HIGH) throw IllegalArgumentException("too high")
+                  at <script body>(script.kts:8)
+                  | Checker.check(Level.HIGH)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report compilation error at original line of declaration moved out of the script body`() = runTest {
+        // given
+        val script = """
+            val before = 1
+            data class Point(val x: Int, val y: Int)
+            enum class Direction(val delta: Point) {
+                UP(Point(0, missing))
+            }
+            Direction.UP
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:17: error: Unresolved reference 'missing'.
+                  |     UP(Point(0, <error>missing</error>))
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint that declaration moved out of the script body cannot access its local declarations`() = runTest {
+        // given
+        val script = """
+            val base = 10
+            object Scaler {
+                fun scale(x: Int) = x * base
+            }
+            Scaler.scale(2)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:29: error: Unresolved reference 'base'.
+                  |     fun scale(x: Int) = x * <error>base</error>
+                  hint: 'Scaler' is compiled outside of the script body, where 'base' (line 1) is not visible - pass it as a parameter, or declare it within 'Scaler'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at object accessing dependency`() = runTest {
+        // given
+        val script = $$"""
+            val before = 1
+            object Greeter {
+                fun greet() = "Hello $name"
+            }
+            Greeter.greet()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("name", "World")))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:8: error: Object 'Greeter' captures the script class instance. Try to use class or anonymous object instead.
+                  | object <error>Greeter</error> {
+                  hint: 'Greeter' is compiled outside of the script body, where an object cannot access the dependencies - declare it as a class, or pass the dependencies as parameters.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should keep local classes accessing local declarations of the script body`() = runTest {
+        // given
+        val script = """
+            val base = 10
+            class Scaler {
+                fun scale(x: Int) = x * base
+            }
+            Scaler().scale(2)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 20)
+        }
+    }
+
+
+    @Test
+    fun `should call function declared later in the script`() = runTest {
+        // given
+        val script = $$"""
+            val greeting = greet("World")
+            fun greet(name: String) = "Hello $name"
+            greeting
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "Hello World")
+        }
+    }
+
+    @Test
+    fun `should hint to declare function before its use when it accesses local declarations of the script body`() = runTest {
+        // given
+        val script = """
+            val prefix = ">"
+            val formatted = format("x")
+            fun format(text: String) = prefix + text
+            formatted
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:17: error: Unresolved reference 'format'.
+                  | val formatted = <error>format</error>("x")
+                  hint: 'format' is declared at line 3, while the functions of the script body are visible only after their declaration - move it before line 2.
+            """.trimIndent()
+        }
+    }
+
+
+    @Test
+    fun `should report compiler warnings of successfully executed script`() = runTest {
+        // given
+        val script = """
+            val number: Int = 1
+            if (number is Int) "yes" else "no"
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "yes")
+            warnings sameAs """
+                script.kts:2:5: warning: Check for instance is always 'true'.
+                  | if (<error>number is Int</error>) "yes" else "no"
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frames of nested local functions`() = runTest {
+        // given
+        val script = """
+            fun outer(): Int {
+                fun inner(): Int = error("deep")
+                return inner()
+            }
+            outer()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: deep
+                  at inner(script.kts:2)
+                  |     fun inner(): Int = error("deep")
+                  at outer(script.kts:3)
+                  |     return inner()
+                  at <script body>(script.kts:5)
+                  | outer()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frames of local class and lambda`() = runTest {
+        // given
+        val script = """
+            class Worker {
+                fun work(): Int = error("cannot work")
+            }
+            val task = Runnable { Worker().work() }
+            task.run()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: cannot work
+                  at Worker.work(script.kts:2)
+                  |     fun work(): Int = error("cannot work")
+                  at <lambda>(script.kts:4)
+                  | val task = Runnable { Worker().work() }
+                  at <script body>(script.kts:5)
+                  | task.run()
+            """.trimIndent()
         }
     }
 

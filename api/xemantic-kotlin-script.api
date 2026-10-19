@@ -11,31 +11,52 @@ public final class com/xemantic/kotlin/script/ScriptBlock {
 	public final fun invoke (Lkotlin/jvm/functions/Function2;)Lkotlin/jvm/functions/Function2;
 }
 
-public final class com/xemantic/kotlin/script/ScriptExecutor {
+public final class com/xemantic/kotlin/script/ScriptDependencies {
 	public fun <init> ()V
-	public fun <init> (Ljava/lang/String;)V
-	public synthetic fun <init> (Ljava/lang/String;ILkotlin/jvm/internal/DefaultConstructorMarker;)V
-	public final fun execute (Ljava/lang/String;Ljava/util/List;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
+	public final fun getDependencies ()Ljava/util/List;
+}
+
+public abstract interface annotation class com/xemantic/kotlin/script/ScriptDependenciesDsl : java/lang/annotation/Annotation {
+}
+
+public final class com/xemantic/kotlin/script/ScriptDependenciesKt {
+	public static final fun execute (Lcom/xemantic/kotlin/script/ScriptExecutor;Ljava/lang/String;Lkotlin/jvm/functions/Function1;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
+}
+
+public abstract interface class com/xemantic/kotlin/script/ScriptExecutor {
+	public abstract fun execute (Ljava/lang/String;Ljava/util/List;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
+	public static synthetic fun execute$default (Lcom/xemantic/kotlin/script/ScriptExecutor;Ljava/lang/String;Ljava/util/List;Lkotlin/coroutines/Continuation;ILjava/lang/Object;)Ljava/lang/Object;
+}
+
+public final class com/xemantic/kotlin/script/ScriptExecutor$DefaultImpls {
 	public static synthetic fun execute$default (Lcom/xemantic/kotlin/script/ScriptExecutor;Ljava/lang/String;Ljava/util/List;Lkotlin/coroutines/Continuation;ILjava/lang/Object;)Ljava/lang/Object;
 }
 
 public final class com/xemantic/kotlin/script/ScriptExecutor$Dependency {
-	public fun <init> (Ljava/lang/String;Lkotlin/reflect/KClass;Ljava/lang/Object;)V
+	public fun <init> (Ljava/lang/String;Lkotlin/reflect/KType;Ljava/lang/Object;)V
 	public final fun getName ()Ljava/lang/String;
-	public final fun getType ()Lkotlin/reflect/KClass;
+	public final fun getType ()Lkotlin/reflect/KType;
 	public final fun getValue ()Ljava/lang/Object;
+}
+
+public final class com/xemantic/kotlin/script/ScriptExecutorKt {
+	public static final fun ScriptExecutor (Lkotlinx/coroutines/CoroutineDispatcher;I)Lcom/xemantic/kotlin/script/ScriptExecutor;
+	public static synthetic fun ScriptExecutor$default (Lkotlinx/coroutines/CoroutineDispatcher;IILjava/lang/Object;)Lcom/xemantic/kotlin/script/ScriptExecutor;
 }
 
 public abstract interface class com/xemantic/kotlin/script/ScriptResult {
 }
 
 public final class com/xemantic/kotlin/script/ScriptResult$Error : com/xemantic/kotlin/script/ScriptResult {
-	public fun <init> (Ljava/lang/String;)V
+	public fun <init> (Ljava/lang/String;Lcom/xemantic/kotlin/script/ExecutionPhase;)V
 	public final fun getMessage ()Ljava/lang/String;
+	public final fun getPhase ()Lcom/xemantic/kotlin/script/ExecutionPhase;
 }
 
 public final class com/xemantic/kotlin/script/ScriptResult$Value : com/xemantic/kotlin/script/ScriptResult {
-	public fun <init> (Ljava/lang/Object;)V
+	public fun <init> (Ljava/lang/Object;Ljava/lang/String;)V
+	public synthetic fun <init> (Ljava/lang/Object;Ljava/lang/String;ILkotlin/jvm/internal/DefaultConstructorMarker;)V
 	public final fun getValue ()Ljava/lang/Object;
+	public final fun getWarnings ()Ljava/lang/String;
 }
 

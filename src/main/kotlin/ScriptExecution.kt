@@ -20,25 +20,25 @@ package com.xemantic.kotlin.script
 
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
-import org.intellij.lang.annotations.Language
 import kotlin.concurrent.atomics.AtomicInt
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.concurrent.atomics.fetchAndIncrement
-import kotlin.reflect.KClass
+import kotlin.concurrent.atomics.incrementAndFetch
+import kotlin.reflect.typeOf
 import kotlin.script.experimental.api.CompiledScript
-import kotlin.script.experimental.api.EvaluationResult
 import kotlin.script.experimental.api.KotlinType
 import kotlin.script.experimental.api.ResultValue
 import kotlin.script.experimental.api.ResultWithDiagnostics
 import kotlin.script.experimental.api.ScriptCompilationConfiguration
 import kotlin.script.experimental.api.ScriptDiagnostic
 import kotlin.script.experimental.api.ScriptEvaluationConfiguration
-import kotlin.script.experimental.api.SourceCode
 import kotlin.script.experimental.api.compilerOptions
 import kotlin.script.experimental.api.defaultImports
 import kotlin.script.experimental.api.providedProperties
@@ -59,40 +59,32 @@ public object ScriptBlock {
 }
 
 /**
- * Creates a [ScriptExecutor.Dependency] of the reified type [T].
+ * The default [ScriptExecutor], see the `ScriptExecutor(...)` factory function for the parameters.
  */
-public inline fun <reified T : Any> dependency(
-    name: String,
-    value: T?
-): ScriptExecutor.Dependency<T> = ScriptExecutor.Dependency(
-    name, T::class, value
-)
-
-/**
- * Executes Kotlin scripts, typically written by an LLM.
- *
- * Failures are reported as [ScriptResult.Error], with a message enclosed in the [errorTag],
- * which points to the offending lines of the script.
- *
- * @param errorTag the name of the tag enclosing error messages.
- */
-public class ScriptExecutor(
-    private val errorTag: String = "impediment"
-) {
-
-    /**
-     * A property provided to the script.
-     */
-    public class Dependency<T : Any>(
-        public val name: String,
-        public val type: KClass<T>,
-        public val value: T?
-    )
+internal class DefaultScriptExecutor(
+    private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
+    compilationCacheSize: Int = 0
+) : ScriptExecutor {
 
     private val logger = KotlinLogging.logger {}
 
     @OptIn(ExperimentalAtomicApi::class)
     private val scriptIdSeq = AtomicInt(1)
+
+    @OptIn(ExperimentalAtomicApi::class)
+    private val compilations = AtomicInt(0)
+
+    /**
+     * The number of the actual compilations, not served by the cache.
+     */
+    @OptIn(ExperimentalAtomicApi::class)
+    internal val compilationCount: Int get() = compilations.load()
+
+    private val compilationCache = if (compilationCacheSize > 0) {
+        ScriptCompilationCache(compilationCacheSize)
+    } else {
+        null
+    }
 
     private val scriptingHost = BasicJvmScriptingHost()
 
@@ -115,26 +107,30 @@ public class ScriptExecutor(
         )
     }
 
-    /**
-     * Executes the [script] in the coroutine of the caller, with a [CoroutineScope] receiver,
-     * so the caller awaits all the coroutines it launched, and its cancellation cancels them.
-     * The script body is evaluated on [Dispatchers.IO], as it might block.
-     */
-    public suspend fun execute(
-        @Language("kotlin") script: String,
-        dependencies: List<Dependency<*>> = emptyList(),
+    override suspend fun execute(
+        script: String,
+        dependencies: List<ScriptExecutor.Dependency<*>>,
     ): ScriptResult {
+
+        dependencies.groupBy { it.name }.forEach { (name, sameName) ->
+            require(sameName.size == 1) { "Duplicate dependency name: $name" }
+            require(name != SCRIPT_BLOCK_NAME && !name.startsWith(GENERIC_DEPENDENCY_PREFIX)) {
+                "Reserved dependency name: $name"
+            }
+        }
 
         @OptIn(ExperimentalAtomicApi::class)
         val scriptId = scriptIdSeq.fetchAndIncrement()
         logger.debug { "Script[$scriptId]: Executing" }
 
         val (result, duration) = measureTimedValue {
-            ScriptHandler(
-                scriptId,
-                dependencies,
-                script
-            ).handle()
+            withContext(dispatcher) {
+                ScriptHandler(
+                    scriptId,
+                    dependencies,
+                    script
+                ).handle()
+            }
         }
 
         logger.debug { "Script[$scriptId]: Execution took $duration in total" }
@@ -144,33 +140,46 @@ public class ScriptExecutor(
 
     private inner class ScriptHandler(
         private val scriptId: Int,
-        dependencies: List<Dependency<*>>,
+        dependencies: List<ScriptExecutor.Dependency<*>>,
         script: String
     ) {
 
-        private val allDependencies = dependencies + Dependency(
-            name = "_script",
-            type = ScriptBlock::class,
+        private val allDependencies = dependencies + ScriptExecutor.Dependency(
+            name = SCRIPT_BLOCK_NAME,
+            type = typeOf<ScriptBlock>(),
             value = ScriptBlock
         )
 
-        private val source = SuspendableScriptSource(script)
+        private val source = ScriptSource(
+            script,
+            preamble = allDependencies.mapNotNull { it.accessor }
+        )
 
         suspend fun handle(): ScriptResult {
+            source.unmatchedClosingBrace?.let {
+                // the brace would close the script block, misplacing all the errors
+                return ScriptResult.Error(
+                    ScriptErrorReporter(source).toUnmatchedClosingBraceMessage(it),
+                    ExecutionPhase.COMPILATION
+                )
+            }
             val result = when (val compilationResult = compile()) {
-                is ResultWithDiagnostics.Success -> {
-                    val compiledScript = compilationResult.value
-                    evaluate(compiledScript)
+                is Success -> {
+                    evaluate(
+                        compiledScript = compilationResult.value,
+                        warnings = compilationResult.reports.filter {
+                            it.severity == ScriptDiagnostic.Severity.WARNING
+                        }
+                    )
                 }
-                is ResultWithDiagnostics.Failure -> {
-                    val failureMessage = errorReporter().toFailureMessage(
-                        phase = ExecutionPhase.COMPILATION,
-                        failure = compilationResult
+                is Failure -> {
+                    val failureMessage = ScriptErrorReporter(source).toFailureMessage(
+                        compilationResult.reports.filterNonIgnorable()
                     )
                     logger.debug {
                         "Script[$scriptId]: Compilation (1/2) failure message: $failureMessage"
                     }
-                    ScriptResult.Error(failureMessage)
+                    ScriptResult.Error(failureMessage, ExecutionPhase.COMPILATION)
                 }
             }
 
@@ -182,17 +191,20 @@ public class ScriptExecutor(
             logger.debug { "Script[$scriptId]: Compiling (1/2)" }
 
             val (compilationResult, duration) = measureTimedValue {
-                scriptingHost.compiler(
-                    script = source,
-                    scriptCompilationConfiguration = compilationConfig()
-                )
+                compilationCache?.getOrCompile(
+                    ScriptCompilationCache.Key(
+                        script = source.text,
+                        dependencies = allDependencies.map { it.name to it.type }
+                    ),
+                    ::doCompile
+                ) ?: doCompile()
             }
 
             when (compilationResult) {
-                is ResultWithDiagnostics.Success -> logger.debug {
+                is Success -> logger.debug {
                     "Script[$scriptId]: Compilation (1/2) succeeded after $duration"
                 }
-                is ResultWithDiagnostics.Failure -> logger.debug {
+                is Failure -> logger.debug {
                     "Script[$scriptId]: Compilation (1/2) failed after $duration"
                 }
             }
@@ -200,8 +212,18 @@ public class ScriptExecutor(
             return compilationResult
         }
 
+        private suspend fun doCompile(): ResultWithDiagnostics<CompiledScript> {
+            @OptIn(ExperimentalAtomicApi::class)
+            compilations.incrementAndFetch()
+            return scriptingHost.compiler(
+                script = source,
+                scriptCompilationConfiguration = compilationConfig()
+            )
+        }
+
         private suspend fun evaluate(
-            compiledScript: CompiledScript
+            compiledScript: CompiledScript,
+            warnings: List<ScriptDiagnostic>
         ): ScriptResult {
 
             logger.debug { "Script[$scriptId]: Evaluating (2/2)" }
@@ -214,16 +236,15 @@ public class ScriptExecutor(
             }
 
             val result = when (evaluationResult) {
-                is ResultWithDiagnostics.Success<EvaluationResult> -> {
-                    evaluationResult.value.returnValue.toScriptResult()
+                is Success -> {
+                    evaluationResult.value.returnValue.toScriptResult(warnings)
                 }
-                is ResultWithDiagnostics.Failure -> {
+                is Failure -> {
                     // in practice, this never happens
-                    val failureMessage = errorReporter().toFailureMessage(
-                        phase = ExecutionPhase.EVALUATION,
-                        failure = evaluationResult
+                    val failureMessage = ScriptErrorReporter(source).toFailureMessage(
+                        evaluationResult.reports.filterNonIgnorable()
                     )
-                    ScriptResult.Error(failureMessage)
+                    ScriptResult.Error(failureMessage, ExecutionPhase.EVALUATION)
                 }
             }
 
@@ -239,288 +260,96 @@ public class ScriptExecutor(
             return result
         }
 
-        private suspend fun ResultValue.toScriptResult() = when (this) {
+        private suspend fun ResultValue.toScriptResult(
+            warnings: List<ScriptDiagnostic>
+        ): ScriptResult = when (this) {
             is ResultValue.Value -> {
                 @Suppress("UNCHECKED_CAST")
                 val block = value as suspend CoroutineScope.() -> Any?
                 try {
                     ScriptResult.Value(
-                        withContext(Dispatchers.IO) { block() }
+                        value = coroutineScope { block() },
+                        warnings = if (warnings.isEmpty()) null else {
+                            ScriptErrorReporter(source).toFailureMessage(warnings)
+                        }
                     )
-                } catch (e: Exception) {
+                } catch (e: Throwable) {
                     // the cancellation of the caller is not a failure of the script
                     if (e is CancellationException) currentCoroutineContext().ensureActive()
+                    // unlike after the StackOverflowError, the JVM might not be able to continue
+                    if (e is VirtualMachineError && e !is StackOverflowError) throw e
                     logger.debug(e) {
                         "Script[$scriptId]: Evaluation failed with error"
                     }
                     val cause = e.cause
+                    // the copy of the exception made by the coroutine stack trace recovery
                     val throwable = if (
                         (cause != null)
                         && (cause::class == e::class)
-                        && (cause.message == cause.message)
+                        && (cause.message == e.message)
                     ) {
                         cause
                     } else {
                         e
                     }
-                    val failureMessage = errorReporter().toFailureMessage(throwable)
-                    ScriptResult.Error(
-                        failureMessage
-                    )
+                    failure(throwable, warnings, block::class.java.name)
                 }
             }
             is ResultValue.Unit -> ScriptResult.Value(Unit)
-            is ResultValue.Error -> {
-                val failureMessage = errorReporter().toFailureMessage(error)
-                ScriptResult.Error(
-                    message = failureMessage
-                )
-            }
+            is ResultValue.Error -> failure(error, warnings, blockClassName = null)
             is ResultValue.NotEvaluated -> throw IllegalStateException(
                 "Should never happen"
             )
         }
 
+        private fun ResultValue.failure(
+            throwable: Throwable,
+            warnings: List<ScriptDiagnostic>,
+            blockClassName: String?
+        ) = ScriptResult.Error(
+            ScriptErrorReporter(
+                source = source,
+                scriptClassName = scriptClass?.java?.name,
+                blockClassName = blockClassName
+            ).toFailureMessage(throwable, warnings),
+            ExecutionPhase.EVALUATION
+        )
+
         private fun evaluationConfig() = ScriptEvaluationConfiguration {
             providedProperties(
-                *(allDependencies.map { it.name to it.value }.toTypedArray())
+                *(allDependencies.map { it.providedName to it.value }.toTypedArray())
             )
         }
 
         private fun compilationConfig() = ScriptCompilationConfiguration(compilationConfigurationTemplate) {
             providedProperties(
-                *(allDependencies.map { it.name to KotlinType(it.type)}.toTypedArray())
+                *(allDependencies.map { it.providedName to KotlinType(it.type) }.toTypedArray())
             )
         }
 
-        private fun errorReporter() = ScriptErrorReporter(
-            errorTag = errorTag,
-            scriptFileName = source.locationId,
-            scriptLines = source.lines,
-            lastImportLine = source.lastImportLine
-        )
-
     }
 
 }
 
-private fun Iterable<ScriptDiagnostic>.filterNonIgnorable() = filterNot { diagnostic ->
-    diagnostic.severity == ScriptDiagnostic.Severity.DEBUG && listOf(
-        "Using JDK home inferred from java.home",
-        "Loading modules:"
-    ).any { diagnostic.message.startsWith(it) }
-}
+private const val SCRIPT_BLOCK_NAME = "_script"
 
-private class ScriptErrorReporter(
-    private val errorTag: String,
-    private val scriptFileName: String,
-    private val scriptLines: List<String>,
-    private val lastImportLine: Int
-) {
+private const val GENERIC_DEPENDENCY_PREFIX = "_dependency_"
 
-    fun toFailureMessage(
-        phase: ExecutionPhase,
-        failure: ResultWithDiagnostics.Failure
-    ) = buildString {
-        append("<$errorTag phase=\"${phase.name}\">\n")
-        failure.reports.filterNonIgnorable().forEach {
-            appendScriptDiagnostic(it)
-        }
-        append("</$errorTag>\n")
-    }
+/*
+ * The scripting host erases the type arguments of a provided property,
+ * so a dependency of generic type is provided under a hidden name,
+ * and cast back to its type by an accessor declared in the preamble of the script.
+ */
 
-    fun toFailureMessage(
-        throwable: Throwable
-    ) = buildString {
-        append("<$errorTag phase=\"${ExecutionPhase.EVALUATION.name}\">\n")
-        appendException(error = throwable)
-        append("</$errorTag>\n")
-    }
+private val ScriptExecutor.Dependency<*>.isGeneric: Boolean
+    get() = type.arguments.isNotEmpty()
 
-    private fun StringBuilder.appendException(
-        prefix: String = "",
-        error: Throwable
-    ) {
-        append(prefix)
-        append(error::class.qualifiedName)
-        error.message?.let {
-            append(": ")
-            append(it)
-        }
-        append("\n")
+private val ScriptExecutor.Dependency<*>.providedName: String
+    get() = if (isGeneric) "$GENERIC_DEPENDENCY_PREFIX$name" else name
 
-        error.stackTrace.forEachIndexed { index, trace ->
-
-            // frames of other scripts, e.g. the one executing this script, are not this script's;
-            // synthetic frames of the script block carry no line number
-            val isScriptTrace = trace.fileName == scriptFileName && trace.lineNumber > 0
-
-            if (isScriptTrace || index == 0) {
-                val className = if (isScriptTrace) {
-                    "Script"
-                } else {
-                    trace.className
-                }
-
-                val fileName = if (isScriptTrace) {
-                    "script.kts"
-                } else {
-                    trace.fileName
-                }
-
-                val lineNumber = if (isScriptTrace) {
-                    trace.lineNumber - 1
-                } else {
-                    trace.lineNumber
-                }
-
-                append("  at ")
-                append(className)
-                append(".")
-                append(trace.methodName)
-                append("(")
-                append(fileName)
-                append(":")
-                append(lineNumber)
-                append(")\n")
-                if (isScriptTrace) {
-                    append("  | ")
-                    append(scriptLines[lineNumber])
-                    append("\n")
-                }
-            }
-
-        }
-
-        error.cause?.let {
-            appendException(
-                prefix = "Caused by: ",
-                error = it
-            )
-        }
-    }
-
-    private fun StringBuilder.appendScriptDiagnostic(
-        diagnostic: ScriptDiagnostic,
-    ) {
-        append("[${diagnostic.severity.name}] ${diagnostic.message}\n")
-        diagnostic.location?.let {
-            appendLocation(location = it)
-        }
-        append("\n")
-    }
-
-    private fun adjustLineNumber(
-        line: Int
-    ): Int = when {
-        line <= lastImportLine -> line
-        line == scriptLines.size -> maxOf(1, line - 2)
-        else -> maxOf(1, line - 1)
-    }
-
-    private fun StringBuilder.appendLocation(
-        location: SourceCode.Location,
-    ) {
-
-        val startLine = adjustLineNumber(location.start.line)
-        val endLine = adjustLineNumber(location.end?.line ?: startLine)
-
-        append("  at line")
-        if (startLine == endLine) {
-            append(" ")
-            append(startLine)
-        } else {
-            append("s ")
-            append(startLine)
-            append("-")
-            append(endLine)
-        }
-        append("\n")
-
-        (startLine..endLine).forEach { line ->
-            append("  | ")
-            val lineIndexOffset = if ((line <= lastImportLine) || (startLine == (scriptLines.size - 1))) 1 else 0
-            val lineIndex = line - lineIndexOffset
-            // Guard against out of bounds access
-            if (lineIndex < 0 || lineIndex >= scriptLines.size) {
-                append("<error>Unable to display source line</error>\n")
-                return@forEach
-            }
-            val scriptLine = scriptLines[lineIndex]
-            val lineBuilder = StringBuilder(scriptLine)
-            if (location.start.line == scriptLines.size) {
-                lineBuilder.append("<error></error>")
-            } else {
-                if (line == startLine) {
-                    val startCol = (location.start.col - 1).coerceIn(0, lineBuilder.length)
-                    lineBuilder.insert(startCol, "<error>")
-                    if ((line == endLine) && (location.end != null)) {
-                        val endCol = (location.end!!.col + 6).coerceIn(0, lineBuilder.length)
-                        lineBuilder.insert(endCol, "</error>")
-                    }
-                }
-                if ((line != startLine) && (line == endLine)) { // TODO should it be else without first expression?
-                    val endCol = (location.end!!.col - 1).coerceIn(0, lineBuilder.length)
-                    lineBuilder.insert(endCol, "</error>")
-                }
-            }
-
-            append(lineBuilder)
-            append("\n")
-        }
-    }
-
-}
-
-private class SuspendableScriptSource(
-    script: String
-) : SourceCode {
-
-    private val parts = splitScriptImportsAndBody(script)
-
-    override val text: String = buildString {
-        parts.imports.forEach {
-            append(it)
-            append('\n')
-        }
-        append("_script {\n")
-        append(parts.body.joinToString(separator = "\n"))
-        append("\n}")
-    }
-
-    override val name: String? = null
-
-    override val locationId: String = "\$${Integer.toHexString(text.hashCode())}.kts"
-
-    val lines: List<String> = text.lines()
-
-    val lastImportLine: Int = parts.imports.size
-}
-
-private fun splitScriptImportsAndBody(
-    script: String
-): ScriptParts {
-
-    val lines = script.lines()
-
-    val lastImportIndex = lines.indexOfLast {
-        it.startsWith("import ")
-    }
-
-    return if (lastImportIndex == -1) {
-        ScriptParts(
-            imports = emptyList(),
-            body = script.lines()
-        )
+private val ScriptExecutor.Dependency<*>.accessor: String?
+    get() = if (isGeneric) {
+        "@Suppress(\"UNCHECKED_CAST\", \"USELESS_CAST\") val `$name`: $type get() = `$providedName` as $type"
     } else {
-        ScriptParts(
-            imports = lines.subList(0, lastImportIndex + 1),
-            body = lines.subList(lastImportIndex + 1, lines.size)
-        )
+        null
     }
-}
-
-private data class ScriptParts(
-    val imports: List<String>,
-    val body: List<String>
-)
