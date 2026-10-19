@@ -25,6 +25,7 @@ import org.intellij.lang.annotations.Language
 import java.lang.reflect.Modifier
 import kotlin.reflect.KClass
 import kotlin.reflect.KType
+import kotlin.reflect.KVisibility
 import kotlin.reflect.typeOf
 
 /**
@@ -127,5 +128,10 @@ private fun Class<*>.isAccessible(): Boolean = if (isArray) {
     !isLocalClass
             && !isAnonymousClass
             && Modifier.isPublic(modifiers)
+            && !isKotlinInternal()
             && declaringClass?.isAccessible() ?: true
 }
+
+/** An internal Kotlin class is public in the bytecode. */
+private fun Class<*>.isKotlinInternal(): Boolean =
+    isAnnotationPresent(Metadata::class.java) && kotlin.visibility == KVisibility.INTERNAL

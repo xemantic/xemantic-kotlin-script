@@ -37,7 +37,7 @@ internal data class ScriptPosition(
  *
  * ```
  * <file annotations, package and imports>
- * <preamble>
+ * <preamble of the dependency accessors>
  * <declarations which cannot be local>
  * _script {
  * <the rest of the script>
@@ -50,7 +50,8 @@ internal data class ScriptPosition(
  */
 internal class ScriptSource(
     script: String,
-    preamble: List<String> = emptyList()
+    /** The declarations of the dependency accessors, by the names of the dependencies. */
+    preamble: Map<String, String> = emptyMap()
 ) : SourceCode {
 
     val scriptLines: List<String>
@@ -68,6 +69,11 @@ internal class ScriptSource(
 
     /** For each line of the [text], the line of the script, or `null` for the lines of the block and the preamble. */
     private val lineMapping: List<Int?>
+
+    /** The 0-based line of the [text] where the preamble starts. */
+    private val preambleStart: Int
+
+    private val preambleDependencies: List<String> = preamble.keys.toList()
 
     private val movedDeclarations: List<Declaration>
 
@@ -102,7 +108,8 @@ internal class ScriptSource(
         if (headerEnd > 0) {
             addLines(0..lineOf(headerEnd - 1)) { it < headerEnd }
         }
-        lines += preamble
+        preambleStart = lines.size
+        lines += preamble.values
         mapping += preamble.map { null }
         movedDeclarations.forEach { declaration ->
             addLines(lineOf(declaration.start)..lineOf(declaration.end - 1)) {
@@ -147,6 +154,14 @@ internal class ScriptSource(
     fun toScriptLine(
         line: Int
     ): Int? = lineMapping.getOrNull(line - 1)
+
+    /**
+     * The name of the dependency, whose accessor is declared at the 1-based [line] of the [text],
+     * or `null`, if it is not a line of the preamble.
+     */
+    fun preambleDependencyAt(
+        line: Int
+    ): String? = preambleDependencies.getOrNull(line - 1 - preambleStart)
 
     /**
      * The name of the declaration moved out of the script body, which contains the [position].
@@ -242,6 +257,15 @@ private val modifiers = setOf(
 
 private val visibilityModifiers = setOf("public", "private", "internal", "protected")
 
+/**
+ * The modifiers of top-level functions and properties, which are not applicable to local ones,
+ * while the declarations moved out of the script body are the members of the script class, where `const` is not allowed either.
+ */
+private val memberOnlyModifiers = setOf("open", "final", "const")
+
+/** The annotations, which are not applicable to local declarations. */
+private val memberOnlyAnnotations = setOf("Volatile", "Transient", "JvmField", "JvmName", "JvmOverloads")
+
 /** Tokens which cannot end a statement, so the line after them continues it. */
 private val continuedAfter = setOf(
     "=", "+=", "-=", "*=", "/=", "%=", "+", "-", "*", "/", "%", "!",
@@ -325,7 +349,10 @@ private class ScriptStructure(
             .map { it.toDeclaration() }
         declarations.filter { it !in moved }.forEach { declaration ->
             declaration.modifiers
-                .filter { it.text in visibilityModifiers }
+                .filter {
+                    it.text in visibilityModifiers || (it.text in memberOnlyModifiers
+                            && (declaration.kind == DeclarationKind.FUNCTION || declaration.kind == DeclarationKind.PROPERTY))
+                }
                 .forEach { blankedRanges += it.start until it.end }
         }
     }
@@ -427,11 +454,15 @@ private class ScriptStructure(
     ): ParsedDeclaration? {
         var index = first
         val declarationModifiers = mutableListOf<Token>()
+        var hasMemberOnlyAnnotation = false
         while (index < tokens.size) {
             val token = tokens[index]
             val next = tokens.getOrNull(index + 1) ?: return null
             when {
-                token.type == KtTokens.AT -> index = annotationEnd(index)
+                token.type == KtTokens.AT -> {
+                    if (isMemberOnlyAnnotation(index)) hasMemberOnlyAnnotation = true
+                    index = annotationEnd(index)
+                }
                 token.type == KtTokens.IDENTIFIER
                         && token.text in modifiers
                         && (next.type == KtTokens.IDENTIFIER || next.type in KtTokens.KEYWORDS) -> {
@@ -477,8 +508,8 @@ private class ScriptStructure(
             INTERFACE,
             OBJECT,
             TYPE_ALIAS -> true
-            FUNCTION -> declarationModifiers.any { it.text == "inline" }
-            PROPERTY -> isExtensionOrHasAccessor(keyword, last)
+            FUNCTION -> declarationModifiers.any { it.text == "inline" } || hasMemberOnlyAnnotation
+            PROPERTY -> isExtensionOrHasAccessor(keyword, last) || hasMemberOnlyAnnotation
         }
         return ParsedDeclaration(
             kind = kind,
@@ -491,6 +522,17 @@ private class ScriptStructure(
             headerTokens = tokens.subList(keyword, bodyStart),
             requiresMove = requiresMove
         )
+    }
+
+    /** Whether the annotation is not applicable to a local declaration, like `@Volatile` or `@get:JvmName`. */
+    private fun isMemberOnlyAnnotation(
+        at: Int
+    ): Boolean {
+        // a use-site target
+        if (tokens.getOrNull(at + 2)?.type == KtTokens.COLON) return true
+        var index = at + 1
+        while (tokens.getOrNull(index + 1)?.type == KtTokens.DOT) index += 2
+        return tokens.getOrNull(index)?.text in memberOnlyAnnotations
     }
 
     private fun annotationEnd(
@@ -606,8 +648,10 @@ private class ScriptStructure(
      * The declarations which cannot be local, together with the types and functions they refer to,
      * and the subtypes of moved sealed types, which cannot be local either.
      *
-     * Local functions are not visible before their declaration, so the ones referred to earlier are moved as well,
-     * unless they, or the declarations they refer to, access the local properties of the script body.
+     * Local functions are not visible before their declaration, so the ones referred to earlier are moved as well.
+     *
+     * The references are recognized by the names only, which might be the names of members as well,
+     * therefore a function is not moved if it, or the declarations it refers to, access the local properties of the script body.
      */
     private fun selectMovedDeclarations(
         declarations: List<ParsedDeclaration>,
@@ -615,8 +659,13 @@ private class ScriptStructure(
     ): Set<ParsedDeclaration> {
         val named = declarations.filter { it.name != null && it.kind != DeclarationKind.PROPERTY }
         val nameIndices = declarations.mapNotNull { it.nameIndex }.toSet()
+        val required = declarations.filter { it.requiresMove }.toSet()
+        val localProperties = declarations.filter {
+            it.kind == DeclarationKind.PROPERTY && it !in required
+        }.mapNotNull { it.name }.toSet()
         fun withReferences(
-            seed: Set<ParsedDeclaration>
+            seed: Set<ParsedDeclaration>,
+            isMovable: (declaration: ParsedDeclaration, moved: Set<ParsedDeclaration>) -> Boolean = { _, _ -> true }
         ): Set<ParsedDeclaration> {
             val moved = seed.toMutableSet()
             do {
@@ -627,23 +676,28 @@ private class ScriptStructure(
                 val added = named.filter { declaration ->
                     declaration !in moved && (declaration.name in referenced
                             || (declaration.kind != DeclarationKind.FUNCTION && declaration.headerTokens.any { it.text in sealed }))
+                            && isMovable(declaration, moved)
                 }
                 moved += added
             } while (added.isNotEmpty())
             return moved
         }
-        var moved = withReferences(declarations.filter { it.requiresMove }.toSet())
-        val localProperties = declarations.filter {
-            it.kind == DeclarationKind.PROPERTY && it !in moved
-        }.mapNotNull { it.name }.toSet()
+        fun accessesLocalProperties(
+            function: ParsedDeclaration,
+            moved: Set<ParsedDeclaration>
+        ): Boolean = (withReferences(moved + function) - moved).any { declaration ->
+            declaration.tokens.any { it.text in localProperties }
+        }
+        var moved = withReferences(required) { declaration, alreadyMoved ->
+            declaration.kind != DeclarationKind.FUNCTION || !accessesLocalProperties(declaration, alreadyMoved)
+        }
         declarations.filter { declaration ->
             declaration.kind == DeclarationKind.FUNCTION && (bodyStart until declaration.first).any {
                 it !in nameIndices && tokens[it].text == declaration.name
             }
         }.forEach { function ->
-            val candidate = withReferences(moved + function)
-            if ((candidate - moved).none { declaration -> declaration.tokens.any { it.text in localProperties } }) {
-                moved = candidate
+            if (!accessesLocalProperties(function, moved)) {
+                moved = withReferences(moved + function)
             }
         }
         return moved.sortedBy { it.first }.toCollection(LinkedHashSet())

@@ -23,9 +23,16 @@ import com.xemantic.kotlin.test.be
 import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlin.script.experimental.api.CompiledScript
+import kotlin.script.experimental.api.ResultWithDiagnostics
 import kotlin.test.Test
 
 class ScriptCompilationCacheTest {
@@ -57,8 +64,8 @@ class ScriptCompilationCacheTest {
     @Test
     fun `should compile the script again when dependency types differ`() = runTest {
         // given
-        val script = """
-            "${'$'}value"
+        val script = $$"""
+            "$value"
         """.trimIndent()
         val executor = DefaultScriptExecutor(compilationCacheSize = 10)
 
@@ -215,6 +222,56 @@ class ScriptCompilationCacheTest {
             }
         }
         assert(executor.compilationCount == 1)
+    }
+
+    @Test
+    fun `should share cancellation exception thrown by the compilation with concurrent callers`() = runTest {
+        // given
+        val cache = ScriptCompilationCache(maxSize = 10)
+        val key = ScriptCompilationCache.Key(script = "foo", dependencies = emptyList())
+        var compilations = 0
+        val compile: suspend () -> ResultWithDiagnostics<CompiledScript> = {
+            compilations++
+            delay(1)
+            throw CancellationException("compiler gave up")
+        }
+
+        // when
+        val results = List(4) {
+            async { runCatching { cache.getOrCompile(key, compile) } }
+        }.awaitAll()
+
+        // then
+        assert(compilations == 1)
+        results.forEach { result ->
+            assert(result.exceptionOrNull()?.message == "compiler gave up")
+        }
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun `should compile again when the compiling caller is cancelled`() = runTest {
+        // given
+        val cache = ScriptCompilationCache(maxSize = 10)
+        val key = ScriptCompilationCache.Key(script = "foo", dependencies = emptyList())
+        val failure = ResultWithDiagnostics.Failure(emptyList())
+        var compilations = 0
+        val compile: suspend () -> ResultWithDiagnostics<CompiledScript> = {
+            compilations++
+            delay(1)
+            failure
+        }
+        val owner = launch { cache.getOrCompile(key, compile) }
+        val waiter = async { cache.getOrCompile(key, compile) }
+        runCurrent()
+
+        // when
+        owner.cancel()
+        val result = waiter.await()
+
+        // then
+        assert(result === failure)
+        assert(compilations == 2)
     }
 
 }

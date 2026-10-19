@@ -152,7 +152,9 @@ internal class DefaultScriptExecutor(
 
         private val source = ScriptSource(
             script,
-            preamble = allDependencies.mapNotNull { it.accessor }
+            preamble = allDependencies.mapNotNull { dependency ->
+                dependency.accessor?.let { dependency.name to it }
+            }.toMap()
         )
 
         suspend fun handle(): ScriptResult {
@@ -269,9 +271,7 @@ internal class DefaultScriptExecutor(
                 try {
                     ScriptResult.Value(
                         value = coroutineScope { block() },
-                        warnings = if (warnings.isEmpty()) null else {
-                            ScriptErrorReporter(source).toFailureMessage(warnings)
-                        }
+                        warnings = warningsMessage(warnings)
                     )
                 } catch (e: Throwable) {
                     // the cancellation of the caller is not a failure of the script
@@ -281,25 +281,20 @@ internal class DefaultScriptExecutor(
                     logger.debug(e) {
                         "Script[$scriptId]: Evaluation failed with error"
                     }
-                    val cause = e.cause
-                    // the copy of the exception made by the coroutine stack trace recovery
-                    val throwable = if (
-                        (cause != null)
-                        && (cause::class == e::class)
-                        && (cause.message == e.message)
-                    ) {
-                        cause
-                    } else {
-                        e
-                    }
-                    failure(throwable, warnings, block::class.java.name)
+                    failure(e.unwrapRecoveredCopy(), warnings, block::class.java.name)
                 }
             }
-            is ResultValue.Unit -> ScriptResult.Value(Unit)
+            is ResultValue.Unit -> ScriptResult.Value(Unit, warningsMessage(warnings))
             is ResultValue.Error -> failure(error, warnings, blockClassName = null)
             is ResultValue.NotEvaluated -> throw IllegalStateException(
                 "Should never happen"
             )
+        }
+
+        private fun warningsMessage(
+            warnings: List<ScriptDiagnostic>
+        ): String? = if (warnings.isEmpty()) null else {
+            ScriptErrorReporter(source).toFailureMessage(warnings)
         }
 
         private fun ResultValue.failure(
@@ -329,6 +324,23 @@ internal class DefaultScriptExecutor(
 
     }
 
+}
+
+/**
+ * The original exception, if this one is its copy made by the coroutine stack trace recovery,
+ * recognized like kotlinx.coroutines does, by the artificial frame of the coroutine boundary.
+ */
+private fun Throwable.unwrapRecoveredCopy(): Throwable {
+    val cause = read(null) { cause }
+    return if (
+        cause != null
+        && cause.javaClass == javaClass
+        && read(emptyArray()) { stackTrace }.any { it.className.startsWith("_COROUTINE.") }
+    ) {
+        cause
+    } else {
+        this
+    }
 }
 
 private const val SCRIPT_BLOCK_NAME = "_script"

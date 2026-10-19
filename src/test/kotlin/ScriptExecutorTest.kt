@@ -35,6 +35,12 @@ import kotlin.reflect.typeOf
 import kotlin.test.Test
 import kotlin.time.Duration.Companion.hours
 
+@RequiresOptIn
+annotation class ExperimentalGadget
+
+@ExperimentalGadget
+class Gadget
+
 class ScriptExecutorTest {
 
     @Test
@@ -228,7 +234,7 @@ class ScriptExecutorTest {
         // given
         val script = """
             import kotlin.math.max
-
+            
             enum class Measure { LENGTH }
             class Longest(val measure: Measure) {
                 fun length() = items.maxOf { it.length }
@@ -252,7 +258,7 @@ class ScriptExecutorTest {
         // given
         val script = """
             import kotlin.math.max
-
+            
             val first = items.first()
             error("failure of ${'$'}first")
         """.trimIndent()
@@ -1219,9 +1225,9 @@ class ScriptExecutorTest {
         // given
         val script = """
             @file:OptIn(ExperimentalStdlibApi::class)
-
+            
             import kotlin.math.max
-
+            
             max(1, undefined)
         """.trimIndent()
         val executor = ScriptExecutor()
@@ -1260,7 +1266,7 @@ class ScriptExecutorTest {
             value class Name(val value: String)
             fun interface Describer { fun describe(figure: Figure): String }
             annotation class Marker
-
+            
             Registry.figures += Circle(Palette.default)
             val figures: Figures = Registry.figures
             val describer = Describer { figure ->
@@ -1287,7 +1293,7 @@ class ScriptExecutorTest {
         // given
         val script = $$"""
             import kotlinx.coroutines.delay
-
+            
             private val greeting = "Hello"
             private suspend fun greet(name: String): String {
                 delay(1)
@@ -1316,7 +1322,7 @@ class ScriptExecutorTest {
         // given
         val script = $$"""
             import kotlinx.coroutines.delay
-
+            
             enum class Punctuation(val mark: String) { EXCLAMATION("!") }
             class Greeter(val punctuation: Punctuation) {
                 suspend fun greet(): String {
@@ -1599,6 +1605,134 @@ class ScriptExecutorTest {
                   | val task = Runnable { Worker().work() }
                   at <script body>(script.kts:5)
                   | task.run()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should execute script with top-level declarations having modifiers and annotations not applicable to local declarations`() = runTest {
+        // given
+        val script = """
+            val offset = 1
+            const val MAX = 10
+            open fun twice(x: Int) = x * 2 + offset
+            @Volatile var counter = 0
+            @JvmField val step = 2
+            @JvmOverloads fun add(a: Int, b: Int = step) = a + b
+            counter = add(twice(MAX))
+            counter
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 23)
+        }
+    }
+
+    @Test
+    fun `should not move function accessing local declarations when member of moved declaration has the same name`() = runTest {
+        // given
+        val script = """
+            val prefix = "x"
+            fun label(s: String) = prefix + s
+            enum class Kind { A; fun label() = name }
+            label(Kind.A.label())
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "xA")
+        }
+    }
+
+    @Test
+    fun `should report exception whose message cannot be read`() = runTest {
+        // given
+        val script = """
+            class Unreadable : RuntimeException() {
+                override val message: String get() = error("unreadable")
+            }
+            throw Unreadable()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                Unreadable: [message unavailable: java.lang.IllegalStateException: unreadable]
+                  at <script body>(script.kts:4)
+                  | throw Unreadable()
+            """.trimIndent()
+        }
+    }
+
+    /**
+     * The exception is not copyable by the coroutine stack trace recovery,
+     * so the outcome does not depend on whether it is enabled.
+     */
+    @Test
+    fun `should report exception caused by exception of the same class and message`() = runTest {
+        // given
+        val script = """
+            class Failure(val code: Int, cause: Throwable? = null) : RuntimeException("failure", cause)
+            val cause = Failure(1)
+            throw Failure(2, cause)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                Failure: failure
+                  at <script body>(script.kts:3)
+                  | throw Failure(2, cause)
+                Caused by: Failure: failure
+                  at <script body>(script.kts:2)
+                  | val cause = Failure(1)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    @OptIn(ExperimentalGadget::class)
+    fun `should report error of dependency accessor at the dependency instead of the script line`() = runTest {
+        // given
+        val script = """
+            gadgets.size
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("gadgets", listOf(Gadget()))))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                dependency 'gadgets': error: This declaration needs opt-in. Its usage must be marked with '@com.xemantic.kotlin.script.ExperimentalGadget' or '@OptIn(com.xemantic.kotlin.script.ExperimentalGadget::class)'
+
+                script.kts:1:1: error: This declaration needs opt-in. Its usage must be marked with '@com.xemantic.kotlin.script.ExperimentalGadget' or '@OptIn(com.xemantic.kotlin.script.ExperimentalGadget::class)'
+                  | <error>gadgets</error>.size
             """.trimIndent()
         }
     }

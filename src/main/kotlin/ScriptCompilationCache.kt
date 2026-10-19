@@ -21,7 +21,7 @@ package com.xemantic.kotlin.script
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlin.reflect.KType
 import kotlin.script.experimental.api.CompiledScript
 import kotlin.script.experimental.api.ResultWithDiagnostics
@@ -46,11 +46,12 @@ internal class ScriptCompilationCache(
         val dependencies: List<Pair<String, KType>>
     )
 
+    /** The compilation results, completed with `null` when the compiling caller was cancelled. */
     private val entries = object : LinkedHashMap<
-        Key, CompletableDeferred<ResultWithDiagnostics<CompiledScript>>
+        Key, CompletableDeferred<ResultWithDiagnostics<CompiledScript>?>
     >(16, 0.75f, true) {
         override fun removeEldestEntry(
-            eldest: MutableMap.MutableEntry<Key, CompletableDeferred<ResultWithDiagnostics<CompiledScript>>>
+            eldest: MutableMap.MutableEntry<Key, CompletableDeferred<ResultWithDiagnostics<CompiledScript>?>>
         ) = size > maxSize
     }
 
@@ -67,13 +68,8 @@ internal class ScriptCompilationCache(
                 }
             }
             if (!owner) {
-                try {
-                    return entry.await()
-                } catch (e: CancellationException) {
-                    currentCoroutineContext().ensureActive()
-                    // the compiling caller was cancelled, compile again
-                    continue
-                }
+                // the compiling caller was cancelled, compile again
+                return entry.await() ?: continue
             }
             try {
                 val result = compile()
@@ -82,7 +78,12 @@ internal class ScriptCompilationCache(
                 return result
             } catch (e: Throwable) {
                 remove(key, entry)
-                entry.completeExceptionally(e)
+                // unlike the cancellation of the caller, the failure of the compilation is shared
+                if (e is CancellationException && !currentCoroutineContext().isActive) {
+                    entry.complete(null)
+                } else {
+                    entry.completeExceptionally(e)
+                }
                 throw e
             }
         }
@@ -90,7 +91,7 @@ internal class ScriptCompilationCache(
 
     private fun remove(
         key: Key,
-        entry: CompletableDeferred<ResultWithDiagnostics<CompiledScript>>
+        entry: CompletableDeferred<ResultWithDiagnostics<CompiledScript>?>
     ) {
         synchronized(entries) {
             entries.remove(key, entry)

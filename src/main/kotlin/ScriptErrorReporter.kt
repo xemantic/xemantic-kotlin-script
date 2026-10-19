@@ -54,12 +54,7 @@ internal class ScriptErrorReporter(
 
     fun toFailureMessage(
         diagnostics: List<ScriptDiagnostic>
-    ): String = buildString {
-        diagnostics.forEachIndexed { index, diagnostic ->
-            if (index > 0) +'\n'
-            appendDiagnostic(diagnostic)
-        }
-    }.trimEnd()
+    ): String = diagnostics.describe().joinToString(separator = "\n").trimEnd()
 
     fun toFailureMessage(
         throwable: Throwable,
@@ -71,11 +66,16 @@ internal class ScriptErrorReporter(
             indent = "",
             reported = Collections.newSetFromMap(IdentityHashMap())
         )
-        warnings.forEach {
+        warnings.describe().forEach {
             +'\n'
-            appendDiagnostic(it)
+            +it
         }
     }.trimEnd()
+
+    /** The descriptions of the diagnostics, without the repeated ones, e.g. of the same type used twice in an accessor. */
+    private fun List<ScriptDiagnostic>.describe(): List<String> = map { diagnostic ->
+        buildString { appendDiagnostic(diagnostic) }
+    }.distinct()
 
     fun toUnmatchedClosingBraceMessage(
         position: ScriptPosition
@@ -101,11 +101,11 @@ internal class ScriptErrorReporter(
         }
         appendDescription(throwable)
         +'\n'
-        appendFrames(throwable.stackTrace, indent)
-        throwable.suppressed.forEach {
+        appendFrames(throwable.read(emptyArray()) { stackTrace }, indent)
+        throwable.read(emptyArray()) { suppressed }.forEach {
             appendThrowable(it, "Suppressed: ", "$indent  ", reported)
         }
-        throwable.cause?.let {
+        throwable.read(null) { cause }?.let {
             appendThrowable(it, "Caused by: ", indent, reported)
         }
     }
@@ -114,7 +114,13 @@ internal class ScriptErrorReporter(
         throwable: Throwable
     ) {
         +className(throwable.javaClass)
-        throwable.message?.let {
+        val message = try {
+            throwable.message
+        } catch (e: Throwable) {
+            val description = listOfNotNull(e.javaClass.name, e.read(null) { message }).joinToString(": ")
+            "[message unavailable: $description]"
+        }
+        message?.let {
             +": "
             +it
         }
@@ -232,11 +238,19 @@ internal class ScriptErrorReporter(
         return best
     }
 
-    /** In the format of kotlinc, `script.kts:line:column: severity: message`, followed by the source lines. */
+    /**
+     * In the format of kotlinc, `script.kts:line:column: severity: message`, followed by the source lines,
+     * or `dependency 'name': severity: message`, if reported in the accessor of the dependency.
+     */
     private fun StringBuilder.appendDiagnostic(
         diagnostic: ScriptDiagnostic
     ) {
         val location = diagnostic.location
+        location?.let { source.preambleDependencyAt(it.start.line) }?.let { dependency ->
+            +"dependency '$dependency': "
+            appendSeverityAndMessage(diagnostic)
+            return
+        }
         val capturingObject = objectCapturingScript.matchEntire(diagnostic.message)?.groupValues[1]
         val range = if (location != null) {
             val start = source.toScriptPosition(location.start.line, location.start.col)
@@ -250,10 +264,7 @@ internal class ScriptErrorReporter(
             capturingObject?.let { source.movedDeclarationName(it) }
         }
         range?.let { appendPosition(it.first) }
-        +diagnostic.severity.name.lowercase()
-        +": "
-        diagnostic.message.trimEnd().lines().joinTo(this, "\n  ")
-        +'\n'
+        appendSeverityAndMessage(diagnostic)
         if (range == null) return
         val (start, end) = range
         appendSourceLines(start, end)
@@ -264,6 +275,15 @@ internal class ScriptErrorReporter(
             +"  hint: '$capturingObject' is compiled outside of the script body, where an object cannot access the dependencies"
             +" - declare it as a class, or pass the dependencies as parameters.\n"
         }
+    }
+
+    private fun StringBuilder.appendSeverityAndMessage(
+        diagnostic: ScriptDiagnostic
+    ) {
+        +diagnostic.severity.name.lowercase()
+        +": "
+        diagnostic.message.trimEnd().lines().joinTo(this, "\n  ")
+        +'\n'
     }
 
     private fun StringBuilder.appendPosition(
@@ -307,4 +327,17 @@ internal class ScriptErrorReporter(
         }
     }
 
+}
+
+/**
+ * The property of the [Throwable], or the [fallback], if reading it throws,
+ * as the exception class of the script might override it.
+ */
+internal inline fun <T> Throwable.read(
+    fallback: T,
+    property: Throwable.() -> T
+): T = try {
+    property()
+} catch (_: Throwable) {
+    fallback
 }

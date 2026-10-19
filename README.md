@@ -46,14 +46,12 @@ Then:
 
 ```kotlin
 val executor = ScriptExecutor()
-val result = executor.execute(
-    script = """
-        import kotlinx.coroutines.delay
-
-        delay(100)
-        "${'$'}greeting ${'$'}{names.joinToString()}".uppercase()
-    """.trimIndent()
-) {
+val result = executor.execute("""
+    import kotlinx.coroutines.delay
+    
+    delay(100)
+    "${'$'}greeting ${'$'}{names.joinToString()}".uppercase()
+""".trimIndent()) {
     "greeting" provides "Hello"
     "names" provides listOf("Alice", "Bob")
 }

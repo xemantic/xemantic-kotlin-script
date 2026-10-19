@@ -30,13 +30,15 @@ import kotlin.test.assertFailsWith
 
 private class Hidden
 
+internal class Internal
+
 class ScriptDependenciesTest {
 
     @Test
     fun `should provide dependencies of inferred types`() = runTest {
         // given
-        val script = """
-            "${'$'}greeting ${'$'}{names.joinToString { it.uppercase() }}"
+        val script = $$"""
+            "$greeting ${names.joinToString { it.uppercase() }}"
         """.trimIndent()
         val executor = ScriptExecutor()
 
@@ -220,6 +222,17 @@ class ScriptDependenciesTest {
 
         // then
         assert(exception.message == "Dependency 'foo' is of type com.xemantic.kotlin.script.Hidden, which is not accessible to the script - provide it as a public type")
+    }
+
+    @Test
+    fun `should reject dependency of internal class`() {
+        // when
+        val exception = assertFailsWith<IllegalArgumentException> {
+            dependency("foo", listOf(Internal()))
+        }
+
+        // then
+        assert(exception.message == "Dependency 'foo' is of type com.xemantic.kotlin.script.Internal, which is not accessible to the script - provide it as a public type")
     }
 
     @Test
