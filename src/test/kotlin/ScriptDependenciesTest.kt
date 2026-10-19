@@ -32,6 +32,10 @@ private class Hidden
 
 internal class Internal
 
+class Outer {
+    class Box<T>(val items: List<T>)
+}
+
 class ScriptDependenciesTest {
 
     @Test
@@ -93,6 +97,42 @@ class ScriptDependenciesTest {
         result should {
             be<ScriptResult.Value>()
             have(value == 42)
+        }
+    }
+
+    @Test
+    fun `should provide dependency of generic nested class`() = runTest {
+        // given
+        val script = """
+            box.items.size
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("box", Outer.Box(listOf(1, 2)))))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should provide dependency of generic nested interface`() = runTest {
+        // given
+        val script = """
+            entry.key + entry.value
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<Map.Entry<String, Int>>("entry", mapOf("foo" to 42).entries.first())))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "foo42")
         }
     }
 

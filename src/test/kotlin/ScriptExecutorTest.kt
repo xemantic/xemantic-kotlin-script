@@ -31,6 +31,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runTest
+import org.jetbrains.kotlin.config.JvmTarget
 import kotlin.reflect.typeOf
 import kotlin.test.Test
 import kotlin.time.Duration.Companion.hours
@@ -1735,6 +1736,102 @@ class ScriptExecutorTest {
                   | <error>gadgets</error>.size
             """.trimIndent()
         }
+    }
+
+    @Test
+    fun `should keep in the script body properties named get and set`() = runTest {
+        // given
+        val script = """
+            val items = listOf(1, 2, 2)
+            val set = items.toSet()
+            val get = set.size + 1
+            get
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 3)
+        }
+    }
+
+    @Test
+    fun `should execute script with CR line endings`() = runTest {
+        // given
+        val script = "enum class E { A }\rval name = E.A.name\rname"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "A")
+        }
+    }
+
+    @Test
+    fun `should hint to declare function before its use when it accesses destructured local declarations`() = runTest {
+        // given
+        val script = """
+            val (w, h) = 3 to 4
+            println(area())
+            fun area() = w * h
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:9: error: Unresolved reference 'area'.
+                  | println(<error>area</error>())
+                  hint: 'area' is declared at line 3, while the functions of the script body are visible only after their declaration - move it before line 2.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report unmatched closing brace closing a parenthesis`() = runTest {
+        // given
+        val script = """
+            println(1
+            }
+            val x = 1
+            x
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:1: error: Syntax error: Unexpected '}' without matching '{'.
+                  | <error>}</error>
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should cap JVM target of the script at the highest one supported by the compiler`() {
+        // when
+        val targets = listOf("17", "21", "999").map { scriptJvmTarget(it) }
+
+        // then
+        assert(targets == listOf("17", "21", JvmTarget.supportedValues().last().description))
     }
 
 }

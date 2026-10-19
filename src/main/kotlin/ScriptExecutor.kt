@@ -92,7 +92,7 @@ public interface ScriptExecutor {
  *   [Dispatchers.IO] by default, as both might block.
  *   The coroutines launched by the script inherit it.
  * @param compilationCacheSize the maximal number of compiled scripts kept for reuse,
- *   evicting the least recently used one, `0` by default, which disables the cache.
+ *   evicting the least recently used one, `0` by default, which disables the cache, must not be negative.
  *   A compiled script is reused when the script text is the same,
  *   and so are the names and types of its dependencies, while their values might differ.
  *   A script which failed to compile is not cached.

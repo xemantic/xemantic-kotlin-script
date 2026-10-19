@@ -83,7 +83,8 @@ internal class ScriptSource(
         val lineBounds = lineBounds(script)
         lineStarts = lineBounds.map { it.first }
         scriptLines = lineBounds.map { script.substring(it.first, it.last + 1) }
-        val structure = ScriptStructure(script)
+        // the lexer recognizes only `\n` as a line terminator, replacing each character keeps the offsets
+        val structure = ScriptStructure(script.replace('\r', '\n'))
         unmatchedClosingBrace = structure.unmatchedClosingBrace?.let { position(it) }
         movedDeclarations = structure.movedDeclarations
         bodyDeclarations = structure.bodyDeclarations
@@ -102,7 +103,10 @@ internal class ScriptSource(
             }
             mapping += line
         }
-        fun lineOf(offset: Int) = lineStarts.indexOfLast { it <= offset }
+        fun lineOf(offset: Int) = lineOf(lineStarts, offset)
+        val excluded = BooleanArray(script.length)
+        movedDeclarations.forEach { excluded.fill(true, it.start, it.end) }
+        structure.blankedRanges.forEach { excluded.fill(true, it.first, it.last + 1) }
 
         val headerEnd = structure.headerEnd
         if (headerEnd > 0) {
@@ -119,9 +123,7 @@ internal class ScriptSource(
         lines += "_script {"
         mapping += null
         addLines(lineOf(headerEnd)..lineBounds.lastIndex) { offset ->
-            offset >= headerEnd
-                    && movedDeclarations.none { offset in it.start until it.end }
-                    && structure.blankedRanges.none { offset in it }
+            offset >= headerEnd && !excluded[offset]
         }
         lines += "}"
         mapping += null
@@ -189,18 +191,24 @@ internal class ScriptSource(
      */
     fun bodyDeclarationLine(
         name: String
-    ): Int? = bodyDeclarations.find { it.name == name }?.let {
+    ): Int? = bodyDeclarations.find { it.name == name || name in it.destructuredNames }?.let {
         position(it.start).line
     }
 
     private fun position(
         offset: Int
     ): ScriptPosition {
-        val line = lineStarts.indexOfLast { it <= offset }
+        val line = lineOf(lineStarts, offset)
         return ScriptPosition(line, offset - lineStarts[line])
     }
 
 }
+
+/** The index of the line containing the [offset], given the sorted [lineStarts]. */
+private fun lineOf(
+    lineStarts: List<Int>,
+    offset: Int
+): Int = lineStarts.binarySearch(offset).let { if (it >= 0) it else -it - 2 }
 
 /** The range of the characters of each line, excluding the line terminator. */
 private fun lineBounds(
@@ -236,7 +244,9 @@ private class Declaration(
     val name: String?,
     val start: Int,
     val end: Int,
-    val nameRange: IntRange?
+    val nameRange: IntRange?,
+    /** The names of a destructuring declaration, like `val (a, b) = pair`. */
+    val destructuredNames: List<String> = emptyList()
 )
 
 private enum class DeclarationKind {
@@ -284,9 +294,27 @@ private val openingTokens = setOf(
     KtTokens.LONG_TEMPLATE_ENTRY_START, KtTokens.OPEN_QUOTE
 )
 
-private val closingTokens = setOf(
-    KtTokens.RBRACE, KtTokens.RPAR, KtTokens.RBRACKET,
-    KtTokens.LONG_TEMPLATE_ENTRY_END, KtTokens.CLOSING_QUOTE
+/** The opening tokens closed by each closing token. */
+private val openingOf = mapOf<IElementType, IElementType>(
+    KtTokens.RBRACE to KtTokens.LBRACE,
+    KtTokens.RPAR to KtTokens.LPAR,
+    KtTokens.RBRACKET to KtTokens.LBRACKET,
+    KtTokens.LONG_TEMPLATE_ENTRY_END to KtTokens.LONG_TEMPLATE_ENTRY_START,
+    KtTokens.CLOSING_QUOTE to KtTokens.OPEN_QUOTE
+)
+
+private val closingTokens = openingOf.keys
+
+/**
+ * The opening tokens which a closing token cannot close past, as the parser ends a block or a string with them,
+ * e.g. the `}` in `foo(1 }` closes the block, while `)` in `{ foo) }` does not.
+ */
+private val enclosingOf = mapOf<IElementType, Set<IElementType>>(
+    KtTokens.RBRACE to setOf(KtTokens.LONG_TEMPLATE_ENTRY_START, KtTokens.OPEN_QUOTE),
+    KtTokens.RPAR to setOf(KtTokens.LBRACE, KtTokens.LONG_TEMPLATE_ENTRY_START, KtTokens.OPEN_QUOTE),
+    KtTokens.RBRACKET to setOf(KtTokens.LBRACE, KtTokens.LONG_TEMPLATE_ENTRY_START, KtTokens.OPEN_QUOTE),
+    KtTokens.LONG_TEMPLATE_ENTRY_END to setOf(KtTokens.OPEN_QUOTE),
+    KtTokens.CLOSING_QUOTE to emptySet()
 )
 
 /**
@@ -333,11 +361,19 @@ private class ScriptStructure(
             it.type in KtTokens.WHITESPACES || it.type in KtTokens.COMMENTS
         }
         depths = IntArray(tokens.size)
-        var depth = 0
+        val opened = mutableListOf<IElementType>()
         tokens.forEachIndexed { index, token ->
-            depths[index] = depth
-            if (token.type in openingTokens) depth++
-            if (token.type in closingTokens) depth = (depth - 1).coerceAtLeast(0)
+            depths[index] = opened.size
+            if (token.type in openingTokens) opened += token.type
+            if (token.type in closingTokens) {
+                val opening = opened.lastIndexOf(openingOf.getValue(token.type))
+                val enclosing = opened.indexOfLast { it in enclosingOf.getValue(token.type) }
+                if (opening > enclosing) {
+                    opened.subList(opening, opened.size).clear()
+                } else if (token.type == KtTokens.RBRACE && enclosing == -1 && unmatchedClosingBrace == null) {
+                    unmatchedClosingBrace = token.start
+                }
+            }
         }
 
         val bodyStart = parseHeader()
@@ -367,14 +403,18 @@ private class ScriptStructure(
         val tokens: List<Token>,
         /** The tokens before the body, e.g. the supertypes. */
         val headerTokens: List<Token>,
-        val requiresMove: Boolean
+        val requiresMove: Boolean,
+        val destructuredNames: List<String>
     ) {
         val isSealed = modifiers.any { it.text == "sealed" }
+        val identifiers = tokens.filter { it.type == KtTokens.IDENTIFIER }.mapTo(HashSet()) { it.text }
+        val headerIdentifiers = headerTokens.filter { it.type == KtTokens.IDENTIFIER }.mapTo(HashSet()) { it.text }
         fun toDeclaration() = Declaration(
             name = name,
             start = tokens.first().start,
             end = tokens.last().end,
-            nameRange = nameIndex?.let { tokens[it - first] }?.let { it.start until it.end }
+            nameRange = nameIndex?.let { tokens[it - first] }?.let { it.start until it.end },
+            destructuredNames = destructuredNames
         )
     }
 
@@ -399,11 +439,8 @@ private class ScriptStructure(
     ): List<ParsedDeclaration> = buildList {
         var index = bodyStart
         while (index < tokens.size) {
+            if (tokens[index].start == unmatchedClosingBrace) break
             if (depths[index] == 0) {
-                if (tokens[index].type == KtTokens.RBRACE) {
-                    unmatchedClosingBrace = tokens[index].start
-                    break
-                }
                 if (isStatementStart(index, bodyStart)) {
                     val declaration = parseDeclaration(index)
                     if (declaration != null) {
@@ -427,6 +464,10 @@ private class ScriptStructure(
     private fun isOnNewLine(
         index: Int
     ): Boolean = index > 0 && script.substring(tokens[index - 1].end, tokens[index].start).contains('\n')
+
+    private fun columnOf(
+        offset: Int
+    ): Int = offset - (script.lastIndexOf('\n', offset - 1) + 1)
 
     private fun continuesPreviousLine(
         index: Int
@@ -511,6 +552,16 @@ private class ScriptStructure(
             FUNCTION -> declarationModifiers.any { it.text == "inline" } || hasMemberOnlyAnnotation
             PROPERTY -> isExtensionOrHasAccessor(keyword, last) || hasMemberOnlyAnnotation
         }
+        val destructuredNames = if (kind == DeclarationKind.PROPERTY && tokens.getOrNull(keyword + 1)?.type == KtTokens.LPAR) {
+            (keyword + 2 until closingIndex(keyword + 1)).filter {
+                depths[it] == depths[keyword] + 1
+                        && tokens[it].type == KtTokens.IDENTIFIER
+                        && tokens[it - 1].type.let { previous -> previous == KtTokens.LPAR || previous == KtTokens.COMMA }
+                        && tokens[it].text != "_"
+            }.map { tokens[it].text }
+        } else {
+            emptyList()
+        }
         return ParsedDeclaration(
             kind = kind,
             name = nameIndex?.let { tokens[it].text },
@@ -520,7 +571,8 @@ private class ScriptStructure(
             last = last,
             tokens = declarationTokens,
             headerTokens = tokens.subList(keyword, bodyStart),
-            requiresMove = requiresMove
+            requiresMove = requiresMove,
+            destructuredNames = destructuredNames
         )
     }
 
@@ -575,7 +627,7 @@ private class ScriptStructure(
         keyword: Int,
         kind: DeclarationKind
     ): Int {
-        val column = tokens[first].start - (script.lastIndexOf('\n', tokens[first].start - 1) + 1)
+        val column = columnOf(tokens[first].start)
         var hasBody = false
         var hasInitializer = false
         var index = keyword + 1
@@ -584,7 +636,7 @@ private class ScriptStructure(
             if (depths[index] == 0) {
                 if (token.type == KtTokens.SEMICOLON || token.type == KtTokens.RBRACE) break
                 if (isOnNewLine(index) && !continuesPreviousLine(index)) {
-                    val tokenColumn = token.start - (script.lastIndexOf('\n', token.start - 1) + 1)
+                    val tokenColumn = columnOf(token.start)
                     val continues = when {
                         token.type == KtTokens.LBRACE -> !hasBody && !hasInitializer
                                 && kind != DeclarationKind.PROPERTY && kind != DeclarationKind.TYPE_ALIAS
@@ -632,7 +684,9 @@ private class ScriptStructure(
             }
             // the receiver of an extension, like in `val String.shouted`
             if (token.type == KtTokens.DOT && angles == 0 && !hasTypeOrInitializer) return true
+            // the name of the property might be `get` or `set` as well
             if ((token.text == "get" || token.text == "set")
+                && index != keyword + 1
                 && tokens[index - 1].type != KtTokens.DOT
                 && (isOnNewLine(index) || !hasInitializer)
             ) return true
@@ -658,46 +712,67 @@ private class ScriptStructure(
         bodyStart: Int
     ): Set<ParsedDeclaration> {
         val named = declarations.filter { it.name != null && it.kind != DeclarationKind.PROPERTY }
-        val nameIndices = declarations.mapNotNull { it.nameIndex }.toSet()
+        val namedByName = named.groupBy { it.name!! }
+        val subtypesByName = mutableMapOf<String, MutableList<ParsedDeclaration>>()
+        named.filter { it.kind != DeclarationKind.FUNCTION }.forEach { declaration ->
+            declaration.headerIdentifiers.forEach { subtypesByName.getOrPut(it) { mutableListOf() } += declaration }
+        }
+        val references = declarations.associateWith { declaration ->
+            buildSet {
+                declaration.identifiers.forEach { addAll(namedByName[it].orEmpty()) }
+                if (declaration.isSealed) addAll(subtypesByName[declaration.name].orEmpty())
+                remove(declaration)
+            }
+        }
+        val referrers = mutableMapOf<ParsedDeclaration, MutableList<ParsedDeclaration>>()
+        references.forEach { (declaration, referenced) ->
+            referenced.forEach { referrers.getOrPut(it) { mutableListOf() } += declaration }
+        }
         val required = declarations.filter { it.requiresMove }.toSet()
         val localProperties = declarations.filter {
             it.kind == DeclarationKind.PROPERTY && it !in required
-        }.mapNotNull { it.name }.toSet()
-        fun withReferences(
-            seed: Set<ParsedDeclaration>,
-            isMovable: (declaration: ParsedDeclaration, moved: Set<ParsedDeclaration>) -> Boolean = { _, _ -> true }
-        ): Set<ParsedDeclaration> {
-            val moved = seed.toMutableSet()
-            do {
-                val referenced = moved.flatMap { declaration ->
-                    declaration.tokens.filter { it.type == KtTokens.IDENTIFIER }.map { it.text }
-                }.toSet()
-                val sealed = moved.filter { it.isSealed }.mapNotNull { it.name }.toSet()
-                val added = named.filter { declaration ->
-                    declaration !in moved && (declaration.name in referenced
-                            || (declaration.kind != DeclarationKind.FUNCTION && declaration.headerTokens.any { it.text in sealed }))
-                            && isMovable(declaration, moved)
-                }
-                moved += added
-            } while (added.isNotEmpty())
-            return moved
-        }
-        fun accessesLocalProperties(
-            function: ParsedDeclaration,
+        }.flatMap { listOfNotNull(it.name) + it.destructuredNames }.toSet()
+        val accessingLocalProperties = declarations.filter { declaration ->
+            declaration.identifiers.any { it in localProperties }
+        }.toSet()
+        /** The declarations not [moved] yet, which access the local properties, or refer to such ones not moved yet. */
+        fun accessingLocalProperties(
             moved: Set<ParsedDeclaration>
-        ): Boolean = (withReferences(moved + function) - moved).any { declaration ->
-            declaration.tokens.any { it.text in localProperties }
+        ): Set<ParsedDeclaration> {
+            val accessing = accessingLocalProperties.filterTo(mutableSetOf()) { it !in moved }
+            val queue = ArrayDeque(accessing)
+            while (queue.isNotEmpty()) {
+                referrers[queue.removeFirst()].orEmpty().forEach {
+                    if (it !in moved && accessing.add(it)) queue += it
+                }
+            }
+            return accessing
         }
-        var moved = withReferences(required) { declaration, alreadyMoved ->
-            declaration.kind != DeclarationKind.FUNCTION || !accessesLocalProperties(declaration, alreadyMoved)
+        val moved = required.toMutableSet()
+        do {
+            val accessing = accessingLocalProperties(moved)
+            val added = moved.flatMap { references.getValue(it) }.filter { declaration ->
+                declaration !in moved && (declaration.kind != DeclarationKind.FUNCTION || declaration !in accessing)
+            }
+            moved += added
+        } while (added.isNotEmpty())
+        val nameIndices = declarations.mapNotNull { it.nameIndex }.toSet()
+        val firstReferences = mutableMapOf<String, Int>()
+        (bodyStart until tokens.size).forEach {
+            if (it !in nameIndices) firstReferences.putIfAbsent(tokens[it].text, it)
         }
         declarations.filter { declaration ->
-            declaration.kind == DeclarationKind.FUNCTION && (bodyStart until declaration.first).any {
-                it !in nameIndices && tokens[it].text == declaration.name
-            }
+            declaration.kind == DeclarationKind.FUNCTION
+                    && (firstReferences[declaration.name] ?: Int.MAX_VALUE) < declaration.first
         }.forEach { function ->
-            if (!accessesLocalProperties(function, moved)) {
-                moved = withReferences(moved + function)
+            if (function !in moved && function !in accessingLocalProperties(moved)) {
+                val queue = ArrayDeque(listOf(function))
+                moved += function
+                while (queue.isNotEmpty()) {
+                    references.getValue(queue.removeFirst()).forEach {
+                        if (moved.add(it)) queue += it
+                    }
+                }
             }
         }
         return moved.sortedBy { it.first }.toCollection(LinkedHashSet())

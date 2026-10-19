@@ -135,6 +135,24 @@ It is up to the caller how to present the error to the LLM, e.g.:
 "<impediment phase=\"${result.phase}\">\n${result.message}\n</impediment>"
 ```
 
+## Security
+
+The script runs with the full privileges of the host application, there is no sandbox.
+It is compiled against the whole classpath, and executed in the JVM of the host,
+so it can do whatever the host can:
+read and write files, open network connections, read the environment variables and system properties,
+access the classes and singletons of the host through reflection,
+start processes, or terminate the JVM with `System.exit`.
+The dependencies limit what the script is given, not what it can reach.
+
+A script written by an LLM should be treated as untrusted code,
+as it might be the result of a prompt injection, or just a hallucination.
+If the LLM can be influenced by content which is not trusted,
+like web pages, documents, emails or tool results,
+execute the scripts in an isolated environment,
+e.g. a separate JVM process running in a container or a virtual machine,
+with no secrets, limited file system and network access, and bounded CPU, memory and execution time.
+
 ## Logging
 
 The library logs through [kotlin-logging](https://github.com/oshai/kotlin-logging) over SLF4J.

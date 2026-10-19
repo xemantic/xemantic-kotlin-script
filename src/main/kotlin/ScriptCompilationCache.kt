@@ -79,10 +79,13 @@ internal class ScriptCompilationCache(
             } catch (e: Throwable) {
                 remove(key, entry)
                 // unlike the cancellation of the caller, the failure of the compilation is shared
-                if (e is CancellationException && !currentCoroutineContext().isActive) {
-                    entry.complete(null)
-                } else {
-                    entry.completeExceptionally(e)
+                when {
+                    e !is CancellationException -> entry.completeExceptionally(e)
+                    !currentCoroutineContext().isActive -> entry.complete(null)
+                    // would silently cancel the waiting callers instead of failing them
+                    else -> entry.completeExceptionally(
+                        IllegalStateException("The compilation of the script was cancelled", e)
+                    )
                 }
                 throw e
             }

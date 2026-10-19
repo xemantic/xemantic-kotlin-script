@@ -34,6 +34,7 @@ import kotlinx.coroutines.test.runTest
 import kotlin.script.experimental.api.CompiledScript
 import kotlin.script.experimental.api.ResultWithDiagnostics
 import kotlin.test.Test
+import kotlin.test.assertFailsWith
 
 class ScriptCompilationCacheTest {
 
@@ -225,7 +226,7 @@ class ScriptCompilationCacheTest {
     }
 
     @Test
-    fun `should share cancellation exception thrown by the compilation with concurrent callers`() = runTest {
+    fun `should fail concurrent callers without cancelling them when the compilation throws cancellation exception`() = runTest {
         // given
         val cache = ScriptCompilationCache(maxSize = 10)
         val key = ScriptCompilationCache.Key(script = "foo", dependencies = emptyList())
@@ -243,9 +244,23 @@ class ScriptCompilationCacheTest {
 
         // then
         assert(compilations == 1)
-        results.forEach { result ->
-            assert(result.exceptionOrNull()?.message == "compiler gave up")
+        val owner = results.first().exceptionOrNull()
+        assert(owner is CancellationException && owner.message == "compiler gave up")
+        results.drop(1).forEach { result ->
+            val waiter = result.exceptionOrNull()
+            assert(waiter is IllegalStateException && waiter !is CancellationException && waiter.message == "The compilation of the script was cancelled")
         }
+    }
+
+    @Test
+    fun `should reject negative compilation cache size`() {
+        // when
+        val exception = assertFailsWith<IllegalArgumentException> {
+            ScriptExecutor(compilationCacheSize = -1)
+        }
+
+        // then
+        assert(exception.message == "compilationCacheSize must not be negative, but was: -1")
     }
 
     @Test

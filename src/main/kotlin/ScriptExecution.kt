@@ -27,6 +27,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
+import org.jetbrains.kotlin.config.JvmTarget
 import kotlin.concurrent.atomics.AtomicInt
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.concurrent.atomics.fetchAndIncrement
@@ -80,6 +81,12 @@ internal class DefaultScriptExecutor(
     @OptIn(ExperimentalAtomicApi::class)
     internal val compilationCount: Int get() = compilations.load()
 
+    init {
+        require(compilationCacheSize >= 0) {
+            "compilationCacheSize must not be negative, but was: $compilationCacheSize"
+        }
+    }
+
     private val compilationCache = if (compilationCacheSize > 0) {
         ScriptCompilationCache(compilationCacheSize)
     } else {
@@ -94,7 +101,7 @@ internal class DefaultScriptExecutor(
                 wholeClasspath = true
             )
             // the default 1.8 target cannot inline functions of the classpath, e.g. `dependency(...)`
-            jvmTarget(System.getProperty("java.specification.version"))
+            jvmTarget(scriptJvmTarget(System.getProperty("java.specification.version")))
         }
         // Add helpful default imports
         defaultImports(
@@ -318,7 +325,7 @@ internal class DefaultScriptExecutor(
 
         private fun compilationConfig() = ScriptCompilationConfiguration(compilationConfigurationTemplate) {
             providedProperties(
-                *(allDependencies.map { it.providedName to KotlinType(it.type) }.toTypedArray())
+                *(allDependencies.map { it.providedName to it.providedType }.toTypedArray())
             )
         }
 
@@ -343,13 +350,22 @@ private fun Throwable.unwrapRecoveredCopy(): Throwable {
     }
 }
 
+/**
+ * The JVM target of the running Java version, or the highest one supported by the compiler,
+ * if the Java version is newer than the compiler.
+ */
+internal fun scriptJvmTarget(
+    javaSpecificationVersion: String
+): String = (JvmTarget.fromString(javaSpecificationVersion) ?: JvmTarget.supportedValues().last()).description
+
 private const val SCRIPT_BLOCK_NAME = "_script"
 
 private const val GENERIC_DEPENDENCY_PREFIX = "_dependency_"
 
 /*
  * The scripting host erases the type arguments of a provided property,
- * so a dependency of generic type is provided under a hidden name,
+ * and fails to compile the erased type of a nested class,
+ * so a dependency of generic type is provided under a hidden name as `Any?`,
  * and cast back to its type by an accessor declared in the preamble of the script.
  */
 
@@ -359,9 +375,12 @@ private val ScriptExecutor.Dependency<*>.isGeneric: Boolean
 private val ScriptExecutor.Dependency<*>.providedName: String
     get() = if (isGeneric) "$GENERIC_DEPENDENCY_PREFIX$name" else name
 
+private val ScriptExecutor.Dependency<*>.providedType: KotlinType
+    get() = if (isGeneric) KotlinType(typeOf<Any?>()) else KotlinType(type)
+
 private val ScriptExecutor.Dependency<*>.accessor: String?
     get() = if (isGeneric) {
-        "@Suppress(\"UNCHECKED_CAST\", \"USELESS_CAST\") val `$name`: $type get() = `$providedName` as $type"
+        "@Suppress(\"UNCHECKED_CAST\") val `$name`: $type get() = `$providedName` as $type"
     } else {
         null
     }
