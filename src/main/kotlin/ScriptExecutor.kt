@@ -22,6 +22,8 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import org.intellij.lang.annotations.Language
+import org.jetbrains.kotlin.lexer.KtKeywordToken
+import org.jetbrains.kotlin.lexer.KtTokens
 import java.lang.reflect.Modifier
 import kotlin.reflect.KClass
 import kotlin.reflect.KType
@@ -39,7 +41,7 @@ public interface ScriptExecutor {
     /**
      * A property provided to the script.
      *
-     * @param name the name of the property, a Kotlin identifier.
+     * @param name the name of the property, a Kotlin identifier, which is not a hard keyword like `in`.
      * @param type the type of the property as seen by the script,
      *   including its type arguments and nullability,
      *   where all the classes must be accessible to the script, i.e. public and not local.
@@ -54,6 +56,9 @@ public interface ScriptExecutor {
         init {
             require(name.matches(identifier) && name.any { it != '_' }) {
                 "Dependency name is not a Kotlin identifier: '$name'"
+            }
+            require(name !in hardKeywords) {
+                "Dependency name is a Kotlin keyword: '$name'"
             }
             type.inaccessibleClass()?.let {
                 throw IllegalArgumentException(
@@ -116,6 +121,9 @@ public inline fun <reified T> dependency(
 )
 
 private val identifier = Regex("[\\p{L}\\p{Nl}_][\\p{L}\\p{Nl}\\p{Nd}_]*")
+
+/** The keywords, like `in` or `class`, which the script could not use as a name, unless quoted in backticks. */
+private val hardKeywords = KtTokens.KEYWORDS.types.mapTo(HashSet()) { (it as KtKeywordToken).value }
 
 /** The first class of this type, or of its type arguments, which the script cannot refer to. */
 private fun KType.inaccessibleClass(): Class<*>? =

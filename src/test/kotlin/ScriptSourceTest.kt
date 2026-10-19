@@ -41,4 +41,23 @@ class ScriptSourceTest {
         assert(source.text.substringAfter("_script {").removeSuffix("}").trim() == "Start.A.first()")
     }
 
+    @Test
+    fun `should move many functions referred to before their declaration among many accessing local property`() {
+        // given
+        val count = 50_000
+        val script = buildString {
+            appendLine("val x = 1")
+            (0 until count).forEach { appendLine("b$it()") }
+            (0 until count).forEach { appendLine("fun a$it() = x") }
+            (0 until count).forEach { appendLine("fun b$it() = $it") }
+        }
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.text.split("_script {")
+        assert("fun b${count - 1}() = ${count - 1}" in moved && "fun a0() = x" in body)
+    }
+
 }

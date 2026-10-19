@@ -26,6 +26,9 @@ import kotlin.script.experimental.api.ScriptDiagnostic
 /** The longest sequence of frames recognized as repeated, e.g. in mutual recursion. */
 private const val MAX_REPEATED_FRAMES = 16
 
+/** The most exceptions reported, including causes and suppressed ones, as the script might chain them endlessly. */
+private const val MAX_REPORTED_EXCEPTIONS = 32
+
 private val unresolvedReference = Regex("Unresolved reference '(.+)'\\.")
 
 /** Reported without a location, for an object accessing the dependencies, which are the members of the script class. */
@@ -85,29 +88,38 @@ internal class ScriptErrorReporter(
         appendSourceLines(position, position.copy(column = position.column + 1))
     }.trimEnd()
 
+    /**
+     * @return `false`, if the [throwable] was omitted, as too many exceptions were reported already.
+     */
     private fun StringBuilder.appendThrowable(
         throwable: Throwable,
         prefix: String,
         indent: String,
         reported: MutableSet<Throwable>
-    ) {
+    ): Boolean {
         +indent
         +prefix
-        if (!reported.add(throwable)) {
+        if (throwable in reported) {
             +"[CIRCULAR REFERENCE: "
             appendDescription(throwable)
             +"]\n"
-            return
+            return true
         }
+        if (reported.size >= MAX_REPORTED_EXCEPTIONS) {
+            +"[FURTHER EXCEPTIONS OMITTED]\n"
+            return false
+        }
+        reported += throwable
         appendDescription(throwable)
         +'\n'
         appendFrames(throwable.read(emptyArray()) { stackTrace }, indent)
-        throwable.read(emptyArray()) { suppressed }.forEach {
-            appendThrowable(it, "Suppressed: ", "$indent  ", reported)
+        for (suppressed in throwable.read(emptyArray()) { suppressed }) {
+            if (!appendThrowable(suppressed, "Suppressed: ", "$indent  ", reported)) break
         }
         throwable.read(null) { cause }?.let {
             appendThrowable(it, "Caused by: ", indent, reported)
         }
+        return true
     }
 
     private fun StringBuilder.appendDescription(

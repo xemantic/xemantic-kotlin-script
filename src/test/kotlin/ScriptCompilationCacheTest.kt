@@ -63,6 +63,30 @@ class ScriptCompilationCacheTest {
     }
 
     @Test
+    fun `should compile the script only once when dependencies are given in another order`() = runTest {
+        // given
+        val script = """
+            greeting.repeat(times)
+        """.trimIndent()
+        val executor = DefaultScriptExecutor(compilationCacheSize = 10)
+
+        // when
+        val result1 = executor.execute(script, listOf(dependency("greeting", "foo"), dependency("times", 2)))
+        val result2 = executor.execute(script, listOf(dependency("times", 3), dependency("greeting", "bar")))
+
+        // then
+        result1 should {
+            be<ScriptResult.Value>()
+            have(value == "foofoo")
+        }
+        result2 should {
+            be<ScriptResult.Value>()
+            have(value == "barbarbar")
+        }
+        assert(executor.compilationCount == 1)
+    }
+
+    @Test
     fun `should compile the script again when dependency types differ`() = runTest {
         // given
         val script = $$"""

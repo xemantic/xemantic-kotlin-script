@@ -1826,6 +1826,105 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report long chain of causes without overflowing the stack`() = runTest {
+        // given
+        val script = $$"""
+            var exception: Throwable = IllegalStateException("root")
+            repeat(100_000) { exception = RuntimeException("wrapper $it", exception) }
+            throw exception
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        // the message is not asserted as a whole, so that the failure would not report all of it
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+        }
+        val lines = (result as ScriptResult.Error).message.lines()
+        val lineCount = lines.size
+        val firstLine = lines.first()
+        val lastLine = lines.last()
+        assert(lineCount < 200)
+        assert(firstLine == "java.lang.RuntimeException: wrapper 99999")
+        assert(lastLine == "Caused by: [FURTHER EXCEPTIONS OMITTED]")
+    }
+
+    @Test
+    fun `should report many suppressed exceptions omitting the further ones`() = runTest {
+        // given
+        val script = """
+            val exception = IllegalStateException("main")
+            repeat(100_000) { exception.addSuppressed(RuntimeException("suppressed")) }
+            throw exception
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        // the message is not asserted as a whole, so that the failure would not report all of it
+        result should {
+            be<ScriptResult.Error>()
+        }
+        val lines = (result as ScriptResult.Error).message.lines()
+        val lineCount = lines.size
+        val omittedLineCount = lines.count { it.endsWith("[FURTHER EXCEPTIONS OMITTED]") }
+        val lastLine = lines.last()
+        assert(lineCount < 200)
+        assert(omittedLineCount == 1)
+        assert(lastLine == "  Suppressed: [FURTHER EXCEPTIONS OMITTED]")
+    }
+
+    @Test
+    fun `should return Unit when script ends with declaration moved out of the script body`() = runTest {
+        // given
+        val scripts = listOf(
+            "42\nenum class Color { RED }",
+            "42\ninterface Shape",
+            "42\nclass Point"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        results.forEach { result ->
+            result should {
+                be<ScriptResult.Value>()
+                have(value is Unit)
+            }
+        }
+    }
+
+    @Test
+    fun `should move property with accessor having annotation or modifier`() = runTest {
+        // given
+        val script = """
+            val String.shouted: String
+                @Suppress("unused") get() = uppercase() + "!"
+            val answer: Int
+                inline get() = 42
+            "x".shouted + answer
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "X!42")
+        }
+    }
+
+    @Test
     fun `should cap JVM target of the script at the highest one supported by the compiler`() {
         // when
         val targets = listOf("17", "21", "999").map { scriptJvmTarget(it) }

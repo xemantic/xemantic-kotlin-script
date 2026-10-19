@@ -229,14 +229,31 @@ class ScriptDependenciesTest {
     }
 
     @Test
+    fun `should reject dependency name which is a hard keyword`() {
+        // when
+        val exceptions = listOf("in", "class", "null").map { name ->
+            assertFailsWith<IllegalArgumentException> {
+                dependency(name, 1)
+            }
+        }
+
+        // then
+        assert(exceptions.map { it.message } == listOf(
+            "Dependency name is a Kotlin keyword: 'in'",
+            "Dependency name is a Kotlin keyword: 'class'",
+            "Dependency name is a Kotlin keyword: 'null'"
+        ))
+    }
+
+    @Test
     fun `should accept dependency names which are Kotlin identifiers`() {
         // when
-        val dependencies = listOf("foo", "_foo", "fooBar1", "żółw").map { name ->
+        val dependencies = listOf("foo", "_foo", "fooBar1", "żółw", "value", "get").map { name ->
             dependency(name, 1)
         }
 
         // then
-        assert(dependencies.map { it.name } == listOf("foo", "_foo", "fooBar1", "żółw"))
+        assert(dependencies.map { it.name } == listOf("foo", "_foo", "fooBar1", "żółw", "value", "get"))
     }
 
     @Test

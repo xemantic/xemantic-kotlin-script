@@ -125,6 +125,11 @@ internal class ScriptSource(
         addLines(lineOf(headerEnd)..lineBounds.lastIndex) { offset ->
             offset >= headerEnd && !excluded[offset]
         }
+        if (structure.endsWithMovedDeclaration) {
+            // the block would return the value of the statement before the declaration, unlike the script
+            lines += "Unit"
+            mapping += null
+        }
         lines += "}"
         mapping += null
 
@@ -342,6 +347,9 @@ private class ScriptStructure(
 
     val bodyDeclarations: List<Declaration>
 
+    /** Whether the last statement of the script is a declaration moved out of the script body. */
+    val endsWithMovedDeclaration: Boolean
+
     /** The modifiers which are not applicable to local declarations. */
     val blankedRanges = mutableListOf<IntRange>()
 
@@ -380,6 +388,7 @@ private class ScriptStructure(
         val declarations = parseBody(bodyStart)
         val moved = selectMovedDeclarations(declarations, bodyStart)
         movedDeclarations = moved.map { it.toDeclaration() }
+        endsWithMovedDeclaration = moved.any { it.last == tokens.lastIndex }
         bodyDeclarations = declarations
             .filter { it !in moved && (it.kind == DeclarationKind.PROPERTY || it.kind == DeclarationKind.FUNCTION) }
             .map { it.toDeclaration() }
@@ -641,8 +650,7 @@ private class ScriptStructure(
                         token.type == KtTokens.LBRACE -> !hasBody && !hasInitializer
                                 && kind != DeclarationKind.PROPERTY && kind != DeclarationKind.TYPE_ALIAS
                         // the accessors of a property are indented
-                        kind == DeclarationKind.PROPERTY && tokenColumn > column -> token.text in setOf("get", "set")
-                                || (token.text in visibilityModifiers && tokens.getOrNull(index + 1)?.text == "set")
+                        kind == DeclarationKind.PROPERTY && tokenColumn > column -> isAccessorStart(index)
                         else -> false
                     }
                     if (!continues) break
@@ -653,6 +661,22 @@ private class ScriptStructure(
             index++
         }
         return index - 1
+    }
+
+    /** Whether an accessor, like `get()` or `@JvmName("x") private set`, starts at the [index]. */
+    private fun isAccessorStart(
+        index: Int
+    ): Boolean {
+        var current = index
+        while (current < tokens.size) {
+            val token = tokens[current]
+            current = when {
+                token.type == KtTokens.AT -> annotationEnd(current)
+                token.text in modifiers -> current + 1
+                else -> return token.text == "get" || token.text == "set"
+            }
+        }
+        return false
     }
 
     private fun hasNestedDeclarations(
@@ -684,6 +708,7 @@ private class ScriptStructure(
             }
             // the receiver of an extension, like in `val String.shouted`
             if (token.type == KtTokens.DOT && angles == 0 && !hasTypeOrInitializer) return true
+            if (index > keyword + 1 && isOnNewLine(index) && isAccessorStart(index)) return true
             // the name of the property might be `get` or `set` as well
             if ((token.text == "get" || token.text == "set")
                 && index != keyword + 1
@@ -749,13 +774,24 @@ private class ScriptStructure(
             return accessing
         }
         val moved = required.toMutableSet()
-        do {
-            val accessing = accessingLocalProperties(moved)
-            val added = moved.flatMap { references.getValue(it) }.filter { declaration ->
-                declaration !in moved && (declaration.kind != DeclarationKind.FUNCTION || declaration !in accessing)
+        var accessing = accessingLocalProperties(moved)
+        val queue = ArrayDeque(moved)
+        while (queue.isNotEmpty()) {
+            references.getValue(queue.removeFirst()).forEach { declaration ->
+                if (declaration !in moved && (declaration.kind != DeclarationKind.FUNCTION || declaration !in accessing)) {
+                    moved += declaration
+                    queue += declaration
+                    // moving a declaration, which is not accessing, cannot change the accessing ones,
+                    // as they refer to the local properties only through the accessing ones
+                    if (declaration in accessing) {
+                        accessing = accessingLocalProperties(moved)
+                        // the functions rejected before might not be accessing anymore
+                        queue.clear()
+                        queue += moved
+                    }
+                }
             }
-            moved += added
-        } while (added.isNotEmpty())
+        }
         val nameIndices = declarations.mapNotNull { it.nameIndex }.toSet()
         val firstReferences = mutableMapOf<String, Int>()
         (bodyStart until tokens.size).forEach {
@@ -765,7 +801,8 @@ private class ScriptStructure(
             declaration.kind == DeclarationKind.FUNCTION
                     && (firstReferences[declaration.name] ?: Int.MAX_VALUE) < declaration.first
         }.forEach { function ->
-            if (function !in moved && function !in accessingLocalProperties(moved)) {
+            // moving a function, which is not accessing, moves only the ones, which are not accessing either
+            if (function !in moved && function !in accessing) {
                 val queue = ArrayDeque(listOf(function))
                 moved += function
                 while (queue.isNotEmpty()) {

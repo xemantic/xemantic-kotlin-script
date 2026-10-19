@@ -151,11 +151,12 @@ internal class DefaultScriptExecutor(
         script: String
     ) {
 
-        private val allDependencies = dependencies + ScriptExecutor.Dependency(
+        // in the order independent of the caller, as the source and the cache key are built from it
+        private val allDependencies = (dependencies + ScriptExecutor.Dependency(
             name = SCRIPT_BLOCK_NAME,
             type = typeOf<ScriptBlock>(),
             value = ScriptBlock
-        )
+        )).sortedBy { it.name }
 
         private val source = ScriptSource(
             script,
@@ -262,7 +263,7 @@ internal class DefaultScriptExecutor(
                     "Script[$scriptId]: Evaluation (2/2) succeeded after $duration"
                 }
                 is ScriptResult.Error -> logger.debug {
-                    "Script[$scriptId]: Evaluation (2/2) failed after $duration"
+                    "Script[$scriptId]: Evaluation (2/2) failed after $duration, failure message: ${result.message}"
                 }
             }
 
@@ -275,21 +276,22 @@ internal class DefaultScriptExecutor(
             is ResultValue.Value -> {
                 @Suppress("UNCHECKED_CAST")
                 val block = value as suspend CoroutineScope.() -> Any?
-                try {
-                    ScriptResult.Value(
-                        value = coroutineScope { block() },
-                        warnings = warningsMessage(warnings)
-                    )
+                // only what the block throws is the failure of the script, not the reporting of its warnings
+                val returned = try {
+                    Result.success(coroutineScope { block() })
                 } catch (e: Throwable) {
                     // the cancellation of the caller is not a failure of the script
                     if (e is CancellationException) currentCoroutineContext().ensureActive()
                     // unlike after the StackOverflowError, the JVM might not be able to continue
                     if (e is VirtualMachineError && e !is StackOverflowError) throw e
-                    logger.debug(e) {
-                        "Script[$scriptId]: Evaluation failed with error"
-                    }
-                    failure(e.unwrapRecoveredCopy(), warnings, block::class.java.name)
+                    Result.failure(e.unwrapRecoveredCopy())
                 }
+                returned.fold(
+                    onSuccess = { ScriptResult.Value(it, warningsMessage(warnings)) },
+                    // the exception of the script is not passed to the logger,
+                    // which might read its properties, overridden by the script to throw
+                    onFailure = { failure(it, warnings, block::class.java.name) }
+                )
             }
             is ResultValue.Unit -> ScriptResult.Value(Unit, warningsMessage(warnings))
             is ResultValue.Error -> failure(error, warnings, blockClassName = null)
