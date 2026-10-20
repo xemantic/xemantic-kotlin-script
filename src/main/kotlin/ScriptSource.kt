@@ -98,6 +98,19 @@ internal class ScriptReference(
 
 }
 
+/**
+ * The [reference] of the script body to a dependency, preceding the declaration of the local property,
+ * or the local function, if [isFunction], of the same name, at the 0-based [line].
+ */
+internal class LaterDeclaredReference(
+    val reference: ScriptReference,
+    val line: Int,
+    val isFunction: Boolean
+)
+
+/** The deprecation message of the dependencies, see [ScriptSource.laterDeclaredDependencyCandidates]. */
+internal const val LATER_DECLARED_DEPENDENCY = "xemantic-kotlin-script: later declared dependency"
+
 /** A dependency, as declared in the preamble of the [ScriptSource]. */
 internal class PreambleDependency(
     val name: String,
@@ -148,8 +161,11 @@ internal const val SCRIPT_BLOCK_END = "} }"
 internal class ScriptSource(
     script: String,
     dependencies: List<PreambleDependency> = emptyList(),
-    /** The dependency not declared for the script body, see [laterDeclaredDependencyCandidates]. */
-    val omittedDependency: String? = null
+    /**
+     * The dependencies declared for the script body with the [LATER_DECLARED_DEPENDENCY] deprecation error,
+     * see [laterDeclaredDependencyCandidates], which does not change how the references are resolved, unlike omitting them.
+     */
+    deprecatedDependencies: Set<String> = emptySet()
 ) : SourceCode {
 
     val scriptLines: List<String>
@@ -173,13 +189,13 @@ internal class ScriptSource(
     val conflictingDependencyDeclarations: List<ScriptReference>
 
     /**
-     * The references of the script body which might refer to the dependencies, preceding the declarations of the local properties of the same names,
-     * by the 0-based lines of these declarations, like `x` in `fun show() = x` followed by `val x = 2`,
-     * while in the script they refer to the properties.
+     * The references of the script body which might refer to the dependencies, preceding the declarations
+     * of the local properties of the same names, like `x` in `fun show() = x` followed by `val x = 2`,
+     * or of the local functions, when called, while in the script they refer to these declarations.
      * Recognized by the names only, they might refer e.g. to the members of the receivers instead,
-     * so they are confirmed by compiling the script without the dependency, see [omittedDependency].
+     * so they are confirmed by compiling the script with these dependencies deprecated, see [deprecatedDependencies].
      */
-    val laterDeclaredDependencyCandidates: List<Pair<ScriptReference, Int>>
+    val laterDeclaredDependencyCandidates: List<LaterDeclaredReference>
 
     private val lineStarts: List<Int>
 
@@ -205,9 +221,12 @@ internal class ScriptSource(
         conflictingDependencyDeclarations = structure.conflictingDependencyDeclarations.map { (name, range) ->
             ScriptReference(name, position(range.first), position(range.last + 1))
         }
-        laterDeclaredDependencyCandidates = structure.laterDeclaredDependencyCandidates.map { (reference, declaration) ->
-            ScriptReference(reference.name, position(reference.offset), position(reference.offset + reference.length)) to
-                    position(declaration).line
+        laterDeclaredDependencyCandidates = structure.laterDeclaredDependencyCandidates.map { (reference, declaration, isFunction) ->
+            LaterDeclaredReference(
+                ScriptReference(reference.name, position(reference.offset), position(reference.offset + reference.length)),
+                position(declaration).line,
+                isFunction
+            )
         }
         bodyDeclarations = structure.bodyDeclarations
 
@@ -238,7 +257,12 @@ internal class ScriptSource(
             dependency: PreambleDependency
         ) {
             preambleDependencies[lines.size] = dependency.name
-            lines += dependency.accessor
+            lines += if (dependency.name in deprecatedDependencies) {
+                // the qualified `kotlin.DeprecationLevel.ERROR` crashes the compiler
+                "@kotlin.Deprecated(\"$LATER_DECLARED_DEPENDENCY\", level = DeprecationLevel.ERROR) ${dependency.accessor}"
+            } else {
+                dependency.accessor
+            }
             mapping += null
         }
         val (shadowed, visible) = dependencies.partition {
@@ -248,9 +272,7 @@ internal class ScriptSource(
         lines += "class $DEPENDENCIES_CLASS {"
         mapping += null
         // the members of the outer receiver of the script body would be called instead of the moved functions
-        shadowed.filterNot {
-            (it.isCallable && it.name in structure.movedFunctions) || it.name == omittedDependency
-        }.forEach { addAccessor(it) }
+        shadowed.filterNot { it.isCallable && it.name in structure.movedFunctions }.forEach { addAccessor(it) }
         lines += "}"
         mapping += null
         movedDeclarations.forEach { declaration ->
@@ -623,8 +645,8 @@ private class ScriptStructure(
     /** The names of the functions moved out of the script body. */
     val movedFunctions: Set<String>
 
-    /** See [ScriptSource.laterDeclaredDependencyCandidates], with the offsets of the declarations. */
-    val laterDeclaredDependencyCandidates: List<Pair<Reference, Int>>
+    /** See [ScriptSource.laterDeclaredDependencyCandidates], with the offsets of the declarations, and whether they are functions. */
+    val laterDeclaredDependencyCandidates: List<Triple<Reference, Int, Boolean>>
 
     /** The names of the [ScriptSource.conflictingDependencyDeclarations], and their ranges. */
     val conflictingDependencyDeclarations: List<Pair<String, IntRange>>
@@ -663,15 +685,21 @@ private class ScriptStructure(
         val (local, movedOut) = declarations.filter { it.kind == DeclarationKind.FUNCTION && !it.isExtension }.partition { it !in moved }
         localFunctions = local.mapNotNullTo(HashSet()) { it.name }
         movedFunctions = movedOut.mapNotNullTo(HashSet()) { it.name }
-        // the first local property of each name of a dependency, by the index of its statement
+        // the first local property, and the first local function, of each name of a dependency, by the index of its statement
         val dependencyProperties = mutableMapOf<String, Pair<Int, ParsedDeclaration>>()
+        val dependencyFunctions = mutableMapOf<String, Pair<Int, ParsedDeclaration>>()
         statements.forEachIndexed { index, statement ->
-            declarationsByPsi[statement]?.takeIf { it.kind == DeclarationKind.PROPERTY && it !in moved }?.let { declaration ->
-                (listOfNotNull(declaration.name) + declaration.destructuredNames)
-                    .filter { it in dependencyNames }
-                    .forEach { dependencyProperties.putIfAbsent(it, index to declaration) }
+            val declaration = declarationsByPsi[statement]?.takeIf { it !in moved } ?: return@forEachIndexed
+            when {
+                declaration.kind == DeclarationKind.PROPERTY -> listOfNotNull(declaration.name) + declaration.destructuredNames
+                declaration in local -> listOfNotNull(declaration.name)
+                else -> emptyList()
+            }.filter { it in dependencyNames }.forEach {
+                val declarations = if (declaration.kind == DeclarationKind.PROPERTY) dependencyProperties else dependencyFunctions
+                declarations.putIfAbsent(it, index to declaration)
             }
         }
+        fun ParsedDeclaration.line() = nameRange?.first ?: start
         laterDeclaredDependencyCandidates = statements.withIndex().flatMap { (index, statement) ->
             if (declarationsByPsi[statement] in moved) return@flatMap emptyList()
             statementReferences[index].mapNotNull { reference ->
@@ -679,7 +707,10 @@ private class ScriptStructure(
                     declarationIndex > index && reference.refersToLocal(localProperties)
                             // calling the function of the script body
                             && !(reference.isCall && (reference.name in localFunctions || reference.name in movedFunctions))
-                }?.let { (_, property) -> reference to (property.nameRange?.first ?: property.start) }
+                }?.let { (_, property) -> Triple(reference, property.line(), false) }
+                    ?: dependencyFunctions[reference.name]?.takeIf { (declarationIndex) ->
+                        declarationIndex > index && reference.isCall && reference.refersToLocal(localFunctions)
+                    }?.let { (_, function) -> Triple(reference, function.line(), true) }
             }
         }
         // unlike an extension property, which does not conflict with the accessor of the dependency

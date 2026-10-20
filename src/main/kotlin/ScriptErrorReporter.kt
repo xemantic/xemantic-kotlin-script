@@ -98,13 +98,15 @@ internal class ScriptErrorReporter(
 
     /** The [references] of the script body to the dependencies, preceding the local properties of their names, see [ScriptSource.laterDeclaredDependencyCandidates]. */
     fun toLaterDeclaredDependencyMessage(
-        references: List<Pair<ScriptReference, Int>>
-    ): String = references.joinToString(separator = "\n") { (reference, line) ->
+        references: List<LaterDeclaredReference>
+    ): String = references.joinToString(separator = "\n") { later ->
+        val reference = later.reference
+        val kind = if (later.isFunction) "function" else "property"
         buildString {
             appendPosition(reference.start)
-            +"error: '${reference.name}' refers to the dependency, as the property '${reference.name}' of the script body is declared later, at line ${line + 1}.\n"
+            +"error: '${reference.name}' refers to the dependency, as the $kind '${reference.name}' of the script body is declared later, at line ${later.line + 1}.\n"
             appendSourceLines(reference.start, reference.end)
-            +"  hint: declare the property before line ${reference.start.line + 1}, or rename it.\n"
+            +"  hint: declare the $kind before line ${reference.start.line + 1}, or rename it.\n"
         }
     }.trimEnd()
 

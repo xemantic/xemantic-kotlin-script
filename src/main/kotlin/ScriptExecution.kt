@@ -106,7 +106,7 @@ internal class DefaultScriptExecutor(
 
     private val compilationCache = if (compilationCacheSize > 0) {
         ScriptCompilationCache<Compilation>(compilationCacheSize) {
-            it.result is ResultWithDiagnostics.Success && it.laterDeclaredDependencyReferences.isEmpty()
+            it.result is ResultWithDiagnostics.Success
         }
     } else {
         null
@@ -184,7 +184,7 @@ internal class DefaultScriptExecutor(
         val source: ScriptSource,
         val result: ResultWithDiagnostics<CompiledScript>?,
         /** The [ScriptSource.laterDeclaredDependencyCandidates] referring to the dependencies indeed. */
-        val laterDeclaredDependencyReferences: List<Pair<ScriptReference, Int>> = emptyList()
+        val laterDeclaredDependencyReferences: List<LaterDeclaredReference> = emptyList()
     )
 
     private inner class ScriptHandler(
@@ -218,10 +218,15 @@ internal class DefaultScriptExecutor(
                 ScriptErrorReporter(source).toSourceFailureMessage(),
                 ExecutionPhase.COMPILATION
             )
-            if (compilation.laterDeclaredDependencyReferences.isNotEmpty()) return ScriptResult.Error(
-                ScriptErrorReporter(source).toLaterDeclaredDependencyMessage(compilation.laterDeclaredDependencyReferences),
-                ExecutionPhase.COMPILATION
-            )
+            if (compilation.laterDeclaredDependencyReferences.isNotEmpty()) {
+                val failureMessage = ScriptErrorReporter(source).toLaterDeclaredDependencyMessage(
+                    compilation.laterDeclaredDependencyReferences
+                )
+                logger.debug {
+                    "Script[$scriptId]: Compilation (1/2) failure message: $failureMessage"
+                }
+                return ScriptResult.Error(failureMessage, ExecutionPhase.COMPILATION)
+            }
             val result = when (compilationResult) {
                 is Success -> {
                     evaluate(
@@ -286,31 +291,31 @@ internal class DefaultScriptExecutor(
         }
 
         private fun source(
-            omittedDependency: String? = null
+            deprecatedDependencies: Set<String> = emptySet()
         ) = ScriptSource(
             script,
             dependencies = allDependencies.filter { it.isHidden }.map { dependency ->
                 PreambleDependency(dependency.name, dependency.accessor, dependency.isCallable)
             },
-            omittedDependency = omittedDependency
+            deprecatedDependencies = deprecatedDependencies
         )
 
         /**
-         * The [ScriptSource.laterDeclaredDependencyCandidates], which are unresolved, when the script is compiled without their dependency,
-         * one by one, so the errors caused by omitting one of them are not attributed to the others.
+         * The [ScriptSource.laterDeclaredDependencyCandidates], which refer to the dependencies indeed,
+         * recognized by the errors of compiling the script once more with these dependencies deprecated.
          */
         private suspend fun laterDeclaredDependencyReferences(
             source: ScriptSource
-        ): List<Pair<ScriptReference, Int>> = source.laterDeclaredDependencyCandidates.groupBy { (reference) ->
-            reference.name
-        }.flatMap { (name, candidates) ->
-            val probe = source(omittedDependency = name)
-            val unresolved = compile(probe).reports.filter {
-                it.severity == ScriptDiagnostic.Severity.ERROR && it.message == "Unresolved reference '$name'."
+        ): List<LaterDeclaredReference> {
+            val candidates = source.laterDeclaredDependencyCandidates
+            if (candidates.isEmpty()) return emptyList()
+            val probe = source(deprecatedDependencies = candidates.mapTo(HashSet()) { it.reference.name })
+            val deprecated = compile(probe).reports.filter {
+                it.severity == ScriptDiagnostic.Severity.ERROR && LATER_DECLARED_DEPENDENCY in it.message
             }.mapNotNull { diagnostic ->
                 diagnostic.location?.start?.let { probe.toScriptPosition(it.line, it.col) }
             }
-            candidates.filter { (reference) -> unresolved.any { it in reference } }
+            return candidates.filter { candidate -> deprecated.any { it in candidate.reference } }
         }
 
         private suspend fun compile(

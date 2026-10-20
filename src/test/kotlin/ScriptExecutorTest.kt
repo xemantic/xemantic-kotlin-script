@@ -3136,4 +3136,49 @@ class ScriptExecutorTest {
         }
     }
 
+    @Test
+    fun `should report error at reference to dependency before local property of the same name declared later also when resolvable otherwise`() = runTest {
+        // given
+        val scripts = listOf(
+            "fun show() = error(\"a\")\nval error = 1\nshow()" to listOf(dependency<(String) -> String>("error") { "dep:$it" }),
+            "fun show() = print\nval print = 2\nshow()" to listOf(dependency("print", 1))
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { (script, dependencies) -> executor.execute(script, dependencies) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.first() } == listOf(
+            "script.kts:1:14: error: 'error' refers to the dependency, as the property 'error' of the script body is declared later, at line 2.",
+            "script.kts:1:14: error: 'print' refers to the dependency, as the property 'print' of the script body is declared later, at line 2."
+        ))
+    }
+
+    @Test
+    fun `should report error at call of dependency before local function of the same name declared later`() = runTest {
+        // given
+        val script = """
+            val p = 1
+            val r = x()
+            fun x() = p + 10
+            r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<() -> Int>("x") { 2 }))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:9: error: 'x' refers to the dependency, as the function 'x' of the script body is declared later, at line 3.
+                  | val r = <error>x</error>()
+                  hint: declare the function before line 2, or rename it.
+            """.trimIndent()
+        }
+    }
+
 }

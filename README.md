@@ -77,10 +77,11 @@ when (result) {
   Invalid dependencies are rejected with `IllegalArgumentException`:
   a name which is not a Kotlin identifier, a duplicate name, a value which is not of the type,
   a name which the script body would resolve on its `CoroutineScope` receiver instead, like `coroutineContext` or `javaClass`,
-  or, for a dependency which can be called, like `launch` or `let`,
+  or such a function name, like `launch` or `let`, for a dependency which can be called,
   or a type which the script cannot refer to, like a private or a local class.
 * A reference to a dependency preceding the declaration of a local property of the same name, like `x` in `fun show() = x` followed by `val x = 2`,
-  is reported as an error, as in a regular script it refers to the property.
+  or a call preceding the declaration of a local function of the same name,
+  is reported as an error, as in a regular script it refers to the declaration.
 * Scripts executed repeatedly, like an agent harness defined as a script, can skip the recompilation
   with `ScriptExecutor(compilationCacheSize = ...)`, keeping that many compiled scripts, the least recently used evicted first.
   A compiled script is reused when the script text, and the names and types of the dependencies are the same,
