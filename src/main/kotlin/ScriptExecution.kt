@@ -298,16 +298,27 @@ internal class DefaultScriptExecutor(
 
         private suspend fun doCompile(): Compilation {
             val source = source()
-            if (source.unmatchedClosingBrace != null || source.conflictingDependencyDeclarations.isNotEmpty()) {
+            if (
+                source.unmatchedClosingBrace != null
+                || source.conflictingDependencyDeclarations.isNotEmpty()
+                || source.splitOverloads.isNotEmpty()
+                || source.laterDeclaredClassReferences.isNotEmpty()
+            ) {
                 return Compilation(source, result = null)
             }
             val result = compile(source)
+            // unless already reported as unresolved
+            val errors = result.reports.filter { it.severity == ScriptDiagnostic.Severity.ERROR }.mapNotNull { diagnostic ->
+                diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }
+            }
+            // resolved to another declaration, as the local property is not visible
+            val untyped = source.untypedPropertyCallCandidates.filter { candidate -> errors.none { it in candidate.reference } }
             if (
                 source.laterDeclaredDependencyCandidates.isEmpty()
                 && source.hiddenLocalFunctionCandidates.isEmpty()
                 && source.shadowedFunctionCandidates.isEmpty()
             ) {
-                return Compilation(source, result)
+                return Compilation(source, result, hiddenLocalFunctionReferences = untyped)
             }
             // recognizing the candidates referring to the wrong declarations indeed
             val probe = source(confirming = true)
@@ -323,10 +334,6 @@ internal class DefaultScriptExecutor(
             val dependencies = deprecated(LATER_DECLARED_DEPENDENCY)
             // only the ones, which the local function applies to, unlike the dependency called anyway
             val functions = deprecated(LATER_DECLARED_FUNCTION)
-            // unless already reported as unresolved
-            val errors = result.reports.filter { it.severity == ScriptDiagnostic.Severity.ERROR }.mapNotNull { diagnostic ->
-                diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }
-            }
             val hidden = deprecated(HIDDEN_LOCAL_FUNCTION).filter { it !in errors }
             // the calls not referring to the moved functions already, which would refer to them in the script, if they apply
             val toFunctions = deprecated(SHADOWED_ORIGINAL)
@@ -353,7 +360,7 @@ internal class DefaultScriptExecutor(
                 },
                 hiddenLocalFunctionReferences = source.hiddenLocalFunctionCandidates.filter { candidate ->
                     hidden.any { it in candidate.reference }
-                }
+                } + untyped
             )
         }
 

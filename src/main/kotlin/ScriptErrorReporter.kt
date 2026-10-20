@@ -94,7 +94,17 @@ internal class ScriptErrorReporter(
             appendSourceLines(declaration.start, declaration.end)
             +"  hint: '${declaration.name}' is compiled outside of the script body, together with the dependencies - rename it.\n"
         }
-    }.joinToString(separator = "\n").trimEnd()
+    }.plus(source.splitOverloads.map { (local, moved) ->
+        buildString {
+            appendPosition(local.start)
+            +"error: '${local.name}' is overloaded by the function declared at line ${moved + 1}, which is compiled outside of the script body, "
+            +"unlike this one accessing its local declarations, so this one hides it in the script body.\n"
+            appendSourceLines(local.start, local.end)
+            +"  hint: rename one of them.\n"
+        }
+    }).joinToString(separator = "\n").trimEnd().ifEmpty {
+        toLaterDeclaredDependencyMessage(source.laterDeclaredClassReferences)
+    }
 
     /** The [references] of the script body to the local properties instead of the functions, see [ScriptSource.shadowedFunctionCandidates]. */
     fun toShadowedFunctionMessage(
@@ -115,7 +125,7 @@ internal class ScriptErrorReporter(
     ): String = references.joinToString(separator = "\n") { hidden ->
         val reference = hidden.reference
         val declaration = source.movedDeclarationAt(reference.start)
-        val kind = if (hidden.isFunction) "function" else "property"
+        val kind = hidden.kind
         buildString {
             appendPosition(reference.start)
             +"error: '${reference.name}' does not refer to the $kind of the script body declared at line ${hidden.line + 1}, which is not visible in '$declaration'.\n"
@@ -130,7 +140,7 @@ internal class ScriptErrorReporter(
         references: List<LaterDeclaredReference>
     ): String = references.joinToString(separator = "\n") { later ->
         val reference = later.reference
-        val kind = if (later.isFunction) "function" else "property"
+        val kind = later.kind
         buildString {
             appendPosition(reference.start)
             +"error: '${reference.name}' refers to the dependency, as the $kind '${reference.name}' of the script body is declared later, at line ${later.line + 1}.\n"

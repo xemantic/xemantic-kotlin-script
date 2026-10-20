@@ -3435,4 +3435,26 @@ class ScriptExecutorTest {
         assert(result is ScriptResult.Error && result.phase == ExecutionPhase.COMPILATION)
     }
 
+    @Test
+    fun `should report wrongly resolved repeated calls, split overloads, untyped function properties and later declared classes`() = runTest {
+        // given
+        val scripts = listOf(
+            "val p = \"!\"\nval a = x(1)\nval b = x(\"a\")\nfun x(s: String) = \"local\" + s + p\na + b" to listOf(dependency<(Any) -> String>("x") { "dep$it" }),
+            "val f = { s: String -> \"prop\" }\nval a = { f(1) }\nval b = f(\"a\")\nfun f(x: Int) = \"fun-int\"\nfun f(s: String) = \"fun-str\"\nb" to emptyList(),
+            "val p = \"!\"\nval r = show(1)\nfun show(x: Any) = \"any${'$'}p\"\nfun show(x: Int) = \"int\"\nr + show(1)" to emptyList(),
+            "val p = \"!\"\nfun show(x: Any) = \"any${'$'}p\"\nfun show(x: Int) = \"int\"\nsealed interface S\nclass T : S { fun f() = show(1) }\nshow(1) + T().f()" to emptyList(),
+            "val log = mutableListOf<String>()\nval print = fun(m: Any?) { log += m.toString() }\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()\nlog" to emptyList(),
+            "val log = mutableListOf<String>()\nfun rec(m: Any?) { log += m.toString() }\nval print = ::rec\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()\nlog" to emptyList(),
+            "val log = mutableListOf<String>()\nfun printer(): (Any?) -> Unit = { log += it.toString() }\nval print = printer()\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()\nlog" to emptyList(),
+            "val p = 1\nval r = Foo(2)\nclass Foo(val v: Int) { fun g() = v + p }\nr" to listOf(dependency<(Int) -> Int>("Foo") { it * 100 })
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { (script, dependencies) -> executor.execute(script, dependencies) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+    }
+
 }
