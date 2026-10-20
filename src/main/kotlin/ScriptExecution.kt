@@ -248,13 +248,18 @@ internal class DefaultScriptExecutor(
             if (source.unmatchedClosingBrace != null) return Compilation(source, result = null)
             @OptIn(ExperimentalAtomicApi::class)
             compilations.incrementAndFetch()
-            return Compilation(
-                source,
+            val result = try {
                 scriptingHost.compiler(
                     script = source,
                     scriptCompilationConfiguration = compilationConfig()
                 )
-            )
+            } catch (e: CancellationException) {
+                // the cancellation of the caller is not a failure of the compilation,
+                // otherwise it would silently cancel the active caller instead of failing it
+                currentCoroutineContext().ensureActive()
+                throw IllegalStateException("The compilation of the script was cancelled", e)
+            }
+            return Compilation(source, result)
         }
 
         private suspend fun evaluate(
