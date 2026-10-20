@@ -3267,4 +3267,54 @@ class ScriptExecutorTest {
         }
     }
 
+    @Test
+    fun `should report error at declaration moved out of the script body calling local function named like library function`() = runTest {
+        // given
+        val script = """
+            val strict = true
+            fun check(flag: Boolean) { if (strict && !flag) throw IllegalStateException("strict") }
+            sealed interface S
+            class T : S { fun f() = check(false) }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:25: error: 'check' does not refer to the function of the script body declared at line 2, which is not visible in 'T'.
+                  | class T : S { fun f() = <error>check</error>(false) }
+                  hint: 'T' is compiled outside of the script body, where 'check' (line 2) is not visible - pass it as a parameter, or declare it within 'T'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call member of supertype from declaration moved out of the script body when local function has its name`() = runTest {
+        // given
+        val script = """
+            val strict = true
+            fun check(flag: Boolean) { if (strict && !flag) throw IllegalStateException("strict") }
+            abstract class Base { fun check(flag: Boolean) = "base:${'$'}flag" }
+            sealed interface S
+            class T : Base(), S { fun f() = check(false) }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "base:false")
+        }
+    }
+
 }

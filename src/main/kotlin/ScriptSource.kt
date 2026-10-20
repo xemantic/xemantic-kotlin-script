@@ -114,6 +114,9 @@ internal const val LATER_DECLARED_DEPENDENCY = "xemantic-kotlin-script: later de
 /** The deprecation message of the copies of the local functions, see [ScriptSource.laterDeclaredDependencyCandidates]. */
 internal const val LATER_DECLARED_FUNCTION = "xemantic-kotlin-script: later declared function"
 
+/** The deprecation message of the copies of the local functions, see [ScriptSource.hiddenLocalFunctionCandidates]. */
+internal const val HIDDEN_LOCAL_FUNCTION = "xemantic-kotlin-script: hidden local function"
+
 /** A dependency, as declared in the preamble of the [ScriptSource]. */
 internal class PreambleDependency(
     val name: String,
@@ -165,10 +168,13 @@ internal class ScriptSource(
     script: String,
     dependencies: List<PreambleDependency> = emptyList(),
     /**
-     * The dependencies declared for the script body with the [LATER_DECLARED_DEPENDENCY] deprecation error,
-     * see [laterDeclaredDependencyCandidates], which does not change how the references are resolved, unlike omitting them.
+     * Whether it is the source of the compilation confirming the [laterDeclaredDependencyCandidates]
+     * and the [hiddenLocalFunctionCandidates], with the declarations they might refer to deprecated with an error,
+     * which does not change how the references are resolved, unlike omitting them,
+     * while the declarations the candidates should refer to are declared as their deprecated copies,
+     * and the suppressions of the deprecation errors by the script are blanked out.
      */
-    deprecatedDependencies: Set<String> = emptySet()
+    confirming: Boolean = false
 ) : SourceCode {
 
     val scriptLines: List<String>
@@ -196,11 +202,20 @@ internal class ScriptSource(
      * of the local properties of the same names, like `x` in `fun show() = x` followed by `val x = 2`,
      * or of the local functions, when called, while in the script they refer to these declarations.
      * Recognized by the names only, they might refer e.g. to the members of the receivers instead,
-     * so they are confirmed by compiling the script with these dependencies deprecated, see [deprecatedDependencies],
+     * so they are confirmed by compiling the script with these dependencies deprecated, see [confirming],
      * where the receiver of the script body declares also the deprecated copies of the signatures of these local functions,
      * which the calls refer to, if the local functions would be called in the script.
      */
     val laterDeclaredDependencyCandidates: List<LaterDeclaredReference>
+
+    /**
+     * The calls of the declarations moved out of the script body named like the local functions of the script body,
+     * by the 0-based lines of the first ones, which are not visible there, so they might be resolved to other functions,
+     * like `check` of the standard library, while in the script they refer to the local functions.
+     * They are confirmed by compiling the script with the deprecated copies of the local functions, see [confirming],
+     * as the members of the script, which the calls refer to, unless they refer e.g. to the inherited members.
+     */
+    val hiddenLocalFunctionCandidates: List<Pair<ScriptReference, Int>>
 
     private val lineStarts: List<Int>
 
@@ -233,12 +248,20 @@ internal class ScriptSource(
                 isFunction
             )
         }
+        hiddenLocalFunctionCandidates = structure.hiddenLocalFunctionCandidates.map { (reference, declaration) ->
+            ScriptReference(reference.name, position(reference.offset), position(reference.offset + reference.length)) to
+                    position(declaration).line
+        }
         bodyDeclarations = structure.bodyDeclarations
+        val deprecatedDependencies = if (confirming) {
+            laterDeclaredDependencyCandidates.mapTo(HashSet()) { it.reference.name }
+        } else {
+            emptySet()
+        }
 
         val lines = mutableListOf<String>()
         val mapping = mutableListOf<Int?>()
         // the confirming compilation reports the deprecation errors, even if suppressed by the script
-        val confirming = deprecatedDependencies.isNotEmpty()
         val unsuppressed = BooleanArray(script.length)
         if (confirming) structure.deprecationErrorSuppressions.forEach { unsuppressed.fill(true, it.first, it.last + 1) }
         fun addLines(
@@ -274,6 +297,16 @@ internal class ScriptSource(
             }
             mapping += null
         }
+        fun addCopies(
+            names: Set<String>,
+            message: String
+        ) = names.flatMap { structure.localFunctionSignatures[it].orEmpty() }.forEach {
+            lines += "@kotlin.Deprecated(\"$message\", level = DeprecationLevel.ERROR) $it"
+            mapping += null
+        }
+        if (confirming) {
+            addCopies(hiddenLocalFunctionCandidates.mapTo(HashSet()) { it.first.name }, HIDDEN_LOCAL_FUNCTION)
+        }
         val (shadowed, visible) = dependencies.partition {
             it.name in structure.localProperties || (it.isCallable && it.name in structure.localFunctions)
         }
@@ -283,10 +316,10 @@ internal class ScriptSource(
         // the members of the outer receiver of the script body would be called instead of the moved functions
         shadowed.filterNot { it.isCallable && it.name in structure.movedFunctions }.forEach { addAccessor(it) }
         if (confirming) {
-            structure.localFunctionSignatures.filterKeys { it in deprecatedDependencies }.values.flatten().forEach {
-                lines += "@kotlin.Deprecated(\"$LATER_DECLARED_FUNCTION\", level = DeprecationLevel.ERROR) $it"
-                mapping += null
-            }
+            addCopies(
+                laterDeclaredDependencyCandidates.filter { it.isFunction }.mapTo(HashSet()) { it.reference.name },
+                LATER_DECLARED_FUNCTION
+            )
         }
         lines += "}"
         mapping += null
@@ -680,8 +713,11 @@ private class ScriptStructure(
     /** The names of the functions moved out of the script body. */
     val movedFunctions: Set<String>
 
-    /** The signatures of the local functions of the names of the dependencies, see [ScriptSource.laterDeclaredDependencyCandidates]. */
+    /** The signatures of the local functions, by their names, see [ScriptSource.confirming]. */
     val localFunctionSignatures: Map<String, List<String>>
+
+    /** See [ScriptSource.hiddenLocalFunctionCandidates], with the offsets of the first local functions. */
+    val hiddenLocalFunctionCandidates: List<Pair<Reference, Int>>
 
     /** The ranges of the `DEPRECATION_ERROR` names suppressed by the script, see [ScriptSource.laterDeclaredDependencyCandidates]. */
     val deprecationErrorSuppressions: List<IntRange>
@@ -741,8 +777,16 @@ private class ScriptStructure(
             }
         }
         fun ParsedDeclaration.line() = nameRange?.first ?: start
-        localFunctionSignatures = local.filter { it.name in dependencyNames }.groupBy({ it.name!! }) { function ->
+        localFunctionSignatures = local.filter { it.name != null }.groupBy({ it.name!! }) { function ->
             (function.psi as KtNamedFunction).signature()
+        }
+        val firstLocalFunctions = local.filter { it.name != null }.groupBy { it.name!! }.mapValues { (_, functions) ->
+            functions.first().line()
+        }
+        hiddenLocalFunctionCandidates = moved.flatMap { declaration ->
+            declaration.references.filter { it.isCall && it.refersToLocal(localFunctions) }.map {
+                it to firstLocalFunctions.getValue(it.name)
+            }
         }
         deprecationErrorSuppressions = file.collectDescendantsOfType<KtAnnotationEntry> {
             it.shortName?.asString() == "Suppress"

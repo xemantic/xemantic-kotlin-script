@@ -185,7 +185,9 @@ internal class DefaultScriptExecutor(
         val source: ScriptSource,
         val result: ResultWithDiagnostics<CompiledScript>?,
         /** The [ScriptSource.laterDeclaredDependencyCandidates] referring to the dependencies indeed. */
-        val laterDeclaredDependencyReferences: List<LaterDeclaredReference> = emptyList()
+        val laterDeclaredDependencyReferences: List<LaterDeclaredReference> = emptyList(),
+        /** The [ScriptSource.hiddenLocalFunctionCandidates] referring to other functions indeed. */
+        val hiddenLocalFunctionReferences: List<Pair<ScriptReference, Int>> = emptyList()
     )
 
     private inner class ScriptHandler(
@@ -219,9 +221,14 @@ internal class DefaultScriptExecutor(
                 ScriptErrorReporter(source).toSourceFailureMessage(),
                 ExecutionPhase.COMPILATION
             )
-            if (compilation.laterDeclaredDependencyReferences.isNotEmpty()) {
+            if (compilation.laterDeclaredDependencyReferences.isNotEmpty() || compilation.hiddenLocalFunctionReferences.isNotEmpty()) {
                 val failureMessage = listOfNotNull(
-                    ScriptErrorReporter(source).toLaterDeclaredDependencyMessage(compilation.laterDeclaredDependencyReferences),
+                    compilation.hiddenLocalFunctionReferences.takeIf { it.isNotEmpty() }?.let {
+                        ScriptErrorReporter(source).toHiddenLocalFunctionMessage(it)
+                    },
+                    compilation.laterDeclaredDependencyReferences.takeIf { it.isNotEmpty() }?.let {
+                        ScriptErrorReporter(source).toLaterDeclaredDependencyMessage(it)
+                    },
                     // explained by the reference to the dependency
                     (compilationResult as? Failure)?.let { ScriptErrorReporter(source).toFailureMessage(it.reports.filterNonIgnorable()) }
                 ).joinToString(separator = "\n\n")
@@ -285,29 +292,12 @@ internal class DefaultScriptExecutor(
             if (source.unmatchedClosingBrace != null || source.conflictingDependencyDeclarations.isNotEmpty()) {
                 return Compilation(source, result = null)
             }
-            return Compilation(source, compile(source), laterDeclaredDependencyReferences(source))
-        }
-
-        private fun source(
-            deprecatedDependencies: Set<String> = emptySet()
-        ) = ScriptSource(
-            script,
-            dependencies = allDependencies.filter { it.isHidden }.map { dependency ->
-                PreambleDependency(dependency.name, dependency.accessor, dependency.isCallable)
-            },
-            deprecatedDependencies = deprecatedDependencies
-        )
-
-        /**
-         * The [ScriptSource.laterDeclaredDependencyCandidates], which refer to the dependencies indeed,
-         * recognized by the errors of compiling the script once more with these dependencies deprecated.
-         */
-        private suspend fun laterDeclaredDependencyReferences(
-            source: ScriptSource
-        ): List<LaterDeclaredReference> {
-            val candidates = source.laterDeclaredDependencyCandidates
-            if (candidates.isEmpty()) return emptyList()
-            val probe = source(deprecatedDependencies = candidates.mapTo(HashSet()) { it.reference.name })
+            val result = compile(source)
+            if (source.laterDeclaredDependencyCandidates.isEmpty() && source.hiddenLocalFunctionCandidates.isEmpty()) {
+                return Compilation(source, result)
+            }
+            // recognizing the candidates referring to the wrong declarations indeed
+            val probe = source(confirming = true)
             val reports = compile(probe).reports
             /** The positions of the errors of the deprecated declarations of this [message]. */
             fun deprecated(
@@ -320,10 +310,32 @@ internal class DefaultScriptExecutor(
             val dependencies = deprecated(LATER_DECLARED_DEPENDENCY)
             // only the ones, which the local function applies to, unlike the dependency called anyway
             val functions = deprecated(LATER_DECLARED_FUNCTION)
-            return candidates.filter { candidate ->
-                (if (candidate.isFunction) functions else dependencies).any { it in candidate.reference }
+            // unless already reported as unresolved
+            val errors = result.reports.filter { it.severity == ScriptDiagnostic.Severity.ERROR }.mapNotNull { diagnostic ->
+                diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }
             }
+            val hidden = deprecated(HIDDEN_LOCAL_FUNCTION).filter { it !in errors }
+            return Compilation(
+                source,
+                result,
+                laterDeclaredDependencyReferences = source.laterDeclaredDependencyCandidates.filter { candidate ->
+                    (if (candidate.isFunction) functions else dependencies).any { it in candidate.reference }
+                },
+                hiddenLocalFunctionReferences = source.hiddenLocalFunctionCandidates.filter { (reference) ->
+                    hidden.any { it in reference }
+                }
+            )
         }
+
+        private fun source(
+            confirming: Boolean = false
+        ) = ScriptSource(
+            script,
+            dependencies = allDependencies.filter { it.isHidden }.map { dependency ->
+                PreambleDependency(dependency.name, dependency.accessor, dependency.isCallable)
+            },
+            confirming = confirming
+        )
 
         private suspend fun compile(
             source: ScriptSource

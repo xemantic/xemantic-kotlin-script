@@ -96,6 +96,19 @@ internal class ScriptErrorReporter(
         }
     }.trimEnd()
 
+    /** The [references] of the declarations moved out of the script body to other functions, see [ScriptSource.hiddenLocalFunctionCandidates]. */
+    fun toHiddenLocalFunctionMessage(
+        references: List<Pair<ScriptReference, Int>>
+    ): String = references.joinToString(separator = "\n") { (reference, line) ->
+        val declaration = source.movedDeclarationAt(reference.start)
+        buildString {
+            appendPosition(reference.start)
+            +"error: '${reference.name}' does not refer to the function of the script body declared at line ${line + 1}, which is not visible in '$declaration'.\n"
+            appendSourceLines(reference.start, reference.end)
+            appendHint(reference.name, reference.start, preferFunction = true)
+        }
+    }.trimEnd()
+
     /** The [references] of the script body to the dependencies, preceding the local properties of their names, see [ScriptSource.laterDeclaredDependencyCandidates]. */
     fun toLaterDeclaredDependencyMessage(
         references: List<LaterDeclaredReference>
