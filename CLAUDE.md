@@ -61,9 +61,6 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   This hides bugs of the exception reporting which only show in production: test them with an exception class the recovery cannot copy, i.e. without a `(String)`, `(String, Throwable)` or `(Throwable)` constructor.
   An exception whose `getStackTrace()` contains `null` crashes the recovery itself, so such a case can only be tested by calling `ScriptErrorReporter` directly.
 
-- In the source of a script, `@Deprecated(..., level = kotlin.DeprecationLevel.ERROR)` with the qualified level crashes the compiler ("Exception in expression checkers", Kotlin 2.4),
-  while the unqualified `DeprecationLevel.ERROR` works — mind it when generating declarations of the preamble.
-
 ## Anti-patterns to avoid
 
 - Do not add content to this file that is already discoverable by reading the source or build scripts — that inflates context without adding signal, reducing AI agent task success rates (see [arxiv 2602.11988](https://arxiv.org/abs/2602.11988)).
