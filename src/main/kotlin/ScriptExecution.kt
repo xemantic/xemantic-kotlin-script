@@ -33,7 +33,6 @@ import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.concurrent.atomics.fetchAndIncrement
 import kotlin.concurrent.atomics.incrementAndFetch
 import kotlin.coroutines.CoroutineContext
-import kotlin.reflect.KClass
 import kotlin.reflect.typeOf
 import kotlin.script.experimental.api.CompiledScript
 import kotlin.script.experimental.api.KotlinType
@@ -46,7 +45,7 @@ import kotlin.script.experimental.api.compilerOptions
 import kotlin.script.experimental.api.defaultImports
 import kotlin.script.experimental.api.providedProperties
 import kotlin.script.experimental.jvm.baseClassLoader
-import kotlin.script.experimental.jvm.dependenciesFromCurrentContext
+import kotlin.script.experimental.jvm.dependenciesFromClassloader
 import kotlin.script.experimental.jvm.jvm
 import kotlin.script.experimental.jvm.jvmTarget
 import kotlin.script.experimental.jvm.loadDependencies
@@ -106,11 +105,13 @@ internal class DefaultScriptExecutor(
      * instead of the context class loader of the dispatcher thread, which might differ.
      */
     private val classLoader: ClassLoader = Thread.currentThread().contextClassLoader
+        ?: DefaultScriptExecutor::class.java.classLoader
 
 
     private val compilationConfigurationTemplate = ScriptCompilationConfiguration {
         jvm {
-            dependenciesFromCurrentContext(
+            dependenciesFromClassloader(
+                classLoader = classLoader,
                 wholeClasspath = true
             )
             // the default 1.8 target cannot inline functions of the classpath, e.g. `dependency(...)`
@@ -453,14 +454,15 @@ private const val HIDDEN_DEPENDENCY_PREFIX = "_dependency_"
 
 /*
  * The scripting host erases the type arguments of a provided property,
- * and fails to compile the erased type of a nested class,
- * while it cannot construct the script class taking a property of value class type, which is not boxed,
- * so such a dependency is provided under a hidden name as `Any?`,
- * and cast back to its type by an accessor declared in the preamble of the script.
+ * fails to compile the erased type of a nested class,
+ * cannot construct the script class taking a property of value class type, which is not boxed,
+ * and resolves a provided property before the members of the implicit receivers, like `size` in `list.run { size }`,
+ * so a dependency is provided under a hidden name as `Any?`,
+ * and cast back to its type by an accessor declared in the preamble of the script, resolved like any member of the script.
  */
 
 private val ScriptExecutor.Dependency<*>.isHidden: Boolean
-    get() = type.arguments.isNotEmpty() || (type.classifier as? KClass<*>)?.isValue == true
+    get() = name != SCRIPT_BLOCK_NAME
 
 private val ScriptExecutor.Dependency<*>.providedName: String
     get() = if (isHidden) "$HIDDEN_DEPENDENCY_PREFIX$name" else name

@@ -404,7 +404,14 @@ private class Reference(
     val length: Int,
     val isQualified: Boolean,
     val isBound: Boolean
-)
+) {
+
+    /** Whether it might refer to one of the local declarations of the script body of these [names]. */
+    fun refersToLocal(
+        names: Set<String>
+    ): Boolean = !isQualified && !isBound && name in names
+
+}
 
 /**
  * The references by name, in the order of the script, without the labels and the names of the arguments,
@@ -564,16 +571,18 @@ private class ScriptStructure(
         val bodyReferences = statements.flatMap { statement ->
             declarationsByPsi[statement]?.references ?: statement.references(scope = statement.parent, declaredNames)
         }
-        val moved = selectMovedDeclarations(declarations, bodyReferences)
+        // only the properties which require it are moved
+        val localProperties = declarations.filter { it.kind == DeclarationKind.PROPERTY && !it.requiresMove }
+            .flatMapTo(HashSet()) { listOfNotNull(it.name) + it.destructuredNames }
+        val moved = selectMovedDeclarations(declarations, bodyReferences, localProperties)
         movedDeclarations = moved.map { it.toDeclaration(withNestedNames = true) }
         endsWithMovedDeclaration = moved.any { it.psi == statements.lastOrNull() }
-        val localProperties = declarations.filter { it.kind == DeclarationKind.PROPERTY && it !in moved }
-            .flatMapTo(HashSet()) { listOfNotNull(it.name) + it.destructuredNames }
+        val localNames = localProperties + declarations.filter {
+            it.kind == DeclarationKind.FUNCTION && it !in moved
+        }.mapNotNull { it.name }
         // without a dependency of the same name, the compiler reports them as unresolved
         shadowedDependencyReferences = moved.flatMap { declaration ->
-            declaration.references.filter {
-                !it.isQualified && !it.isBound && it.name in localProperties && it.name in dependencyNames
-            }
+            declaration.references.filter { it.refersToLocal(localNames) && it.name in dependencyNames }
         }
         bodyDeclarations = declarations
             .filter {
@@ -717,7 +726,8 @@ private class ScriptStructure(
      */
     private fun selectMovedDeclarations(
         declarations: List<ParsedDeclaration>,
-        bodyReferences: List<Reference>
+        bodyReferences: List<Reference>,
+        localProperties: Set<String>
     ): Set<ParsedDeclaration> {
         val named = declarations.filter { it.name != null && it.kind != DeclarationKind.PROPERTY }
         val namedByName = named.groupBy { it.name!! }
@@ -741,11 +751,8 @@ private class ScriptStructure(
             referenced.forEach { referrers.getOrPut(it) { mutableListOf() } += declaration }
         }
         val required = declarations.filter { it.requiresMove }.toSet()
-        val localProperties = declarations.filter {
-            it.kind == DeclarationKind.PROPERTY && it !in required
-        }.flatMap { listOfNotNull(it.name) + it.destructuredNames }.toSet()
         val accessingLocalProperties = declarations.filter { declaration ->
-            declaration.references.any { !it.isQualified && !it.isBound && it.name in localProperties }
+            declaration.references.any { it.refersToLocal(localProperties) }
         }.toSet()
         /** The declarations not [moved] yet, which access the local properties, or refer to such ones not moved yet. */
         fun accessingLocalProperties(

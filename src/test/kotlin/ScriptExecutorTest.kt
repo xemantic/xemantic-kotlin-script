@@ -2596,4 +2596,71 @@ class ScriptExecutorTest {
         }
     }
 
+    @Test
+    fun `should resolve members of implicit receivers before dependencies of the same names`() = runTest {
+        // given
+        val scripts = listOf(
+            "listOf(1, 2, 3).run { size }",
+            "class Numbers : ArrayList<Int>() { fun count() = size }\nNumbers().count()",
+            "buildString { append(\"abc\"); append(length) }"
+        )
+        val dependencies = listOf(dependency("size", 42), dependency("length", 42))
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, dependencies) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(3, 0, "abc3"))
+    }
+
+    @Test
+    fun `should report error at declaration moved out of the script body referring to dependency shadowed by local function`() = runTest {
+        // given
+        val script = """
+            val prefix = "local:"
+            fun log(message: String) = prefix + message
+            sealed interface Check
+            class Below : Check { fun ok() = log("hi") }
+            Below().ok()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<(String) -> String>("log") { "dep:$it" }))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:34: error: 'log' refers to the dependency, not to the function of the script body declared at line 2.
+                  | class Below : Check { fun ok() = <error>log</error>("hi") }
+                  hint: 'Below' is compiled outside of the script body, where 'log' (line 2) is not visible - pass it as a parameter, or declare it within 'Below'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should create executor on thread without context class loader`() = runTest {
+        // given
+        val thread = Thread.currentThread()
+        val contextClassLoader = thread.contextClassLoader
+        thread.contextClassLoader = null
+        val executor = try {
+            ScriptExecutor()
+        } finally {
+            thread.contextClassLoader = contextClassLoader
+        }
+
+        // when
+        val result = executor.execute("1 + 1")
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
 }

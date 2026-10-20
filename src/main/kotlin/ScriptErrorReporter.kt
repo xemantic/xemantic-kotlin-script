@@ -90,8 +90,11 @@ internal class ScriptErrorReporter(
     } ?: source.shadowedDependencyReferences.joinToString(separator = "\n") { reference ->
         buildString {
             appendPosition(reference.start)
-            +"error: '${reference.name}' refers to the dependency, not to the property of the script body"
-            source.bodyDeclarationLine(reference.name)?.let { (line) -> +" declared at line ${line + 1}" }
+            +"error: '${reference.name}' refers to the dependency, not to the"
+            source.bodyDeclarationLine(reference.name)?.let { (line, kind) ->
+                +(if (kind == DeclarationKind.FUNCTION) " function" else " property")
+                +" of the script body declared at line ${line + 1}"
+            } ?: +" declaration of the script body"
             +".\n"
             appendSourceLines(reference.start, reference.end)
             appendHint(reference.name, reference.start)
