@@ -324,15 +324,28 @@ internal class DefaultScriptExecutor(
             }
             // recognizing the candidates referring to the wrong declarations indeed
             val probe = source(confirming = true)
-            /** The positions of the warnings of the deprecated, or opted in, declarations of this [message] in the [source], see [ScriptSource.confirming]. */
-            fun List<ScriptDiagnostic>.marked(
+            /**
+             * The positions, from the start to the end, if known, of the warnings of the deprecated,
+             * or opted in, declarations of this [message] in the [source], with their messages, see [ScriptSource.confirming].
+             */
+            fun List<ScriptDiagnostic>.markedRanges(
                 source: ScriptSource,
                 message: String
             ) = filter {
                 it.severity == ScriptDiagnostic.Severity.WARNING && message in it.message
             }.mapNotNull { diagnostic ->
-                diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }
+                diagnostic.location?.let { location ->
+                    Triple(
+                        source.toScriptPosition(location.start.line, location.start.col),
+                        location.end?.let { source.toScriptPosition(it.line, it.col) },
+                        diagnostic.message
+                    )
+                }
             }
+            fun List<ScriptDiagnostic>.marked(
+                source: ScriptSource,
+                message: String
+            ) = markedRanges(source, message).map { it.first }
             val reports = compile(probe).reports
             fun deprecated(
                 message: String
@@ -340,18 +353,20 @@ internal class DefaultScriptExecutor(
             val dependencies = deprecated(LATER_DECLARED_DEPENDENCY)
             // only the ones, which the local function applies to, unlike the dependency called anyway
             val functions = deprecated(LATER_DECLARED_FUNCTION)
-            // also by the name of the function, and its range, for the operators sharing their positions, like `get` and `set`
-            val hidden = reports.filter {
-                it.severity == ScriptDiagnostic.Severity.WARNING && HIDDEN_LOCAL_FUNCTION in it.message
-            }.mapNotNull { diagnostic ->
-                diagnostic.location?.let { location ->
-                    Triple(
-                        probe.toScriptPosition(location.start.line, location.start.col),
-                        location.end?.let { probe.toScriptPosition(it.line, it.col) },
-                        diagnostic.message
-                    )
+            // each assigned to the candidate of its name containing it, the one of the same end, if nested, like `a[0][1]`
+            val hiddenWarnings = reports.markedRanges(probe, HIDDEN_LOCAL_FUNCTION)
+            val hiddenCandidates = source.hiddenLocalFunctionCandidates
+            val hidden = hiddenWarnings.mapNotNullTo(HashSet()) { (start, end, message) ->
+                hiddenCandidates.filter { candidate ->
+                    start in candidate.reference && hiddenLocalFunctionMessage(candidate.reference.name) in message
+                            // the compiler reports the operators as unresolved, misleading, so they are hinted at as well
+                            && (candidate.isOperator || start !in errors)
+                }.let { matching ->
+                    matching.firstOrNull { it.reference.end == end } ?: matching.minByOrNull {
+                        (it.reference.end.line - it.reference.start.line) * 100_000 + it.reference.end.column - it.reference.start.column
+                    }
                 }
-            }.filter { (start) -> start !in errors }
+            }
             // the references not resolved to the moved declarations, unless already reported as errors
             val toDeclarations = deprecated(COROUTINE_SCOPE_ORIGINAL)
             val coroutineScopeReferences = source.coroutineScopeCandidates.filter { candidate ->
@@ -394,14 +409,7 @@ internal class DefaultScriptExecutor(
                 shadowedFunctionReferences = toProperties.filter { (reference) ->
                     shadowed.any { it in reference }
                 },
-                hiddenLocalFunctionReferences = source.hiddenLocalFunctionCandidates.filter { candidate ->
-                    val reference = candidate.reference
-                    val name = Regex("[ .`]${Regex.escape(reference.name)}`?[(:<]")
-                    hidden.any { (start, end, message) ->
-                        start in reference && (!candidate.isOperator || (start == reference.start && (end == null || end == reference.end)))
-                                && name.containsMatchIn(message)
-                    }
-                }
+                hiddenLocalFunctionReferences = hiddenCandidates.filter { it in hidden }
             )
         }
 

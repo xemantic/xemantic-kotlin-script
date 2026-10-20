@@ -3760,4 +3760,46 @@ class ScriptExecutorTest {
         assert(messages.all { "'set'" !in it })
     }
 
+    @Test
+    fun `should report invisible operator functions of delegates, typed destructuring entries and binary operators`() = runTest {
+        // given
+        val scripts = listOf(
+            "import kotlin.reflect.KProperty\nval scale = listOf(10).first()\nclass Cfg : HashMap<String, Int>()\noperator fun Cfg.getValue(t: Any?, p: KProperty<*>): Int = scale\nenum class E { A; fun f(): Int { val v by Cfg().apply { put(\"v\", 1) }; return v } }\nE.A.f()" to "getValue",
+            "class Row : ArrayList<Int>()\nval scale = listOf(10).first()\noperator fun Row.component1() = scale\nenum class E { A; fun f(): Int { val (a: Int, b) = Row().apply { add(1); add(2) }; return a + b } }\nE.A.f()" to "component1",
+            "val scale = listOf(10).first()\nclass Grid(var n: Int = 1)\noperator fun Grid.plus(o: Int) = Grid(n + o + scale)\nenum class E { A; fun f() = (Grid() + 1).n }\nE.A.f()" to "plus"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { (script) -> executor.execute(script) }
+
+        // then
+        assert(results.zip(scripts).all { (result, script) ->
+            result is ScriptResult.Error && "'${script.second}' does not refer to the function of the script body" in result.message
+        })
+    }
+
+    @Test
+    fun `should move operator extensions of the iterator returned by a member`() = runTest {
+        // given
+        val script = """
+            class Counter(var n: Int) { operator fun iterator() = this }
+            operator fun Counter.hasNext() = n > 0
+            operator fun Counter.next() = n--
+            val r = total(Counter(3))
+            fun total(c: Counter): Int { var s = 0; for (x in c) s += x; return s }
+            r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 6)
+        }
+    }
+
 }

@@ -132,6 +132,11 @@ internal const val LATER_DECLARED_FUNCTION = "xemantic-kotlin-script: later decl
 /** The deprecation message of the copies of the local functions, see [ScriptSource.hiddenLocalFunctionCandidates]. */
 internal const val HIDDEN_LOCAL_FUNCTION = "xemantic-kotlin-script: hidden local function"
 
+/** The deprecation message of the copy of the local declaration of this [name], see [ScriptSource.hiddenLocalFunctionCandidates]. */
+internal fun hiddenLocalFunctionMessage(
+    name: String
+): String = "$HIDDEN_LOCAL_FUNCTION: $name;"
+
 /** The deprecation message of the copies of the moved functions, see [ScriptSource.shadowedFunctionCandidates]. */
 internal const val SHADOWED_FUNCTION = "xemantic-kotlin-script: shadowed function"
 
@@ -390,7 +395,11 @@ internal class ScriptSource(
             mapping += null
         }
         if (confirming) {
-            addCopies(structure.hiddenLocalFunctionCopies, HIDDEN_LOCAL_FUNCTION)
+            // named in the message, as the operators of the same position refer to different functions, like `get` and `set`
+            structure.hiddenLocalFunctionCopies.forEach { (name, declaration) ->
+                lines += "@kotlin.Deprecated(\"${hiddenLocalFunctionMessage(name)}\") $declaration"
+                mapping += null
+            }
             // the deprecation of the local functions, like the copies in the script block, is not reported, unlike their opt-in
             listOf(LATER_DECLARED_FUNCTION, SHADOWED_FUNCTION, SHADOWED_ORIGINAL, COROUTINE_SCOPE_ORIGINAL, COROUTINE_SCOPE_FUNCTION).forEach { message ->
                 lines += "@kotlin.RequiresOptIn(\"$message\", level = RequiresOptIn.Level.WARNING) annotation class ${optInMarker(message)}"
@@ -862,8 +871,7 @@ private fun PsiElement.operatorReferences(
                 }
                 add(names, element)
             }
-            // while its `hasNext` and `next` are referred to by the `iterator`, as they are called on its result
-            is KtForExpression -> element.loopRange?.let { add(listOf("iterator"), element, it.startOffset, it.textLength) }
+            is KtForExpression -> element.loopRange?.let { add(listOf("iterator", "hasNext", "next"), element, it.startOffset, it.textLength) }
             is KtDestructuringDeclaration -> element.entries.forEachIndexed { index, entry ->
                 add(listOf("component${index + 1}"), element, entry.startOffset, entry.textLength)
             }
@@ -1030,7 +1038,7 @@ private class ScriptStructure(
     val hiddenLocalFunctionCandidates: List<Triple<Reference, Int, Boolean>>
 
     /** The deprecated copies of the local declarations, see [ScriptSource.hiddenLocalFunctionCandidates]. */
-    val hiddenLocalFunctionCopies: List<String>
+    val hiddenLocalFunctionCopies: List<Pair<String, String>>
 
     /** The ranges of the `@Suppress` annotations of the script, which might suppress the deprecations, see [ScriptSource.confirming]. */
     val suppressions: List<IntRange>
@@ -1188,11 +1196,12 @@ private class ScriptStructure(
         hiddenLocalFunctionCopies = if (!confirming) emptyList() else {
             hiddenLocalFunctionCandidates.mapTo(LinkedHashSet()) { it.first.name }.flatMap { name ->
                 // the moved declarations cannot refer to the values of the local classes
-                (localFunctionsByName[name].orEmpty() + localExtensions[name].orEmpty())
+                ((localFunctionsByName[name].orEmpty() + localExtensions[name].orEmpty())
                     .filterNot { it.refersToTypes(localClassNames) }
                     .mapNotNull { it.signature() } +
                         (callableProperties[name]?.map { (_, type) -> "val `$name`: $type get() = kotlin.TODO()" }
                             ?: listOfNotNull(if (name in localPropertiesByName) "val `$name`: Nothing get() = kotlin.TODO()" else null))
+                ).map { name to it }
             }
         }
         // also the aliases, like `typealias Q = Suppress` or `import kotlin.Suppress as Q`
@@ -1486,25 +1495,28 @@ private class ScriptStructure(
         }
         // the operator functions called on the result of `iterator`, like by a for loop
         val iteratorOperators = named.filter { it.isOperator && it.isExtension && (it.name == "hasNext" || it.name == "next") }
-        val references = declarations.associateWith { declaration ->
+        // not by the operators, which refer to the operator functions by their names only, whatever the types of the operands,
+        // so an operator function accessing the local properties would make all the declarations using such an operator accessing,
+        // while the ones calling it indeed are reported, see ScriptSource.hiddenLocalFunctionCandidates
+        val plainReferences = declarations.associateWith { declaration ->
             buildSet {
-                declaration.references.forEach { addAll(it.referenced()) }
-                if (declaration.isOperator && declaration.isExtension && declaration.name == "iterator") addAll(iteratorOperators)
+                declaration.references.filter { !it.isOperator }.forEach { addAll(it.referenced()) }
                 if (declaration.isSealed) addAll(subtypesByName[declaration.name].orEmpty())
                 remove(declaration)
             }
         }
-        // not by the operators, which refer to the operator functions by their names only, whatever the types of the operands,
-        // so an operator function accessing the local properties would make all the declarations using such an operator accessing,
-        // while the ones calling it indeed are reported, see ScriptSource.hiddenLocalFunctionCandidates
+        // the operator functions called on the result of the `iterator` extension, like by a for loop
+        val references = declarations.associateWith { declaration ->
+            buildSet {
+                addAll(plainReferences.getValue(declaration))
+                declaration.references.filter { it.isOperator }.forEach { addAll(it.referenced()) }
+                if (declaration.isOperator && declaration.isExtension && declaration.name == "iterator") addAll(iteratorOperators)
+                remove(declaration)
+            }
+        }
         val referrers = mutableMapOf<ParsedDeclaration, MutableList<ParsedDeclaration>>()
-        declarations.forEach { declaration ->
-            declaration.references.filter { !it.isOperator }.flatMap { it.referenced() }.toSet().forEach {
-                if (it !== declaration) referrers.getOrPut(it) { mutableListOf() } += declaration
-            }
-            if (declaration.isSealed) subtypesByName[declaration.name].orEmpty().forEach {
-                if (it !== declaration) referrers.getOrPut(it) { mutableListOf() } += declaration
-            }
+        plainReferences.forEach { (declaration, referenced) ->
+            referenced.forEach { referrers.getOrPut(it) { mutableListOf() } += declaration }
         }
         val required = declarations.filter { it.requiresMove }.toSet()
         val accessingLocalProperties = declarations.filter { declaration ->
