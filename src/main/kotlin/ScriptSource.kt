@@ -99,13 +99,13 @@ internal class PreambleDependency(
     val isCallable: Boolean = false
 )
 
-/** The class of the receiver of the script body, see [ScriptSource]. */
+/** The class of the outer receiver of the script body, declaring the shadowed dependencies, see [ScriptSource]. */
 internal const val DEPENDENCIES_CLASS_NAME = "_ScriptDependencies"
 
 private const val DEPENDENCIES_CLASS = "`$DEPENDENCIES_CLASS_NAME`"
 
 /** The line starting the script block in the [ScriptSource.text]. */
-internal const val SCRIPT_BLOCK_START = "_script({ $DEPENDENCIES_CLASS() }) { {"
+internal const val SCRIPT_BLOCK_START = "_script($DEPENDENCIES_CLASS()) { {"
 
 /** The line ending the script block in the [ScriptSource.text]. */
 internal const val SCRIPT_BLOCK_END = "} }"
@@ -120,7 +120,7 @@ internal const val SCRIPT_BLOCK_END = "} }"
  * <the accessors of the shadowed dependencies>
  * }
  * <declarations which cannot be local>
- * _script({ _ScriptDependencies() }) { {
+ * _script(_ScriptDependencies()) { {
  * <the rest of the script>
  * } }
  * ```

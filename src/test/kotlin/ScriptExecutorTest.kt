@@ -50,6 +50,10 @@ class Logger {
     operator fun invoke(message: String) = "dep:$message"
 }
 
+class DurationLogger {
+    operator fun invoke(duration: kotlin.time.Duration) = "dep:$duration"
+}
+
 class ScriptExecutorTest {
 
     @Test
@@ -2914,6 +2918,62 @@ class ScriptExecutorTest {
         result should {
             be<ScriptResult.Value>()
             have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should report error at declaration moved out of the script body calling dependency with invoke operator of value class parameter shadowed by local function`() = runTest {
+        // given
+        val script = """
+            import kotlin.time.Duration
+            import kotlin.time.Duration.Companion.seconds
+            val prefix = ">"
+            fun log(duration: Duration) = prefix + duration
+            sealed interface S
+            class T : S { fun f() = log(1.seconds) }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("log", DurationLogger())))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:6:25: error: Unresolved reference 'log'.
+                  | class T : S { fun f() = <error>log</error>(1.seconds) }
+                  hint: 'T' is compiled outside of the script body, where 'log' (line 4) is not visible - pass it as a parameter, or declare it within 'T'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint to declare function before its use when called after elvis operator`() = runTest {
+        // given
+        val script = """
+            val base: Int? = 1
+            val r = base ?: compute()
+            val compute = 2
+            fun compute() = base
+            r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:17: error: Unresolved reference 'compute'.
+                  | val r = base ?: <error>compute</error>()
+                  hint: 'compute' is declared at line 4, while the functions of the script body are visible only after their declaration - move it before line 2.
+            """.trimIndent()
         }
     }
 

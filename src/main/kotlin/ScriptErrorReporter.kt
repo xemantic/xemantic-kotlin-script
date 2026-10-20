@@ -325,7 +325,9 @@ internal class ScriptErrorReporter(
                 // unless it is a supertype, like in `class T : Base {`
                 preferFunction = source.scriptLines[end.line].drop(end.column).trimStart().let {
                     it.startsWith('(') || it.startsWith('{')
-                } && !source.scriptLines[start.line].take(start.column).trimEnd().endsWith(':')
+                } && !source.scriptLines[start.line].take(start.column).trimEnd().let {
+                    it.endsWith(':') && !it.endsWith("?:") && !it.endsWith("::")
+                }
             )
         }
         if (capturing != null) {

@@ -34,6 +34,7 @@ import kotlin.concurrent.atomics.fetchAndIncrement
 import kotlin.concurrent.atomics.incrementAndFetch
 import kotlin.coroutines.CoroutineContext
 import kotlin.reflect.KClass
+import kotlin.reflect.KFunction
 import kotlin.reflect.typeOf
 import kotlin.script.experimental.api.CompiledScript
 import kotlin.script.experimental.api.KotlinType
@@ -59,9 +60,9 @@ import kotlin.time.measureTimedValue
  */
 public object ScriptBlock {
     public operator fun <S> invoke(
-        receiver: () -> S,
+        receiver: S,
         block: S.() -> (suspend CoroutineScope.() -> Any?)
-    ): ScriptBody = ScriptBody { receiver().block() }
+    ): ScriptBody = ScriptBody(receiver.block())
 }
 
 /**
@@ -69,7 +70,7 @@ public object ScriptBlock {
  * see [ScriptSource], run with the coroutine scope of the caller as the inner one.
  */
 public class ScriptBody internal constructor(
-    internal val block: () -> (suspend CoroutineScope.() -> Any?)
+    internal val block: suspend CoroutineScope.() -> Any?
 )
 
 /**
@@ -340,7 +341,7 @@ internal class DefaultScriptExecutor(
         ): ScriptResult = when (this) {
             is ResultValue.Value -> {
                 // the script block closed early, unnoticed by the check of the unmatched closing brace
-                val block = (value as? ScriptBody ?: return earlyClosedBlockError()).block()
+                val block = (value as? ScriptBody ?: return earlyClosedBlockError()).block
                 // only what the block throws is the failure of the script, not the reporting of its warnings
                 val returned = try {
                     // the scripting host sets it only while constructing the script, which just returns the block
@@ -471,13 +472,15 @@ private const val SCRIPT_BLOCK_NAME = "_script"
 private const val HIDDEN_DEPENDENCY_PREFIX = "_dependency_"
 
 /**
- * The members and the extensions of the coroutine scope, which is the receiver of the script body,
- * and of the nested ones, like in `launch { }`, imported by default,
- * so the script would refer to them instead of the dependencies of these names,
- * as the members and extensions of the receivers take precedence, like `size` in `list.run { size }`.
+ * The names the script body resolves on its receiver, the coroutine scope, or on the nested ones, like in `launch { }`,
+ * instead of the dependencies of these names, as the receivers take precedence, like `size` in `list.run { size }`:
+ * the members of `CoroutineScope` and `Any`, the extensions of `CoroutineScope` imported by default from `kotlinx.coroutines`,
+ * and the extensions of any receiver imported by default from `kotlin`.
  */
 private val coroutineScopeNames = setOf(
-    "coroutineContext", "isActive", "javaClass", "launch", "async", "cancel", "ensureActive", "plus"
+    "coroutineContext", "toString", "hashCode", "equals",
+    "isActive", "launch", "async", "cancel", "ensureActive", "plus", "newCoroutineContext",
+    "javaClass", "let", "run", "also", "apply", "takeIf", "takeUnless", "to", "runCatching"
 )
 
 /*
@@ -504,11 +507,17 @@ private val ScriptExecutor.Dependency<*>.accessor: String
 
 /** Whether it is of a function type, or of a type with the `invoke` operator, so the script can call it. */
 private val ScriptExecutor.Dependency<*>.isCallable: Boolean
-    get() = (type.classifier as? KClass<*>)?.java?.let { type ->
-        Function::class.java.isAssignableFrom(type) || try {
-            type.methods.any { it.name == "invoke" }
-        } catch (_: LinkageError) {
-            // e.g. a method referring to an optional class, which is missing
+    get() = (type.classifier as? KClass<*>)?.let { type ->
+        Function::class.java.isAssignableFrom(type.java) || try {
+            if (type.java.isAnnotationPresent(Metadata::class.java)) {
+                // named like `invoke-LRDsOJo` in the bytecode, if it takes a value class
+                type.members.any { it is KFunction<*> && it.name == "invoke" && it.isOperator }
+            } else {
+                // every Java method named `invoke` is an operator
+                type.java.methods.any { it.name == "invoke" }
+            }
+        } catch (_: Throwable) {
+            // e.g. a member referring to an optional class, which is missing, so it cannot be inspected
             false
         }
     } == true
