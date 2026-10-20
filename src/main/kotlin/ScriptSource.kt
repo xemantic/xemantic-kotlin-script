@@ -233,13 +233,15 @@ internal class ScriptSource(
     }
 
     /**
-     * The start and the end of the name of the declaration moved out of the script body.
+     * The start and the end of the name of the declaration moved out of the script body,
+     * or of the class nested in it, as the compiler names it without the enclosing classes.
      */
     fun movedDeclarationName(
         name: String
-    ): Pair<ScriptPosition, ScriptPosition>? = movedDeclarations.find {
-        it.name == name
-    }?.nameRange?.let {
+    ): Pair<ScriptPosition, ScriptPosition>? = (
+            movedDeclarations.find { it.name == name }?.nameRange
+                ?: movedDeclarations.firstNotNullOfOrNull { it.nestedNameRanges[name] }
+    )?.let {
         position(it.first) to position(it.last + 1)
     }
 
@@ -300,7 +302,9 @@ private class Declaration(
     val nameRange: IntRange?,
     /** The names of a destructuring declaration, like `val (a, b) = pair`. */
     val destructuredNames: List<String> = emptyList(),
-    val isClass: Boolean = false
+    val isClass: Boolean = false,
+    /** The ranges of the names of the classes nested in the declaration, by these names, the first one of each name. */
+    val nestedNameRanges: Map<String, IntRange> = emptyMap()
 )
 
 private enum class DeclarationKind {
@@ -477,8 +481,12 @@ private class ScriptStructure(
         val block = file.script?.blockExpression
         val statements = block?.statements.orEmpty()
         val declarations = statements.mapNotNull { parseDeclaration(it) }
-        val moved = selectMovedDeclarations(declarations, block?.references(scope = block).orEmpty())
-        movedDeclarations = moved.map { it.toDeclaration() }
+        val declarationsByPsi = declarations.associateBy { it.psi }
+        val bodyReferences = statements.flatMap { statement ->
+            declarationsByPsi[statement]?.references ?: statement.references(scope = statement.parent)
+        }
+        val moved = selectMovedDeclarations(declarations, bodyReferences)
+        movedDeclarations = moved.map { it.toDeclaration(withNestedNames = true) }
         endsWithMovedDeclaration = moved.any { it.psi == statements.lastOrNull() }
         bodyDeclarations = declarations
             .filter {
@@ -494,6 +502,7 @@ private class ScriptStructure(
                 .forEach { blankedRanges += it.startOffset until it.startOffset + it.textLength }
             if (declaration.kind == DeclarationKind.PROPERTY) {
                 declaration.psi.memberOnlyAnnotationEntries().forEach { blankedRanges += it.startOffset until it.endOffset }
+                declaration.accessors.forEach { blankedRanges += it.startOffset until it.endOffset }
             }
         }
     }
@@ -505,6 +514,8 @@ private class ScriptStructure(
         val name: String?,
         val nameRange: IntRange?,
         val requiresMove: Boolean,
+        /** The accessors of the property, which are its part. */
+        val accessors: List<KtPropertyAccessor>,
         val destructuredNames: List<String>,
         val isSealed: Boolean,
         /** Whether it is a function with a receiver, like `fun Int.double()`. */
@@ -515,13 +526,24 @@ private class ScriptStructure(
         /** Without the comments preceding the declaration, which are left in the script body. */
         val start = psi.startOffsetSkippingComments
         val references = psi.references(scope = psi.parent)
-        fun toDeclaration() = Declaration(
+        fun toDeclaration(
+            withNestedNames: Boolean = false
+        ) = Declaration(
             name = name,
             start = start,
             end = end,
             nameRange = nameRange,
             destructuredNames = destructuredNames,
-            isClass = kind == DeclarationKind.CLASS
+            isClass = kind == DeclarationKind.CLASS,
+            nestedNameRanges = if (withNestedNames && psi is KtClassOrObject) {
+                buildMap {
+                    psi.collectDescendantsOfType<KtClassOrObject> { it !== psi }.forEach { nested ->
+                        nested.nameIdentifier?.let { putIfAbsent(it.text, it.startOffset until it.endOffset) }
+                    }
+                }
+            } else {
+                emptyMap()
+            }
         )
     }
 
@@ -559,9 +581,10 @@ private class ScriptStructure(
             is KtTypeAlias -> true
             is KtNamedFunction -> declaration.hasModifier(KtTokens.INLINE_KEYWORD) || hasMemberOnlyAnnotation
             // otherwise its initializer would run when the script class is constructed, before the script body,
-            // so instead its annotations are blanked out, unless the order does not matter
+            // so instead its annotations, and its accessors without a body, like `private set`, are blanked out,
+            // unless the order does not matter
             is KtProperty -> declaration.receiverTypeReference != null
-                    || accessors.isNotEmpty()
+                    || accessors.any { it.hasBody() }
                     || (hasMemberOnlyAnnotation && declaration.initializer.isConstant())
             else -> false
         }
@@ -572,6 +595,7 @@ private class ScriptStructure(
             name = nameIdentifier?.text,
             nameRange = nameIdentifier?.let { it.startOffset until it.endOffset },
             requiresMove = requiresMove,
+            accessors = accessors,
             destructuredNames = (declaration as? KtDestructuringDeclaration)?.entries.orEmpty()
                 .mapNotNull { it.name }
                 .filter { it != "_" },
@@ -730,6 +754,11 @@ private fun unmatchedClosingBrace(
     while (true) {
         val type = lexer.tokenType ?: return null
         if (type in openingTokens) opened += type
+        // ends the unterminated single-line string instead of the closing quote
+        if (type == KtTokens.DANGLING_NEWLINE) {
+            val quote = opened.lastIndexOf(KtTokens.OPEN_QUOTE)
+            if (quote >= 0) opened.subList(quote, opened.size).clear()
+        }
         openingOf[type]?.let { closed ->
             val opening = opened.lastIndexOf(closed)
             val enclosing = opened.indexOfLast { it in enclosingOf.getValue(type) }

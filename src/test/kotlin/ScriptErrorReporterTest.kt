@@ -20,6 +20,7 @@ package com.xemantic.kotlin.script
 
 import com.xemantic.kotlin.test.assert
 import com.xemantic.kotlin.test.sameAs
+import kotlin.script.experimental.api.ScriptDiagnostic
 import kotlin.test.Test
 
 class ScriptErrorReporterTest {
@@ -74,6 +75,27 @@ class ScriptErrorReporterTest {
 
         // then
         message sameAs "error: Failed without any diagnostic message."
+    }
+
+    @Test
+    fun `should report exception of the diagnostic`() {
+        // given
+        val cause = NoClassDefFoundError("Foo").apply { stackTrace = emptyArray() }
+        val diagnostic = ScriptDiagnostic(
+            code = ScriptDiagnostic.unspecifiedError,
+            message = "Unable to instantiate class Script",
+            exception = cause
+        )
+        val reporter = ScriptErrorReporter(ScriptSource("foo"))
+
+        // when
+        val message = reporter.toFailureMessage(listOf(diagnostic))
+
+        // then
+        message sameAs """
+            error: Unable to instantiate class Script
+              Caused by: java.lang.NoClassDefFoundError: Foo
+        """.trimIndent()
     }
 
 }

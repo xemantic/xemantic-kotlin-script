@@ -20,8 +20,6 @@ package com.xemantic.kotlin.script
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.isActive
 import kotlin.reflect.KType
 
 /**
@@ -54,6 +52,10 @@ internal class ScriptCompilationCache<T : Any>(
      */
     private val entries = LinkedHashMap<Key, CompletableDeferred<T?>>(16, 0.75f, true)
 
+    /**
+     * @param compile throws [CancellationException] only when its caller is cancelled,
+     *   as the waiting callers would be cancelled by it as well.
+     */
     suspend fun getOrCompile(
         key: Key,
         compile: suspend () -> T
@@ -81,15 +83,7 @@ internal class ScriptCompilationCache<T : Any>(
             } catch (e: Throwable) {
                 remove(key, entry)
                 // unlike the cancellation of the caller, the failure of the compilation is shared
-                when {
-                    e !is CancellationException -> entry.completeExceptionally(e)
-                    !currentCoroutineContext().isActive -> entry.complete(null)
-                    // would silently cancel the active callers instead of failing them
-                    else -> IllegalStateException("The compilation of the script was cancelled", e).let {
-                        entry.completeExceptionally(it)
-                        throw it
-                    }
-                }
+                if (e is CancellationException) entry.complete(null) else entry.completeExceptionally(e)
                 throw e
             }
         }

@@ -24,6 +24,7 @@ import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
 import kotlinx.coroutines.CompletableJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
@@ -32,6 +33,7 @@ import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runTest
 import org.jetbrains.kotlin.config.JvmTarget
+import java.util.concurrent.Executors
 import kotlin.reflect.typeOf
 import kotlin.test.Test
 import kotlin.time.Duration.Companion.hours
@@ -41,6 +43,8 @@ annotation class ExperimentalGadget
 
 @ExperimentalGadget
 class Gadget
+
+class Widget(val name: String)
 
 class ScriptExecutorTest {
 
@@ -2325,6 +2329,165 @@ class ScriptExecutorTest {
             message sameAs """
                 error: The script is nested too deeply to be parsed.
             """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should run script body with the class loader of the script as the context class loader`() = runTest {
+        // given
+        val script = """
+            class Foo
+            kotlinx.coroutines.delay(1)
+            Thread.currentThread().contextClassLoader.loadClass(Foo::class.java.name) == Foo::class.java
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == true)
+        }
+    }
+
+    @Test
+    fun `should evaluate script with the class loader of the executor whatever the context class loader of the dispatcher thread`() = runTest {
+        // given
+        val isolated = object : ClassLoader(null) {}
+        val dispatcher = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable).apply { contextClassLoader = isolated }
+        }.asCoroutineDispatcher()
+        val executor = ScriptExecutor(dispatcher = dispatcher)
+
+        // when
+        val result = try {
+            executor.execute("widget.name", listOf(dependency("widget", Widget("foo"))))
+        } finally {
+            dispatcher.close()
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "foo")
+        }
+    }
+
+    @Test
+    fun `should report error at enum class accessing dependency`() = runTest {
+        // given
+        val script = """
+            enum class Mood { HAPPY; fun greet() = greeting }
+            Mood.HAPPY.greet()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("greeting", "Hello")))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:12: error: Enum class 'Mood' captures the script class instance. Try to use class or anonymous object instead.
+                  | enum class <error>Mood</error> { HAPPY; fun greet() = greeting }
+                  hint: 'Mood' is compiled outside of the script body, where an enum class cannot access the dependencies - pass the dependencies as parameters.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at nested class accessing dependency`() = runTest {
+        // given
+        val script = """
+            class Outer {
+                class Nested { fun greet() = greeting }
+            }
+            Outer.Nested().greet()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("greeting", "Hello")))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:11: error: Nested class 'Nested' captures the script class instance. Try to use the explicit 'inner' modifier for both the nested 'Nested' and outer 'Outer'.
+                  |     class <error>Nested</error> { fun greet() = greeting }
+                  hint: 'Nested' is compiled outside of the script body, where a nested class cannot access the dependencies - pass the dependencies as parameters.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should initialize property with accessor modifier in the order of the script`() = runTest {
+        // given
+        val script = """
+            log += "a"
+            var count = run { log += "b"; 0 }
+                private set
+            count++
+            "${'$'}log ${'$'}count"
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("log", mutableListOf<String>())))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "[a, b] 1")
+        }
+    }
+
+    @Test
+    fun `should report unmatched closing brace following unterminated string`() = runTest {
+        // given
+        val script = """
+            val s = "abc
+            println(s) }
+            s
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:12: error: Syntax error: Unexpected '}' without matching '{'.
+                  | println(s) <error>}</error>
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should launch coroutine without importing launch`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf<Int>()
+            launch { log += 1 }.join()
+            log
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == listOf(1))
         }
     }
 

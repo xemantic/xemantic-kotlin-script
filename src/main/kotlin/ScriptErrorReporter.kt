@@ -31,8 +31,8 @@ private const val MAX_REPORTED_EXCEPTIONS = 32
 
 private val unresolvedReference = Regex("Unresolved reference '(.+)'\\.")
 
-/** Reported without a location, for an object accessing the dependencies, which are the members of the script class. */
-private val objectCapturingScript = Regex("Object '(.+)' captures the script class instance\\..*")
+/** Reported without a location, e.g. for an object accessing the dependencies, which are the members of the script class. */
+private val declarationCapturingScript = Regex("(Object|Enum class|Interface|Nested class) '(.+)' captures the script class instance\\..*")
 
 internal fun Iterable<ScriptDiagnostic>.filterNonIgnorable() = filterNot { diagnostic ->
     diagnostic.severity == ScriptDiagnostic.Severity.DEBUG && listOf(
@@ -273,7 +273,8 @@ internal class ScriptErrorReporter(
             appendSeverityAndMessage(diagnostic)
             return
         }
-        val capturingObject = objectCapturingScript.matchEntire(diagnostic.message)?.groupValues[1]
+        val capturing = declarationCapturingScript.matchEntire(diagnostic.message)?.groupValues
+        val capturingDeclaration = capturing?.get(2)
         val range = if (location != null) {
             val start = source.toScriptPosition(location.start.line, location.start.col)
             val end = location.end?.let {
@@ -283,7 +284,7 @@ internal class ScriptErrorReporter(
             } ?: start
             start to end
         } else {
-            capturingObject?.let { source.movedDeclarationName(it) }
+            capturingDeclaration?.let { source.movedDeclarationName(it) }
         }
         range?.let { appendPosition(it.first) }
         appendSeverityAndMessage(diagnostic)
@@ -293,9 +294,12 @@ internal class ScriptErrorReporter(
         unresolvedReference.matchEntire(diagnostic.message)?.let { match ->
             appendHint(name = match.groupValues[1], position = start)
         }
-        if (capturingObject != null) {
-            +"  hint: '$capturingObject' is compiled outside of the script body, where an object cannot access the dependencies"
-            +" - declare it as a class, or pass the dependencies as parameters.\n"
+        if (capturing != null) {
+            val kind = capturing[1].lowercase()
+            val article = if (kind[0] in "aeiou") "an" else "a"
+            val alternative = if (kind == "object") "declare it as a class, or " else ""
+            +"  hint: '$capturingDeclaration' is compiled outside of the script body, where $article $kind cannot access the dependencies"
+            +" - ${alternative}pass the dependencies as parameters.\n"
         }
     }
 
@@ -306,6 +310,10 @@ internal class ScriptErrorReporter(
         +": "
         diagnostic.message.trimEnd().lines().joinTo(this, "\n  ")
         +'\n'
+        // e.g. of the failure to instantiate the script class
+        diagnostic.exception?.let {
+            appendThrowable(it, "Caused by: ", "  ", Collections.newSetFromMap(IdentityHashMap()))
+        }
     }
 
     private fun StringBuilder.appendPosition(

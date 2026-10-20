@@ -23,7 +23,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.ThreadContextElement
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
@@ -32,6 +32,7 @@ import kotlin.concurrent.atomics.AtomicInt
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.concurrent.atomics.fetchAndIncrement
 import kotlin.concurrent.atomics.incrementAndFetch
+import kotlin.coroutines.CoroutineContext
 import kotlin.reflect.typeOf
 import kotlin.script.experimental.api.CompiledScript
 import kotlin.script.experimental.api.KotlinType
@@ -43,9 +44,11 @@ import kotlin.script.experimental.api.ScriptEvaluationConfiguration
 import kotlin.script.experimental.api.compilerOptions
 import kotlin.script.experimental.api.defaultImports
 import kotlin.script.experimental.api.providedProperties
+import kotlin.script.experimental.jvm.baseClassLoader
 import kotlin.script.experimental.jvm.dependenciesFromCurrentContext
 import kotlin.script.experimental.jvm.jvm
 import kotlin.script.experimental.jvm.jvmTarget
+import kotlin.script.experimental.jvm.loadDependencies
 import kotlin.script.experimental.jvmhost.BasicJvmScriptingHost
 import kotlin.time.measureTimedValue
 
@@ -97,6 +100,13 @@ internal class DefaultScriptExecutor(
 
     private val scriptingHost = BasicJvmScriptingHost()
 
+    /**
+     * The class loader the script is compiled against, also evaluating it,
+     * instead of the context class loader of the dispatcher thread, which might differ.
+     */
+    private val classLoader: ClassLoader = Thread.currentThread().contextClassLoader
+
+
     private val compilationConfigurationTemplate = ScriptCompilationConfiguration {
         jvm {
             dependenciesFromCurrentContext(
@@ -105,9 +115,9 @@ internal class DefaultScriptExecutor(
             // the default 1.8 target cannot inline functions of the classpath, e.g. `dependency(...)`
             jvmTarget(scriptJvmTarget(System.getProperty("java.specification.version")))
         }
-        // Add helpful default imports
+        // the script body has a CoroutineScope receiver, so it can launch coroutines without imports
         defaultImports(
-            "kotlinx.coroutines.async"
+            "kotlinx.coroutines.*"
         )
         // TODO can be removed once the time API is stable?
         compilerOptions.append(
@@ -255,7 +265,7 @@ internal class DefaultScriptExecutor(
                 )
             } catch (e: CancellationException) {
                 // the cancellation of the caller is not a failure of the compilation,
-                // otherwise it would silently cancel the active caller instead of failing it
+                // otherwise it would silently cancel the active caller, and the ones waiting in the cache, instead of failing them
                 currentCoroutineContext().ensureActive()
                 throw IllegalStateException("The compilation of the script was cancelled", e)
             }
@@ -314,7 +324,8 @@ internal class DefaultScriptExecutor(
                 val block = value as suspend CoroutineScope.() -> Any?
                 // only what the block throws is the failure of the script, not the reporting of its warnings
                 val returned = try {
-                    Result.success(coroutineScope { block() })
+                    // the scripting host sets it only while constructing the script, which just returns the block
+                    Result.success(withContext(ContextClassLoader(block::class.java.classLoader)) { block() })
                 } catch (e: Throwable) {
                     // the cancellation of the caller is not a failure of the script
                     if (e is CancellationException) currentCoroutineContext().ensureActive()
@@ -356,6 +367,11 @@ internal class DefaultScriptExecutor(
         )
 
         private fun evaluationConfig() = ScriptEvaluationConfiguration {
+            jvm {
+                baseClassLoader(classLoader)
+                // the classpath of the compilation is taken from the base class loader already
+                loadDependencies(false)
+            }
             providedProperties(
                 *(allDependencies.map { it.providedName to it.value }.toTypedArray())
             )
@@ -367,6 +383,35 @@ internal class DefaultScriptExecutor(
             )
         }
 
+    }
+
+}
+
+/**
+ * Sets the context class loader of every thread the coroutine resumes on.
+ */
+private class ContextClassLoader(
+    private val classLoader: ClassLoader
+) : ThreadContextElement<ClassLoader?> {
+
+    companion object Key : CoroutineContext.Key<ContextClassLoader>
+
+    override val key: CoroutineContext.Key<ContextClassLoader> get() = Key
+
+    override fun updateThreadContext(
+        context: CoroutineContext
+    ): ClassLoader? {
+        val thread = Thread.currentThread()
+        val previous = thread.contextClassLoader
+        thread.contextClassLoader = classLoader
+        return previous
+    }
+
+    override fun restoreThreadContext(
+        context: CoroutineContext,
+        oldState: ClassLoader?
+    ) {
+        Thread.currentThread().contextClassLoader = oldState
     }
 
 }

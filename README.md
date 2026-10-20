@@ -85,8 +85,10 @@ when (result) {
   so any class available to the host application can be imported by the script.
 * Declarations which cannot be local to a block, like enum classes, objects, interfaces or sealed types,
   are compiled outside of the script body, together with the types and functions they refer to.
+  So is a property with a getter or a setter having a body, like `val total get() = items.size`, as a local property cannot have one.
   Therefore, they cannot refer to the local values of the script body, only to the dependencies,
-  while an object cannot refer even to the dependencies, as they are the members of the script instance.
+  while an object, an enum class, an interface or a nested class cannot refer even to the dependencies,
+  as they are the members of the script instance.
   An error message will hint at this, if it happens.
 
 ### Error reporting

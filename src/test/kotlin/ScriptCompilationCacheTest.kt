@@ -23,7 +23,6 @@ import com.xemantic.kotlin.test.be
 import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
@@ -276,7 +275,7 @@ class ScriptCompilationCacheTest {
     }
 
     @Test
-    fun `should fail the compiling and concurrent callers without cancelling them when the compilation throws cancellation exception`() = runTest {
+    fun `should fail the compiling and concurrent callers when the compilation fails`() = runTest {
         // given
         val cache = ScriptCompilationCache<String>(maxSize = 10) { true }
         val key = ScriptCompilationCache.Key(script = "foo", dependencies = emptyList())
@@ -284,7 +283,7 @@ class ScriptCompilationCacheTest {
         val compile: suspend () -> String = {
             compilations++
             delay(1.milliseconds)
-            throw CancellationException("compiler gave up")
+            throw IllegalStateException("compiler failed")
         }
 
         // when
@@ -296,7 +295,7 @@ class ScriptCompilationCacheTest {
         assert(compilations == 1)
         results.forEach { result ->
             val failure = result.exceptionOrNull()
-            assert(failure is IllegalStateException && failure !is CancellationException && failure.message == "The compilation of the script was cancelled")
+            assert(failure is IllegalStateException && failure.message == "compiler failed")
         }
     }
 
