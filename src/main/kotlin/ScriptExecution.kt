@@ -347,10 +347,14 @@ internal class DefaultScriptExecutor(
             // the calls not referring to the moved functions already, which would refer to them in the script, if they apply
             val toFunctions = deprecated(SHADOWED_ORIGINAL)
             val toProperties = source.shadowedFunctionCandidates.filter { (reference) -> toFunctions.none { it in reference } }
-            val shadowed = if (toProperties.isEmpty()) emptyList() else {
+            // the remaining calls of the functions, which would refer to them in the script, if they apply, like the properties
+            val (coroutineScopeFunctions, coroutineScopeProperties) = coroutineScope.partition { it.isFunction }
+            val copies = if (toProperties.isEmpty() && coroutineScopeFunctions.isEmpty()) null else {
                 val copies = source(confirming = true, shadowedFunctionCopies = true)
-                compile(copies).reports.marked(copies, SHADOWED_FUNCTION)
+                copies to compile(copies).reports
             }
+            val shadowed = copies?.let { (copies, reports) -> reports.marked(copies, SHADOWED_FUNCTION) }.orEmpty()
+            val toCoroutineScope = copies?.let { (copies, reports) -> reports.marked(copies, COROUTINE_SCOPE_FUNCTION) }.orEmpty()
             return Compilation(
                 source,
                 result,
@@ -360,7 +364,9 @@ internal class DefaultScriptExecutor(
                             + dependencies.takeIf { !candidate.isFunction || candidate.isCallableReference }.orEmpty())
                         .any { it in candidate.reference }
                 },
-                coroutineScopeReferences = coroutineScope,
+                coroutineScopeReferences = coroutineScopeProperties + coroutineScopeFunctions.filter { candidate ->
+                    toCoroutineScope.any { it in candidate.reference }
+                },
                 shadowedFunctionReferences = toProperties.filter { (reference) ->
                     shadowed.any { it in reference }
                 },

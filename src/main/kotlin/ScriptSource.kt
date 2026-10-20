@@ -35,6 +35,8 @@ import org.jetbrains.kotlin.lexer.KotlinLexer
 import org.jetbrains.kotlin.lexer.KtTokens
 import org.jetbrains.kotlin.psi.KtAnnotation
 import org.jetbrains.kotlin.psi.KtAnnotationEntry
+import org.jetbrains.kotlin.psi.KtArrayAccessExpression
+import org.jetbrains.kotlin.psi.KtBinaryExpression
 import org.jetbrains.kotlin.psi.KtBlockExpression
 import org.jetbrains.kotlin.psi.KtCallExpression
 import org.jetbrains.kotlin.psi.KtCallableReferenceExpression
@@ -56,6 +58,7 @@ import org.jetbrains.kotlin.psi.KtParameter
 import org.jetbrains.kotlin.psi.KtParenthesizedExpression
 import org.jetbrains.kotlin.psi.KtPrefixExpression
 import org.jetbrains.kotlin.psi.KtProperty
+import org.jetbrains.kotlin.psi.KtPropertyDelegate
 import org.jetbrains.kotlin.psi.KtPropertyAccessor
 import org.jetbrains.kotlin.psi.KtPsiFactory
 import org.jetbrains.kotlin.psi.KtSimpleNameExpression
@@ -143,8 +146,11 @@ internal val coroutineScopeFunctions = setOf(
     "let", "run", "also", "apply", "takeIf", "takeUnless", "to", "runCatching"
 )
 
-/** The deprecation message of the moved declarations, see [ScriptSource.coroutineScopeCandidates]. */
+/** The opt-in message of the moved declarations, see [ScriptSource.coroutineScopeCandidates]. */
 internal const val COROUTINE_SCOPE_ORIGINAL = "xemantic-kotlin-script: coroutine scope original"
+
+/** The opt-in message of the copies of the moved functions, see [ScriptSource.coroutineScopeCandidates]. */
+internal const val COROUTINE_SCOPE_FUNCTION = "xemantic-kotlin-script: coroutine scope function"
 
 /** The deprecation message of the moved functions, see [ScriptSource.shadowedFunctionCandidates]. */
 internal const val SHADOWED_ORIGINAL = "xemantic-kotlin-script: shadowed original"
@@ -373,7 +379,7 @@ internal class ScriptSource(
         if (confirming) {
             addCopies(structure.hiddenLocalFunctionCopies, HIDDEN_LOCAL_FUNCTION)
             // the deprecation of the local functions, like the copies in the script block, is not reported, unlike their opt-in
-            listOf(LATER_DECLARED_FUNCTION, SHADOWED_FUNCTION).forEach { message ->
+            listOf(LATER_DECLARED_FUNCTION, SHADOWED_FUNCTION, SHADOWED_ORIGINAL, COROUTINE_SCOPE_ORIGINAL, COROUTINE_SCOPE_FUNCTION).forEach { message ->
                 lines += "@kotlin.RequiresOptIn(\"$message\", level = RequiresOptIn.Level.WARNING) annotation class ${optInMarker(message)}"
                 mapping += null
             }
@@ -399,12 +405,13 @@ internal class ScriptSource(
             emptySet()
         }
         movedDeclarations.forEach { declaration ->
+            // opt-in markers, which can mark the same declaration, unlike the deprecations
             if (declaration.kind == DeclarationKind.FUNCTION && declaration.name in deprecatedFunctions) {
-                lines += "@kotlin.Deprecated(\"$SHADOWED_ORIGINAL\")"
+                lines += "@${optInMarker(SHADOWED_ORIGINAL)}"
                 mapping += null
             }
             if (declaration.name in coroutineScopeDeclarations) {
-                lines += "@kotlin.Deprecated(\"$COROUTINE_SCOPE_ORIGINAL\")"
+                lines += "@${optInMarker(COROUTINE_SCOPE_ORIGINAL)}"
                 mapping += null
             }
             addLines(lineOf(declaration.start)..lineOf(declaration.end - 1)) {
@@ -742,6 +749,7 @@ private fun PsiElement.references(
     declaredNames: DeclaredNames
 ): List<Reference> = collectDescendantsOfType<KtSimpleNameExpression> {
     it !is KtLabelReferenceExpression && it.parent !is KtValueArgumentName
+            && !(it is KtOperationReferenceExpression && it.getReferencedNameElementType() != KtTokens.IDENTIFIER)
 }.map { expression ->
     val callableReference = expression.parent as? KtCallableReferenceExpression
     val name = expression.getReferencedName()
@@ -760,6 +768,73 @@ private fun PsiElement.references(
         isCallableReference = callableReference?.callableReference == expression,
         canAccessScriptMembers = canAccessScriptMembers(expression, scope)
     )
+} + operatorReferences(scope)
+
+/** The names of the operator functions called by the operators, like `plus` of `+`. */
+private val operatorNames = mapOf(
+    KtTokens.PLUS to listOf("plus"), KtTokens.MINUS to listOf("minus"), KtTokens.MUL to listOf("times"),
+    KtTokens.DIV to listOf("div"), KtTokens.PERC to listOf("rem"), KtTokens.RANGE to listOf("rangeTo"),
+    KtTokens.RANGE_UNTIL to listOf("rangeUntil"), KtTokens.IN_KEYWORD to listOf("contains"), KtTokens.NOT_IN to listOf("contains"),
+    KtTokens.LT to listOf("compareTo"), KtTokens.GT to listOf("compareTo"),
+    KtTokens.LTEQ to listOf("compareTo"), KtTokens.GTEQ to listOf("compareTo"),
+    KtTokens.PLUSEQ to listOf("plusAssign", "plus"), KtTokens.MINUSEQ to listOf("minusAssign", "minus"),
+    KtTokens.MULTEQ to listOf("timesAssign", "times"), KtTokens.DIVEQ to listOf("divAssign", "div"),
+    KtTokens.PERCEQ to listOf("remAssign", "rem"), KtTokens.PLUSPLUS to listOf("inc"), KtTokens.MINUSMINUS to listOf("dec")
+)
+
+/** The names of the operator functions called by the prefix operators, like `unaryMinus` of `-`. */
+private val prefixOperatorNames = mapOf(
+    KtTokens.MINUS to listOf("unaryMinus"), KtTokens.PLUS to listOf("unaryPlus"), KtTokens.EXCL to listOf("not"),
+    KtTokens.PLUSPLUS to listOf("inc"), KtTokens.MINUSMINUS to listOf("dec")
+)
+
+/**
+ * The references to the operator functions called by the operators and the conventions,
+ * like `plus` of `a + b`, `get` of `a[i]`, `iterator` of `for (x in a)`, `component1` of `val (a, b) = p`, or `invoke` of `f()()`,
+ * which are qualified, by the operands, so they might refer to the extension functions only.
+ */
+private fun PsiElement.operatorReferences(
+    scope: PsiElement
+): List<Reference> = buildList {
+    fun add(
+        names: List<String>,
+        element: PsiElement
+    ) = names.forEach { name ->
+        add(
+            Reference(
+                name = name,
+                offset = element.startOffset,
+                length = element.textLength,
+                isQualified = true,
+                isBound = false,
+                isCall = true,
+                isCallableReference = false,
+                canAccessScriptMembers = canAccessScriptMembers(element, scope)
+            )
+        )
+    }
+    collectDescendantsOfType<KtOperationReferenceExpression> {
+        it.getReferencedNameElementType() != KtTokens.IDENTIFIER
+    }.forEach { operation ->
+        val token = operation.getReferencedNameElementType()
+        val names = if (operation.parent is KtPrefixExpression) prefixOperatorNames[token] else operatorNames[token]
+        names?.let { add(it, operation) }
+    }
+    collectDescendantsOfType<KtArrayAccessExpression>().forEach { access ->
+        val assigned = (access.parent as? KtBinaryExpression)?.let {
+            it.left == access && it.operationToken == KtTokens.EQ
+        } == true
+        add(if (assigned) listOf("set") else listOf("get", "set"), access)
+    }
+    collectDescendantsOfType<KtForExpression>().forEach { loop ->
+        loop.loopRange?.let { add(listOf("iterator", "hasNext", "next"), it) }
+    }
+    collectDescendantsOfType<KtDestructuringDeclaration>().forEach { destructuring ->
+        add(destructuring.entries.indices.map { "component${it + 1}" }, destructuring)
+    }
+    collectDescendantsOfType<KtCallExpression> { it.calleeExpression !is KtSimpleNameExpression && it.calleeExpression != null }
+        .forEach { add(listOf("invoke"), it) }
+    collectDescendantsOfType<KtPropertyDelegate>().forEach { add(listOf("getValue", "setValue", "provideDelegate"), it) }
 }
 
 /** See [Reference.canAccessScriptMembers]. */
@@ -1106,13 +1181,18 @@ private class ScriptStructure(
             }
         }
         shadowedFunctionCandidates = shadowedFunctionCandidatesByStatement.values.flatten()
+        // unlike the extension properties, which do not apply without their receivers
         val coroutineScopeDeclarations = moved.filter {
-            (it.kind == DeclarationKind.FUNCTION || it.kind == DeclarationKind.PROPERTY) && it.name != null
-                    && (it.name in coroutineScopeProperties || it.name in coroutineScopeFunctions)
+            (it.kind == DeclarationKind.FUNCTION || (it.kind == DeclarationKind.PROPERTY && (it.psi as? KtProperty)?.receiverTypeReference == null))
+                    && it.name != null && (it.name in coroutineScopeProperties || it.name in coroutineScopeFunctions)
         }.groupBy { it.name!! }
         coroutineScopeCandidates = statements.indices.flatMap { index ->
             if (declarationsByPsi[statements[index]] in moved) return@flatMap emptyList()
-            statementReferences[index].filter { !it.isQualified && !it.isBound && it.name in coroutineScopeDeclarations }.map {
+            statementReferences[index].filter { reference ->
+                !reference.isQualified && !reference.isBound && reference.name in coroutineScopeDeclarations
+                        // refers to the local property shadowing the function, see shadowedFunctionCandidates
+                        && shadowingProperties[reference.name]?.let { (propertyIndex) -> propertyIndex < index } != true
+            }.map {
                 val declaration = coroutineScopeDeclarations.getValue(it.name).first()
                 Triple(it, declaration.line(), declaration.kind == DeclarationKind.FUNCTION)
             }
@@ -1166,7 +1246,16 @@ private class ScriptStructure(
                 localFunctionsByName,
                 LATER_DECLARED_FUNCTION
             )
-            if (shadowedFunctionCopies) addCopies(shadowedFunctionCandidatesByStatement, movedFunctionsByName, SHADOWED_FUNCTION)
+            if (shadowedFunctionCopies) {
+                addCopies(shadowedFunctionCandidatesByStatement, movedFunctionsByName, SHADOWED_FUNCTION)
+                // also the extension ones, which might not apply, like `fun Robot.launch()` to `launch { }`
+                val coroutineScopeFunctions = coroutineScopeCandidates.filter { it.third }.mapTo(LinkedHashSet()) { it.first.name }
+                if (coroutineScopeFunctions.isNotEmpty() && statements.isNotEmpty()) {
+                    getOrPut(statements.first().startOffset) { mutableListOf() } += coroutineScopeFunctions.flatMap { name ->
+                        moved.filter { it.kind == DeclarationKind.FUNCTION && it.name == name }.mapNotNull { it.signature() }
+                    }.map { COROUTINE_SCOPE_FUNCTION to it }
+                }
+            }
         }
         // unlike an extension property, which does not conflict with the accessor of the dependency
         conflictingDependencyDeclarations = moved.filter {

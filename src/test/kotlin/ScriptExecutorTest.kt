@@ -3571,4 +3571,64 @@ class ScriptExecutorTest {
         assert((results[1] as? ScriptResult.Error)?.message?.lines()?.first() == "script.kts:2:24: error: Unresolved reference 'isActive'.")
     }
 
+    @Test
+    fun `should execute scripts calling functions of the coroutine scope next to moved declarations of their names which do not apply`() = runTest {
+        // given
+        val scripts = listOf(
+            "val a = run(3)\nval b = run { 5 }\nfun run(steps: Int) = steps * 2\na + b",
+            "class Robot(val n: String)\nval r = Robot(\"r\")\nval x = r.launch()\nval job = launch { }\njob.join()\nfun Robot.launch() = \"go \" + n\nx"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(11, "go r"))
+    }
+
+    @Test
+    fun `should move operator functions referred to by operators`() = runTest {
+        // given
+        val scripts = listOf(
+            "val p = Point(1, 2) + Point(3, 4)\ndata class Point(val x: Int, val y: Int)\noperator fun Point.plus(o: Point) = Point(x + o.x, y + o.y)\np.toString()",
+            "data class Money(val c: Int)\noperator fun Money.plus(o: Money) = Money(c + o.c)\nval r = sum(Money(1), Money(2))\nfun sum(a: Money, b: Money) = a + b\nr.toString()",
+            "class Grid\nval g = Grid()\nval v = g[1]\noperator fun Grid.get(i: Int) = i * 10\nv",
+            "val l = mutableListOf<Int>()\nfor (i in Countdown(3)) l += i\nclass Countdown(val n: Int)\noperator fun Countdown.iterator() = (n downTo 1).iterator()\nl"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("Point(x=4, y=6)", "Money(c=3)", 10, listOf(3, 2, 1)))
+    }
+
+    @Test
+    fun `should report call of local property shadowing moved function named like function of the coroutine scope once`() = runTest {
+        // given
+        val script = """
+            val cancel = { r: String -> "prop " + r }
+            val x = cancel("a")
+            fun cancel(reason: String) = "fun " + reason
+            x
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:9: error: 'cancel' refers to the property of the script body declared at line 1, instead of the function declared at line 3, which a regular script calls.
+                  | val x = <error>cancel</error>("a")
+                  hint: rename the property or the function.
+            """.trimIndent()
+        }
+    }
+
 }
