@@ -3181,4 +3181,90 @@ class ScriptExecutorTest {
         }
     }
 
+    @Test
+    fun `should report error at reference to dependency before local property of the same name despite suppressed deprecation error`() = runTest {
+        // given
+        val scripts = listOf(
+            "@Suppress(\"DEPRECATION_ERROR\") fun show() = x\nval x = 2\nshow()",
+            "@file:Suppress(\"DEPRECATION_ERROR\")\nfun show() = x\nval x = 2\nshow()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, listOf(dependency("x", 1))) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.first() } == listOf(
+            "script.kts:1:45: error: 'x' refers to the dependency, as the property 'x' of the script body is declared later, at line 2.",
+            "script.kts:2:14: error: 'x' refers to the dependency, as the property 'x' of the script body is declared later, at line 3."
+        ))
+    }
+
+    @Test
+    fun `should explain compilation error caused by reference to dependency before local property of the same name`() = runTest {
+        // given
+        val script = """
+            fun show(): String = x
+            val x = "s"
+            show()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("x", 1)))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:22: error: 'x' refers to the dependency, as the property 'x' of the script body is declared later, at line 2.
+                  | fun show(): String = <error>x</error>
+                  hint: declare the property before line 1, or rename it.
+
+                script.kts:1:22: error: Return type mismatch: expected 'String', actual 'Int'.
+                  | fun show(): String = <error>x</error>
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call dependency before local function of the same name which does not apply`() = runTest {
+        // given
+        val script = """
+            val p = "!"
+            val r = f(1)
+            fun f(s: String) = s + p
+            r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<(Int) -> Int>("f") { it * 2 }))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should provide dependency of nullable function type named like function of the coroutine scope`() = runTest {
+        // given
+        val script = """
+            let?.invoke() ?: 3
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<(() -> Int)?>("let", null)))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 3)
+        }
+    }
+
 }

@@ -111,6 +111,9 @@ internal class LaterDeclaredReference(
 /** The deprecation message of the dependencies, see [ScriptSource.laterDeclaredDependencyCandidates]. */
 internal const val LATER_DECLARED_DEPENDENCY = "xemantic-kotlin-script: later declared dependency"
 
+/** The deprecation message of the copies of the local functions, see [ScriptSource.laterDeclaredDependencyCandidates]. */
+internal const val LATER_DECLARED_FUNCTION = "xemantic-kotlin-script: later declared function"
+
 /** A dependency, as declared in the preamble of the [ScriptSource]. */
 internal class PreambleDependency(
     val name: String,
@@ -193,7 +196,9 @@ internal class ScriptSource(
      * of the local properties of the same names, like `x` in `fun show() = x` followed by `val x = 2`,
      * or of the local functions, when called, while in the script they refer to these declarations.
      * Recognized by the names only, they might refer e.g. to the members of the receivers instead,
-     * so they are confirmed by compiling the script with these dependencies deprecated, see [deprecatedDependencies].
+     * so they are confirmed by compiling the script with these dependencies deprecated, see [deprecatedDependencies],
+     * where the receiver of the script body declares also the deprecated copies of the signatures of these local functions,
+     * which the calls refer to, if the local functions would be called in the script.
      */
     val laterDeclaredDependencyCandidates: List<LaterDeclaredReference>
 
@@ -232,6 +237,10 @@ internal class ScriptSource(
 
         val lines = mutableListOf<String>()
         val mapping = mutableListOf<Int?>()
+        // the confirming compilation reports the deprecation errors, even if suppressed by the script
+        val confirming = deprecatedDependencies.isNotEmpty()
+        val unsuppressed = BooleanArray(script.length)
+        if (confirming) structure.deprecationErrorSuppressions.forEach { unsuppressed.fill(true, it.first, it.last + 1) }
         fun addLines(
             range: IntRange,
             keep: (offset: Int) -> Boolean
@@ -239,7 +248,7 @@ internal class ScriptSource(
             val bounds = lineBounds[line]
             lines += buildString {
                 bounds.forEach { offset ->
-                    +(if (keep(offset)) script[offset] else ' ')
+                    +(if (keep(offset) && !unsuppressed[offset]) script[offset] else ' ')
                 }
             }
             mapping += line
@@ -273,6 +282,12 @@ internal class ScriptSource(
         mapping += null
         // the members of the outer receiver of the script body would be called instead of the moved functions
         shadowed.filterNot { it.isCallable && it.name in structure.movedFunctions }.forEach { addAccessor(it) }
+        if (confirming) {
+            structure.localFunctionSignatures.filterKeys { it in deprecatedDependencies }.values.flatten().forEach {
+                lines += "@kotlin.Deprecated(\"$LATER_DECLARED_FUNCTION\", level = DeprecationLevel.ERROR) $it"
+                mapping += null
+            }
+        }
         lines += "}"
         mapping += null
         movedDeclarations.forEach { declaration ->
@@ -449,6 +464,26 @@ private val memberOnlyAnnotations = setOf("Volatile", "Transient", "JvmField", "
 
 private fun KtDeclaration.memberOnlyAnnotationEntries(): List<KtAnnotationEntry> = annotationEntries.filter {
     it.useSiteTarget != null || it.shortName?.asString() in memberOnlyAnnotations
+}
+
+/**
+ * The declaration of a function of the same signature, which is never called, like `fun f(s: String): Nothing = kotlin.TODO()`,
+ * without the default values of the parameters, which might refer to the local declarations.
+ */
+private fun KtNamedFunction.signature(): String = buildString {
+    if (hasModifier(KtTokens.SUSPEND_KEYWORD)) +"suspend "
+    +"fun "
+    if (typeParameters.isNotEmpty()) {
+        +typeParameters.joinToString(prefix = "<", postfix = "> ") { parameter ->
+            "`${parameter.name}`" + (parameter.extendsBound?.let { ": ${it.text}" } ?: "")
+        }
+    }
+    +"`$name`("
+    +valueParameters.joinToString { parameter ->
+        (if (parameter.isVarArg) "vararg " else "") + "`${parameter.name}`: ${parameter.typeReference?.text}" +
+                (if (parameter.hasDefaultValue()) " = kotlin.TODO()" else "")
+    }
+    +"): Nothing = kotlin.TODO()"
 }
 
 /** Whether the expression is a literal, which can be evaluated at any time. */
@@ -645,6 +680,12 @@ private class ScriptStructure(
     /** The names of the functions moved out of the script body. */
     val movedFunctions: Set<String>
 
+    /** The signatures of the local functions of the names of the dependencies, see [ScriptSource.laterDeclaredDependencyCandidates]. */
+    val localFunctionSignatures: Map<String, List<String>>
+
+    /** The ranges of the `DEPRECATION_ERROR` names suppressed by the script, see [ScriptSource.laterDeclaredDependencyCandidates]. */
+    val deprecationErrorSuppressions: List<IntRange>
+
     /** See [ScriptSource.laterDeclaredDependencyCandidates], with the offsets of the declarations, and whether they are functions. */
     val laterDeclaredDependencyCandidates: List<Triple<Reference, Int, Boolean>>
 
@@ -700,6 +741,14 @@ private class ScriptStructure(
             }
         }
         fun ParsedDeclaration.line() = nameRange?.first ?: start
+        localFunctionSignatures = local.filter { it.name in dependencyNames }.groupBy({ it.name!! }) { function ->
+            (function.psi as KtNamedFunction).signature()
+        }
+        deprecationErrorSuppressions = file.collectDescendantsOfType<KtAnnotationEntry> {
+            it.shortName?.asString() == "Suppress"
+        }.flatMap { entry ->
+            entry.collectDescendantsOfType<KtStringTemplateExpression> { it.text == "\"DEPRECATION_ERROR\"" }
+        }.map { it.startOffset + 1 until it.endOffset - 1 }
         laterDeclaredDependencyCandidates = statements.withIndex().flatMap { (index, statement) ->
             if (declarationsByPsi[statement] in moved) return@flatMap emptyList()
             statementReferences[index].mapNotNull { reference ->

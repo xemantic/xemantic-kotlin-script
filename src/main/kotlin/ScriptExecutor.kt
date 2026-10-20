@@ -113,7 +113,9 @@ public interface ScriptExecutor {
  *   evicting the least recently used one, `0` by default, which disables the cache, must not be negative.
  *   A compiled script is reused when the script text is the same,
  *   and so are the names and types of its dependencies, while their values might differ.
- *   A script which failed to compile is not cached.
+ *   A script which failed to compile is not cached,
+ *   unlike a compiled one, which might still be reported as a [ExecutionPhase.COMPILATION] error every time,
+ *   e.g. for referring to a dependency before the declaration of the same name.
  */
 public fun ScriptExecutor(
     dispatcher: CoroutineDispatcher = Dispatchers.IO,

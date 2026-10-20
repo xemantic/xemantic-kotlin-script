@@ -93,7 +93,8 @@ internal class DefaultScriptExecutor(
     private val compilations = AtomicInt(0)
 
     /**
-     * The number of the actual compilations, not served by the cache.
+     * The number of the actual compilations, not served by the cache,
+     * including the ones confirming the [ScriptSource.laterDeclaredDependencyCandidates].
      */
     @OptIn(ExperimentalAtomicApi::class)
     internal val compilationCount: Int get() = compilations.load()
@@ -219,9 +220,11 @@ internal class DefaultScriptExecutor(
                 ExecutionPhase.COMPILATION
             )
             if (compilation.laterDeclaredDependencyReferences.isNotEmpty()) {
-                val failureMessage = ScriptErrorReporter(source).toLaterDeclaredDependencyMessage(
-                    compilation.laterDeclaredDependencyReferences
-                )
+                val failureMessage = listOfNotNull(
+                    ScriptErrorReporter(source).toLaterDeclaredDependencyMessage(compilation.laterDeclaredDependencyReferences),
+                    // explained by the reference to the dependency
+                    (compilationResult as? Failure)?.let { ScriptErrorReporter(source).toFailureMessage(it.reports.filterNonIgnorable()) }
+                ).joinToString(separator = "\n\n")
                 logger.debug {
                     "Script[$scriptId]: Compilation (1/2) failure message: $failureMessage"
                 }
@@ -282,12 +285,7 @@ internal class DefaultScriptExecutor(
             if (source.unmatchedClosingBrace != null || source.conflictingDependencyDeclarations.isNotEmpty()) {
                 return Compilation(source, result = null)
             }
-            val result = compile(source)
-            return Compilation(
-                source,
-                result,
-                if (result is Success) laterDeclaredDependencyReferences(source) else emptyList()
-            )
+            return Compilation(source, compile(source), laterDeclaredDependencyReferences(source))
         }
 
         private fun source(
@@ -310,12 +308,21 @@ internal class DefaultScriptExecutor(
             val candidates = source.laterDeclaredDependencyCandidates
             if (candidates.isEmpty()) return emptyList()
             val probe = source(deprecatedDependencies = candidates.mapTo(HashSet()) { it.reference.name })
-            val deprecated = compile(probe).reports.filter {
-                it.severity == ScriptDiagnostic.Severity.ERROR && LATER_DECLARED_DEPENDENCY in it.message
+            val reports = compile(probe).reports
+            /** The positions of the errors of the deprecated declarations of this [message]. */
+            fun deprecated(
+                message: String
+            ) = reports.filter {
+                it.severity == ScriptDiagnostic.Severity.ERROR && message in it.message
             }.mapNotNull { diagnostic ->
                 diagnostic.location?.start?.let { probe.toScriptPosition(it.line, it.col) }
             }
-            return candidates.filter { candidate -> deprecated.any { it in candidate.reference } }
+            val dependencies = deprecated(LATER_DECLARED_DEPENDENCY)
+            // only the ones, which the local function applies to, unlike the dependency called anyway
+            val functions = deprecated(LATER_DECLARED_FUNCTION)
+            return candidates.filter { candidate ->
+                (if (candidate.isFunction) functions else dependencies).any { it in candidate.reference }
+            }
         }
 
         private suspend fun compile(
@@ -551,7 +558,7 @@ private val ScriptExecutor.Dependency<*>.accessor: String
 
 /** Whether it is of a function type, or of a type with the public `invoke` operator, so the script can call it. */
 private val ScriptExecutor.Dependency<*>.isCallable: Boolean
-    get() = (type.classifier as? KClass<*>)?.let { type ->
+    get() = !type.isMarkedNullable && (type.classifier as? KClass<*>)?.let { type ->
         Function::class.java.isAssignableFrom(type.java) || try {
             if (type.java.isAnnotationPresent(Metadata::class.java)) {
                 // named like `invoke-LRDsOJo` in the bytecode, if it takes a value class
