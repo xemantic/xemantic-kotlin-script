@@ -64,6 +64,7 @@ when (result) {
 * The script body runs as a suspend block with a `CoroutineScope` receiver, in the coroutine of the caller:
   the caller awaits all the coroutines the script launches, and cancelling the caller cancels the script.
   Cancellation cannot interrupt a blocking call of the script though, like `Thread.sleep`.
+  Unlike in a regular `.kts` file, `this` in the script body is therefore this `CoroutineScope`, not the script instance.
 * The script is compiled and evaluated on `Dispatchers.IO`, as both might block.
   Another dispatcher can be given as `ScriptExecutor(dispatcher = ...)`,
   e.g. `Dispatchers.IO.limitedParallelism(4)` to bound the threads used by scripts,

@@ -27,6 +27,8 @@ import kotlinx.coroutines.test.runTest
 import kotlin.reflect.typeOf
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
 
 private class Hidden
 
@@ -312,6 +314,56 @@ class ScriptDependenciesTest {
 
         // then
         assert(exception.message == "Dependency 'foo' of type kotlin.String has a value of class java.lang.Integer")
+    }
+
+    @Test
+    fun `should provide dependencies of value class types`() = runTest {
+        // given
+        val script = $$"""
+            "${timeout.inWholeSeconds} ${count + 1u} ${delay?.inWholeSeconds}"
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "timeout" provides 5.seconds
+            "count" provides 5u
+            provide<Duration?>("delay", 2.seconds)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "5 6 2")
+        }
+    }
+
+    @Test
+    fun `should reject dependency of type parameter`() {
+        // given
+        val type = Pair<*, *>::first.returnType
+
+        // when
+        val exception = assertFailsWith<IllegalArgumentException> {
+            ScriptExecutor.Dependency("foo", type, "bar")
+        }
+
+        // then
+        assert(exception.message == "Dependency 'foo' is of type A, which is a type parameter - provide it as a concrete type")
+    }
+
+    @Test
+    fun `should reject dependency of platform type`() {
+        // given
+        val type = Thread::getAllStackTraces.returnType
+
+        // when
+        val exception = assertFailsWith<IllegalArgumentException> {
+            ScriptExecutor.Dependency("foo", type, Thread.getAllStackTraces())
+        }
+
+        // then
+        assert(exception.message == "Dependency 'foo' is of platform type $type, which the script cannot refer to - provide it as a Kotlin type, e.g. with typeOf")
     }
 
 }

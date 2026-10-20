@@ -93,4 +93,29 @@ class ScriptSourceTest {
         assert(texts.withIndex().all { (index, text) -> "enum class E$index" !in text.substringAfter("_script {") })
     }
 
+    @Test
+    fun `should parse long function body and class body`() {
+        // given
+        val count = 100_000
+        val script = buildString {
+            appendLine("fun f(): Int {")
+            appendLine("    val v0 = 0")
+            (1 until count).forEach { appendLine("    val v$it = v${it - 1}") }
+            appendLine("    return v${count - 1}")
+            appendLine("}")
+            appendLine("class C {")
+            appendLine("    val w0 = 0")
+            (1 until count).forEach { appendLine("    val w$it = w${it - 1}") }
+            appendLine("}")
+            append("f() + C().w${count - 1}")
+        }
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val body = source.text.substringAfter("_script {")
+        assert("fun f(): Int {" in body && "class C {" in body)
+    }
+
 }

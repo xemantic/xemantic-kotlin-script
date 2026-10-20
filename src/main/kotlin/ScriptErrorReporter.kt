@@ -180,7 +180,7 @@ internal class ScriptErrorReporter(
                     sourceLine = source.scriptLines[scriptLine]
                 )
                 index == 0 -> Frame(
-                    location = "${element.className}.${element.methodName}(${element.fileName}:${element.lineNumber})",
+                    location = "${element.className}.${element.methodName}(${sourceOf(element)})",
                     sourceLine = null
                 )
                 else -> null
@@ -200,6 +200,19 @@ internal class ScriptErrorReporter(
                 +"$indent  ... (the $repeated above repeated ${repetitions - 1} more times)\n"
             }
             index += length * repetitions
+        }
+    }
+
+    /** Like in [StackTraceElement.toString], e.g. `Native Method`, instead of the negative line number. */
+    private fun sourceOf(
+        frame: StackTraceElement
+    ): String {
+        val fileName = frame.fileName
+        return when {
+            frame.isNativeMethod -> "Native Method"
+            fileName == null -> "Unknown Source"
+            frame.lineNumber >= 0 -> "$fileName:${frame.lineNumber}"
+            else -> fileName
         }
     }
 
@@ -340,19 +353,23 @@ internal class ScriptErrorReporter(
 
     /**
      * Unlike in a regular script, the declarations moved out of the script body cannot see its local declarations,
-     * and the local functions and classes of the script body are not visible before their declaration.
+     * and the local declarations of the script body are not visible before their declaration.
      */
     private fun StringBuilder.appendHint(
         name: String,
         position: ScriptPosition
     ) {
-        val (line, isClass) = source.bodyDeclarationLine(name) ?: return
+        val (line, kind) = source.bodyDeclarationLine(name) ?: return
         val declaration = source.movedDeclarationAt(position)
         if (declaration != null) {
             +"  hint: '$declaration' is compiled outside of the script body, where '$name' (line ${line + 1}) is not visible"
             +" - pass it as a parameter, or declare it within '$declaration'.\n"
         } else if (line > position.line) {
-            val declarations = if (isClass) "classes" else "functions"
+            val declarations = when (kind) {
+                CLASS -> "classes"
+                FUNCTION -> "functions"
+                else -> "properties"
+            }
             +"  hint: '$name' is declared at line ${line + 1}, while the $declarations of the script body are visible only after their declaration"
             +" - move it before line ${position.line + 1}.\n"
         }

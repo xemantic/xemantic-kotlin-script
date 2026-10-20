@@ -98,4 +98,37 @@ class ScriptErrorReporterTest {
         """.trimIndent()
     }
 
+    @Test
+    fun `should report native frame and frames without source information`() {
+        // given
+        fun failure(
+            message: String,
+            frame: StackTraceElement,
+            cause: Throwable? = null
+        ) = RuntimeException(message, cause).apply { stackTrace = arrayOf(frame) }
+        val throwable = failure(
+            "native",
+            StackTraceElement("java.lang.reflect.Array", "newArray", "Array.java", -2),
+            failure(
+                "no line",
+                StackTraceElement("Foo", "bar", "Foo.java", -1),
+                failure("no file", StackTraceElement("Foo", "baz", null, -1))
+            )
+        )
+        val reporter = ScriptErrorReporter(ScriptSource("foo"))
+
+        // when
+        val message = reporter.toFailureMessage(throwable, warnings = emptyList())
+
+        // then
+        message sameAs """
+            java.lang.RuntimeException: native
+              at java.lang.reflect.Array.newArray(Native Method)
+            Caused by: java.lang.RuntimeException: no line
+              at Foo.bar(Foo.java)
+            Caused by: java.lang.RuntimeException: no file
+              at Foo.baz(Unknown Source)
+        """.trimIndent()
+    }
+
 }

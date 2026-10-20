@@ -69,6 +69,7 @@ import org.jetbrains.kotlin.psi.psiUtil.endOffset
 import org.jetbrains.kotlin.psi.psiUtil.getReceiverExpression
 import org.jetbrains.kotlin.psi.psiUtil.startOffset
 import org.jetbrains.kotlin.psi.psiUtil.startOffsetSkippingComments
+import java.util.IdentityHashMap
 import kotlin.concurrent.atomics.AtomicLong
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.concurrent.atomics.incrementAndFetch
@@ -115,6 +116,12 @@ internal class ScriptSource(
     /** The first `}` closing the script block, which would otherwise end the script early. */
     val unmatchedClosingBrace: ScriptPosition?
 
+    /**
+     * Whether the script ends with a declaration moved out of the script body, so it returns `Unit`,
+     * while the block returns `null` instead, as `Unit` might be shadowed by a declaration or a dependency of the script.
+     */
+    val returnsUnit: Boolean
+
     private val lineStarts: List<Int>
 
     /** For each line of the [text], the line of the script, or `null` for the lines of the block and the preamble. */
@@ -137,6 +144,7 @@ internal class ScriptSource(
         val structure = ScriptStructure(script.replace('\r', '\n'))
         unmatchedClosingBrace = structure.unmatchedClosingBrace?.let { position(it) }
         movedDeclarations = structure.movedDeclarations
+        returnsUnit = structure.endsWithMovedDeclaration
         bodyDeclarations = structure.bodyDeclarations
 
         val lines = mutableListOf<String>()
@@ -175,9 +183,9 @@ internal class ScriptSource(
         addLines(lineOf(headerEnd)..lineBounds.lastIndex) { offset ->
             offset >= headerEnd && !excluded[offset]
         }
-        if (structure.endsWithMovedDeclaration) {
+        if (returnsUnit) {
             // the block would return the value of the statement before the declaration, unlike the script
-            lines += "Unit"
+            lines += "null"
             mapping += null
         }
         lines += "}"
@@ -246,12 +254,12 @@ internal class ScriptSource(
     }
 
     /**
-     * The 0-based line of the declaration of the [name] in the script body, and whether it is a class.
+     * The 0-based line of the declaration of the [name] in the script body, and its kind.
      */
     fun bodyDeclarationLine(
         name: String
-    ): Pair<Int, Boolean>? = bodyDeclarations.find { it.name == name || name in it.destructuredNames }?.let {
-        position(it.start).line to it.isClass
+    ): Pair<Int, DeclarationKind>? = bodyDeclarations.find { it.name == name || name in it.destructuredNames }?.let {
+        position(it.start).line to it.kind
     }
 
     private fun position(
@@ -297,17 +305,17 @@ private fun lineBounds(
 
 private class Declaration(
     val name: String?,
+    val kind: DeclarationKind,
     val start: Int,
     val end: Int,
     val nameRange: IntRange?,
     /** The names of a destructuring declaration, like `val (a, b) = pair`. */
     val destructuredNames: List<String> = emptyList(),
-    val isClass: Boolean = false,
     /** The ranges of the names of the classes nested in the declaration, by these names, the first one of each name. */
     val nestedNameRanges: Map<String, IntRange> = emptyMap()
 )
 
-private enum class DeclarationKind {
+internal enum class DeclarationKind {
     CLASS,
     INTERFACE,
     OBJECT,
@@ -385,7 +393,8 @@ private class Reference(
  * bound by the declarations within the [scope], exclusive.
  */
 private fun PsiElement.references(
-    scope: PsiElement
+    scope: PsiElement,
+    declaredNames: DeclaredNames
 ): List<Reference> = collectDescendantsOfType<KtSimpleNameExpression> {
     it !is KtLabelReferenceExpression && it.parent !is KtValueArgumentName
 }.map { expression ->
@@ -397,7 +406,7 @@ private fun PsiElement.references(
         isQualified = expression.getReceiverExpression() != null || (
                 callableReference?.callableReference == expression && callableReference.receiverExpression != null
         ),
-        isBound = isBound(expression, name, scope)
+        isBound = isBound(expression, name, scope, declaredNames)
     )
 }
 
@@ -408,7 +417,8 @@ private fun PsiElement.references(
 private fun isBound(
     expression: PsiElement,
     name: String,
-    scope: PsiElement
+    scope: PsiElement,
+    declaredNames: DeclaredNames
 ): Boolean {
     var child = expression
     var parent = expression.parent
@@ -417,11 +427,11 @@ private fun isBound(
     while (parent != null && parent !== scope) {
         val declares = when (parent) {
             is KtDeclarationWithBody -> parent.valueParameters.any { it.declares(name) }
-            is KtBlockExpression -> parent.statements.takeWhile { it !== child }.any { it.declares(name) }
+            is KtBlockExpression -> declaredNames.isDeclaredBefore(parent, child, name)
             is KtForExpression -> child === parent.body && parent.loopParameter?.declares(name) == true
             is KtCatchClause -> child === parent.catchBody && parent.catchParameter?.name == name
             is KtWhenExpression -> child !== parent.subjectVariable && parent.subjectVariable?.name == name
-            is KtClassBody -> parent.declarations.any { it.declares(name) }
+            is KtClassBody -> declaredNames.isDeclared(parent, name)
             is KtClassOrObject -> parent.primaryConstructorParameters.any {
                 it.name == name && (it.hasValOrVar() || !inFunction)
             }
@@ -437,11 +447,55 @@ private fun isBound(
 
 private fun PsiElement.declares(
     name: String
-): Boolean = when (this) {
-    is KtParameter -> this.name == name || destructuringDeclaration?.declares(name) == true
-    is KtDestructuringDeclaration -> entries.any { it.name == name }
-    is KtNamedDeclaration -> this.name == name
-    else -> false
+): Boolean = name in declaredNames()
+
+private fun PsiElement.declaredNames(): List<String> = when (this) {
+    is KtParameter -> listOfNotNull(name) + destructuringDeclaration?.declaredNames().orEmpty()
+    is KtDestructuringDeclaration -> entries.mapNotNull { it.name }
+    is KtNamedDeclaration -> listOfNotNull(name)
+    else -> emptyList()
+}
+
+/**
+ * The names declared in the blocks and the class bodies, collected once for each of them,
+ * as otherwise every reference would scan all the declarations of its enclosing ones.
+ */
+private class DeclaredNames {
+
+    /** The index of the first statement declaring each name, by the blocks. */
+    private val blockNames = IdentityHashMap<KtBlockExpression, Map<String, Int>>()
+
+    /** The index of each statement in its block. */
+    private val statementIndices = IdentityHashMap<PsiElement, Int>()
+
+    private val classBodyNames = IdentityHashMap<KtClassBody, Set<String>>()
+
+    /** Whether the [name] is declared in the [block] by a statement preceding the [child] of the block. */
+    fun isDeclaredBefore(
+        block: KtBlockExpression,
+        child: PsiElement,
+        name: String
+    ): Boolean {
+        val names = blockNames.getOrPut(block) {
+            buildMap {
+                block.statements.forEachIndexed { index, statement ->
+                    statementIndices[statement] = index
+                    statement.declaredNames().forEach { putIfAbsent(it, index) }
+                }
+            }
+        }
+        val declaration = names[name] ?: return false
+        // a child which is not a statement, e.g. of an erroneous script, sees all the statements
+        return declaration < (statementIndices[child] ?: Int.MAX_VALUE)
+    }
+
+    fun isDeclared(
+        classBody: KtClassBody,
+        name: String
+    ): Boolean = name in classBodyNames.getOrPut(classBody) {
+        classBody.declarations.flatMapTo(HashSet()) { it.declaredNames() }
+    }
+
 }
 
 /**
@@ -467,6 +521,8 @@ private class ScriptStructure(
     /** The modifiers which are not applicable to local declarations. */
     val blankedRanges = mutableListOf<IntRange>()
 
+    private val declaredNames = DeclaredNames()
+
     init {
         val file = psiFactory.createFile("script.kts", script)
         headerEnd = listOfNotNull(
@@ -483,7 +539,7 @@ private class ScriptStructure(
         val declarations = statements.mapNotNull { parseDeclaration(it) }
         val declarationsByPsi = declarations.associateBy { it.psi }
         val bodyReferences = statements.flatMap { statement ->
-            declarationsByPsi[statement]?.references ?: statement.references(scope = statement.parent)
+            declarationsByPsi[statement]?.references ?: statement.references(scope = statement.parent, declaredNames)
         }
         val moved = selectMovedDeclarations(declarations, bodyReferences)
         movedDeclarations = moved.map { it.toDeclaration(withNestedNames = true) }
@@ -521,20 +577,20 @@ private class ScriptStructure(
         /** Whether it is a function with a receiver, like `fun Int.double()`. */
         val isExtension: Boolean,
         /** The names of the supertypes, like `Shape` in `class Circle(val r: Int) : Shape`. */
-        val supertypeNames: List<String>
+        val supertypeNames: List<String>,
+        val references: List<Reference>
     ) {
         /** Without the comments preceding the declaration, which are left in the script body. */
         val start = psi.startOffsetSkippingComments
-        val references = psi.references(scope = psi.parent)
         fun toDeclaration(
             withNestedNames: Boolean = false
         ) = Declaration(
             name = name,
+            kind = kind,
             start = start,
             end = end,
             nameRange = nameRange,
             destructuredNames = destructuredNames,
-            isClass = kind == DeclarationKind.CLASS,
             nestedNameRanges = if (withNestedNames && psi is KtClassOrObject) {
                 buildMap {
                     psi.collectDescendantsOfType<KtClassOrObject> { it !== psi }.forEach { nested ->
@@ -603,7 +659,8 @@ private class ScriptStructure(
             isExtension = declaration is KtNamedFunction && declaration.receiverTypeReference != null,
             supertypeNames = (declaration as? KtClassOrObject)?.superTypeListEntries.orEmpty().mapNotNull {
                 (it.typeReference?.typeElement as? KtUserType)?.referencedName
-            }
+            },
+            references = declaration.references(scope = declaration.parent, declaredNames)
         )
     }
 

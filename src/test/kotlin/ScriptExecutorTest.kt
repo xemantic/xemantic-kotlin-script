@@ -2500,4 +2500,49 @@ class ScriptExecutorTest {
         assert(targets == listOf("17", "21", JvmTarget.supportedValues().last().description))
     }
 
+    @Test
+    fun `should return Unit when script ends with declaration moved out of the script body while Unit is shadowed`() = runTest {
+        // given
+        val scripts = listOf(
+            "val Unit = 7\nenum class Color { RED }" to emptyList(),
+            "42\nenum class Color { RED }" to listOf(dependency("Unit", 42))
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { (script, dependencies) -> executor.execute(script, dependencies) }
+
+        // then
+        results.forEach { result ->
+            result should {
+                be<ScriptResult.Value>()
+                have(value === Unit)
+            }
+        }
+    }
+
+    @Test
+    fun `should hint to declare property before its use`() = runTest {
+        // given
+        val script = """
+            println(x)
+            val x = 1
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:9: error: Unresolved reference 'x'.
+                  | println(<error>x</error>)
+                  hint: 'x' is declared at line 2, while the properties of the script body are visible only after their declaration - move it before line 1.
+            """.trimIndent()
+        }
+    }
+
 }

@@ -33,6 +33,7 @@ import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.concurrent.atomics.fetchAndIncrement
 import kotlin.concurrent.atomics.incrementAndFetch
 import kotlin.coroutines.CoroutineContext
+import kotlin.reflect.KClass
 import kotlin.reflect.typeOf
 import kotlin.script.experimental.api.CompiledScript
 import kotlin.script.experimental.api.KotlinType
@@ -133,7 +134,7 @@ internal class DefaultScriptExecutor(
 
         dependencies.groupBy { it.name }.forEach { (name, sameName) ->
             require(sameName.size == 1) { "Duplicate dependency name: $name" }
-            require(name != SCRIPT_BLOCK_NAME && !name.startsWith(GENERIC_DEPENDENCY_PREFIX)) {
+            require(name != SCRIPT_BLOCK_NAME && !name.startsWith(HIDDEN_DEPENDENCY_PREFIX)) {
                 "Reserved dependency name: $name"
             }
         }
@@ -316,10 +317,7 @@ internal class DefaultScriptExecutor(
         ): ScriptResult = when (this) {
             is ResultValue.Value -> {
                 // the script block closed early, unnoticed by the check of the unmatched closing brace
-                if (value !is Function2<*, *, *>) return ScriptResult.Error(
-                    "error: The script could not be run, check if its braces are balanced.",
-                    ExecutionPhase.COMPILATION
-                )
+                if (value !is Function2<*, *, *>) return earlyClosedBlockError()
                 @Suppress("UNCHECKED_CAST")
                 val block = value as suspend CoroutineScope.() -> Any?
                 // only what the block throws is the failure of the script, not the reporting of its warnings
@@ -334,18 +332,24 @@ internal class DefaultScriptExecutor(
                     Result.failure(e.unwrapRecoveredCopy())
                 }
                 returned.fold(
-                    onSuccess = { ScriptResult.Value(it, warningsMessage(warnings)) },
+                    onSuccess = { ScriptResult.Value(if (source.returnsUnit) Unit else it, warningsMessage(warnings)) },
                     // the exception of the script is not passed to the logger,
                     // which might read its properties, overridden by the script to throw
                     onFailure = { failure(it, warnings, block::class.java.name) }
                 )
             }
-            is ResultValue.Unit -> ScriptResult.Value(Unit, warningsMessage(warnings))
+            // the script block closed early as well, followed by a statement of Unit type, or a declaration
+            is ResultValue.Unit -> earlyClosedBlockError()
             is ResultValue.Error -> failure(error, warnings, blockClassName = null)
             is ResultValue.NotEvaluated -> throw IllegalStateException(
                 "Should never happen"
             )
         }
+
+        private fun earlyClosedBlockError() = ScriptResult.Error(
+            "error: The script could not be run, check if its braces are balanced.",
+            ExecutionPhase.COMPILATION
+        )
 
         private fun warningsMessage(
             warnings: List<ScriptDiagnostic>
@@ -443,26 +447,27 @@ internal fun scriptJvmTarget(
 
 private const val SCRIPT_BLOCK_NAME = "_script"
 
-private const val GENERIC_DEPENDENCY_PREFIX = "_dependency_"
+private const val HIDDEN_DEPENDENCY_PREFIX = "_dependency_"
 
 /*
  * The scripting host erases the type arguments of a provided property,
  * and fails to compile the erased type of a nested class,
- * so a dependency of generic type is provided under a hidden name as `Any?`,
+ * while it cannot construct the script class taking a property of value class type, which is not boxed,
+ * so such a dependency is provided under a hidden name as `Any?`,
  * and cast back to its type by an accessor declared in the preamble of the script.
  */
 
-private val ScriptExecutor.Dependency<*>.isGeneric: Boolean
-    get() = type.arguments.isNotEmpty()
+private val ScriptExecutor.Dependency<*>.isHidden: Boolean
+    get() = type.arguments.isNotEmpty() || (type.classifier as? KClass<*>)?.isValue == true
 
 private val ScriptExecutor.Dependency<*>.providedName: String
-    get() = if (isGeneric) "$GENERIC_DEPENDENCY_PREFIX$name" else name
+    get() = if (isHidden) "$HIDDEN_DEPENDENCY_PREFIX$name" else name
 
 private val ScriptExecutor.Dependency<*>.providedType: KotlinType
-    get() = if (isGeneric) KotlinType(typeOf<Any?>()) else KotlinType(type)
+    get() = if (isHidden) KotlinType(typeOf<Any?>()) else KotlinType(type)
 
 private val ScriptExecutor.Dependency<*>.accessor: String?
-    get() = if (isGeneric) {
+    get() = if (isHidden) {
         "@Suppress(\"UNCHECKED_CAST\") val `$name`: $type get() = `$providedName` as $type"
     } else {
         null
