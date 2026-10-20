@@ -43,7 +43,7 @@ class ScriptSourceTest {
         val source = ScriptSource(script)
 
         // then
-        assert(source.text.substringAfter(SCRIPT_BLOCK_START).removeSuffix("}").trim() == "Start.A.first()")
+        assert(source.text.substringAfter(SCRIPT_BLOCK_START).removeSuffix(SCRIPT_BLOCK_END).trim() == "Start.A.first()")
     }
 
     @Test

@@ -321,10 +321,11 @@ internal class ScriptErrorReporter(
             appendHint(
                 name = match.groupValues[1],
                 position = start,
-                // unlike a property, a function of the same name is called, also with a trailing lambda
+                // unlike a property, a function of the same name is called, also with a trailing lambda,
+                // unless it is a supertype, like in `class T : Base {`
                 preferFunction = source.scriptLines[end.line].drop(end.column).trimStart().let {
                     it.startsWith('(') || it.startsWith('{')
-                }
+                } && !source.scriptLines[start.line].take(start.column).trimEnd().endsWith(':')
             )
         }
         if (capturing != null) {

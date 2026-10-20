@@ -34,7 +34,6 @@ import kotlin.concurrent.atomics.fetchAndIncrement
 import kotlin.concurrent.atomics.incrementAndFetch
 import kotlin.coroutines.CoroutineContext
 import kotlin.reflect.KClass
-import kotlin.reflect.KFunction
 import kotlin.reflect.typeOf
 import kotlin.script.experimental.api.CompiledScript
 import kotlin.script.experimental.api.KotlinType
@@ -59,25 +58,19 @@ import kotlin.time.measureTimedValue
  * which [ScriptExecutor.execute] runs in the coroutine of its caller.
  */
 public object ScriptBlock {
-    public operator fun <S : CoroutineScope> invoke(
-        receiver: (CoroutineScope) -> S,
-        block: suspend S.() -> Any?
-    ): ScriptBody<S> = ScriptBody(receiver, block)
+    public operator fun <S> invoke(
+        receiver: () -> S,
+        block: S.() -> (suspend CoroutineScope.() -> Any?)
+    ): ScriptBody = ScriptBody { receiver().block() }
 }
 
 /**
- * The script body, run with the [receiver] of the coroutine scope of the caller, giving access to the dependencies.
+ * The script body, with the outer receiver giving access to the shadowed dependencies,
+ * see [ScriptSource], run with the coroutine scope of the caller as the inner one.
  */
-public class ScriptBody<S : CoroutineScope> internal constructor(
-    private val receiver: (CoroutineScope) -> S,
-    internal val block: suspend S.() -> Any?
-) {
-
-    internal suspend fun run(
-        scope: CoroutineScope
-    ): Any? = receiver(scope).block()
-
-}
+public class ScriptBody internal constructor(
+    internal val block: () -> (suspend CoroutineScope.() -> Any?)
+)
 
 /**
  * The default [ScriptExecutor], see the `ScriptExecutor(...)` factory function for the parameters.
@@ -155,9 +148,7 @@ internal class DefaultScriptExecutor(
             require(name != SCRIPT_BLOCK_NAME && name != DEPENDENCIES_CLASS_NAME && !name.startsWith(HIDDEN_DEPENDENCY_PREFIX)) {
                 "Reserved dependency name: $name"
             }
-            // the member of the receiver of the script body, conflicting with the accessor of the dependency,
-            // and the extension of the coroutine scope, resolved instead within the nested ones, like `launch { }`
-            require(name != "coroutineContext" && name != "isActive") {
+            require(name !in coroutineScopeNames) {
                 "Reserved dependency name: $name - it would be resolved to the CoroutineScope of the script body"
             }
         }
@@ -349,12 +340,11 @@ internal class DefaultScriptExecutor(
         ): ScriptResult = when (this) {
             is ResultValue.Value -> {
                 // the script block closed early, unnoticed by the check of the unmatched closing brace
-                val body = value as? ScriptBody<*> ?: return earlyClosedBlockError()
-                val block = body.block
+                val block = (value as? ScriptBody ?: return earlyClosedBlockError()).block()
                 // only what the block throws is the failure of the script, not the reporting of its warnings
                 val returned = try {
                     // the scripting host sets it only while constructing the script, which just returns the block
-                    Result.success(withContext(ContextClassLoader(block::class.java.classLoader)) { body.run(this) })
+                    Result.success(withContext(ContextClassLoader(block::class.java.classLoader)) { block() })
                 } catch (e: Throwable) {
                     // the cancellation of the caller is not a failure of the script
                     if (e is CancellationException) currentCoroutineContext().ensureActive()
@@ -480,6 +470,16 @@ private const val SCRIPT_BLOCK_NAME = "_script"
 
 private const val HIDDEN_DEPENDENCY_PREFIX = "_dependency_"
 
+/**
+ * The members and the extensions of the coroutine scope, which is the receiver of the script body,
+ * and of the nested ones, like in `launch { }`, imported by default,
+ * so the script would refer to them instead of the dependencies of these names,
+ * as the members and extensions of the receivers take precedence, like `size` in `list.run { size }`.
+ */
+private val coroutineScopeNames = setOf(
+    "coroutineContext", "isActive", "javaClass", "launch", "async", "cancel", "ensureActive", "plus"
+)
+
 /*
  * The scripting host erases the type arguments of a provided property,
  * fails to compile the erased type of a nested class,
@@ -504,7 +504,11 @@ private val ScriptExecutor.Dependency<*>.accessor: String
 
 /** Whether it is of a function type, or of a type with the `invoke` operator, so the script can call it. */
 private val ScriptExecutor.Dependency<*>.isCallable: Boolean
-    get() = (type.classifier as? KClass<*>)?.let { type ->
-        Function::class.java.isAssignableFrom(type.java)
-                || type.members.any { it is KFunction<*> && it.name == "invoke" && it.isOperator }
+    get() = (type.classifier as? KClass<*>)?.java?.let { type ->
+        Function::class.java.isAssignableFrom(type) || try {
+            type.methods.any { it.name == "invoke" }
+        } catch (_: LinkageError) {
+            // e.g. a method referring to an optional class, which is missing
+            false
+        }
     } == true

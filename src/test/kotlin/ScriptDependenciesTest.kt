@@ -370,7 +370,7 @@ class ScriptDependenciesTest {
     @Test
     fun `should reject dependency names resolved to the coroutine scope of the script body instead`() = runTest {
         // given
-        val names = listOf("coroutineContext", "isActive")
+        val names = listOf("coroutineContext", "isActive", "javaClass", "launch", "async", "cancel", "ensureActive", "plus")
         val executor = ScriptExecutor()
 
         // when

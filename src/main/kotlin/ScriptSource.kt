@@ -105,7 +105,10 @@ internal const val DEPENDENCIES_CLASS_NAME = "_ScriptDependencies"
 private const val DEPENDENCIES_CLASS = "`$DEPENDENCIES_CLASS_NAME`"
 
 /** The line starting the script block in the [ScriptSource.text]. */
-internal const val SCRIPT_BLOCK_START = "_script({ $DEPENDENCIES_CLASS(it) }) {"
+internal const val SCRIPT_BLOCK_START = "_script({ $DEPENDENCIES_CLASS() }) { {"
+
+/** The line ending the script block in the [ScriptSource.text]. */
+internal const val SCRIPT_BLOCK_END = "} }"
 
 /**
  * The script turned into a block, which can be run in the coroutine of the caller:
@@ -113,21 +116,22 @@ internal const val SCRIPT_BLOCK_START = "_script({ $DEPENDENCIES_CLASS(it) }) {"
  * ```
  * <file annotations, package and imports>
  * <the dependency accessors, unless shadowed by the local declarations of the script body>
- * class _ScriptDependencies(scope: CoroutineScope) : CoroutineScope by scope {
- * <the dependency accessors>
+ * class _ScriptDependencies {
+ * <the accessors of the shadowed dependencies>
  * }
  * <declarations which cannot be local>
- * _script({ _ScriptDependencies(it) }) {
+ * _script({ _ScriptDependencies() }) { {
  * <the rest of the script>
- * }
+ * } }
  * ```
  *
- * The script body refers to the dependencies as the members of its receiver,
- * resolved after the members of the inner receivers, like `size` in `list.run { size }`,
- * but before the extensions of the coroutine scope, like `isActive`.
- * The declarations moved out of the script body refer to them as the members of the script instead,
- * so a dependency shadowed by a local declaration of the script body is not declared there,
- * leaving their references to it unresolved, as in the script they refer to the local declaration.
+ * The script refers to the dependencies as the members of the script,
+ * resolved after the members of the receivers, like `size` in `list.run { size }`.
+ * A dependency shadowed by a local declaration of the script body is not declared there,
+ * leaving the references of the declarations moved out of the script body unresolved,
+ * as in the script they refer to the local declaration,
+ * while the script body refers to it as the member of the outer receiver of the script block,
+ * the inner one being the coroutine scope of the caller.
  *
  * Declarations are moved by blanking them out with spaces in one copy of their lines,
  * and everything else in the other, so the columns of the script are retained,
@@ -214,12 +218,13 @@ internal class ScriptSource(
             lines += dependency.accessor
             mapping += null
         }
-        dependencies.filterNot {
+        val (shadowed, visible) = dependencies.partition {
             it.name in structure.localProperties || (it.isCallable && it.name in structure.localFunctions)
-        }.forEach { addAccessor(it) }
-        lines += "class $DEPENDENCIES_CLASS(scope: kotlinx.coroutines.CoroutineScope) : kotlinx.coroutines.CoroutineScope by scope {"
+        }
+        visible.forEach { addAccessor(it) }
+        lines += "class $DEPENDENCIES_CLASS {"
         mapping += null
-        dependencies.forEach { addAccessor(it) }
+        shadowed.forEach { addAccessor(it) }
         lines += "}"
         mapping += null
         movedDeclarations.forEach { declaration ->
@@ -237,7 +242,7 @@ internal class ScriptSource(
             lines += "null"
             mapping += null
         }
-        lines += "}"
+        lines += SCRIPT_BLOCK_END
         mapping += null
 
         text = lines.joinToString(separator = "\n")

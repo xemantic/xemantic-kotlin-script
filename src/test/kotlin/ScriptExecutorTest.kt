@@ -2830,25 +2830,6 @@ class ScriptExecutorTest {
     }
 
     @Test
-    fun `should resolve dependencies before the extensions of the coroutine scope of the script body`() = runTest {
-        // given
-        val script = """
-            listOf(javaClass, launch + 1)
-        """.trimIndent()
-        val dependencies = listOf(dependency("javaClass", "x"), dependency("launch", 1))
-        val executor = ScriptExecutor()
-
-        // when
-        val result = executor.execute(script, dependencies)
-
-        // then
-        result should {
-            be<ScriptResult.Value>()
-            have(value == listOf("x", 2))
-        }
-    }
-
-    @Test
     fun `should report error at declaration moved out of the script body calling dependency with invoke operator shadowed by local function`() = runTest {
         // given
         val script = """
@@ -2894,6 +2875,45 @@ class ScriptExecutorTest {
         result should {
             be<ScriptResult.Value>()
             have(value == "dep:x2")
+        }
+    }
+
+    @Test
+    fun `should run script body with the coroutine of its caller as the receiver`() = runTest {
+        // given
+        val script = """
+            this is Job && coroutineContext[Job] === this
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("limit", 1)))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == true)
+        }
+    }
+
+    @Test
+    fun `should call function moved out of the script body instead of callable dependency of the same name`() = runTest {
+        // given
+        val script = """
+            sealed interface S
+            class T : S { fun f() = g() }
+            fun g(): Int = 1
+            g() + T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<() -> Int>("g") { 2 }))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
         }
     }
 
