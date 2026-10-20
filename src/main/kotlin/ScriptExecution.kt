@@ -340,17 +340,28 @@ internal class DefaultScriptExecutor(
             val dependencies = deprecated(LATER_DECLARED_DEPENDENCY)
             // only the ones, which the local function applies to, unlike the dependency called anyway
             val functions = deprecated(LATER_DECLARED_FUNCTION)
-            val hidden = deprecated(HIDDEN_LOCAL_FUNCTION).filter { it !in errors }
+            // also by the name of the function, and its range, for the operators sharing their positions, like `get` and `set`
+            val hidden = reports.filter {
+                it.severity == ScriptDiagnostic.Severity.WARNING && HIDDEN_LOCAL_FUNCTION in it.message
+            }.mapNotNull { diagnostic ->
+                diagnostic.location?.let { location ->
+                    Triple(
+                        probe.toScriptPosition(location.start.line, location.start.col),
+                        location.end?.let { probe.toScriptPosition(it.line, it.col) },
+                        diagnostic.message
+                    )
+                }
+            }.filter { (start) -> start !in errors }
             // the references not resolved to the moved declarations, unless already reported as errors
             val toDeclarations = deprecated(COROUTINE_SCOPE_ORIGINAL)
-            val coroutineScope = source.coroutineScopeCandidates.filter { candidate ->
+            val coroutineScopeReferences = source.coroutineScopeCandidates.filter { candidate ->
                 toDeclarations.none { it in candidate.reference } && errors.none { it in candidate.reference }
             }
             // the calls not referring to the moved functions already, which would refer to them in the script, if they apply
             val toFunctions = deprecated(SHADOWED_ORIGINAL)
             val toProperties = source.shadowedFunctionCandidates.filter { (reference) -> toFunctions.none { it in reference } }
             // the remaining calls of the functions, which would refer to them in the script, if they apply, like the properties
-            val functionCandidates = coroutineScope.filter { it.isFunction }
+            val functionCandidates = coroutineScopeReferences.filter { it.isFunction }
             // independent of each other
             val (shadowed, toCoroutineScope) = coroutineScope {
                 val shadowed = async {
@@ -377,14 +388,19 @@ internal class DefaultScriptExecutor(
                         .any { it in candidate.reference }
                 },
                 // in the order of the script
-                coroutineScopeReferences = coroutineScope.filter { candidate ->
+                coroutineScopeReferences = coroutineScopeReferences.filter { candidate ->
                     !candidate.isFunction || toCoroutineScope.any { it in candidate.reference }
                 },
                 shadowedFunctionReferences = toProperties.filter { (reference) ->
                     shadowed.any { it in reference }
                 },
                 hiddenLocalFunctionReferences = source.hiddenLocalFunctionCandidates.filter { candidate ->
-                    hidden.any { it in candidate.reference }
+                    val reference = candidate.reference
+                    val name = Regex("[ .`]${Regex.escape(reference.name)}`?[(:<]")
+                    hidden.any { (start, end, message) ->
+                        start in reference && (!candidate.isOperator || (start == reference.start && (end == null || end == reference.end)))
+                                && name.containsMatchIn(message)
+                    }
                 }
             )
         }

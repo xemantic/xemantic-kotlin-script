@@ -3727,4 +3727,37 @@ class ScriptExecutorTest {
         )
     }
 
+    @Test
+    fun `should move functions using array access and loops next to operator functions accessing local properties`() = runTest {
+        // given
+        val scripts = listOf(
+            "class Grid { val cells = IntArray(4) }\nval log = mutableListOf<Int>()\nval g = Grid()\nval r = first(g)\nfun first(g: Grid) = g[0] + 1\noperator fun Grid.get(i: Int) = cells[i]\noperator fun Grid.set(i: Int, v: Int) { log += i; cells[i] = v }\nr",
+            "class Gen(var n: Int)\nval log = mutableListOf<Int>()\nval r = sum(listOf(1, 2, 3))\nfun sum(xs: List<Int>): Int { var t = 0; for (x in xs) t += x; return t }\noperator fun Gen.iterator() = this\noperator fun Gen.hasNext() = n > 0\noperator fun Gen.next(): Int { log += n; return n-- }\nr"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(1, 6))
+    }
+
+    @Test
+    fun `should report each invisible operator function of array access once`() = runTest {
+        // given
+        val scripts = listOf(
+            "val scale = listOf(10).first()\nclass Grid\noperator fun Grid.get(i: Int) = i * scale\noperator fun Grid.set(i: Int, v: Int) { println(scale) }\nval g get() = Grid().let { it[1] + 0 }\ng",
+            "val scale = listOf(10).first()\nclass Grid\noperator fun Grid.get(i: Int) = i * scale\nval g get() = listOf(Grid()).let { it[0][1] }\ng"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val messages = scripts.map { (executor.execute(it) as ScriptResult.Error).message }
+
+        // then
+        assert(messages.map { message -> message.lines().count { "does not refer to the function" in it } } == listOf(1, 1))
+        assert(messages.all { "'set'" !in it })
+    }
+
 }

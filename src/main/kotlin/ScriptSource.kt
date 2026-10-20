@@ -116,7 +116,9 @@ internal class LaterDeclaredReference(
     val line: Int,
     val isFunction: Boolean,
     /** Whether it refers to the declaration as a function, like `::foo`, which might be resolved to a property instead. */
-    val isCallableReference: Boolean = false
+    val isCallableReference: Boolean = false,
+    /** Whether it is an operator, or a convention, like `[]` of `get`, sharing its position with other ones, like `set`. */
+    val isOperator: Boolean = false
 ) {
     val kind: String get() = if (isFunction) "function" else "property"
 }
@@ -326,7 +328,7 @@ internal class ScriptSource(
         }
         fun Reference.toScriptReference() = ScriptReference(name, position(offset), position(offset + length))
         fun Triple<Reference, Int, Boolean>.toLaterDeclaredReference() = LaterDeclaredReference(
-            first.toScriptReference(), position(second).line, third, first.isCallableReference
+            first.toScriptReference(), position(second).line, third, first.isCallableReference, first.isOperator
         )
         laterDeclaredDependencyCandidates = structure.laterDeclaredDependencyCandidates.map { it.toLaterDeclaredReference() }
         hiddenLocalFunctionCandidates = structure.hiddenLocalFunctionCandidates.map { it.toLaterDeclaredReference() }
@@ -809,7 +811,9 @@ private val prefixOperatorNames = mapOf(
  * The references to the operator functions called by the operators and the conventions,
  * like `plus` of `a + b`, `get` of `a[i]`, `iterator` of `for (x in a)`, `component1` of `val (a, b) = p`, or `invoke` of `f()()`,
  * which are qualified, by the operands, so they might refer to the extension functions only,
- * at the positions of the operators, like `[`, so they do not contain the references of the operands.
+ * at the positions where the compiler reports the calls, like the whole array access expression,
+ * which might contain the references of the operands, and other operators, like `set` and `get`,
+ * so they are confirmed by the names of the functions as well, see [LaterDeclaredReference.isOperator].
  */
 private fun PsiElement.operatorReferences(
     scope: PsiElement
@@ -845,18 +849,21 @@ private fun PsiElement.operatorReferences(
                     (if (element.parent is KtPrefixExpression) prefixOperatorNames[token] else operatorNames[token])?.let { add(it, element) }
                 }
             }
-            // at the first character, where the compiler reports the call, which does not contain the operands
+            // the whole expression, where the compiler reports the call
             is KtArrayAccessExpression -> {
                 val parent = element.parent
                 val names = when {
-                    parent is KtBinaryExpression && parent.left == element ->
-                        if (parent.operationToken == KtTokens.EQ) listOf("set") else listOf("get", "set")
-                    parent is KtUnaryExpression -> listOf("get", "set")
+                    parent is KtBinaryExpression && parent.left == element && parent.operationToken == KtTokens.EQ -> listOf("set")
+                    parent is KtBinaryExpression && parent.left == element && parent.operationToken in KtTokens.AUGMENTED_ASSIGNMENTS ->
+                        listOf("get", "set")
+                    parent is KtUnaryExpression && (parent.operationToken == KtTokens.PLUSPLUS || parent.operationToken == KtTokens.MINUSMINUS) ->
+                        listOf("get", "set")
                     else -> listOf("get")
                 }
-                add(names, element, length = 1)
+                add(names, element)
             }
-            is KtForExpression -> element.loopRange?.let { add(listOf("iterator", "hasNext", "next"), element, it.startOffset, it.textLength) }
+            // while its `hasNext` and `next` are referred to by the `iterator`, as they are called on its result
+            is KtForExpression -> element.loopRange?.let { add(listOf("iterator"), element, it.startOffset, it.textLength) }
             is KtDestructuringDeclaration -> element.entries.forEachIndexed { index, entry ->
                 add(listOf("component${index + 1}"), element, entry.startOffset, entry.textLength)
             }
@@ -1477,16 +1484,27 @@ private class ScriptStructure(
         fun Reference.referenced(): List<ParsedDeclaration> = namedByName[name].orEmpty().filter {
             (!isQualified || it.isExtension) && (!isOperator || it.isOperator)
         }
+        // the operator functions called on the result of `iterator`, like by a for loop
+        val iteratorOperators = named.filter { it.isOperator && it.isExtension && (it.name == "hasNext" || it.name == "next") }
         val references = declarations.associateWith { declaration ->
             buildSet {
                 declaration.references.forEach { addAll(it.referenced()) }
+                if (declaration.isOperator && declaration.isExtension && declaration.name == "iterator") addAll(iteratorOperators)
                 if (declaration.isSealed) addAll(subtypesByName[declaration.name].orEmpty())
                 remove(declaration)
             }
         }
+        // not by the operators, which refer to the operator functions by their names only, whatever the types of the operands,
+        // so an operator function accessing the local properties would make all the declarations using such an operator accessing,
+        // while the ones calling it indeed are reported, see ScriptSource.hiddenLocalFunctionCandidates
         val referrers = mutableMapOf<ParsedDeclaration, MutableList<ParsedDeclaration>>()
-        references.forEach { (declaration, referenced) ->
-            referenced.forEach { referrers.getOrPut(it) { mutableListOf() } += declaration }
+        declarations.forEach { declaration ->
+            declaration.references.filter { !it.isOperator }.flatMap { it.referenced() }.toSet().forEach {
+                if (it !== declaration) referrers.getOrPut(it) { mutableListOf() } += declaration
+            }
+            if (declaration.isSealed) subtypesByName[declaration.name].orEmpty().forEach {
+                if (it !== declaration) referrers.getOrPut(it) { mutableListOf() } += declaration
+            }
         }
         val required = declarations.filter { it.requiresMove }.toSet()
         val accessingLocalProperties = declarations.filter { declaration ->
@@ -1541,7 +1559,8 @@ private class ScriptStructure(
                 moved += declaration
                 while (queue.isNotEmpty()) {
                     references.getValue(queue.removeFirst()).forEach {
-                        if (moved.add(it)) queue += it
+                        // referred to by an operator, while accessing the local properties, see the referrers
+                        if ((it.kind != DeclarationKind.FUNCTION || it !in accessing) && moved.add(it)) queue += it
                     }
                 }
             }
