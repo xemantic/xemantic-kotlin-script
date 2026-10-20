@@ -99,6 +99,19 @@ when (result) {
   An error message will hint at this, if it happens,
   also when such a reference compiles, as it is resolved to another declaration of the same name, like `check` of the standard library.
 
+### Known limitations
+
+The script body is compiled as a block, which differs from a regular script in how the names are resolved,
+when the declarations of the script have the same names as each other, or as the dependencies.
+Most of these cases are reported as errors, while the following ones still resolve differently, without an error:
+
+* overloads of a function, of which only some are compiled outside of the script body ([#30](https://github.com/xemantic/xemantic-kotlin-script/issues/30)),
+* a call preceding a local class named like a callable dependency ([#31](https://github.com/xemantic/xemantic-kotlin-script/issues/31)),
+* a call from outside of the script body to a local property, whose function type is known only to the compiler, like `val print = printer()` ([#32](https://github.com/xemantic/xemantic-kotlin-script/issues/32)),
+* a call preceding a local function named like a callable dependency, which refers to a local class declared later ([#33](https://github.com/xemantic/xemantic-kotlin-script/issues/33)).
+
+Giving the declarations and the dependencies distinct names avoids them.
+
 ### Error reporting
 
 A script like:

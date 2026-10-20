@@ -298,12 +298,7 @@ internal class DefaultScriptExecutor(
 
         private suspend fun doCompile(): Compilation {
             val source = source()
-            if (
-                source.unmatchedClosingBrace != null
-                || source.conflictingDependencyDeclarations.isNotEmpty()
-                || source.splitOverloads.isNotEmpty()
-                || source.laterDeclaredClassReferences.isNotEmpty()
-            ) {
+            if (source.unmatchedClosingBrace != null || source.conflictingDependencyDeclarations.isNotEmpty()) {
                 return Compilation(source, result = null)
             }
             val result = compile(source)
@@ -311,14 +306,12 @@ internal class DefaultScriptExecutor(
             val errors = result.reports.filter { it.severity == ScriptDiagnostic.Severity.ERROR }.mapNotNull { diagnostic ->
                 diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }
             }
-            // resolved to another declaration, as the local property is not visible
-            val untyped = source.untypedPropertyCallCandidates.filter { candidate -> errors.none { it in candidate.reference } }
             if (
                 source.laterDeclaredDependencyCandidates.isEmpty()
                 && source.hiddenLocalFunctionCandidates.isEmpty()
                 && source.shadowedFunctionCandidates.isEmpty()
             ) {
-                return Compilation(source, result, hiddenLocalFunctionReferences = untyped)
+                return Compilation(source, result)
             }
             // recognizing the candidates referring to the wrong declarations indeed
             val probe = source(confirming = true)
@@ -360,7 +353,7 @@ internal class DefaultScriptExecutor(
                 },
                 hiddenLocalFunctionReferences = source.hiddenLocalFunctionCandidates.filter { candidate ->
                     hidden.any { it in candidate.reference }
-                } + untyped
+                }
             )
         }
 

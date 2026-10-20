@@ -94,17 +94,7 @@ internal class ScriptErrorReporter(
             appendSourceLines(declaration.start, declaration.end)
             +"  hint: '${declaration.name}' is compiled outside of the script body, together with the dependencies - rename it.\n"
         }
-    }.plus(source.splitOverloads.map { (local, moved) ->
-        buildString {
-            appendPosition(local.start)
-            +"error: '${local.name}' is overloaded by the function declared at line ${moved + 1}, which is compiled outside of the script body, "
-            +"unlike this one accessing its local declarations, so this one hides it in the script body.\n"
-            appendSourceLines(local.start, local.end)
-            +"  hint: rename one of them.\n"
-        }
-    }).joinToString(separator = "\n").trimEnd().ifEmpty {
-        toLaterDeclaredDependencyMessage(source.laterDeclaredClassReferences)
-    }
+    }.joinToString(separator = "\n").trimEnd()
 
     /** The [references] of the script body to the local properties instead of the functions, see [ScriptSource.shadowedFunctionCandidates]. */
     fun toShadowedFunctionMessage(

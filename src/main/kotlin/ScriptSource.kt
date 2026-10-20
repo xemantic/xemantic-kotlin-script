@@ -109,10 +109,9 @@ internal class LaterDeclaredReference(
     val line: Int,
     val isFunction: Boolean,
     /** Whether it refers to the declaration as a function, like `::foo`, which might be resolved to a property instead. */
-    val isCallableReference: Boolean = false,
-    val isClass: Boolean = false
+    val isCallableReference: Boolean = false
 ) {
-    val kind: String get() = if (isClass) "class" else if (isFunction) "function" else "property"
+    val kind: String get() = if (isFunction) "function" else "property"
 }
 
 /** The deprecation message of the dependencies, see [ScriptSource.laterDeclaredDependencyCandidates]. */
@@ -231,26 +230,6 @@ internal class ScriptSource(
     val shadowedFunctionCandidates: List<Triple<ScriptReference, Int, Int>>
 
     /**
-     * The calls of the declarations moved out of the script body named like the local properties of the types,
-     * which might be functions, but are not known without compiling them, like `val print = printer()`,
-     * confirmed when the compilation resolves them to other declarations, like `print` of the standard library,
-     * as the local properties are not visible there.
-     */
-    val untypedPropertyCallCandidates: List<LaterDeclaredReference>
-
-    /**
-     * The local functions of the script body, by the 0-based lines of their overloads moved out of the script body,
-     * which the local ones hide in the script body, while in the script they are all visible.
-     */
-    val splitOverloads: List<Pair<ScriptReference, Int>>
-
-    /**
-     * The calls of the script body preceding the local classes named like the callable dependencies,
-     * by the 0-based lines of the classes, calling the dependencies instead.
-     */
-    val laterDeclaredClassReferences: List<LaterDeclaredReference>
-
-    /**
      * The references of the script body which might refer to the dependencies, preceding the declarations
      * of the local properties of the same names, like `x` in `fun show() = x` followed by `val x = 2`,
      * or of the local functions, when called, while in the script they refer to these declarations.
@@ -290,7 +269,6 @@ internal class ScriptSource(
         val structure = ScriptStructure(
             script.replace('\r', '\n'),
             dependencies.mapTo(HashSet()) { it.name },
-            dependencies.filter { it.isCallable }.mapTo(HashSet()) { it.name },
             confirming,
             shadowedFunctionCopies
         )
@@ -308,13 +286,6 @@ internal class ScriptSource(
         hiddenLocalFunctionCandidates = structure.hiddenLocalFunctionCandidates.map { it.toLaterDeclaredReference() }
         shadowedFunctionCandidates = structure.shadowedFunctionCandidates.map { (reference, property, function) ->
             Triple(reference.toScriptReference(), position(property).line, position(function).line)
-        }
-        untypedPropertyCallCandidates = structure.untypedPropertyCallCandidates.map { it.toLaterDeclaredReference() }
-        splitOverloads = structure.splitOverloads.map { (name, range, moved) ->
-            ScriptReference(name, position(range.first), position(range.last + 1)) to position(moved).line
-        }
-        laterDeclaredClassReferences = structure.laterDeclaredClassReferences.map { (reference, type) ->
-            LaterDeclaredReference(reference.toScriptReference(), position(type).line, isFunction = false, isClass = true)
         }
         bodyDeclarations = structure.bodyDeclarations
         val deprecatedDependencies = if (confirming) {
@@ -609,7 +580,8 @@ private fun KtNamedFunction.signature(): String? = if (
         (if (parameter.isVarArg) "vararg " else "") + "`${parameter.name}`: ${parameter.typeReference?.singleLineText()}" +
                 (if (parameter.hasDefaultValue()) " = kotlin.TODO()" else "")
     }
-    +"): Nothing"
+    // keeping the type of the call, which might be an argument of another one
+    +"): ${typeReference?.singleLineText() ?: "Nothing"}"
     typeConstraintList?.let {
         +" where "
         +it.singleLineText()
@@ -623,10 +595,15 @@ private fun KtNamedFunction.signature(): String? = if (
  */
 private fun KtProperty.functionType(
     /** The function of the script body of this name, like `rec` of `val print = ::rec`. */
-    localFunction: (String) -> KtNamedFunction?
+    localFunction: (String) -> KtNamedFunction?,
+    /** The type of the type alias of the script of this name, like `(Any?) -> Unit` of `typealias Printer = (Any?) -> Unit`. */
+    typeAlias: (String) -> String?
 ): String? {
+    // whatever it is, like a class with the invoke operator, as the compiler resolves the calls,
+    // except the type alias of the script, which the calls are not resolved to the same way as to its function type
     typeReference?.let { type ->
-        return type.singleLineText().takeIf { "->" in it }
+        val text = type.singleLineText()
+        return typeAlias(text.trim()) ?: text
     }
     fun List<KtParameter>.functionType(
         receiver: String? = null
@@ -647,14 +624,6 @@ private fun KtProperty.functionType(
         }
         else -> null
     }
-}
-
-/**
- * Whether the type of the property, which is not declared, might be a function type, unknown without compiling it,
- * unlike the one of a literal, like `10L` or `"text"`.
- */
-private fun KtProperty.mightBeFunction(): Boolean = typeReference == null && initializer.let {
-    it != null && !it.isConstant() && it !is KtStringTemplateExpression
 }
 
 /** The text without the comments and the line breaks, as each declaration of the preamble is a single line. */
@@ -842,8 +811,6 @@ private class DeclaredNames {
 private class ScriptStructure(
     private val script: String,
     dependencyNames: Set<String>,
-    /** The names of the dependencies, which can be called, like the local classes of these names. */
-    callableDependencyNames: Set<String>,
     /** Whether to compute the copies of the declarations, see [ScriptSource.confirming]. */
     confirming: Boolean,
     /** See [ScriptSource.shadowedFunctionCopies]. */
@@ -882,14 +849,6 @@ private class ScriptStructure(
     /** See [ScriptSource.shadowedFunctionCandidates], with the offsets of the properties and the functions. */
     val shadowedFunctionCandidates: List<Triple<Reference, Int, Int>>
 
-    /** See [ScriptSource.untypedPropertyCallCandidates], with the offsets of the properties. */
-    val untypedPropertyCallCandidates: List<Triple<Reference, Int, Boolean>>
-
-    /** See [ScriptSource.splitOverloads], with the ranges of the names of the local functions, and the offsets of the moved ones. */
-    val splitOverloads: List<Triple<String, IntRange, Int>>
-
-    /** See [ScriptSource.laterDeclaredClassReferences], with the offsets of the classes. */
-    val laterDeclaredClassReferences: List<Pair<Reference, Int>>
 
     /**
      * The deprecated copies of the local functions, see [ScriptSource.laterDeclaredDependencyCandidates],
@@ -959,7 +918,10 @@ private class ScriptStructure(
         fun ParsedDeclaration.refersToTypes(
             names: Set<String>
         ): Boolean = (psi as KtNamedFunction).let { function ->
-            listOfNotNull(function.receiverTypeReference, function.valueParameterList, function.typeParameterList, function.typeConstraintList)
+            listOfNotNull(
+                function.receiverTypeReference, function.valueParameterList, function.typeParameterList, function.typeConstraintList,
+                function.typeReference
+            )
                 .any { part -> part.collectDescendantsOfType<KtUserType>().any { it.referencedName in names } }
         }
         val localClassNames = localClasses.mapTo(HashSet()) { it.name!! }
@@ -968,19 +930,27 @@ private class ScriptStructure(
             it.kind == DeclarationKind.FUNCTION && it.isExtension && it !in moved && it.name != null
         }.groupBy { it.name!! }
         val localFunctionsByName = local.filter { it.name != null }.groupBy { it.name!! }
-        val localPropertiesByName = declarations.filter {
-            it.kind == DeclarationKind.PROPERTY && it !in moved && it.name != null
-        }.groupBy { it.name!! }
-        // the local properties of the known function types, which can be called
-        val callableProperties = localPropertiesByName.values.flatten().mapNotNull { property ->
-            (property.psi as? KtProperty)?.functionType { name ->
-                localFunctionsByName[name]?.singleOrNull()?.psi as? KtNamedFunction
-            }?.let { property to it }
-        }.groupBy { it.first.name!! }
-        // of the types, which might be functions, but are not known without compiling, like `val print = printer()`
-        val untypedProperties = localPropertiesByName.filterKeys { it !in callableProperties }.filterValues { properties ->
-            properties.any { (it.psi as? KtProperty)?.mightBeFunction() == true }
+        val typeAliases = declarations.mapNotNull { declaration ->
+            (declaration.psi as? KtTypeAlias)?.takeIf { it.typeParameters.isEmpty() }?.let { alias ->
+                alias.getTypeReference()?.let { alias.name!! to it.singleLineText() }
+            }
+        }.toMap()
+        // also the destructured ones, like `E` of `val (E, F) = 2.0 to 3.0`
+        val localPropertyDeclarations = declarations.filter { it.kind == DeclarationKind.PROPERTY && it !in moved }
+        val localPropertiesByName = buildMap<String, MutableList<ParsedDeclaration>> {
+            localPropertyDeclarations.forEach { property ->
+                (listOfNotNull(property.name) + property.destructuredNames).forEach { getOrPut(it) { mutableListOf() } += property }
+            }
         }
+        // the local properties of the known types, which might be called, unless they refer to the local classes
+        val callableProperties = localPropertyDeclarations.filter { it.name != null }.mapNotNull { property ->
+            (property.psi as? KtProperty)?.takeIf { declaration ->
+                declaration.typeReference?.collectDescendantsOfType<KtUserType>()?.none { it.referencedName in localClassNames } ?: true
+            }?.functionType(
+                localFunction = { name -> localFunctionsByName[name]?.singleOrNull()?.psi as? KtNamedFunction },
+                typeAlias = { name -> typeAliases[name] }
+            )?.let { property to it }
+        }.groupBy { it.first.name!! }
         hiddenLocalFunctionCandidates = moved.flatMap { declaration ->
             declaration.references.filter { !it.isBound }.mapNotNull { reference ->
                 val name = reference.name
@@ -990,25 +960,12 @@ private class ScriptStructure(
                     reference.isCall && name in localExtensions -> localExtensions.getValue(name).first() to true
                     // also with a receiver, like `" a ".trim()` of `val trim: String.() -> String`
                     reference.isCall && name in callableProperties -> callableProperties.getValue(name).first().first to false
-                    // confirmed by the compilation resolving it to another declaration, see untypedPropertyCallCandidates
-                    reference.isCall && reference.refersToLocal(localProperties) && name in untypedProperties -> null
                     // like `E`, resolved to `kotlin.math.E` instead
                     !reference.isCall && reference.refersToLocal(localProperties) && name in localPropertiesByName ->
                         localPropertiesByName.getValue(name).first() to false
                     else -> null
                 }?.let { (local, isFunction) -> Triple(reference, local.line(), isFunction) }
             }
-        }
-        untypedPropertyCallCandidates = moved.flatMap { declaration ->
-            declaration.references.filter {
-                it.isCall && it.refersToLocal(localProperties) && it.name in untypedProperties && it.name !in callableProperties
-            }.map { Triple(it, untypedProperties.getValue(it.name).first().line(), false) }
-        }
-        // the overloads, which are partly moved out of the script body, while the other ones hide them there
-        val movedFunctionOverloads = declarations.filter { it in moved && it.kind == DeclarationKind.FUNCTION && it.name != null }
-            .groupBy { it.name!! to it.isExtension }
-        splitOverloads = declarations.filter { it.kind == DeclarationKind.FUNCTION && it.name != null && it !in moved }.mapNotNull { local ->
-            movedFunctionOverloads[local.name!! to local.isExtension]?.first()?.let { Triple(local.name, local.nameRange!!, it.line()) }
         }
         hiddenLocalFunctionCopies = if (!confirming) emptyList() else {
             hiddenLocalFunctionCandidates.mapTo(LinkedHashSet()) { it.first.name }.flatMap { name ->
@@ -1078,11 +1035,23 @@ private class ScriptStructure(
             ) = candidatesByStatement.entries.sortedBy { it.key }.flatMap { (index, candidates) ->
                 candidates.map { it.first.name to index }
             }.distinctBy { it.first }.forEach { (name, index) ->
+                /** The start of the statement, including the comments preceding it, which the copies should not be inserted into. */
+                fun leadingStart(
+                    statementIndex: Int
+                ): Int {
+                    var start = statements[statementIndex].startOffset
+                    var element = statements[statementIndex].prevSibling
+                    while (element is PsiWhiteSpace || element is PsiComment) {
+                        if (element is PsiComment) start = element.startOffset
+                        element = element.prevSibling
+                    }
+                    return start
+                }
                 // preceding the first statement sharing the line, so the inserted line does not split another statement
                 var first = index
-                while (first > 0 && '\n' !in script.substring(statements[first - 1].endOffset, statements[first].startOffset)) first--
+                while (first > 0 && '\n' !in script.substring(statements[first - 1].endOffset, leadingStart(first))) first--
                 val invisibleClasses = localClasses.filter { statementIndices.getValue(it.psi) >= first }.mapTo(HashSet()) { it.name!! }
-                getOrPut(statements[first].startOffset) { mutableListOf() } += functions[name].orEmpty()
+                getOrPut(leadingStart(first)) { mutableListOf() } += functions[name].orEmpty()
                     .filterNot { it.refersToTypes(invisibleClasses) }
                     .mapNotNull { it.signature() }
                     .map { message to it }
@@ -1093,19 +1062,6 @@ private class ScriptStructure(
                 LATER_DECLARED_FUNCTION
             )
             if (shadowedFunctionCopies) addCopies(shadowedFunctionCandidatesByStatement, movedFunctionsByName, SHADOWED_FUNCTION)
-        }
-        // the calls preceding the local classes named like the callable dependencies, which they call instead
-        val firstLocalClasses = mutableMapOf<String, Pair<Int, ParsedDeclaration>>()
-        localClasses.filter { it.name in callableDependencyNames }.forEach {
-            firstLocalClasses.putIfAbsent(it.name!!, statementIndices.getValue(it.psi) to it)
-        }
-        laterDeclaredClassReferences = statements.indices.flatMap { index ->
-            if (declarationsByPsi[statements[index]] in moved) return@flatMap emptyList()
-            statementReferences[index].mapNotNull { reference ->
-                firstLocalClasses[reference.name]?.takeIf { (classIndex) ->
-                    classIndex > index && reference.isCall && reference.refersToLocal(localClassNames)
-                }?.let { (_, type) -> reference to type.line() }
-            }
         }
         // unlike an extension property, which does not conflict with the accessor of the dependency
         conflictingDependencyDeclarations = moved.filter {

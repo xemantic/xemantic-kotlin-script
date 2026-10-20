@@ -3442,11 +3442,8 @@ class ScriptExecutorTest {
             "val p = \"!\"\nval a = x(1)\nval b = x(\"a\")\nfun x(s: String) = \"local\" + s + p\na + b" to listOf(dependency<(Any) -> String>("x") { "dep$it" }),
             "val f = { s: String -> \"prop\" }\nval a = { f(1) }\nval b = f(\"a\")\nfun f(x: Int) = \"fun-int\"\nfun f(s: String) = \"fun-str\"\nb" to emptyList(),
             "val p = \"!\"\nval r = show(1)\nfun show(x: Any) = \"any${'$'}p\"\nfun show(x: Int) = \"int\"\nr + show(1)" to emptyList(),
-            "val p = \"!\"\nfun show(x: Any) = \"any${'$'}p\"\nfun show(x: Int) = \"int\"\nsealed interface S\nclass T : S { fun f() = show(1) }\nshow(1) + T().f()" to emptyList(),
             "val log = mutableListOf<String>()\nval print = fun(m: Any?) { log += m.toString() }\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()\nlog" to emptyList(),
-            "val log = mutableListOf<String>()\nfun rec(m: Any?) { log += m.toString() }\nval print = ::rec\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()\nlog" to emptyList(),
-            "val log = mutableListOf<String>()\nfun printer(): (Any?) -> Unit = { log += it.toString() }\nval print = printer()\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()\nlog" to emptyList(),
-            "val p = 1\nval r = Foo(2)\nclass Foo(val v: Int) { fun g() = v + p }\nr" to listOf(dependency<(Int) -> Int>("Foo") { it * 100 })
+            "val log = mutableListOf<String>()\nfun rec(m: Any?) { log += m.toString() }\nval print = ::rec\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()\nlog" to emptyList()
         )
         val executor = ScriptExecutor()
 
@@ -3455,6 +3452,41 @@ class ScriptExecutorTest {
 
         // then
         assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+    }
+
+    @Test
+    fun `should report wrongly resolved references after comments, of aliased function types and destructured names`() = runTest {
+        // given
+        val scripts = listOf(
+            "val p = \"!\"\nval log = mutableListOf<String>()\n/* note\n */ log += x(\"a\")\nfun x(s: String) = \"local\" + s + p\nlog" to listOf(dependency<(Any) -> String>("x") { "dep$it" }),
+            "val log = mutableListOf<String>()\ntypealias Printer = (Any?) -> Unit\nval print: Printer = { log += it.toString() }\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()\nlog" to emptyList(),
+            "import kotlin.math.*\nval (E, F) = 2.0 to 3.0\nsealed interface S\nclass T : S { fun f() = E }\nT().f()" to emptyList()
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { (script, dependencies) -> executor.execute(script, dependencies) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+    }
+
+    @Test
+    fun `should execute valid scripts with overloads, classes and properties named like other declarations`() = runTest {
+        // given
+        val scripts = listOf(
+            "val p = \"!\"\nfun show(x: Int) = \"int\" + p\ninline fun show(s: String) = \"str\" + s\nshow(1) + show(\"a\")" to emptyList(),
+            "val p = 1\nval r = Foo(\"x\")\nclass Foo(val v: Int) { fun g() = v + p }\nr" to listOf(dependency<(String) -> Int>("Foo") { 100 }),
+            "val delay = 10L * 2\nsealed class Task { suspend fun go(): String { delay(1); return \"done\" } }\nclass Job1 : Task()\nJob1().go() + delay" to emptyList(),
+            "val items = listOf(1, 2)\nval size = items.size\nsealed interface Shape { fun size(): Int = 3 }\nclass Box : Shape { fun twice() = 2 * size() }\nBox().twice() + size" to emptyList()
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { (script, dependencies) -> executor.execute(script, dependencies) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("int!stra", 100, "done20", 8))
     }
 
 }
