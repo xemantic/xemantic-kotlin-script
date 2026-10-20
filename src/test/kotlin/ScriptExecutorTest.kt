@@ -3317,4 +3317,33 @@ class ScriptExecutorTest {
         }
     }
 
+    @Test
+    fun `should report wrongly resolved references despite suppressions, multiline types and inapplicable overloads`() = runTest {
+        // given
+        val scripts = listOf(
+            // suppressed in another letter case
+            "@Suppress(\"deprecation_error\") fun show() = x\nval x = 2\nshow()" to listOf(dependency("x", 1)),
+            // parameter type spanning lines
+            "val strict = true\nfun check(flag: Boolean, cb: (\n String\n) -> Unit = {}) { if (strict && !flag) throw IllegalStateException() }\nsealed interface S\nclass T : S { fun f() = check(false) }\nT().f()" to emptyList(),
+            // local function which does not apply
+            "fun greet(n: Int) = n\nval r = greet(\"Joe\")\nval greet = { s: String -> \"Hi ${'$'}s\" }\nr" to listOf(dependency<(String) -> String>("greet") { "DEP ${'$'}it" }),
+            // local property of function type
+            "val log = mutableListOf<String>()\nval print = { m: Any? -> log += m.toString() }\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()\nlog" to emptyList(),
+            // local extension function
+            "val factor = 10\nfun List<Int>.sum(): Int = fold(0) { a, b -> a + b * factor }\nsealed class Shape { fun total() = listOf(1, 2).sum() }\nclass Circle : Shape()\nCircle().total()" to emptyList()
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { (script, dependencies) -> executor.execute(script, dependencies) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+        assert(results.all { result ->
+            (result as ScriptResult.Error).message.lines().first().let {
+                "refers to the dependency" in it || "does not refer to the" in it
+            }
+        })
+    }
+
 }

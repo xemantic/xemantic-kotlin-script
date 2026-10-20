@@ -98,14 +98,17 @@ internal class ScriptErrorReporter(
 
     /** The [references] of the declarations moved out of the script body to other functions, see [ScriptSource.hiddenLocalFunctionCandidates]. */
     fun toHiddenLocalFunctionMessage(
-        references: List<Pair<ScriptReference, Int>>
-    ): String = references.joinToString(separator = "\n") { (reference, line) ->
+        references: List<LaterDeclaredReference>
+    ): String = references.joinToString(separator = "\n") { hidden ->
+        val reference = hidden.reference
         val declaration = source.movedDeclarationAt(reference.start)
+        val kind = if (hidden.isFunction) "function" else "property"
         buildString {
             appendPosition(reference.start)
-            +"error: '${reference.name}' does not refer to the function of the script body declared at line ${line + 1}, which is not visible in '$declaration'.\n"
+            +"error: '${reference.name}' does not refer to the $kind of the script body declared at line ${hidden.line + 1}, which is not visible in '$declaration'.\n"
             appendSourceLines(reference.start, reference.end)
-            appendHint(reference.name, reference.start, preferFunction = true)
+            +"  hint: '$declaration' is compiled outside of the script body, where '${reference.name}' (line ${hidden.line + 1}) is not visible"
+            +" - pass it as a parameter, or declare it within '$declaration'.\n"
         }
     }.trimEnd()
 

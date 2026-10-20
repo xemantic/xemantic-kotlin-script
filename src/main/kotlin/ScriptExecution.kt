@@ -187,7 +187,7 @@ internal class DefaultScriptExecutor(
         /** The [ScriptSource.laterDeclaredDependencyCandidates] referring to the dependencies indeed. */
         val laterDeclaredDependencyReferences: List<LaterDeclaredReference> = emptyList(),
         /** The [ScriptSource.hiddenLocalFunctionCandidates] referring to other functions indeed. */
-        val hiddenLocalFunctionReferences: List<Pair<ScriptReference, Int>> = emptyList()
+        val hiddenLocalFunctionReferences: List<LaterDeclaredReference> = emptyList()
     )
 
     private inner class ScriptHandler(
@@ -321,21 +321,22 @@ internal class DefaultScriptExecutor(
                 laterDeclaredDependencyReferences = source.laterDeclaredDependencyCandidates.filter { candidate ->
                     (if (candidate.isFunction) functions else dependencies).any { it in candidate.reference }
                 },
-                hiddenLocalFunctionReferences = source.hiddenLocalFunctionCandidates.filter { (reference) ->
-                    hidden.any { it in reference }
+                hiddenLocalFunctionReferences = source.hiddenLocalFunctionCandidates.filter { candidate ->
+                    hidden.any { it in candidate.reference }
                 }
             )
         }
 
+        /** Inspected once, as recognizing a callable dependency might inspect its members by reflection. */
+        private val preambleDependencies by lazy {
+            allDependencies.filter { it.isHidden }.map { dependency ->
+                PreambleDependency(dependency.name, dependency.accessor, dependency.isCallable)
+            }
+        }
+
         private fun source(
             confirming: Boolean = false
-        ) = ScriptSource(
-            script,
-            dependencies = allDependencies.filter { it.isHidden }.map { dependency ->
-                PreambleDependency(dependency.name, dependency.accessor, dependency.isCallable)
-            },
-            confirming = confirming
-        )
+        ) = ScriptSource(script, preambleDependencies, confirming)
 
         private suspend fun compile(
             source: ScriptSource
