@@ -19,9 +19,44 @@
 package com.xemantic.kotlin.script
 
 import com.xemantic.kotlin.core.text.unaryPlus
+import org.jetbrains.kotlin.CoreEnvironmentDeprecation
+import org.jetbrains.kotlin.cli.extensionsStorage
+import org.jetbrains.kotlin.cli.jvm.compiler.EnvironmentConfigFiles
+import org.jetbrains.kotlin.cli.jvm.compiler.KotlinCoreEnvironment
+import org.jetbrains.kotlin.com.intellij.openapi.util.Disposer
+import org.jetbrains.kotlin.com.intellij.psi.PsiComment
+import org.jetbrains.kotlin.com.intellij.psi.PsiElement
+import org.jetbrains.kotlin.com.intellij.psi.PsiWhiteSpace
 import org.jetbrains.kotlin.com.intellij.psi.tree.IElementType
+import org.jetbrains.kotlin.compiler.plugin.CompilerPluginRegistrar
+import org.jetbrains.kotlin.compiler.plugin.ExperimentalCompilerApi
+import org.jetbrains.kotlin.config.CompilerConfiguration
 import org.jetbrains.kotlin.lexer.KotlinLexer
 import org.jetbrains.kotlin.lexer.KtTokens
+import org.jetbrains.kotlin.psi.KtAnnotation
+import org.jetbrains.kotlin.psi.KtAnnotationEntry
+import org.jetbrains.kotlin.psi.KtCallableReferenceExpression
+import org.jetbrains.kotlin.psi.KtClass
+import org.jetbrains.kotlin.psi.KtClassOrObject
+import org.jetbrains.kotlin.psi.KtDeclaration
+import org.jetbrains.kotlin.psi.KtDestructuringDeclaration
+import org.jetbrains.kotlin.psi.KtExpression
+import org.jetbrains.kotlin.psi.KtLabelReferenceExpression
+import org.jetbrains.kotlin.psi.KtNamedDeclaration
+import org.jetbrains.kotlin.psi.KtNamedFunction
+import org.jetbrains.kotlin.psi.KtObjectDeclaration
+import org.jetbrains.kotlin.psi.KtProperty
+import org.jetbrains.kotlin.psi.KtPsiFactory
+import org.jetbrains.kotlin.psi.KtSimpleNameExpression
+import org.jetbrains.kotlin.psi.KtTypeAlias
+import org.jetbrains.kotlin.psi.KtUserType
+import org.jetbrains.kotlin.psi.KtValueArgumentName
+import org.jetbrains.kotlin.psi.psiUtil.allChildren
+import org.jetbrains.kotlin.psi.psiUtil.collectDescendantsOfType
+import org.jetbrains.kotlin.psi.psiUtil.endOffset
+import org.jetbrains.kotlin.psi.psiUtil.getReceiverExpression
+import org.jetbrains.kotlin.psi.psiUtil.startOffset
+import org.jetbrains.kotlin.psi.psiUtil.startOffsetSkippingComments
 import kotlin.script.experimental.api.SourceCode
 
 /**
@@ -83,7 +118,7 @@ internal class ScriptSource(
         val lineBounds = lineBounds(script)
         lineStarts = lineBounds.map { it.first }
         scriptLines = lineBounds.map { script.substring(it.first, it.last + 1) }
-        // the lexer recognizes only `\n` as a line terminator, replacing each character keeps the offsets
+        // the parser recognizes only `\n` as a line terminator, replacing each character keeps the offsets
         val structure = ScriptStructure(script.replace('\r', '\n'))
         unmatchedClosingBrace = structure.unmatchedClosingBrace?.let { position(it) }
         movedDeclarations = structure.movedDeclarations
@@ -238,13 +273,6 @@ private fun lineBounds(
     add(start until script.length)
 }
 
-private class Token(
-    val type: IElementType,
-    val start: Int,
-    val end: Int,
-    val text: String
-)
-
 private class Declaration(
     val name: String?,
     val start: Int,
@@ -263,67 +291,70 @@ private enum class DeclarationKind {
     PROPERTY
 }
 
-private val modifiers = setOf(
-    "public", "private", "internal", "protected",
-    "enum", "sealed", "data", "open", "abstract", "final", "inner", "value", "annotation",
-    "inline", "suspend", "tailrec", "operator", "infix", "external",
-    "const", "lateinit", "override", "expect", "actual"
+private val visibilityModifiers = setOf(
+    KtTokens.PUBLIC_KEYWORD, KtTokens.PRIVATE_KEYWORD, KtTokens.INTERNAL_KEYWORD, KtTokens.PROTECTED_KEYWORD
 )
-
-private val visibilityModifiers = setOf("public", "private", "internal", "protected")
 
 /**
  * The modifiers of top-level functions and properties, which are not applicable to local ones,
  * while the declarations moved out of the script body are the members of the script class, where `const` is not allowed either.
  */
-private val memberOnlyModifiers = setOf("open", "final", "const")
+private val memberOnlyModifiers = setOf(KtTokens.OPEN_KEYWORD, KtTokens.FINAL_KEYWORD, KtTokens.CONST_KEYWORD)
+
+/** The modifiers of classes, which cannot be local. */
+private val nonLocalClassModifiers = listOf(
+    KtTokens.ENUM_KEYWORD, KtTokens.SEALED_KEYWORD, KtTokens.ANNOTATION_KEYWORD, KtTokens.VALUE_KEYWORD, KtTokens.INLINE_KEYWORD
+)
 
 /** The annotations, which are not applicable to local declarations. */
 private val memberOnlyAnnotations = setOf("Volatile", "Transient", "JvmField", "JvmName", "JvmOverloads")
 
-/** Tokens which cannot end a statement, so the line after them continues it. */
-private val continuedAfter = setOf(
-    "=", "+=", "-=", "*=", "/=", "%=", "+", "-", "*", "/", "%", "!",
-    "&&", "||", "?:", ".", "?.", ",", ":", "::", "->", "(", "[", "{", "<",
-    "==", "!=", "===", "!==", ">=", "<=", "..", "..<",
-    "in", "!in", "is", "!is", "as", "as?", "else", "@"
-)
-
-/** Tokens which cannot start a statement, so the line starting with them continues the previous one. */
-private val continuingWith = setOf(
-    ".", "?.", "?:", "&&", "||", ":", "=", "->", "as", "as?", "where", "by"
-)
-
-private val openingTokens = setOf(
-    KtTokens.LBRACE, KtTokens.LPAR, KtTokens.LBRACKET,
-    KtTokens.LONG_TEMPLATE_ENTRY_START, KtTokens.OPEN_QUOTE
-)
-
-/** The opening tokens closed by each closing token. */
-private val openingOf = mapOf<IElementType, IElementType>(
-    KtTokens.RBRACE to KtTokens.LBRACE,
-    KtTokens.RPAR to KtTokens.LPAR,
-    KtTokens.RBRACKET to KtTokens.LBRACKET,
-    KtTokens.LONG_TEMPLATE_ENTRY_END to KtTokens.LONG_TEMPLATE_ENTRY_START,
-    KtTokens.CLOSING_QUOTE to KtTokens.OPEN_QUOTE
-)
-
-private val closingTokens = openingOf.keys
-
 /**
- * The opening tokens which a closing token cannot close past, as the parser ends a block or a string with them,
- * e.g. the `}` in `foo(1 }` closes the block, while `)` in `{ foo) }` does not.
+ * Parses the scripts, without compiling them.
+ *
+ * The environment of the compiler is never disposed, which keeps its application environment,
+ * shared with the scripting host, for the lifetime of the class loader.
  */
-private val enclosingOf = mapOf<IElementType, Set<IElementType>>(
-    KtTokens.RBRACE to setOf(KtTokens.LONG_TEMPLATE_ENTRY_START, KtTokens.OPEN_QUOTE),
-    KtTokens.RPAR to setOf(KtTokens.LBRACE, KtTokens.LONG_TEMPLATE_ENTRY_START, KtTokens.OPEN_QUOTE),
-    KtTokens.RBRACKET to setOf(KtTokens.LBRACE, KtTokens.LONG_TEMPLATE_ENTRY_START, KtTokens.OPEN_QUOTE),
-    KtTokens.LONG_TEMPLATE_ENTRY_END to setOf(KtTokens.OPEN_QUOTE),
-    KtTokens.CLOSING_QUOTE to emptySet()
-)
+@OptIn(ExperimentalCompilerApi::class, CoreEnvironmentDeprecation::class, CompilerConfiguration.Internals::class)
+private val psiFactory: KtPsiFactory by lazy {
+    val environment = KotlinCoreEnvironment.createForProduction(
+        Disposer.newDisposable(),
+        CompilerConfiguration().apply {
+            extensionsStorage = CompilerPluginRegistrar.ExtensionStorage()
+        },
+        EnvironmentConfigFiles.JVM_CONFIG_FILES
+    )
+    KtPsiFactory(environment.project, markGenerated = false)
+}
 
 /**
- * The top-level structure of the script, recognized with the Kotlin lexer:
+ * A reference by name, like `foo` in `foo()` or `Foo` in `x: Foo`.
+ *
+ * @param isQualified whether it has a receiver, like `size` in `list.size`,
+ *   so it refers to a member, or an extension.
+ */
+private class Reference(
+    val name: String,
+    val offset: Int,
+    val isQualified: Boolean
+)
+
+/** The references by name, in the order of the script, without the labels and the names of the arguments. */
+private fun PsiElement.references(): List<Reference> = collectDescendantsOfType<KtSimpleNameExpression> {
+    it !is KtLabelReferenceExpression && it.parent !is KtValueArgumentName
+}.map { expression ->
+    val callableReference = expression.parent as? KtCallableReferenceExpression
+    Reference(
+        name = expression.getReferencedName(),
+        offset = expression.startOffset,
+        isQualified = expression.getReceiverExpression() != null || (
+                callableReference?.callableReference == expression && callableReference.receiverExpression != null
+        )
+    )
+}
+
+/**
+ * The top-level structure of the script, recognized with the Kotlin parser:
  * the header of file annotations, package and imports, and the declarations
  * which cannot be local to the script block, see [ScriptSource].
  */
@@ -331,17 +362,9 @@ private class ScriptStructure(
     private val script: String
 ) {
 
-    /** The significant tokens, without whitespaces and comments. */
-    private val tokens: List<Token>
+    val headerEnd: Int
 
-    /** The nesting depth of brackets, braces, parentheses and strings, before each token. */
-    private val depths: IntArray
-
-    var headerEnd: Int = 0
-        private set
-
-    var unmatchedClosingBrace: Int? = null
-        private set
+    val unmatchedClosingBrace: Int? = unmatchedClosingBrace(script)
 
     val movedDeclarations: List<Declaration>
 
@@ -354,374 +377,129 @@ private class ScriptStructure(
     val blankedRanges = mutableListOf<IntRange>()
 
     init {
-        val allTokens = buildList {
-            val lexer = KotlinLexer()
-            lexer.start(script)
-            while (lexer.tokenType != null) {
-                add(Token(lexer.tokenType!!, lexer.tokenStart, lexer.tokenEnd, script.substring(lexer.tokenStart, lexer.tokenEnd)))
-                lexer.advance()
-            }
-        }
-        if (allTokens.firstOrNull()?.type == KtTokens.SHEBANG_COMMENT) {
-            headerEnd = allTokens.first().end
-        }
-        tokens = allTokens.filterNot {
-            it.type in KtTokens.WHITESPACES || it.type in KtTokens.COMMENTS
-        }
-        depths = IntArray(tokens.size)
-        val opened = mutableListOf<IElementType>()
-        tokens.forEachIndexed { index, token ->
-            depths[index] = opened.size
-            if (token.type in openingTokens) opened += token.type
-            if (token.type in closingTokens) {
-                val opening = opened.lastIndexOf(openingOf.getValue(token.type))
-                val enclosing = opened.indexOfLast { it in enclosingOf.getValue(token.type) }
-                if (opening > enclosing) {
-                    opened.subList(opening, opened.size).clear()
-                } else if (token.type == KtTokens.RBRACE && enclosing == -1 && unmatchedClosingBrace == null) {
-                    unmatchedClosingBrace = token.start
-                }
-            }
-        }
-
-        val bodyStart = parseHeader()
-        val declarations = parseBody(bodyStart)
-        val moved = selectMovedDeclarations(declarations, bodyStart)
+        val file = psiFactory.createFile("script.kts", script)
+        headerEnd = listOfNotNull(
+            file.firstChild?.takeIf { it.node.elementType == KtTokens.SHEBANG_COMMENT },
+            // like `@file:JvmName("x")`, while the parser takes there also a stray `@` of the script body
+            file.fileAnnotationList?.children?.lastOrNull {
+                (it as? KtAnnotationEntry)?.useSiteTarget != null || (it as? KtAnnotation)?.useSiteTarget != null
+            },
+            file.packageDirective,
+            file.importList
+        ).filter { it.textLength > 0 }.maxOfOrNull { it.endOffset } ?: 0
+        val block = file.script?.blockExpression
+        val statements = block?.statements.orEmpty()
+        val declarations = statements.mapNotNull { parseDeclaration(it) }
+        val moved = selectMovedDeclarations(declarations, block?.references().orEmpty())
         movedDeclarations = moved.map { it.toDeclaration() }
-        endsWithMovedDeclaration = moved.any { it.last == tokens.lastIndex }
+        endsWithMovedDeclaration = moved.any { it.psi == statements.lastOrNull() }
         bodyDeclarations = declarations
             .filter { it !in moved && (it.kind == DeclarationKind.PROPERTY || it.kind == DeclarationKind.FUNCTION) }
             .map { it.toDeclaration() }
         declarations.filter { it !in moved }.forEach { declaration ->
-            declaration.modifiers
+            declaration.psi.modifierList?.node?.getChildren(null).orEmpty()
                 .filter {
-                    it.text in visibilityModifiers || (it.text in memberOnlyModifiers
+                    it.elementType in visibilityModifiers || (it.elementType in memberOnlyModifiers
                             && (declaration.kind == DeclarationKind.FUNCTION || declaration.kind == DeclarationKind.PROPERTY))
                 }
-                .forEach { blankedRanges += it.start until it.end }
+                .forEach { blankedRanges += it.startOffset until it.startOffset + it.textLength }
         }
     }
 
     private class ParsedDeclaration(
+        val psi: KtDeclaration,
+        val end: Int,
         val kind: DeclarationKind,
         val name: String?,
-        val nameIndex: Int?,
-        val modifiers: List<Token>,
-        val first: Int,
-        val last: Int,
-        val tokens: List<Token>,
-        /** The tokens before the body, e.g. the supertypes. */
-        val headerTokens: List<Token>,
+        val nameRange: IntRange?,
         val requiresMove: Boolean,
-        val destructuredNames: List<String>
+        val destructuredNames: List<String>,
+        val isSealed: Boolean,
+        /** Whether it is a function with a receiver, like `fun Int.double()`. */
+        val isExtension: Boolean,
+        /** The names of the supertypes, like `Shape` in `class Circle(val r: Int) : Shape`. */
+        val supertypeNames: List<String>
     ) {
-        val isSealed = modifiers.any { it.text == "sealed" }
-        val identifiers = tokens.filter { it.type == KtTokens.IDENTIFIER }.mapTo(HashSet()) { it.text }
-        val headerIdentifiers = headerTokens.filter { it.type == KtTokens.IDENTIFIER }.mapTo(HashSet()) { it.text }
+        /** Without the comments preceding the declaration, which are left in the script body. */
+        val start = psi.startOffsetSkippingComments
+        val references = psi.references()
         fun toDeclaration() = Declaration(
             name = name,
-            start = tokens.first().start,
-            end = tokens.last().end,
-            nameRange = nameIndex?.let { tokens[it - first] }?.let { it.start until it.end },
+            start = start,
+            end = end,
+            nameRange = nameRange,
             destructuredNames = destructuredNames
         )
     }
 
-    private fun parseHeader(): Int {
-        var index = 0
-        while (index < tokens.size) {
-            val token = tokens[index]
-            val isHeaderEntry = (token.type == KtTokens.AT
-                    && tokens.getOrNull(index + 1)?.text == "file"
-                    && tokens.getOrNull(index + 2)?.type == KtTokens.COLON
-            ) || token.text == "package" || token.text == "import"
-            if (!isHeaderEntry) break
-            index = statementEnd(index)
-            if (tokens.getOrNull(index)?.type == KtTokens.SEMICOLON) index++
-            headerEnd = tokens[index - 1].end
+    private fun parseDeclaration(
+        statement: KtExpression
+    ): ParsedDeclaration? {
+        val declaration = statement as? KtDeclaration ?: return null
+        val kind = when (declaration) {
+            is KtClass -> if (declaration.isInterface()) DeclarationKind.INTERFACE else DeclarationKind.CLASS
+            is KtObjectDeclaration -> if (declaration.isObjectLiteral()) return null else DeclarationKind.OBJECT
+            is KtTypeAlias -> DeclarationKind.TYPE_ALIAS
+            is KtNamedFunction -> DeclarationKind.FUNCTION
+            is KtProperty, is KtDestructuringDeclaration -> DeclarationKind.PROPERTY
+            else -> return null
         }
-        return index
-    }
-
-    private fun parseBody(
-        bodyStart: Int
-    ): List<ParsedDeclaration> = buildList {
-        var index = bodyStart
-        while (index < tokens.size) {
-            if (tokens[index].start == unmatchedClosingBrace) break
-            if (depths[index] == 0) {
-                if (isStatementStart(index, bodyStart)) {
-                    val declaration = parseDeclaration(index)
-                    if (declaration != null) {
-                        add(declaration)
-                        index = declaration.last + 1
-                        continue
-                    }
-                }
+        val nameIdentifier = (declaration as? KtNamedDeclaration)?.nameIdentifier
+        // e.g. an anonymous function, which is an expression
+        if (nameIdentifier == null && declaration !is KtDestructuringDeclaration) return null
+        // unlike in the script, the local property in the script block has no accessors,
+        // so `get` and `set` starting a line, which is not indented, are the statements following it
+        val accessors = (declaration as? KtProperty)?.accessors.orEmpty().takeWhile {
+            !isOnNewLine(it.startOffset) || columnOf(it.startOffset) > columnOf(declaration.startOffsetSkippingComments)
+        }
+        val end = (declaration as? KtProperty)?.accessors?.getOrNull(accessors.size)?.let { firstOmitted ->
+            declaration.allChildren.toList().last {
+                it.endOffset <= firstOmitted.startOffset && it !is PsiWhiteSpace && it !is PsiComment
+            }.endOffset
+        } ?: declaration.endOffset
+        val hasMemberOnlyAnnotation = declaration.annotationEntries.any {
+            it.useSiteTarget != null || it.shortName?.asString() in memberOnlyAnnotations
+        }
+        val requiresMove = when (declaration) {
+            is KtClass -> declaration.isInterface()
+                    || nonLocalClassModifiers.any { declaration.hasModifier(it) }
+                    || declaration.declarations.any { it is KtClassOrObject || it is KtTypeAlias }
+            is KtObjectDeclaration,
+            is KtTypeAlias -> true
+            is KtNamedFunction -> declaration.hasModifier(KtTokens.INLINE_KEYWORD) || hasMemberOnlyAnnotation
+            is KtProperty -> declaration.receiverTypeReference != null
+                    || accessors.isNotEmpty()
+                    || hasMemberOnlyAnnotation
+            else -> false
+        }
+        return ParsedDeclaration(
+            psi = declaration,
+            end = end,
+            kind = kind,
+            name = nameIdentifier?.text,
+            nameRange = nameIdentifier?.let { it.startOffset until it.endOffset },
+            requiresMove = requiresMove,
+            destructuredNames = (declaration as? KtDestructuringDeclaration)?.entries.orEmpty()
+                .mapNotNull { it.name }
+                .filter { it != "_" },
+            isSealed = declaration.hasModifier(KtTokens.SEALED_KEYWORD),
+            isExtension = declaration is KtNamedFunction && declaration.receiverTypeReference != null,
+            supertypeNames = (declaration as? KtClassOrObject)?.superTypeListEntries.orEmpty().mapNotNull {
+                (it.typeReference?.typeElement as? KtUserType)?.referencedName
             }
-            index++
-        }
+        )
     }
 
-    private fun isStatementStart(
-        index: Int,
-        bodyStart: Int
-    ): Boolean = index == bodyStart
-            || tokens[index - 1].type == KtTokens.SEMICOLON
-            || (isOnNewLine(index) && !continuesPreviousLine(index))
-
+    /** Whether the [offset] is preceded only by whitespaces in its line. */
     private fun isOnNewLine(
-        index: Int
-    ): Boolean = index > 0 && script.substring(tokens[index - 1].end, tokens[index].start).contains('\n')
+        offset: Int
+    ): Boolean = script.lastIndexOf('\n', offset - 1).let { lineEnd ->
+        (lineEnd + 1 until offset).all { script[it].isWhitespace() }
+    }
 
     private fun columnOf(
         offset: Int
     ): Int = offset - (script.lastIndexOf('\n', offset - 1) + 1)
-
-    private fun continuesPreviousLine(
-        index: Int
-    ): Boolean = tokens[index - 1].text in continuedAfter || tokens[index].text in continuingWith
-
-    /** The index after the last token of the statement starting at the [index], ignoring its kind. */
-    private fun statementEnd(
-        index: Int
-    ): Int {
-        val depth = depths[index]
-        var current = index + 1
-        while (current < tokens.size) {
-            if (depths[current] <= depth) {
-                if (depths[current] < depth) break
-                if (tokens[current].type == KtTokens.SEMICOLON) break
-                if (isOnNewLine(current) && !continuesPreviousLine(current)) break
-            }
-            current++
-        }
-        return current
-    }
-
-    private fun parseDeclaration(
-        first: Int
-    ): ParsedDeclaration? {
-        var index = first
-        val declarationModifiers = mutableListOf<Token>()
-        var hasMemberOnlyAnnotation = false
-        while (index < tokens.size) {
-            val token = tokens[index]
-            val next = tokens.getOrNull(index + 1) ?: return null
-            when {
-                token.type == KtTokens.AT -> {
-                    if (isMemberOnlyAnnotation(index)) hasMemberOnlyAnnotation = true
-                    index = annotationEnd(index)
-                }
-                token.type == KtTokens.IDENTIFIER
-                        && token.text in modifiers
-                        && (next.type == KtTokens.IDENTIFIER || next.type in KtTokens.KEYWORDS) -> {
-                    declarationModifiers += token
-                    index++
-                }
-                else -> break
-            }
-        }
-        if (index >= tokens.size) return null
-        val keywordToken = tokens[index]
-        val next = tokens.getOrNull(index + 1)
-        var keyword = index
-        val kind = when (keywordToken.text) {
-            "class" -> DeclarationKind.CLASS
-            "interface" -> DeclarationKind.INTERFACE
-            "object" -> if (next?.type == KtTokens.IDENTIFIER) DeclarationKind.OBJECT else return null
-            "typealias" -> DeclarationKind.TYPE_ALIAS
-            "fun" -> if (next?.text == "interface") {
-                keyword++
-                DeclarationKind.INTERFACE
-            } else {
-                DeclarationKind.FUNCTION
-            }
-            "val", "var" -> DeclarationKind.PROPERTY
-            else -> return null
-        }
-        val last = declarationEnd(first, keyword, kind)
-        val declarationTokens = tokens.subList(first, last + 1)
-        val bodyStart = (keyword..last).firstOrNull {
-            depths[it] == 0 && tokens[it].type == KtTokens.LBRACE
-        } ?: (last + 1)
-        val nameIndex = when (kind) {
-            FUNCTION -> (keyword..last).firstOrNull {
-                depths[it] == 0 && tokens[it].type == KtTokens.LPAR
-            }?.let { it - 1 }
-            else -> keyword + 1
-        }?.takeIf { tokens.getOrNull(it)?.type == KtTokens.IDENTIFIER }
-        val requiresMove = when (kind) {
-            CLASS -> declarationModifiers.any {
-                it.text in setOf("enum", "sealed", "annotation", "value", "inline")
-            } || hasNestedDeclarations(bodyStart, last)
-            INTERFACE,
-            OBJECT,
-            TYPE_ALIAS -> true
-            FUNCTION -> declarationModifiers.any { it.text == "inline" } || hasMemberOnlyAnnotation
-            PROPERTY -> isExtensionOrHasAccessor(keyword, last) || hasMemberOnlyAnnotation
-        }
-        val destructuredNames = if (kind == DeclarationKind.PROPERTY && tokens.getOrNull(keyword + 1)?.type == KtTokens.LPAR) {
-            (keyword + 2 until closingIndex(keyword + 1)).filter {
-                depths[it] == depths[keyword] + 1
-                        && tokens[it].type == KtTokens.IDENTIFIER
-                        && tokens[it - 1].type.let { previous -> previous == KtTokens.LPAR || previous == KtTokens.COMMA }
-                        && tokens[it].text != "_"
-            }.map { tokens[it].text }
-        } else {
-            emptyList()
-        }
-        return ParsedDeclaration(
-            kind = kind,
-            name = nameIndex?.let { tokens[it].text },
-            nameIndex = nameIndex,
-            modifiers = declarationModifiers,
-            first = first,
-            last = last,
-            tokens = declarationTokens,
-            headerTokens = tokens.subList(keyword, bodyStart),
-            requiresMove = requiresMove,
-            destructuredNames = destructuredNames
-        )
-    }
-
-    /** Whether the annotation is not applicable to a local declaration, like `@Volatile` or `@get:JvmName`. */
-    private fun isMemberOnlyAnnotation(
-        at: Int
-    ): Boolean {
-        // a use-site target
-        if (tokens.getOrNull(at + 2)?.type == KtTokens.COLON) return true
-        var index = at + 1
-        while (tokens.getOrNull(index + 1)?.type == KtTokens.DOT) index += 2
-        return tokens.getOrNull(index)?.text in memberOnlyAnnotations
-    }
-
-    private fun annotationEnd(
-        at: Int
-    ): Int {
-        var index = at + 1
-        if (tokens.getOrNull(index)?.type == KtTokens.LBRACKET) {
-            return closingIndex(index) + 1
-        }
-        // a use-site target, like in `@get:JvmName`
-        if (tokens.getOrNull(index + 1)?.type == KtTokens.COLON) index += 2
-        index++
-        while (tokens.getOrNull(index)?.type == KtTokens.DOT) index += 2
-        if (tokens.getOrNull(index)?.type == KtTokens.LT) {
-            var angles = 0
-            while (index < tokens.size) {
-                if (tokens[index].type == KtTokens.LT) angles++
-                if (tokens[index].type == KtTokens.GT) angles--
-                index++
-                if (angles == 0) break
-            }
-        }
-        if (tokens.getOrNull(index)?.type == KtTokens.LPAR && !isOnNewLine(index)) {
-            index = closingIndex(index) + 1
-        }
-        return index
-    }
-
-    private fun closingIndex(
-        opening: Int
-    ): Int {
-        val depth = depths[opening]
-        return (opening + 1 until tokens.size).firstOrNull { depths[it] == depth + 1 && tokens[it].type in closingTokens }
-            ?: tokens.lastIndex
-    }
-
-    /** The index of the last token of the declaration. */
-    private fun declarationEnd(
-        first: Int,
-        keyword: Int,
-        kind: DeclarationKind
-    ): Int {
-        val column = columnOf(tokens[first].start)
-        var hasBody = false
-        var hasInitializer = false
-        var index = keyword + 1
-        while (index < tokens.size) {
-            val token = tokens[index]
-            if (depths[index] == 0) {
-                if (token.type == KtTokens.SEMICOLON || token.type == KtTokens.RBRACE) break
-                if (isOnNewLine(index) && !continuesPreviousLine(index)) {
-                    val tokenColumn = columnOf(token.start)
-                    val continues = when {
-                        token.type == KtTokens.LBRACE -> !hasBody && !hasInitializer
-                                && kind != DeclarationKind.PROPERTY && kind != DeclarationKind.TYPE_ALIAS
-                        // the accessors of a property are indented
-                        kind == DeclarationKind.PROPERTY && tokenColumn > column -> isAccessorStart(index)
-                        else -> false
-                    }
-                    if (!continues) break
-                }
-                if (token.type == KtTokens.EQ) hasInitializer = true
-                if (token.type == KtTokens.LBRACE) hasBody = true
-            }
-            index++
-        }
-        return index - 1
-    }
-
-    /** Whether an accessor, like `get()` or `@JvmName("x") private set`, starts at the [index]. */
-    private fun isAccessorStart(
-        index: Int
-    ): Boolean {
-        var current = index
-        while (current < tokens.size) {
-            val token = tokens[current]
-            current = when {
-                token.type == KtTokens.AT -> annotationEnd(current)
-                token.text in modifiers -> current + 1
-                else -> return token.text == "get" || token.text == "set"
-            }
-        }
-        return false
-    }
-
-    private fun hasNestedDeclarations(
-        bodyStart: Int,
-        last: Int
-    ): Boolean = (bodyStart + 1..last).any { index ->
-        val token = tokens[index]
-        depths[index] == 1 && tokens[index - 1].type != KtTokens.COLONCOLON && when (token.text) {
-            "class", "interface", "typealias" -> true
-            "object" -> tokens.getOrNull(index + 1)?.type == KtTokens.IDENTIFIER
-            "companion" -> tokens.getOrNull(index + 1)?.text == "object"
-            else -> false
-        }
-    }
-
-    private fun isExtensionOrHasAccessor(
-        keyword: Int,
-        last: Int
-    ): Boolean {
-        var hasTypeOrInitializer = false
-        var hasInitializer = false
-        var angles = 0
-        for (index in keyword + 1..last) {
-            if (depths[index] != 0) continue
-            val token = tokens[index]
-            when (token.type) {
-                KtTokens.LT -> angles++
-                KtTokens.GT -> angles--
-            }
-            // the receiver of an extension, like in `val String.shouted`
-            if (token.type == KtTokens.DOT && angles == 0 && !hasTypeOrInitializer) return true
-            if (index > keyword + 1 && isOnNewLine(index) && isAccessorStart(index)) return true
-            // the name of the property might be `get` or `set` as well
-            if ((token.text == "get" || token.text == "set")
-                && index != keyword + 1
-                && tokens[index - 1].type != KtTokens.DOT
-                && (isOnNewLine(index) || !hasInitializer)
-            ) return true
-            if (token.type == KtTokens.COLON || token.type == KtTokens.EQ || token.text == "by") {
-                hasTypeOrInitializer = true
-            }
-            if (token.type == KtTokens.EQ) hasInitializer = true
-        }
-        return false
-    }
 
     /**
      * The declarations which cannot be local, together with the types and functions they refer to,
@@ -734,17 +512,21 @@ private class ScriptStructure(
      */
     private fun selectMovedDeclarations(
         declarations: List<ParsedDeclaration>,
-        bodyStart: Int
+        bodyReferences: List<Reference>
     ): Set<ParsedDeclaration> {
         val named = declarations.filter { it.name != null && it.kind != DeclarationKind.PROPERTY }
         val namedByName = named.groupBy { it.name!! }
         val subtypesByName = mutableMapOf<String, MutableList<ParsedDeclaration>>()
         named.filter { it.kind != DeclarationKind.FUNCTION }.forEach { declaration ->
-            declaration.headerIdentifiers.forEach { subtypesByName.getOrPut(it) { mutableListOf() } += declaration }
+            declaration.supertypeNames.forEach { subtypesByName.getOrPut(it) { mutableListOf() } += declaration }
+        }
+        // a qualified reference, like `list.size`, cannot refer to a declaration of the script, unless it is an extension
+        fun Reference.referenced(): List<ParsedDeclaration> = namedByName[name].orEmpty().filter {
+            !isQualified || it.isExtension
         }
         val references = declarations.associateWith { declaration ->
             buildSet {
-                declaration.identifiers.forEach { addAll(namedByName[it].orEmpty()) }
+                declaration.references.forEach { addAll(it.referenced()) }
                 if (declaration.isSealed) addAll(subtypesByName[declaration.name].orEmpty())
                 remove(declaration)
             }
@@ -758,7 +540,7 @@ private class ScriptStructure(
             it.kind == DeclarationKind.PROPERTY && it !in required
         }.flatMap { listOfNotNull(it.name) + it.destructuredNames }.toSet()
         val accessingLocalProperties = declarations.filter { declaration ->
-            declaration.identifiers.any { it in localProperties }
+            declaration.references.any { !it.isQualified && it.name in localProperties }
         }.toSet()
         /** The declarations not [moved] yet, which access the local properties, or refer to such ones not moved yet. */
         fun accessingLocalProperties(
@@ -792,14 +574,13 @@ private class ScriptStructure(
                 }
             }
         }
-        val nameIndices = declarations.mapNotNull { it.nameIndex }.toSet()
-        val firstReferences = mutableMapOf<String, Int>()
-        (bodyStart until tokens.size).forEach {
-            if (it !in nameIndices) firstReferences.putIfAbsent(tokens[it].text, it)
+        val firstReferences = mutableMapOf<ParsedDeclaration, Int>()
+        bodyReferences.forEach { reference ->
+            reference.referenced().forEach { firstReferences.putIfAbsent(it, reference.offset) }
         }
         declarations.filter { declaration ->
             declaration.kind == DeclarationKind.FUNCTION
-                    && (firstReferences[declaration.name] ?: Int.MAX_VALUE) < declaration.first
+                    && (firstReferences[declaration] ?: Int.MAX_VALUE) < declaration.start
         }.forEach { function ->
             // moving a function, which is not accessing, moves only the ones, which are not accessing either
             if (function !in moved && function !in accessing) {
@@ -812,7 +593,59 @@ private class ScriptStructure(
                 }
             }
         }
-        return moved.sortedBy { it.first }.toCollection(LinkedHashSet())
+        return moved.sortedBy { it.start }.toCollection(LinkedHashSet())
     }
 
+}
+
+private val openingTokens = setOf(
+    KtTokens.LBRACE, KtTokens.LPAR, KtTokens.LBRACKET,
+    KtTokens.LONG_TEMPLATE_ENTRY_START, KtTokens.OPEN_QUOTE
+)
+
+/** The opening tokens closed by each closing token. */
+private val openingOf = mapOf<IElementType, IElementType>(
+    KtTokens.RBRACE to KtTokens.LBRACE,
+    KtTokens.RPAR to KtTokens.LPAR,
+    KtTokens.RBRACKET to KtTokens.LBRACKET,
+    KtTokens.LONG_TEMPLATE_ENTRY_END to KtTokens.LONG_TEMPLATE_ENTRY_START,
+    KtTokens.CLOSING_QUOTE to KtTokens.OPEN_QUOTE
+)
+
+/**
+ * The opening tokens which a closing token cannot close past, as the parser ends a block or a string with them,
+ * e.g. the `}` in `foo(1 }` closes the block, while `)` in `{ foo) }` does not.
+ */
+private val enclosingOf = mapOf<IElementType, Set<IElementType>>(
+    KtTokens.RBRACE to setOf(KtTokens.LONG_TEMPLATE_ENTRY_START, KtTokens.OPEN_QUOTE),
+    KtTokens.RPAR to setOf(KtTokens.LBRACE, KtTokens.LONG_TEMPLATE_ENTRY_START, KtTokens.OPEN_QUOTE),
+    KtTokens.RBRACKET to setOf(KtTokens.LBRACE, KtTokens.LONG_TEMPLATE_ENTRY_START, KtTokens.OPEN_QUOTE),
+    KtTokens.LONG_TEMPLATE_ENTRY_END to setOf(KtTokens.OPEN_QUOTE),
+    KtTokens.CLOSING_QUOTE to emptySet()
+)
+
+/**
+ * The offset of the first `}` closing the script block, which the script is wrapped in,
+ * recognized with the lexer, as the parser of the script alone recovers from it differently.
+ */
+private fun unmatchedClosingBrace(
+    script: String
+): Int? {
+    val lexer = KotlinLexer()
+    lexer.start(script)
+    val opened = mutableListOf<IElementType>()
+    while (true) {
+        val type = lexer.tokenType ?: return null
+        if (type in openingTokens) opened += type
+        openingOf[type]?.let { closed ->
+            val opening = opened.lastIndexOf(closed)
+            val enclosing = opened.indexOfLast { it in enclosingOf.getValue(type) }
+            if (opening > enclosing) {
+                opened.subList(opening, opened.size).clear()
+            } else if (type == KtTokens.RBRACE && enclosing == -1) {
+                return lexer.tokenStart
+            }
+        }
+        lexer.advance()
+    }
 }

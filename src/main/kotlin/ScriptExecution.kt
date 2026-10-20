@@ -344,7 +344,7 @@ private fun Throwable.unwrapRecoveredCopy(): Throwable {
     return if (
         cause != null
         && cause.javaClass == javaClass
-        && read(emptyArray()) { stackTrace }.any { it.className.startsWith("_COROUTINE.") }
+        && read(emptyList()) { stackTrace.filterNotNull() }.any { it.className.startsWith("_COROUTINE.") }
     ) {
         cause
     } else {

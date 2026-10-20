@@ -112,7 +112,8 @@ internal class ScriptErrorReporter(
         reported += throwable
         appendDescription(throwable)
         +'\n'
-        appendFrames(throwable.read(emptyArray()) { stackTrace }, indent)
+        // the exception class of the script might override it to contain nulls
+        appendFrames(throwable.read(emptyList()) { stackTrace.filterNotNull() }, indent)
         for (suppressed in throwable.read(emptyArray()) { suppressed }) {
             if (!appendThrowable(suppressed, "Suppressed: ", "$indent  ", reported)) break
         }
@@ -143,6 +144,8 @@ internal class ScriptErrorReporter(
     ): String {
         val name = type.name
         return when {
+            // the synthetic name, like `Script$result$1$fail$1`, would not tell anything
+            type.isAnonymousClass -> "<anonymous ${className(type.superclass)}>"
             // e.g. the classes declared in the script body
             type.isLocalClass -> type.simpleName
             scriptClassName != null && name.startsWith("$scriptClassName$") ->
@@ -157,7 +160,7 @@ internal class ScriptErrorReporter(
     )
 
     private fun StringBuilder.appendFrames(
-        stackTrace: Array<StackTraceElement>,
+        stackTrace: List<StackTraceElement>,
         indent: String
     ) {
         val frames = stackTrace.withIndex().mapNotNull { (index, element) ->

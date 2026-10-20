@@ -58,6 +58,7 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 - Expected compilation error messages in `ScriptExecutorTest` are compiler-version specific: Kotlin 2.4 dropped the redundant "must either have an explicit type" diagnostic for `val x =` which 2.3 reported, so re-check them after every Kotlin upgrade.
 - Tests run with kotlinx.coroutines debug mode (Gradle enables `-ea`), so an exception thrown by the script block arrives as a stack-trace-recovery copy wrapping the original, which `ScriptExecutor` unwraps.
   This hides bugs of the exception reporting which only show in production: test them with an exception class the recovery cannot copy, i.e. without a `(String)`, `(String, Throwable)` or `(Throwable)` constructor.
+  An exception whose `getStackTrace()` contains `null` crashes the recovery itself, so such a case can only be tested by calling `ScriptErrorReporter` directly.
 
 ## Anti-patterns to avoid
 

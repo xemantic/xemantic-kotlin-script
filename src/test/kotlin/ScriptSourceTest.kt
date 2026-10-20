@@ -19,6 +19,11 @@
 package com.xemantic.kotlin.script
 
 import com.xemantic.kotlin.test.assert
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 import kotlin.test.Test
 
 class ScriptSourceTest {
@@ -58,6 +63,21 @@ class ScriptSourceTest {
         // then
         val (moved, body) = source.text.split("_script {")
         assert("fun b${count - 1}() = ${count - 1}" in moved && "fun a0() = x" in body)
+    }
+
+    @Test
+    fun `should parse scripts concurrently`() = runTest {
+        // given
+        val scripts = (0 until 200).map { "fun f$it() = E$it.A\nenum class E$it { A }\nf$it()" }
+
+        // when
+        val texts = withContext(Dispatchers.Default) {
+            scripts.map { async { ScriptSource(it).text } }.awaitAll()
+        }
+
+        // then
+        assert(texts == scripts.map { ScriptSource(it).text })
+        assert(texts.withIndex().all { (index, text) -> "enum class E$index" !in text.substringAfter("_script {") })
     }
 
 }

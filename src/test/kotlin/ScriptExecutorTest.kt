@@ -1925,6 +1925,183 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should execute statement following star import in the script body`() = runTest {
+        // given
+        val script = """
+            import kotlinx.coroutines.*
+            delay(1)
+            "done"
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "done")
+        }
+    }
+
+    @Test
+    fun `should not treat name in string literal as reference to function declared later`() = runTest {
+        // given
+        val script = """
+            import kotlinx.coroutines.launch
+            val label = "work"
+            fun work() = launch { }
+            work()
+            label
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "work")
+        }
+    }
+
+    @Test
+    fun `should not treat member access as reference to function declared later`() = runTest {
+        // given
+        val script = """
+            import kotlinx.coroutines.launch
+            val list = listOf(1)
+            val count = list.size
+            fun size() = launch { }
+            size()
+            count
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 1)
+        }
+    }
+
+    @Test
+    fun `should call extension function declared later in the script`() = runTest {
+        // given
+        val script = """
+            val doubled = 21.double()
+            fun Int.double() = this * 2
+            doubled
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+        }
+    }
+
+    @Test
+    fun `should not treat class taking sealed type as constructor parameter as its subtype`() = runTest {
+        // given
+        val script = """
+            val factor = 2
+            sealed interface Shape
+            class Circle(val r: Int) : Shape
+            class Scaler(val s: Shape) { fun scale() = factor }
+            Scaler(Circle(1)).scale()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should return Unit when script ends with declaration moved out of the script body followed by semicolon`() = runTest {
+        // given
+        val script = "42\ninterface Foo;"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value is Unit)
+        }
+    }
+
+    @Test
+    fun `should report anonymous exception class by its superclass`() = runTest {
+        // given
+        val script = """
+            open class Failure(message: String) : RuntimeException(message)
+            fun fail(): Nothing = throw object : Failure("anonymous failure") {}
+            fail()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                <anonymous Failure>: anonymous failure
+                  at fail(script.kts:2)
+                  | fun fail(): Nothing = throw object : Failure("anonymous failure") {}
+                  at <script body>(script.kts:3)
+                  | fail()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should split statements spanning lines according to the Kotlin grammar`() = runTest {
+        // given
+        val script = """
+            import kotlinx.coroutines.*
+            val numbers = listOf(1, 2, 3)
+                .map { it * 2 } /* a comment
+                spanning lines */
+            var sum = 0
+            outer@ for (n in numbers) { if (n > 4) break@outer; sum += n }
+            fun total() = launch { sum *= 2 }
+            total().join()
+            val result = sum *
+                2
+            result
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 24)
+        }
+    }
+
+    @Test
     fun `should cap JVM target of the script at the highest one supported by the compiler`() {
         // when
         val targets = listOf("17", "21", "999").map { scriptJvmTarget(it) }
