@@ -43,7 +43,7 @@ class ScriptSourceTest {
         val source = ScriptSource(script)
 
         // then
-        assert(source.text.substringAfter("_script {").removeSuffix("}").trim() == "Start.A.first()")
+        assert(source.text.substringAfter(SCRIPT_BLOCK_START).removeSuffix("}").trim() == "Start.A.first()")
     }
 
     @Test
@@ -61,7 +61,7 @@ class ScriptSourceTest {
         val source = ScriptSource(script)
 
         // then
-        val (moved, body) = source.text.split("_script {")
+        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
         assert("fun b${count - 1}() = ${count - 1}" in moved && "fun a0() = x" in body)
     }
 
@@ -90,7 +90,7 @@ class ScriptSourceTest {
 
         // then
         assert(texts == scripts.map { ScriptSource(it).text })
-        assert(texts.withIndex().all { (index, text) -> "enum class E$index" !in text.substringAfter("_script {") })
+        assert(texts.withIndex().all { (index, text) -> "enum class E$index" !in text.substringAfter(SCRIPT_BLOCK_START) })
     }
 
     @Test
@@ -114,7 +114,7 @@ class ScriptSourceTest {
         val source = ScriptSource(script)
 
         // then
-        val body = source.text.substringAfter("_script {")
+        val body = source.text.substringAfter(SCRIPT_BLOCK_START)
         assert("fun f(): Int {" in body && "class C {" in body)
     }
 

@@ -76,7 +76,7 @@ when (result) {
   A dependency list built dynamically can be passed instead, as `execute(script, listOf(dependency("greeting", "Hello")))`.
   Invalid dependencies are rejected with `IllegalArgumentException`:
   a name which is not a Kotlin identifier, a duplicate name, a value which is not of the type,
-  a name which the script body would resolve to its `CoroutineScope` instead, like `coroutineContext` or `launch`,
+  the name `coroutineContext`, which the script body would resolve to its `CoroutineScope` instead,
   or a type which the script cannot refer to, like a private or a local class.
 * Scripts executed repeatedly, like an agent harness defined as a script, can skip the recompilation
   with `ScriptExecutor(compilationCacheSize = ...)`, keeping that many compiled scripts, the least recently used evicted first.
@@ -89,7 +89,7 @@ when (result) {
   are compiled outside of the script body, together with the types and functions they refer to.
   So is a property with a getter or a setter having a body, like `val total get() = items.size`, as a local property cannot have one.
   Therefore, they cannot refer to the local values of the script body, only to the dependencies,
-  and referring to a local value or function of the same name as a dependency is reported as an error, instead of using the dependency,
+  and referring to a local value or function of the same name as a dependency is reported as unresolved, instead of using the dependency,
   while an object, an enum class, an interface or a nested class cannot refer even to the dependencies,
   as they are the members of the script instance.
   An error message will hint at this, if it happens.

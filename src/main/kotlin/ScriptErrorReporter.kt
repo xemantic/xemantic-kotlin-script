@@ -96,24 +96,6 @@ internal class ScriptErrorReporter(
         }
     }.trimEnd()
 
-    /** The [references] of the declarations moved out of the script body, which refer to the dependencies shadowed by the local declarations. */
-    fun toShadowedDependencyMessage(
-        references: List<ScriptReference>
-    ): String = references.joinToString(separator = "\n") { reference ->
-        buildString {
-            appendPosition(reference.start)
-            +"error: '${reference.name}' refers to the dependency, not to the"
-            val function = if (reference.isCall) source.bodyDeclarationLine(reference.name, DeclarationKind.FUNCTION) else null
-            (function ?: source.bodyDeclarationLine(reference.name, DeclarationKind.PROPERTY))?.let { (line, kind) ->
-                +(if (kind == DeclarationKind.FUNCTION) " function" else " property")
-                +" of the script body declared at line ${line + 1}"
-            } ?: +" declaration of the script body"
-            +".\n"
-            appendSourceLines(reference.start, reference.end)
-            appendHint(reference.name, reference.start, preferFunction = reference.isCall)
-        }
-    }.trimEnd()
-
     private fun toUnmatchedClosingBraceMessage(
         position: ScriptPosition
     ): String = buildString {
@@ -336,7 +318,12 @@ internal class ScriptErrorReporter(
         val (start, end) = range
         appendSourceLines(start, end)
         unresolvedReference.matchEntire(diagnostic.message)?.let { match ->
-            appendHint(name = match.groupValues[1], position = start)
+            appendHint(
+                name = match.groupValues[1],
+                position = start,
+                // unlike a property, a function of the same name is called
+                preferFunction = source.scriptLines[end.line].drop(end.column).trimStart().startsWith('(')
+            )
         }
         if (capturing != null) {
             val kind = capturing[1].lowercase()

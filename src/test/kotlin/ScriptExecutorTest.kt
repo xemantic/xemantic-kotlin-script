@@ -2564,7 +2564,7 @@ class ScriptExecutorTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                script.kts:3:44: error: 'limit' refers to the dependency, not to the property of the script body declared at line 1.
+                script.kts:3:44: error: Unresolved reference 'limit'.
                   | class Below : Check { fun ok(v: Int) = v < <error>limit</error> }
                   hint: 'Below' is compiled outside of the script body, where 'limit' (line 1) is not visible - pass it as a parameter, or declare it within 'Below'.
             """.trimIndent()
@@ -2589,7 +2589,7 @@ class ScriptExecutorTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
             message sameAs $$"""
-                script.kts:2:24: error: 'prefix' refers to the dependency, not to the property of the script body declared at line 1.
+                script.kts:2:24: error: Unresolved reference 'prefix'.
                   | val greeting get() = "$<error>prefix</error>!"
                   hint: 'greeting' is compiled outside of the script body, where 'prefix' (line 1) is not visible - pass it as a parameter, or declare it within 'greeting'.
             """.trimIndent()
@@ -2634,7 +2634,7 @@ class ScriptExecutorTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                script.kts:4:34: error: 'log' refers to the dependency, not to the function of the script body declared at line 2.
+                script.kts:4:34: error: Unresolved reference 'log'.
                   | class Below : Check { fun ok() = <error>log</error>("hi") }
                   hint: 'Below' is compiled outside of the script body, where 'log' (line 2) is not visible - pass it as a parameter, or declare it within 'Below'.
             """.trimIndent()
@@ -2753,32 +2753,6 @@ class ScriptExecutorTest {
     }
 
     @Test
-    fun `should report error at declaration moved out of the script body referring to shadowed dependency despite suppressed deprecation`() = runTest {
-        // given
-        val script = """
-            val limit = 5
-            sealed interface Check
-            @Suppress("DEPRECATION") class Below : Check { fun ok(v: Int) = v < limit }
-            Below().ok(7)
-        """.trimIndent()
-        val executor = ScriptExecutor()
-
-        // when
-        val result = executor.execute(script, listOf(dependency("limit", 10)))
-
-        // then
-        result should {
-            be<ScriptResult.Error>()
-            have(phase == ExecutionPhase.COMPILATION)
-            message sameAs """
-                script.kts:3:69: error: 'limit' refers to the dependency, not to the property of the script body declared at line 1.
-                  | @Suppress("DEPRECATION") class Below : Check { fun ok(v: Int) = v < <error>limit</error> }
-                  hint: 'Below' is compiled outside of the script body, where 'limit' (line 1) is not visible - pass it as a parameter, or declare it within 'Below'.
-            """.trimIndent()
-        }
-    }
-
-    @Test
     fun `should report error at declaration moved out of the script body calling dependency shadowed by local function named like local property`() = runTest {
         // given
         val script = """
@@ -2798,7 +2772,7 @@ class ScriptExecutorTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                script.kts:4:25: error: 'limit' refers to the dependency, not to the function of the script body declared at line 2.
+                script.kts:4:25: error: Unresolved reference 'limit'.
                   | class T : S { fun f() = <error>limit</error>() }
                   hint: 'T' is compiled outside of the script body, where 'limit' (line 2) is not visible - pass it as a parameter, or declare it within 'T'.
             """.trimIndent()
@@ -2821,6 +2795,52 @@ class ScriptExecutorTest {
         result should {
             be<ScriptResult.Value>()
             have(value == 44)
+        }
+    }
+
+    @Test
+    fun `should recognize declarations of the script named with backticks`() = runTest {
+        // given
+        val scripts = listOf(
+            "val `limit` = 5\nsealed interface S\nclass T : S { fun f() = limit }\nT().f()",
+            "val total = `compute total`() + 1\nfun `compute total`() = 42\ntotal"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, listOf(dependency("limit", 10))) }
+
+        // then
+        results[0] should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                script.kts:3:25: error: Unresolved reference 'limit'.
+                  | class T : S { fun f() = <error>limit</error> }
+                  hint: 'T' is compiled outside of the script body, where 'limit' (line 1) is not visible - pass it as a parameter, or declare it within 'T'.
+            """.trimIndent()
+        }
+        results[1] should {
+            be<ScriptResult.Value>()
+            have(value == 43)
+        }
+    }
+
+    @Test
+    fun `should resolve dependencies before the extensions of the coroutine scope of the script body`() = runTest {
+        // given
+        val script = """
+            listOf(javaClass, isActive, launch + 1)
+        """.trimIndent()
+        val dependencies = listOf(dependency("javaClass", "x"), dependency("isActive", "y"), dependency("launch", 1))
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, dependencies)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == listOf("x", "y", 2))
         }
     }
 

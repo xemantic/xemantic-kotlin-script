@@ -33,6 +33,7 @@ import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.concurrent.atomics.fetchAndIncrement
 import kotlin.concurrent.atomics.incrementAndFetch
 import kotlin.coroutines.CoroutineContext
+import kotlin.reflect.KClass
 import kotlin.reflect.typeOf
 import kotlin.script.experimental.api.CompiledScript
 import kotlin.script.experimental.api.KotlinType
@@ -57,9 +58,24 @@ import kotlin.time.measureTimedValue
  * which [ScriptExecutor.execute] runs in the coroutine of its caller.
  */
 public object ScriptBlock {
-    public operator fun invoke(
-        block: suspend CoroutineScope.() -> Any?
-    ): suspend CoroutineScope.() -> Any? = block
+    public operator fun <S : CoroutineScope> invoke(
+        receiver: (CoroutineScope) -> S,
+        block: suspend S.() -> Any?
+    ): ScriptBody<S> = ScriptBody(receiver, block)
+}
+
+/**
+ * The script body, run with the [receiver] of the coroutine scope of the caller, giving access to the dependencies.
+ */
+public class ScriptBody<S : CoroutineScope> internal constructor(
+    private val receiver: (CoroutineScope) -> S,
+    internal val block: suspend S.() -> Any?
+) {
+
+    internal suspend fun run(
+        scope: CoroutineScope
+    ): Any? = receiver(scope).block()
+
 }
 
 /**
@@ -92,7 +108,7 @@ internal class DefaultScriptExecutor(
 
     private val compilationCache = if (compilationCacheSize > 0) {
         ScriptCompilationCache<Compilation>(compilationCacheSize) {
-            it.result is ResultWithDiagnostics.Success && it.shadowedDependencyReferences.isEmpty()
+            it.result is ResultWithDiagnostics.Success
         }
     } else {
         null
@@ -138,7 +154,8 @@ internal class DefaultScriptExecutor(
             require(name != SCRIPT_BLOCK_NAME && !name.startsWith(HIDDEN_DEPENDENCY_PREFIX)) {
                 "Reserved dependency name: $name"
             }
-            require(name !in coroutineScopeNames) {
+            // the member of the receiver of the script body, which would conflict with the accessor of the dependency
+            require(name != "coroutineContext") {
                 "Reserved dependency name: $name - it would be resolved to the CoroutineScope of the script body"
             }
         }
@@ -164,13 +181,11 @@ internal class DefaultScriptExecutor(
 
     /**
      * The [source] of the script, together with the [result] of its compilation,
-     * or `null`, if the script was not compiled because of the failure recognized in its source,
-     * and the [ScriptSource.shadowedDependencyCandidates] which refer to the dependencies indeed.
+     * or `null`, if the script was not compiled because of the failure recognized in its source.
      */
     private class Compilation(
         val source: ScriptSource,
-        val result: ResultWithDiagnostics<CompiledScript>?,
-        val shadowedDependencyReferences: List<ScriptReference> = emptyList()
+        val result: ResultWithDiagnostics<CompiledScript>?
     )
 
     private inner class ScriptHandler(
@@ -202,14 +217,6 @@ internal class DefaultScriptExecutor(
             source = compilation.source
             val compilationResult = compilation.result ?: return ScriptResult.Error(
                 ScriptErrorReporter(source).toSourceFailureMessage(),
-                ExecutionPhase.COMPILATION
-            )
-            val shadowed = compilation.shadowedDependencyReferences
-            if (shadowed.isNotEmpty()) return ScriptResult.Error(
-                listOfNotNull(
-                    ScriptErrorReporter(source).toShadowedDependencyMessage(shadowed),
-                    (compilationResult as? Failure)?.let { ScriptErrorReporter(source).toFailureMessage(it.reports.filterNonIgnorable()) }
-                ).joinToString(separator = "\n\n"),
                 ExecutionPhase.COMPILATION
             )
             val result = when (compilationResult) {
@@ -267,17 +274,14 @@ internal class DefaultScriptExecutor(
             if (source.unmatchedClosingBrace != null || source.conflictingDependencyDeclarations.isNotEmpty()) {
                 return Compilation(source, result = null)
             }
-            return Compilation(source, compile(source), shadowedDependencyReferences(source))
+            return Compilation(source, compile(source))
         }
 
-        private fun source(
-            withoutAccessors: Set<String> = emptySet()
-        ) = ScriptSource(
+        private fun source() = ScriptSource(
             script,
-            preamble = allDependencies.filter { it.name !in withoutAccessors }.mapNotNull { dependency ->
-                dependency.accessor?.let { dependency.name to it }
-            }.toMap(),
-            dependencyNames = allDependencies.mapTo(HashSet()) { it.name }
+            dependencies = allDependencies.filter { it.isHidden }.map { dependency ->
+                PreambleDependency(dependency.name, dependency.accessor, dependency.isCallable)
+            }
         )
 
         private suspend fun compile(
@@ -298,24 +302,6 @@ internal class DefaultScriptExecutor(
             }
         }
 
-        /**
-         * The [ScriptSource.shadowedDependencyCandidates] which refer to the dependencies indeed,
-         * recognized by compiling the script once more without their accessors, where they are unresolved,
-         * unlike the ones referring e.g. to the inherited members.
-         */
-        private suspend fun shadowedDependencyReferences(
-            source: ScriptSource
-        ): List<ScriptReference> {
-            val candidates = source.shadowedDependencyCandidates
-            if (candidates.isEmpty()) return emptyList()
-            val probe = source(withoutAccessors = candidates.mapTo(HashSet()) { it.name })
-            val errors = compile(probe).reports.filter {
-                it.severity == ScriptDiagnostic.Severity.ERROR
-            }.mapNotNull { error ->
-                error.location?.start?.let { probe.toScriptPosition(it.line, it.col) }
-            }
-            return candidates.filter { candidate -> errors.any { it in candidate } }
-        }
 
         private suspend fun evaluate(
             compiledScript: CompiledScript,
@@ -361,13 +347,12 @@ internal class DefaultScriptExecutor(
         ): ScriptResult = when (this) {
             is ResultValue.Value -> {
                 // the script block closed early, unnoticed by the check of the unmatched closing brace
-                if (value !is Function2<*, *, *>) return earlyClosedBlockError()
-                @Suppress("UNCHECKED_CAST")
-                val block = value as suspend CoroutineScope.() -> Any?
+                val body = value as? ScriptBody<*> ?: return earlyClosedBlockError()
+                val block = body.block
                 // only what the block throws is the failure of the script, not the reporting of its warnings
                 val returned = try {
                     // the scripting host sets it only while constructing the script, which just returns the block
-                    Result.success(withContext(ContextClassLoader(block::class.java.classLoader)) { block() })
+                    Result.success(withContext(ContextClassLoader(block::class.java.classLoader)) { body.run(this) })
                 } catch (e: Throwable) {
                     // the cancellation of the caller is not a failure of the script
                     if (e is CancellationException) currentCoroutineContext().ensureActive()
@@ -493,19 +478,13 @@ private const val SCRIPT_BLOCK_NAME = "_script"
 
 private const val HIDDEN_DEPENDENCY_PREFIX = "_dependency_"
 
-/**
- * The members of the `CoroutineScope` receiver of the script body, and its extensions imported by default,
- * which the script would refer to instead of the dependencies of these names.
- */
-private val coroutineScopeNames = setOf("coroutineContext", "isActive", "launch", "async", "cancel", "ensureActive", "plus")
-
 /*
  * The scripting host erases the type arguments of a provided property,
  * fails to compile the erased type of a nested class,
  * cannot construct the script class taking a property of value class type, which is not boxed,
  * and resolves a provided property before the members of the implicit receivers, like `size` in `list.run { size }`,
  * so a dependency is provided under a hidden name as `Any?`,
- * and cast back to its type by an accessor declared in the preamble of the script, resolved like any member of the script.
+ * and cast back to its type by the accessors declared in the preamble of the script, see [ScriptSource].
  */
 
 private val ScriptExecutor.Dependency<*>.isHidden: Boolean
@@ -517,10 +496,10 @@ private val ScriptExecutor.Dependency<*>.providedName: String
 private val ScriptExecutor.Dependency<*>.providedType: KotlinType
     get() = if (isHidden) KotlinType(typeOf<Any?>()) else KotlinType(type)
 
-private val ScriptExecutor.Dependency<*>.accessor: String?
-    get() = if (isHidden) {
-        // with an initializer, unlike a getter, the dependency can be smart cast
-        "@Suppress(\"UNCHECKED_CAST\") val `$name`: $type = `$providedName` as $type"
-    } else {
-        null
-    }
+// with an initializer, unlike a getter, the dependency can be smart cast
+private val ScriptExecutor.Dependency<*>.accessor: String
+    get() = "@Suppress(\"UNCHECKED_CAST\") val `$name`: $type = `$providedName` as $type"
+
+/** Whether it is of a function type, so the script can call it. */
+private val ScriptExecutor.Dependency<*>.isCallable: Boolean
+    get() = (type.classifier as? KClass<*>)?.java?.let { Function::class.java.isAssignableFrom(it) } == true

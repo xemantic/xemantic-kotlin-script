@@ -76,9 +76,8 @@ internal class ScriptCompilationCache<T : Any>(
             try {
                 val result = compile()
                 synchronized(entries) {
-                    if (!isReusable(result)) entries.remove(key, entry)
+                    if (isReusable(result)) evict() else entries.remove(key, entry)
                     entry.complete(result)
-                    evict()
                 }
                 return result
             } catch (e: Throwable) {

@@ -36,7 +36,6 @@ import org.jetbrains.kotlin.lexer.KtTokens
 import org.jetbrains.kotlin.psi.KtAnnotation
 import org.jetbrains.kotlin.psi.KtAnnotationEntry
 import org.jetbrains.kotlin.psi.KtBlockExpression
-import org.jetbrains.kotlin.psi.KtCallExpression
 import org.jetbrains.kotlin.psi.KtCallableReferenceExpression
 import org.jetbrains.kotlin.psi.KtCatchClause
 import org.jetbrains.kotlin.psi.KtClass
@@ -84,32 +83,49 @@ internal data class ScriptPosition(
     val column: Int
 )
 
-/** The reference to the [name] in the script, from the [start] to the [end], exclusive, within one line. */
+/** The reference to the [name] in the script, from the [start] to the [end], exclusive. */
 internal class ScriptReference(
     val name: String,
     val start: ScriptPosition,
-    val end: ScriptPosition,
-    /** Whether it is called, so it might refer to a function. */
-    val isCall: Boolean = false
-) {
+    val end: ScriptPosition
+)
 
-    operator fun contains(
-        position: ScriptPosition
-    ): Boolean = position.line == start.line && position.column >= start.column && position.column < end.column
+/** A dependency, as declared in the preamble of the [ScriptSource]. */
+internal class PreambleDependency(
+    val name: String,
+    /** The declaration of the property of the dependency, like `val x: T = _dependency_x as T`. */
+    val accessor: String,
+    /** Whether it can be called like a function, so a local function of the same name shadows it. */
+    val isCallable: Boolean = false
+)
 
-}
+/** The class of the receiver of the script body, see [ScriptSource]. */
+private const val DEPENDENCIES_CLASS = "`_ScriptDependencies`"
+
+/** The line starting the script block in the [ScriptSource.text]. */
+internal const val SCRIPT_BLOCK_START = "_script({ $DEPENDENCIES_CLASS(it) }) {"
 
 /**
  * The script turned into a block, which can be run in the coroutine of the caller:
  *
  * ```
  * <file annotations, package and imports>
- * <preamble of the dependency accessors>
+ * <the dependency accessors, unless shadowed by the local declarations of the script body>
+ * class _ScriptDependencies(scope: CoroutineScope) : CoroutineScope by scope {
+ * <the dependency accessors>
+ * }
  * <declarations which cannot be local>
- * _script {
+ * _script({ _ScriptDependencies(it) }) {
  * <the rest of the script>
  * }
  * ```
+ *
+ * The script body refers to the dependencies as the members of its receiver,
+ * resolved after the members of the inner receivers, like `size` in `list.run { size }`,
+ * but before the extensions of the coroutine scope, like `isActive`.
+ * The declarations moved out of the script body refer to them as the members of the script instead,
+ * so a dependency shadowed by a local declaration of the script body is not declared there,
+ * leaving their references to it unresolved, as in the script they refer to the local declaration.
  *
  * Declarations are moved by blanking them out with spaces in one copy of their lines,
  * and everything else in the other, so the columns of the script are retained,
@@ -117,9 +133,7 @@ internal class ScriptReference(
  */
 internal class ScriptSource(
     script: String,
-    /** The declarations of the dependency accessors, by the names of the dependencies. */
-    preamble: Map<String, String> = emptyMap(),
-    dependencyNames: Set<String> = preamble.keys
+    dependencies: List<PreambleDependency> = emptyList()
 ) : SourceCode {
 
     val scriptLines: List<String>
@@ -139,13 +153,6 @@ internal class ScriptSource(
      */
     val returnsUnit: Boolean
 
-    /**
-     * The references of the declarations moved out of the script body to the local declarations of the script body,
-     * which might compile, but refer to the dependencies of the same names instead,
-     * recognized by the names only, so they might also refer e.g. to the inherited members.
-     */
-    val shadowedDependencyCandidates: List<ScriptReference>
-
     /** The properties moved out of the script body, which have the names of the dependencies, conflicting with their accessors. */
     val conflictingDependencyDeclarations: List<ScriptReference>
 
@@ -154,10 +161,8 @@ internal class ScriptSource(
     /** For each line of the [text], the line of the script, or `null` for the lines of the block and the preamble. */
     private val lineMapping: List<Int?>
 
-    /** The 0-based line of the [text] where the preamble starts. */
-    private val preambleStart: Int
-
-    private val preambleDependencies: List<String> = preamble.keys.toList()
+    /** The names of the dependencies, by the 0-based lines of the [text] declaring their accessors. */
+    private val preambleDependencies = mutableMapOf<Int, String>()
 
     private val movedDeclarations: List<Declaration>
 
@@ -168,13 +173,10 @@ internal class ScriptSource(
         lineStarts = lineBounds.map { it.first }
         scriptLines = lineBounds.map { script.substring(it.first, it.last + 1) }
         // the parser recognizes only `\n` as a line terminator, replacing each character keeps the offsets
-        val structure = ScriptStructure(script.replace('\r', '\n'), dependencyNames)
+        val structure = ScriptStructure(script.replace('\r', '\n'), dependencies.mapTo(HashSet()) { it.name })
         unmatchedClosingBrace = structure.unmatchedClosingBrace?.let { position(it) }
         movedDeclarations = structure.movedDeclarations
         returnsUnit = structure.endsWithMovedDeclaration
-        shadowedDependencyCandidates = structure.shadowedDependencyCandidates.map {
-            ScriptReference(it.name, position(it.offset), position(it.offset + it.length), it.isCall)
-        }
         conflictingDependencyDeclarations = structure.conflictingDependencyDeclarations.map { (name, range) ->
             ScriptReference(name, position(range.first), position(range.last + 1))
         }
@@ -203,15 +205,27 @@ internal class ScriptSource(
         if (headerEnd > 0) {
             addLines(0..lineOf(headerEnd - 1)) { it < headerEnd }
         }
-        preambleStart = lines.size
-        lines += preamble.values
-        mapping += preamble.map { null }
+        fun addAccessor(
+            dependency: PreambleDependency
+        ) {
+            preambleDependencies[lines.size] = dependency.name
+            lines += dependency.accessor
+            mapping += null
+        }
+        dependencies.filterNot {
+            it.name in structure.localProperties || (it.isCallable && it.name in structure.localFunctions)
+        }.forEach { addAccessor(it) }
+        lines += "class $DEPENDENCIES_CLASS(scope: kotlinx.coroutines.CoroutineScope) : kotlinx.coroutines.CoroutineScope by scope {"
+        mapping += null
+        dependencies.forEach { addAccessor(it) }
+        lines += "}"
+        mapping += null
         movedDeclarations.forEach { declaration ->
             addLines(lineOf(declaration.start)..lineOf(declaration.end - 1)) {
                 it in declaration.start until declaration.end
             }
         }
-        lines += "_script {"
+        lines += SCRIPT_BLOCK_START
         mapping += null
         addLines(lineOf(headerEnd)..lineBounds.lastIndex) { offset ->
             offset >= headerEnd && !excluded[offset]
@@ -261,7 +275,7 @@ internal class ScriptSource(
      */
     fun preambleDependencyAt(
         line: Int
-    ): String? = preambleDependencies.getOrNull(line - 1 - preambleStart)
+    ): String? = preambleDependencies[line - 1]
 
     /**
      * The name of the declaration moved out of the script body, which contains the [position].
@@ -420,11 +434,8 @@ private val psiFactory: KtPsiFactory by lazy {
 private class Reference(
     val name: String,
     val offset: Int,
-    val length: Int,
     val isQualified: Boolean,
-    val isBound: Boolean,
-    /** Whether it is called, like `foo` in `foo()`, or referred to as a function, like `::foo`. */
-    val isCall: Boolean
+    val isBound: Boolean
 ) {
 
     /** Whether it might refer to one of the local declarations of the script body of these [names]. */
@@ -449,13 +460,10 @@ private fun PsiElement.references(
     Reference(
         name = name,
         offset = expression.startOffset,
-        length = expression.textLength,
         isQualified = expression.getReceiverExpression() != null || (
                 callableReference?.callableReference == expression && callableReference.receiverExpression != null
         ),
-        isBound = isBound(expression, name, scope, declaredNames),
-        isCall = (expression.parent as? KtCallExpression)?.calleeExpression == expression
-                || callableReference?.callableReference == expression
+        isBound = isBound(expression, name, scope, declaredNames)
     )
 }
 
@@ -568,8 +576,11 @@ private class ScriptStructure(
     /** Whether the last statement of the script is a declaration moved out of the script body. */
     val endsWithMovedDeclaration: Boolean
 
-    /** See [ScriptSource.shadowedDependencyCandidates]. */
-    val shadowedDependencyCandidates: List<Reference>
+    /** The names of the properties of the script body, which are local to the script block. */
+    val localProperties: Set<String>
+
+    /** The names of the functions of the script body, which are local to the script block. */
+    val localFunctions: Set<String>
 
     /** The names of the [ScriptSource.conflictingDependencyDeclarations], and their ranges. */
     val conflictingDependencyDeclarations: List<Pair<String, IntRange>>
@@ -598,20 +609,14 @@ private class ScriptStructure(
             declarationsByPsi[statement]?.references ?: statement.references(scope = statement.parent, declaredNames)
         }
         // only the properties which require it are moved
-        val localProperties = declarations.filter { it.kind == DeclarationKind.PROPERTY && !it.requiresMove }
+        localProperties = declarations.filter { it.kind == DeclarationKind.PROPERTY && !it.requiresMove }
             .flatMapTo(HashSet()) { listOfNotNull(it.name) + it.destructuredNames }
         val moved = selectMovedDeclarations(declarations, bodyReferences, localProperties)
         movedDeclarations = moved.map { it.toDeclaration(withNestedNames = true) }
         endsWithMovedDeclaration = moved.any { it.psi == statements.lastOrNull() }
-        val localFunctions = declarations.filter {
+        localFunctions = declarations.filter {
             it.kind == DeclarationKind.FUNCTION && it !in moved
         }.mapNotNullTo(HashSet()) { it.name }
-        // without a dependency of the same name, the compiler reports them as unresolved
-        shadowedDependencyCandidates = moved.flatMap { declaration ->
-            declaration.references.filter {
-                it.name in dependencyNames && (it.refersToLocal(localProperties) || (it.isCall && it.refersToLocal(localFunctions)))
-            }
-        }
         // unlike an extension property, which does not conflict with the accessor of the dependency
         conflictingDependencyDeclarations = moved.filter {
             it.kind == DeclarationKind.PROPERTY && (it.psi as? KtProperty)?.receiverTypeReference == null && it.name in dependencyNames
@@ -666,7 +671,7 @@ private class ScriptStructure(
             nestedNameRanges = if (withNestedNames && psi is KtClassOrObject) {
                 buildMap {
                     psi.collectDescendantsOfType<KtClassOrObject> { it !== psi }.forEach { nested ->
-                        nested.nameIdentifier?.let { putIfAbsent(it.text, it.startOffset until it.endOffset) }
+                        nested.nameIdentifier?.let { putIfAbsent(nested.name!!, it.startOffset until it.endOffset) }
                     }
                 }
             } else {
@@ -720,7 +725,8 @@ private class ScriptStructure(
             psi = declaration,
             end = end,
             kind = kind,
-            name = nameIdentifier?.text,
+            // without the backticks, like the references
+            name = (declaration as? KtNamedDeclaration)?.name,
             nameRange = nameIdentifier?.let { it.startOffset until it.endOffset },
             requiresMove = requiresMove,
             accessors = accessors,
