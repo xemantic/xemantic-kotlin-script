@@ -92,7 +92,7 @@ internal class DefaultScriptExecutor(
 
     private val compilationCache = if (compilationCacheSize > 0) {
         ScriptCompilationCache<Compilation>(compilationCacheSize) {
-            it.result is ResultWithDiagnostics.Success
+            it.result is ResultWithDiagnostics.Success && it.shadowedDependencyReferences.isEmpty()
         }
     } else {
         null
@@ -138,6 +138,9 @@ internal class DefaultScriptExecutor(
             require(name != SCRIPT_BLOCK_NAME && !name.startsWith(HIDDEN_DEPENDENCY_PREFIX)) {
                 "Reserved dependency name: $name"
             }
+            require(name !in coroutineScopeNames) {
+                "Reserved dependency name: $name - it would be resolved to the CoroutineScope of the script body"
+            }
         }
 
         @OptIn(ExperimentalAtomicApi::class)
@@ -161,11 +164,13 @@ internal class DefaultScriptExecutor(
 
     /**
      * The [source] of the script, together with the [result] of its compilation,
-     * or `null`, if the script was not compiled because of the failure recognized in its source.
+     * or `null`, if the script was not compiled because of the failure recognized in its source,
+     * and the [ScriptSource.shadowedDependencyCandidates] which refer to the dependencies indeed.
      */
     private class Compilation(
         val source: ScriptSource,
-        val result: ResultWithDiagnostics<CompiledScript>?
+        val result: ResultWithDiagnostics<CompiledScript>?,
+        val shadowedDependencyReferences: List<ScriptReference> = emptyList()
     )
 
     private inner class ScriptHandler(
@@ -199,19 +204,11 @@ internal class DefaultScriptExecutor(
                 ScriptErrorReporter(source).toSourceFailureMessage(),
                 ExecutionPhase.COMPILATION
             )
-            val (shadowingWarnings, reports) = compilationResult.reports.partition {
-                SHADOWED_DEPENDENCY in it.message
-            }
-            // the other warnings are of the references of the script body, which refer to the dependencies indeed
-            val shadowed = source.shadowedDependencyCandidates.filter { candidate ->
-                shadowingWarnings.any { warning ->
-                    warning.location?.start?.let { candidate.contains(source.toScriptPosition(it.line, it.col)) } == true
-                }
-            }
+            val shadowed = compilation.shadowedDependencyReferences
             if (shadowed.isNotEmpty()) return ScriptResult.Error(
                 listOfNotNull(
                     ScriptErrorReporter(source).toShadowedDependencyMessage(shadowed),
-                    if (compilationResult is Failure) ScriptErrorReporter(source).toFailureMessage(reports.filterNonIgnorable()) else null
+                    (compilationResult as? Failure)?.let { ScriptErrorReporter(source).toFailureMessage(it.reports.filterNonIgnorable()) }
                 ).joinToString(separator = "\n\n"),
                 ExecutionPhase.COMPILATION
             )
@@ -219,14 +216,14 @@ internal class DefaultScriptExecutor(
                 is Success -> {
                     evaluate(
                         compiledScript = compilationResult.value,
-                        warnings = reports.filter {
+                        warnings = compilationResult.reports.filter {
                             it.severity == ScriptDiagnostic.Severity.WARNING
                         }
                     )
                 }
                 is Failure -> {
                     val failureMessage = ScriptErrorReporter(source).toFailureMessage(
-                        reports.filterNonIgnorable()
+                        compilationResult.reports.filterNonIgnorable()
                     )
                     logger.debug {
                         "Script[$scriptId]: Compilation (1/2) failure message: $failureMessage"
@@ -266,19 +263,29 @@ internal class DefaultScriptExecutor(
         }
 
         private suspend fun doCompile(): Compilation {
-            val source = ScriptSource(
-                script,
-                preamble = allDependencies.mapNotNull { dependency ->
-                    dependency.accessor?.let { dependency.name to it }
-                }.toMap(),
-                dependencyNames = allDependencies.mapTo(HashSet()) { it.name }
-            )
+            val source = source()
             if (source.unmatchedClosingBrace != null || source.conflictingDependencyDeclarations.isNotEmpty()) {
                 return Compilation(source, result = null)
             }
+            return Compilation(source, compile(source), shadowedDependencyReferences(source))
+        }
+
+        private fun source(
+            withoutAccessors: Set<String> = emptySet()
+        ) = ScriptSource(
+            script,
+            preamble = allDependencies.filter { it.name !in withoutAccessors }.mapNotNull { dependency ->
+                dependency.accessor?.let { dependency.name to it }
+            }.toMap(),
+            dependencyNames = allDependencies.mapTo(HashSet()) { it.name }
+        )
+
+        private suspend fun compile(
+            source: ScriptSource
+        ): ResultWithDiagnostics<CompiledScript> {
             @OptIn(ExperimentalAtomicApi::class)
             compilations.incrementAndFetch()
-            val result = try {
+            return try {
                 scriptingHost.compiler(
                     script = source,
                     scriptCompilationConfiguration = compilationConfig()
@@ -289,7 +296,25 @@ internal class DefaultScriptExecutor(
                 currentCoroutineContext().ensureActive()
                 throw IllegalStateException("The compilation of the script was cancelled", e)
             }
-            return Compilation(source, result)
+        }
+
+        /**
+         * The [ScriptSource.shadowedDependencyCandidates] which refer to the dependencies indeed,
+         * recognized by compiling the script once more without their accessors, where they are unresolved,
+         * unlike the ones referring e.g. to the inherited members.
+         */
+        private suspend fun shadowedDependencyReferences(
+            source: ScriptSource
+        ): List<ScriptReference> {
+            val candidates = source.shadowedDependencyCandidates
+            if (candidates.isEmpty()) return emptyList()
+            val probe = source(withoutAccessors = candidates.mapTo(HashSet()) { it.name })
+            val errors = compile(probe).reports.filter {
+                it.severity == ScriptDiagnostic.Severity.ERROR
+            }.mapNotNull { error ->
+                error.location?.start?.let { probe.toScriptPosition(it.line, it.col) }
+            }
+            return candidates.filter { candidate -> errors.any { it in candidate } }
         }
 
         private suspend fun evaluate(
@@ -467,6 +492,12 @@ internal fun scriptJvmTarget(
 private const val SCRIPT_BLOCK_NAME = "_script"
 
 private const val HIDDEN_DEPENDENCY_PREFIX = "_dependency_"
+
+/**
+ * The members of the `CoroutineScope` receiver of the script body, and its extensions imported by default,
+ * which the script would refer to instead of the dependencies of these names.
+ */
+private val coroutineScopeNames = setOf("coroutineContext", "isActive", "launch", "async", "cancel", "ensureActive", "plus")
 
 /*
  * The scripting host erases the type arguments of a provided property,

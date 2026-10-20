@@ -103,13 +103,14 @@ internal class ScriptErrorReporter(
         buildString {
             appendPosition(reference.start)
             +"error: '${reference.name}' refers to the dependency, not to the"
-            source.bodyDeclarationLine(reference.name)?.let { (line, kind) ->
+            val function = if (reference.isCall) source.bodyDeclarationLine(reference.name, DeclarationKind.FUNCTION) else null
+            (function ?: source.bodyDeclarationLine(reference.name, DeclarationKind.PROPERTY))?.let { (line, kind) ->
                 +(if (kind == DeclarationKind.FUNCTION) " function" else " property")
                 +" of the script body declared at line ${line + 1}"
             } ?: +" declaration of the script body"
             +".\n"
             appendSourceLines(reference.start, reference.end)
-            appendHint(reference.name, reference.start)
+            appendHint(reference.name, reference.start, preferFunction = reference.isCall)
         }
     }.trimEnd()
 
@@ -387,9 +388,11 @@ internal class ScriptErrorReporter(
      */
     private fun StringBuilder.appendHint(
         name: String,
-        position: ScriptPosition
+        position: ScriptPosition,
+        preferFunction: Boolean = false
     ) {
-        val (line, kind) = source.bodyDeclarationLine(name) ?: return
+        val (line, kind) = (if (preferFunction) source.bodyDeclarationLine(name, DeclarationKind.FUNCTION) else null)
+            ?: source.bodyDeclarationLine(name) ?: return
         val declaration = source.movedDeclarationAt(position)
         if (declaration != null) {
             +"  hint: '$declaration' is compiled outside of the script body, where '$name' (line ${line + 1}) is not visible"

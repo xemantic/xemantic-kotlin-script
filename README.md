@@ -76,6 +76,7 @@ when (result) {
   A dependency list built dynamically can be passed instead, as `execute(script, listOf(dependency("greeting", "Hello")))`.
   Invalid dependencies are rejected with `IllegalArgumentException`:
   a name which is not a Kotlin identifier, a duplicate name, a value which is not of the type,
+  a name which the script body would resolve to its `CoroutineScope` instead, like `coroutineContext` or `launch`,
   or a type which the script cannot refer to, like a private or a local class.
 * Scripts executed repeatedly, like an agent harness defined as a script, can skip the recompilation
   with `ScriptExecutor(compilationCacheSize = ...)`, keeping that many compiled scripts, the least recently used evicted first.

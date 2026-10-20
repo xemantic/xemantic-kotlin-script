@@ -88,7 +88,9 @@ internal data class ScriptPosition(
 internal class ScriptReference(
     val name: String,
     val start: ScriptPosition,
-    val end: ScriptPosition
+    val end: ScriptPosition,
+    /** Whether it is called, so it might refer to a function. */
+    val isCall: Boolean = false
 ) {
 
     operator fun contains(
@@ -139,9 +141,8 @@ internal class ScriptSource(
 
     /**
      * The references of the declarations moved out of the script body to the local declarations of the script body,
-     * which might compile, but refer to the dependencies of the same names instead.
-     * The accessors of these dependencies are deprecated with the [SHADOWED_DEPENDENCY],
-     * so the compiler warns at the references which actually refer to them.
+     * which might compile, but refer to the dependencies of the same names instead,
+     * recognized by the names only, so they might also refer e.g. to the inherited members.
      */
     val shadowedDependencyCandidates: List<ScriptReference>
 
@@ -172,12 +173,11 @@ internal class ScriptSource(
         movedDeclarations = structure.movedDeclarations
         returnsUnit = structure.endsWithMovedDeclaration
         shadowedDependencyCandidates = structure.shadowedDependencyCandidates.map {
-            ScriptReference(it.name, position(it.offset), position(it.offset + it.length))
+            ScriptReference(it.name, position(it.offset), position(it.offset + it.length), it.isCall)
         }
         conflictingDependencyDeclarations = structure.conflictingDependencyDeclarations.map { (name, range) ->
             ScriptReference(name, position(range.first), position(range.last + 1))
         }
-        val shadowedDependencies = structure.shadowedDependencyCandidates.mapTo(HashSet()) { it.name }
         bodyDeclarations = structure.bodyDeclarations
 
         val lines = mutableListOf<String>()
@@ -204,9 +204,7 @@ internal class ScriptSource(
             addLines(0..lineOf(headerEnd - 1)) { it < headerEnd }
         }
         preambleStart = lines.size
-        lines += preamble.map { (name, accessor) ->
-            if (name in shadowedDependencies) "@Deprecated(\"$SHADOWED_DEPENDENCY\") $accessor" else accessor
-        }
+        lines += preamble.values
         mapping += preamble.map { null }
         movedDeclarations.forEach { declaration ->
             addLines(lineOf(declaration.start)..lineOf(declaration.end - 1)) {
@@ -292,8 +290,11 @@ internal class ScriptSource(
      * The 0-based line of the declaration of the [name] in the script body, and its kind.
      */
     fun bodyDeclarationLine(
-        name: String
-    ): Pair<Int, DeclarationKind>? = bodyDeclarations.find { it.name == name || name in it.destructuredNames }?.let {
+        name: String,
+        kind: DeclarationKind? = null
+    ): Pair<Int, DeclarationKind>? = bodyDeclarations.find {
+        (it.name == name || name in it.destructuredNames) && (kind == null || it.kind == kind)
+    }?.let {
         position(it.start).line to it.kind
     }
 
@@ -308,9 +309,6 @@ internal class ScriptSource(
 
 @OptIn(ExperimentalAtomicApi::class)
 private val sourceIdSeq = AtomicLong(0)
-
-/** The deprecation message of the accessors of the dependencies, which might be shadowed, see [ScriptSource.shadowedDependencyCandidates]. */
-internal const val SHADOWED_DEPENDENCY = "xemantic-kotlin-script: shadowed dependency"
 
 /** The index of the line containing the [offset], given the sorted [lineStarts]. */
 private fun lineOf(
@@ -614,8 +612,9 @@ private class ScriptStructure(
                 it.name in dependencyNames && (it.refersToLocal(localProperties) || (it.isCall && it.refersToLocal(localFunctions)))
             }
         }
+        // unlike an extension property, which does not conflict with the accessor of the dependency
         conflictingDependencyDeclarations = moved.filter {
-            it.kind == DeclarationKind.PROPERTY && it.name in dependencyNames
+            it.kind == DeclarationKind.PROPERTY && (it.psi as? KtProperty)?.receiverTypeReference == null && it.name in dependencyNames
         }.map { it.name!! to it.nameRange!! }
         bodyDeclarations = declarations
             .filter {

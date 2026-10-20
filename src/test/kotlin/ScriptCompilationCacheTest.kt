@@ -367,4 +367,24 @@ class ScriptCompilationCacheTest {
         assert(compilations == 2)
     }
 
+    @Test
+    fun `should not cache compilation of script referring to shadowed dependency`() = runTest {
+        // given
+        val valid = "limit + 1"
+        val shadowing = "val limit = 5\nsealed interface S\nclass T : S { fun f() = limit }\nT().f()"
+        val dependencies = listOf(dependency("limit", 10))
+        val executor = DefaultScriptExecutor(compilationCacheSize = 1)
+
+        // when
+        val results = listOf(valid, shadowing).map { executor.execute(it, dependencies) }
+        val compilationCount = executor.compilationCount
+        val result = executor.execute(valid, dependencies)
+
+        // then
+        assert(results.map { it is ScriptResult.Value } == listOf(true, false))
+        assert(result is ScriptResult.Value)
+        // not evicted by the shadowing script
+        assert(executor.compilationCount == compilationCount)
+    }
+
 }

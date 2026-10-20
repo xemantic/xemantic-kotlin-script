@@ -63,10 +63,11 @@ internal class ScriptCompilationCache<T : Any>(
         while (true) {
             var owner = false
             val entry = synchronized(entries) {
+                // evicting only once the compilation is reusable, so the failing ones do not evict the others
                 entries.getOrPut(key) {
                     owner = true
                     CompletableDeferred()
-                }.also { evict() }
+                }
             }
             if (!owner) {
                 // the compiling caller was cancelled, compile again

@@ -366,4 +366,23 @@ class ScriptDependenciesTest {
         assert(exception.message == "Dependency 'foo' is of platform type $type, which the script cannot refer to - provide it as a Kotlin type, e.g. with typeOf")
     }
 
+    @Test
+    fun `should reject dependency names resolved to the coroutine scope of the script body instead`() = runTest {
+        // given
+        val names = listOf("coroutineContext", "isActive", "launch", "async", "cancel", "ensureActive", "plus")
+        val executor = ScriptExecutor()
+
+        // when
+        val exceptions = names.map { name ->
+            assertFailsWith<IllegalArgumentException> {
+                executor.execute("foo", listOf(dependency(name, 1)))
+            }
+        }
+
+        // then
+        assert(exceptions.map { it.message } == names.map {
+            "Reserved dependency name: $it - it would be resolved to the CoroutineScope of the script body"
+        })
+    }
+
 }

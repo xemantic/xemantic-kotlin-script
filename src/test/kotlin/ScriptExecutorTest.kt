@@ -2752,4 +2752,76 @@ class ScriptExecutorTest {
         }
     }
 
+    @Test
+    fun `should report error at declaration moved out of the script body referring to shadowed dependency despite suppressed deprecation`() = runTest {
+        // given
+        val script = """
+            val limit = 5
+            sealed interface Check
+            @Suppress("DEPRECATION") class Below : Check { fun ok(v: Int) = v < limit }
+            Below().ok(7)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("limit", 10)))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:69: error: 'limit' refers to the dependency, not to the property of the script body declared at line 1.
+                  | @Suppress("DEPRECATION") class Below : Check { fun ok(v: Int) = v < <error>limit</error> }
+                  hint: 'Below' is compiled outside of the script body, where 'limit' (line 1) is not visible - pass it as a parameter, or declare it within 'Below'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at declaration moved out of the script body calling dependency shadowed by local function named like local property`() = runTest {
+        // given
+        val script = """
+            val limit = 1
+            fun limit() = limit + 1
+            sealed interface S
+            class T : S { fun f() = limit() }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<() -> Int>("limit") { 3 }))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:25: error: 'limit' refers to the dependency, not to the function of the script body declared at line 2.
+                  | class T : S { fun f() = <error>limit</error>() }
+                  hint: 'T' is compiled outside of the script body, where 'limit' (line 2) is not visible - pass it as a parameter, or declare it within 'T'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should use extension property moved out of the script body having the name of a dependency`() = runTest {
+        // given
+        val script = """
+            val String.size get() = length
+            "ab".size + size
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("size", 42)))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 44)
+        }
+    }
+
 }
