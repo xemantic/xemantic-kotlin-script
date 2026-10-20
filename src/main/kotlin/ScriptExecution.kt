@@ -322,7 +322,7 @@ internal class DefaultScriptExecutor(
             }
             // recognizing the candidates referring to the wrong declarations indeed
             val probe = source(confirming = true)
-            /** The positions of the warnings of the marked declarations of this [message] in the [source], see [ScriptSource.confirming]. */
+            /** The positions of the warnings of the deprecated, or opted in, declarations of this [message] in the [source], see [ScriptSource.confirming]. */
             fun List<ScriptDiagnostic>.marked(
                 source: ScriptSource,
                 message: String
@@ -348,13 +348,15 @@ internal class DefaultScriptExecutor(
             val toFunctions = deprecated(SHADOWED_ORIGINAL)
             val toProperties = source.shadowedFunctionCandidates.filter { (reference) -> toFunctions.none { it in reference } }
             // the remaining calls of the functions, which would refer to them in the script, if they apply, like the properties
-            val (coroutineScopeFunctions, coroutineScopeProperties) = coroutineScope.partition { it.isFunction }
-            val copies = if (toProperties.isEmpty() && coroutineScopeFunctions.isEmpty()) null else {
+            val functionCandidates = coroutineScope.filter { it.isFunction }
+            val shadowed = if (toProperties.isEmpty()) emptyList() else {
                 val copies = source(confirming = true, shadowedFunctionCopies = true)
-                copies to compile(copies).reports
+                compile(copies).reports.marked(copies, SHADOWED_FUNCTION)
             }
-            val shadowed = copies?.let { (copies, reports) -> reports.marked(copies, SHADOWED_FUNCTION) }.orEmpty()
-            val toCoroutineScope = copies?.let { (copies, reports) -> reports.marked(copies, COROUTINE_SCOPE_FUNCTION) }.orEmpty()
+            val toCoroutineScope = if (functionCandidates.isEmpty()) emptyList() else {
+                val copies = source(confirming = true, coroutineScopeCopies = true)
+                compile(copies).reports.marked(copies, COROUTINE_SCOPE_FUNCTION)
+            }
             return Compilation(
                 source,
                 result,
@@ -364,8 +366,9 @@ internal class DefaultScriptExecutor(
                             + dependencies.takeIf { !candidate.isFunction || candidate.isCallableReference }.orEmpty())
                         .any { it in candidate.reference }
                 },
-                coroutineScopeReferences = coroutineScopeProperties + coroutineScopeFunctions.filter { candidate ->
-                    toCoroutineScope.any { it in candidate.reference }
+                // in the order of the script
+                coroutineScopeReferences = coroutineScope.filter { candidate ->
+                    !candidate.isFunction || toCoroutineScope.any { it in candidate.reference }
                 },
                 shadowedFunctionReferences = toProperties.filter { (reference) ->
                     shadowed.any { it in reference }
@@ -385,8 +388,9 @@ internal class DefaultScriptExecutor(
 
         private fun source(
             confirming: Boolean = false,
-            shadowedFunctionCopies: Boolean = false
-        ) = ScriptSource(script, preambleDependencies, confirming, shadowedFunctionCopies)
+            shadowedFunctionCopies: Boolean = false,
+            coroutineScopeCopies: Boolean = false
+        ) = ScriptSource(script, preambleDependencies, confirming, shadowedFunctionCopies, coroutineScopeCopies)
 
         private suspend fun compile(
             source: ScriptSource

@@ -48,6 +48,7 @@ import org.jetbrains.kotlin.psi.KtConstantExpression
 import org.jetbrains.kotlin.psi.KtDeclaration
 import org.jetbrains.kotlin.psi.KtDeclarationWithBody
 import org.jetbrains.kotlin.psi.KtDestructuringDeclaration
+import org.jetbrains.kotlin.psi.KtElement
 import org.jetbrains.kotlin.psi.KtExpression
 import org.jetbrains.kotlin.psi.KtForExpression
 import org.jetbrains.kotlin.psi.KtLabelReferenceExpression
@@ -73,6 +74,7 @@ import org.jetbrains.kotlin.psi.psiUtil.allChildren
 import org.jetbrains.kotlin.psi.psiUtil.collectDescendantsOfType
 import org.jetbrains.kotlin.psi.psiUtil.endOffset
 import org.jetbrains.kotlin.psi.psiUtil.getReceiverExpression
+import org.jetbrains.kotlin.psi.psiUtil.forEachDescendantOfType
 import org.jetbrains.kotlin.psi.psiUtil.parents
 import org.jetbrains.kotlin.psi.psiUtil.startOffset
 import org.jetbrains.kotlin.psi.psiUtil.startOffsetSkippingComments
@@ -152,7 +154,7 @@ internal const val COROUTINE_SCOPE_ORIGINAL = "xemantic-kotlin-script: coroutine
 /** The opt-in message of the copies of the moved functions, see [ScriptSource.coroutineScopeCandidates]. */
 internal const val COROUTINE_SCOPE_FUNCTION = "xemantic-kotlin-script: coroutine scope function"
 
-/** The deprecation message of the moved functions, see [ScriptSource.shadowedFunctionCandidates]. */
+/** The opt-in message of the moved functions, see [ScriptSource.shadowedFunctionCandidates]. */
 internal const val SHADOWED_ORIGINAL = "xemantic-kotlin-script: shadowed original"
 
 /** The opt-in annotation marking the local copies of the declarations, reporting this [message] where they are used. */
@@ -223,7 +225,13 @@ internal class ScriptSource(
      * recognizing whether they apply, instead of deprecating the moved functions themselves,
      * recognizing whether the candidates refer to them already.
      */
-    shadowedFunctionCopies: Boolean = false
+    shadowedFunctionCopies: Boolean = false,
+    /**
+     * Whether the confirming compilation declares the copies of the moved functions preceding the [coroutineScopeCandidates],
+     * recognizing whether they apply, in a compilation of its own, as they precede the local properties shadowing them,
+     * unlike the copies of [shadowedFunctionCopies].
+     */
+    coroutineScopeCopies: Boolean = false
 ) : SourceCode {
 
     val scriptLines: List<String>
@@ -249,7 +257,7 @@ internal class ScriptSource(
     /**
      * The calls of the script body to the local properties, which have the names of the functions moved out of the script body,
      * by the 0-based lines of the properties and the functions, while in the script they call the functions, if they apply.
-     * They are confirmed by compiling the script with the functions deprecated, see [confirming],
+     * They are confirmed by compiling the script with the functions marked with an opt-in, see [confirming],
      * reporting the calls referring to them already, and the remaining ones by compiling it with their copies,
      * declared as the local functions preceding the calls, which they refer to, if the functions apply, see [shadowedFunctionCopies].
      */
@@ -259,8 +267,9 @@ internal class ScriptSource(
      * The references of the script body to the declarations moved out of it, named like the members or the extensions
      * of its coroutine scope receiver, like `cancel`, by the 0-based lines of the declarations, which might be resolved
      * to the coroutine scope instead, while in the script they refer to the declarations.
-     * They are confirmed by compiling the script with the declarations deprecated, see [confirming],
-     * reporting the ones not referring to them.
+     * They are confirmed by compiling the script with the declarations marked with an opt-in, see [confirming],
+     * reporting the ones not referring to them, the properties, and the functions, which apply, recognized by their copies,
+     * see [shadowedFunctionCopies], while the ones within the lambdas are not reported, as they might have the receivers.
      */
     val coroutineScopeCandidates: List<LaterDeclaredReference>
 
@@ -305,7 +314,8 @@ internal class ScriptSource(
             script.replace('\r', '\n'),
             dependencies.mapTo(HashSet()) { it.name },
             confirming,
-            shadowedFunctionCopies
+            shadowedFunctionCopies,
+            coroutineScopeCopies
         )
         unmatchedClosingBrace = structure.unmatchedClosingBrace?.let { position(it) }
         movedDeclarations = structure.movedDeclarations
@@ -394,12 +404,13 @@ internal class ScriptSource(
         shadowed.filterNot { it.isCallable && it.name in structure.movedFunctions }.forEach { addAccessor(it) }
         lines += "}"
         mapping += null
-        val deprecatedFunctions = if (confirming && !shadowedFunctionCopies) {
+        val markedOriginals = confirming && !shadowedFunctionCopies && !coroutineScopeCopies
+        val deprecatedFunctions = if (markedOriginals) {
             shadowedFunctionCandidates.mapTo(HashSet()) { it.first.name }
         } else {
             emptySet()
         }
-        val coroutineScopeDeclarations = if (confirming && !shadowedFunctionCopies) {
+        val coroutineScopeDeclarations = if (markedOriginals) {
             coroutineScopeCandidates.mapTo(HashSet()) { it.reference.name }
         } else {
             emptySet()
@@ -423,8 +434,8 @@ internal class ScriptSource(
         // the copies preceding the statements, where the local classes declared before them are visible
         val blockCopies = structure.blockCopies.entries.groupBy({ lineOf(it.key) }) { it.value }
         (lineOf(headerEnd)..lineBounds.lastIndex).forEach { line ->
-            blockCopies[line]?.flatten()?.forEach { (message, declaration) ->
-                lines += "@${optInMarker(message)} $declaration"
+            blockCopies[line]?.flatten()?.forEach { (messages, declaration) ->
+                lines += messages.joinToString(separator = " ", postfix = " ") { "@${optInMarker(it)}" } + declaration
                 mapping += null
             }
             addLines(line..line) { offset ->
@@ -730,7 +741,11 @@ private class Reference(
      * Whether it is within a declaration, which can access the members of the script, when moved out of the script body,
      * unlike e.g. an object, an enum class, an interface, or a nested class.
      */
-    val canAccessScriptMembers: Boolean
+    val canAccessScriptMembers: Boolean,
+    /** Whether it is an operator, or a convention, like `+`, referring to the operator functions only, like `plus`. */
+    val isOperator: Boolean = false,
+    /** Whether it is within a lambda, which might have a receiver, so its resolution is not known without compiling. */
+    val isInLambda: Boolean = false
 ) {
 
     /** Whether it might refer to one of the local declarations of the script body of these [names]. */
@@ -766,7 +781,8 @@ private fun PsiElement.references(
                 || callableReference?.callableReference == expression
                 || (expression is KtOperationReferenceExpression && expression.getReferencedNameElementType() == KtTokens.IDENTIFIER),
         isCallableReference = callableReference?.callableReference == expression,
-        canAccessScriptMembers = canAccessScriptMembers(expression, scope)
+        canAccessScriptMembers = canAccessScriptMembers(expression, scope),
+        isInLambda = isInLambda(expression, scope)
     )
 } + operatorReferences(scope)
 
@@ -791,51 +807,68 @@ private val prefixOperatorNames = mapOf(
 /**
  * The references to the operator functions called by the operators and the conventions,
  * like `plus` of `a + b`, `get` of `a[i]`, `iterator` of `for (x in a)`, `component1` of `val (a, b) = p`, or `invoke` of `f()()`,
- * which are qualified, by the operands, so they might refer to the extension functions only.
+ * which are qualified, by the operands, so they might refer to the extension functions only,
+ * at the positions of the operators, like `[`, so they do not contain the references of the operands.
  */
 private fun PsiElement.operatorReferences(
     scope: PsiElement
 ): List<Reference> = buildList {
     fun add(
         names: List<String>,
-        element: PsiElement
-    ) = names.forEach { name ->
-        add(
-            Reference(
-                name = name,
-                offset = element.startOffset,
-                length = element.textLength,
-                isQualified = true,
-                isBound = false,
-                isCall = true,
-                isCallableReference = false,
-                canAccessScriptMembers = canAccessScriptMembers(element, scope)
+        element: PsiElement,
+        position: PsiElement = element
+    ) {
+        val canAccessScriptMembers = canAccessScriptMembers(element, scope)
+        val inLambda = isInLambda(element, scope)
+        names.forEach { name ->
+            add(
+                Reference(
+                    name = name,
+                    offset = position.startOffset,
+                    length = position.textLength,
+                    isQualified = true,
+                    isBound = false,
+                    isCall = true,
+                    isCallableReference = false,
+                    canAccessScriptMembers = canAccessScriptMembers,
+                    isOperator = true,
+                    isInLambda = inLambda
+                )
             )
-        )
+        }
     }
-    collectDescendantsOfType<KtOperationReferenceExpression> {
-        it.getReferencedNameElementType() != KtTokens.IDENTIFIER
-    }.forEach { operation ->
-        val token = operation.getReferencedNameElementType()
-        val names = if (operation.parent is KtPrefixExpression) prefixOperatorNames[token] else operatorNames[token]
-        names?.let { add(it, operation) }
+    forEachDescendantOfType<KtElement> { element ->
+        when (element) {
+            is KtOperationReferenceExpression -> {
+                val token = element.getReferencedNameElementType()
+                if (token != KtTokens.IDENTIFIER) {
+                    (if (element.parent is KtPrefixExpression) prefixOperatorNames[token] else operatorNames[token])?.let { add(it, element) }
+                }
+            }
+            is KtArrayAccessExpression -> {
+                val assigned = (element.parent as? KtBinaryExpression)?.let {
+                    it.left == element && it.operationToken == KtTokens.EQ
+                } == true
+                add(listOf(if (assigned) "set" else "get"), element, element.indicesNode.firstChild ?: element)
+            }
+            is KtForExpression -> element.loopRange?.let { add(listOf("iterator"), element, it) }
+            is KtDestructuringDeclaration -> element.entries.forEachIndexed { index, entry ->
+                add(listOf("component${index + 1}"), element, entry)
+            }
+            is KtCallExpression -> if (element.calleeExpression !is KtSimpleNameExpression && element.calleeExpression != null) {
+                add(listOf("invoke"), element, element.valueArgumentList ?: element.lambdaArguments.firstOrNull() ?: element)
+            }
+            is KtPropertyDelegate -> add(listOf("getValue", "setValue", "provideDelegate"), element)
+            else -> {}
+        }
     }
-    collectDescendantsOfType<KtArrayAccessExpression>().forEach { access ->
-        val assigned = (access.parent as? KtBinaryExpression)?.let {
-            it.left == access && it.operationToken == KtTokens.EQ
-        } == true
-        add(if (assigned) listOf("set") else listOf("get", "set"), access)
-    }
-    collectDescendantsOfType<KtForExpression>().forEach { loop ->
-        loop.loopRange?.let { add(listOf("iterator", "hasNext", "next"), it) }
-    }
-    collectDescendantsOfType<KtDestructuringDeclaration>().forEach { destructuring ->
-        add(destructuring.entries.indices.map { "component${it + 1}" }, destructuring)
-    }
-    collectDescendantsOfType<KtCallExpression> { it.calleeExpression !is KtSimpleNameExpression && it.calleeExpression != null }
-        .forEach { add(listOf("invoke"), it) }
-    collectDescendantsOfType<KtPropertyDelegate>().forEach { add(listOf("getValue", "setValue", "provideDelegate"), it) }
 }
+
+/** Whether the [expression] is within a lambda, which might have a receiver, within the [scope], exclusive. */
+private fun isInLambda(
+    expression: PsiElement,
+    scope: PsiElement
+): Boolean = expression.parents.takeWhile { it !== scope }.any { it is KtLambdaExpression }
 
 /** See [Reference.canAccessScriptMembers]. */
 private fun canAccessScriptMembers(
@@ -955,7 +988,9 @@ private class ScriptStructure(
     /** Whether to compute the copies of the declarations, see [ScriptSource.confirming]. */
     confirming: Boolean,
     /** See [ScriptSource.shadowedFunctionCopies]. */
-    shadowedFunctionCopies: Boolean
+    shadowedFunctionCopies: Boolean,
+    /** See [ScriptSource.coroutineScopeCopies]. */
+    coroutineScopeCopies: Boolean
 ) {
 
     val headerEnd: Int
@@ -997,9 +1032,9 @@ private class ScriptStructure(
     /**
      * The deprecated copies of the local functions, see [ScriptSource.laterDeclaredDependencyCandidates],
      * and of the moved functions, see [ScriptSource.shadowedFunctionCandidates],
-     * with their deprecation messages, by the offsets of the statements they precede.
+     * with the messages of their opt-in markers, by the offsets of the statements they precede.
      */
-    val blockCopies: Map<Int, List<Pair<String, String>>>
+    val blockCopies: Map<Int, List<Pair<List<String>, String>>>
 
     /** See [ScriptSource.laterDeclaredDependencyCandidates], with the offsets of the declarations, and whether they are functions. */
     val laterDeclaredDependencyCandidates: List<Triple<Reference, Int, Boolean>>
@@ -1126,7 +1161,8 @@ private class ScriptStructure(
                 when {
                     reference.isCall && reference.refersToLocal(localFunctions) -> localFunctionsByName.getValue(name).first() to true
                     // like `listOf(1, 2).sum()`
-                    reference.isCall && name in localExtensions -> localExtensions.getValue(name).first() to true
+                    reference.isCall && localExtensions[name]?.any { !reference.isOperator || it.isOperator } == true ->
+                        localExtensions.getValue(name).first() to true
                     // also with a receiver, like `" a ".trim()` of `val trim: String.() -> String`
                     reference.isCall && name in callableProperties -> callableProperties.getValue(name).first().first to false
                     // like `E`, resolved to `kotlin.math.E` instead
@@ -1186,10 +1222,12 @@ private class ScriptStructure(
             (it.kind == DeclarationKind.FUNCTION || (it.kind == DeclarationKind.PROPERTY && (it.psi as? KtProperty)?.receiverTypeReference == null))
                     && it.name != null && (it.name in coroutineScopeProperties || it.name in coroutineScopeFunctions)
         }.groupBy { it.name!! }
-        coroutineScopeCandidates = statements.indices.flatMap { index ->
-            if (declarationsByPsi[statements[index]] in moved) return@flatMap emptyList()
+        val coroutineScopeCandidatesByStatement = statements.indices.associateWith { index ->
+            if (declarationsByPsi[statements[index]] in moved) return@associateWith emptyList()
             statementReferences[index].filter { reference ->
                 !reference.isQualified && !reference.isBound && reference.name in coroutineScopeDeclarations
+                        // like in `coroutineScope { launch { } }`, where the nested coroutine scope is resolved also in the script
+                        && !reference.isInLambda
                         // refers to the local property shadowing the function, see shadowedFunctionCandidates
                         && shadowingProperties[reference.name]?.let { (propertyIndex) -> propertyIndex < index } != true
             }.map {
@@ -1197,6 +1235,7 @@ private class ScriptStructure(
                 Triple(it, declaration.line(), declaration.kind == DeclarationKind.FUNCTION)
             }
         }
+        coroutineScopeCandidates = coroutineScopeCandidatesByStatement.values.flatten()
         val laterDeclaredCandidatesByStatement = statements.indices.associateWith { index ->
             if (declarationsByPsi[statements[index]] in moved) return@associateWith emptyList()
             statementReferences[index].mapNotNull { reference ->
@@ -1246,16 +1285,23 @@ private class ScriptStructure(
                 localFunctionsByName,
                 LATER_DECLARED_FUNCTION
             )
-            if (shadowedFunctionCopies) {
-                addCopies(shadowedFunctionCandidatesByStatement, movedFunctionsByName, SHADOWED_FUNCTION)
+            if (shadowedFunctionCopies) addCopies(shadowedFunctionCandidatesByStatement, movedFunctionsByName, SHADOWED_FUNCTION)
+            if (coroutineScopeCopies) {
                 // also the extension ones, which might not apply, like `fun Robot.launch()` to `launch { }`
-                val coroutineScopeFunctions = coroutineScopeCandidates.filter { it.third }.mapTo(LinkedHashSet()) { it.first.name }
-                if (coroutineScopeFunctions.isNotEmpty() && statements.isNotEmpty()) {
-                    getOrPut(statements.first().startOffset) { mutableListOf() } += coroutineScopeFunctions.flatMap { name ->
-                        moved.filter { it.kind == DeclarationKind.FUNCTION && it.name == name }.mapNotNull { it.signature() }
-                    }.map { COROUTINE_SCOPE_FUNCTION to it }
-                }
+                addCopies(
+                    coroutineScopeCandidatesByStatement.mapValues { (_, candidates) -> candidates.filter { it.third } },
+                    moved.filter { it.kind == DeclarationKind.FUNCTION && it.name != null }.groupBy { it.name!! },
+                    COROUTINE_SCOPE_FUNCTION
+                )
             }
+        }.let { copies ->
+            // the same signature once, preceding its first use, as declaring it twice would make the calls ambiguous
+            val first = mutableMapOf<String, Int>()
+            copies.entries.sortedBy { it.key }.forEach { (offset, declarations) ->
+                declarations.forEach { (_, declaration) -> first.putIfAbsent(declaration, offset) }
+            }
+            copies.entries.flatMap { (_, declarations) -> declarations }.groupBy({ it.second }) { it.first }
+                .entries.groupBy({ first.getValue(it.key) }) { (declaration, messages) -> messages.distinct() to declaration }
         }
         // unlike an extension property, which does not conflict with the accessor of the dependency
         conflictingDependencyDeclarations = moved.filter {
@@ -1293,6 +1339,8 @@ private class ScriptStructure(
         val isSealed: Boolean,
         /** Whether it is a function with a receiver, like `fun Int.double()`. */
         val isExtension: Boolean,
+        /** Whether it is an operator function, like `operator fun Point.plus(other: Point)`. */
+        val isOperator: Boolean,
         /** The names of the supertypes, like `Shape` in `class Circle(val r: Int) : Shape`. */
         val supertypeNames: List<String>,
         val references: List<Reference>
@@ -1381,6 +1429,7 @@ private class ScriptStructure(
                 .filter { it != "_" },
             isSealed = declaration.hasModifier(KtTokens.SEALED_KEYWORD),
             isExtension = declaration is KtNamedFunction && declaration.receiverTypeReference != null,
+            isOperator = declaration is KtNamedFunction && declaration.hasModifier(KtTokens.OPERATOR_KEYWORD),
             supertypeNames = (declaration as? KtClassOrObject)?.superTypeListEntries.orEmpty().mapNotNull {
                 (it.typeReference?.typeElement as? KtUserType)?.referencedName
             },
@@ -1421,7 +1470,7 @@ private class ScriptStructure(
         }
         // a qualified reference, like `list.size`, cannot refer to a declaration of the script, unless it is an extension
         fun Reference.referenced(): List<ParsedDeclaration> = namedByName[name].orEmpty().filter {
-            !isQualified || it.isExtension
+            (!isQualified || it.isExtension) && (!isOperator || it.isOperator)
         }
         val references = declarations.associateWith { declaration ->
             buildSet {

@@ -3631,4 +3631,62 @@ class ScriptExecutorTest {
         }
     }
 
+    @Test
+    fun `should keep extensions named like operators in the script body, and the nested coroutine scopes`() = runTest {
+        // given
+        val scripts = listOf(
+            "val xs = listOf(1, 2, 3)\nval first = xs[0]\nclass Grid\nfun Grid.get(i: Int) = async { i * 10 }\nGrid().get(2).await() + first",
+            "var total = 0\nfor (i in 1..3) total += i\nclass Sim\nfun Sim.next() = if (isActive) 1 else 0\ntotal + Sim().next()",
+            "val found = 2 in listOf(1, 2)\nclass Area\nfun Area.contains(x: Int): Boolean { launch { }; return x > 0 }\nfound && Area().contains(1)",
+            "coroutineScope { launch { println(\"inner\") } }\nfun launch(block: () -> Unit) { block() }\n\"done\""
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(21, 7, true, "done"))
+    }
+
+    @Test
+    fun `should report calls resolved to the coroutine scope after comments and shadowed functions in the order of the script`() = runTest {
+        // given
+        val scripts = listOf(
+            "/* intro\n */ launch { println(\"x\") }\nfun launch(block: () -> Unit) { println(\"mine\"); block() }\n\"done\"",
+            "val a = cancel(\"z\")\nval cancel = { r: String -> \"prop \" + r }\nval x = cancel(\"a\")\nfun cancel(reason: String) = \"fun \" + reason\nx"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        val errorLines = results.map { result ->
+            (result as? ScriptResult.Error)?.message?.lines()?.filter { it.startsWith("script.kts:") }?.map { it.substringBefore(": error") }
+        }
+        // line 1 of the second script calls the moved function already, unlike the coroutine scope, while line 3 calls the property
+        assert(errorLines == listOf(listOf("script.kts:2:5"), listOf("script.kts:3:9")))
+    }
+
+    @Test
+    fun `should report only the operator functions called by the operator`() = runTest {
+        // given
+        val script = """
+            val scale = listOf(10).first()
+            class Grid
+            operator fun Grid.get(i: Int) = i * scale
+            operator fun Grid.set(i: Int, v: Int) { }
+            enum class E { A; fun f() = Grid()[1] }
+            E.A.f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert(result is ScriptResult.Error && "'get'" in result.message && "'set'" !in result.message)
+    }
+
 }
