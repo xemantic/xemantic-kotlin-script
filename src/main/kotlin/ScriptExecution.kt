@@ -173,7 +173,15 @@ internal class DefaultScriptExecutor(
         private lateinit var source: ScriptSource
 
         suspend fun handle(): ScriptResult {
-            val compilation = compile()
+            val compilation = try {
+                compile()
+            } catch (_: StackOverflowError) {
+                // thrown by parsing the script, while the compiler reports it as a diagnostic
+                return ScriptResult.Error(
+                    "error: The script is nested too deeply to be parsed.",
+                    ExecutionPhase.COMPILATION
+                )
+            }
             source = compilation.source
             val compilationResult = compilation.result ?: return ScriptResult.Error(
                 // the brace would close the script block, misplacing all the errors
@@ -292,6 +300,11 @@ internal class DefaultScriptExecutor(
             warnings: List<ScriptDiagnostic>
         ): ScriptResult = when (this) {
             is ResultValue.Value -> {
+                // the script block closed early, unnoticed by the check of the unmatched closing brace
+                if (value !is Function2<*, *, *>) return ScriptResult.Error(
+                    "error: The script could not be run, check if its braces are balanced.",
+                    ExecutionPhase.COMPILATION
+                )
                 @Suppress("UNCHECKED_CAST")
                 val block = value as suspend CoroutineScope.() -> Any?
                 // only what the block throws is the failure of the script, not the reporting of its warnings

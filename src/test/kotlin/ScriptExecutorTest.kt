@@ -855,14 +855,17 @@ class ScriptExecutorTest {
         // given
         val executor = ScriptExecutor()
 
-        // when/then
-        repeat(50) { i ->
+        // when
+        val results = List(50) { i ->
             val script = $$"""
                 val index = $$i
                 "result-$index"
             """.trimIndent()
+            executor.execute(script)
+        }
 
-            val result = executor.execute(script)
+        // then
+        results.forEachIndexed { i, result ->
             result should {
                 be<ScriptResult.Value>()
                 have(value == "result-$i")
@@ -2215,6 +2218,112 @@ class ScriptExecutorTest {
                   | fun lambda(): Int = error("failure")
                   at <script body>(script.kts:2)
                   | lambda()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should use class declared later in the script`() = runTest {
+        // given
+        val script = """
+            val p = Point(1, 2)
+            data class Point(val x: Int, val y: Int)
+            p.x + p.y
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 3)
+        }
+    }
+
+    @Test
+    fun `should use class declared later in the script from function declared before it`() = runTest {
+        // given
+        val script = """
+            fun box() = Box(1)
+            class Box(val v: Int)
+            box().v
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 1)
+        }
+    }
+
+    @Test
+    fun `should use classes referring to each other`() = runTest {
+        // given
+        val script = """
+            class A { fun b() = B() }
+            class B { fun a() = A() }
+            A().b().a()::class.simpleName
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "A")
+        }
+    }
+
+    @Test
+    fun `should hint to declare class before its use when it accesses local declarations of the script body`() = runTest {
+        // given
+        val script = """
+            val base = 10
+            val scaled = Scaler().scale(2)
+            class Scaler { fun scale(x: Int) = x * base }
+            scaled
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:14: error: Unresolved reference 'Scaler'.
+                  | val scaled = <error>Scaler</error>().scale(2)
+                  hint: 'Scaler' is declared at line 3, while the classes of the script body are visible only after their declaration - move it before line 2.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report script too deeply nested to be parsed`() = runTest {
+        // given
+        val depth = 3000
+        val script = "run {\n".repeat(depth) + "42\n" + "}\n".repeat(depth)
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                error: The script is nested too deeply to be parsed.
             """.trimIndent()
         }
     }

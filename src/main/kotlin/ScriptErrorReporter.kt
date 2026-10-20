@@ -332,19 +332,20 @@ internal class ScriptErrorReporter(
 
     /**
      * Unlike in a regular script, the declarations moved out of the script body cannot see its local declarations,
-     * and the local functions of the script body are not visible before their declaration.
+     * and the local functions and classes of the script body are not visible before their declaration.
      */
     private fun StringBuilder.appendHint(
         name: String,
         position: ScriptPosition
     ) {
-        val line = source.bodyDeclarationLine(name) ?: return
+        val (line, isClass) = source.bodyDeclarationLine(name) ?: return
         val declaration = source.movedDeclarationAt(position)
         if (declaration != null) {
             +"  hint: '$declaration' is compiled outside of the script body, where '$name' (line ${line + 1}) is not visible"
             +" - pass it as a parameter, or declare it within '$declaration'.\n"
         } else if (line > position.line) {
-            +"  hint: '$name' is declared at line ${line + 1}, while the functions of the script body are visible only after their declaration"
+            val declarations = if (isClass) "classes" else "functions"
+            +"  hint: '$name' is declared at line ${line + 1}, while the $declarations of the script body are visible only after their declaration"
             +" - move it before line ${position.line + 1}.\n"
         }
     }

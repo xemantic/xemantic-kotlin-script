@@ -84,10 +84,11 @@ internal class ScriptCompilationCache<T : Any>(
                 when {
                     e !is CancellationException -> entry.completeExceptionally(e)
                     !currentCoroutineContext().isActive -> entry.complete(null)
-                    // would silently cancel the waiting callers instead of failing them
-                    else -> entry.completeExceptionally(
-                        IllegalStateException("The compilation of the script was cancelled", e)
-                    )
+                    // would silently cancel the active callers instead of failing them
+                    else -> IllegalStateException("The compilation of the script was cancelled", e).let {
+                        entry.completeExceptionally(it)
+                        throw it
+                    }
                 }
                 throw e
             }

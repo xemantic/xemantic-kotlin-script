@@ -276,7 +276,7 @@ class ScriptCompilationCacheTest {
     }
 
     @Test
-    fun `should fail concurrent callers without cancelling them when the compilation throws cancellation exception`() = runTest {
+    fun `should fail the compiling and concurrent callers without cancelling them when the compilation throws cancellation exception`() = runTest {
         // given
         val cache = ScriptCompilationCache<String>(maxSize = 10) { true }
         val key = ScriptCompilationCache.Key(script = "foo", dependencies = emptyList())
@@ -294,11 +294,9 @@ class ScriptCompilationCacheTest {
 
         // then
         assert(compilations == 1)
-        val owner = results.first().exceptionOrNull()
-        assert(owner is CancellationException && owner.message == "compiler gave up")
-        results.drop(1).forEach { result ->
-            val waiter = result.exceptionOrNull()
-            assert(waiter is IllegalStateException && waiter !is CancellationException && waiter.message == "The compilation of the script was cancelled")
+        results.forEach { result ->
+            val failure = result.exceptionOrNull()
+            assert(failure is IllegalStateException && failure !is CancellationException && failure.message == "The compilation of the script was cancelled")
         }
     }
 

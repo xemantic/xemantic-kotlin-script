@@ -69,6 +69,9 @@ import org.jetbrains.kotlin.psi.psiUtil.endOffset
 import org.jetbrains.kotlin.psi.psiUtil.getReceiverExpression
 import org.jetbrains.kotlin.psi.psiUtil.startOffset
 import org.jetbrains.kotlin.psi.psiUtil.startOffsetSkippingComments
+import kotlin.concurrent.atomics.AtomicLong
+import kotlin.concurrent.atomics.ExperimentalAtomicApi
+import kotlin.concurrent.atomics.incrementAndFetch
 import kotlin.script.experimental.api.SourceCode
 
 /**
@@ -182,7 +185,9 @@ internal class ScriptSource(
 
         text = lines.joinToString(separator = "\n")
         lineMapping = mapping
-        locationId = "\$${Integer.toHexString(text.hashCode())}.kts"
+        // unique, as the frames of the script are recognized by it, also among the frames of other scripts
+        @OptIn(ExperimentalAtomicApi::class)
+        locationId = "\$${sourceIdSeq.incrementAndFetch()}.kts"
     }
 
     /** The end of the last non-blank line, where the errors of the script block are reported. */
@@ -239,12 +244,12 @@ internal class ScriptSource(
     }
 
     /**
-     * The 0-based line of the declaration of the [name] in the script body.
+     * The 0-based line of the declaration of the [name] in the script body, and whether it is a class.
      */
     fun bodyDeclarationLine(
         name: String
-    ): Int? = bodyDeclarations.find { it.name == name || name in it.destructuredNames }?.let {
-        position(it.start).line
+    ): Pair<Int, Boolean>? = bodyDeclarations.find { it.name == name || name in it.destructuredNames }?.let {
+        position(it.start).line to it.isClass
     }
 
     private fun position(
@@ -255,6 +260,9 @@ internal class ScriptSource(
     }
 
 }
+
+@OptIn(ExperimentalAtomicApi::class)
+private val sourceIdSeq = AtomicLong(0)
 
 /** The index of the line containing the [offset], given the sorted [lineStarts]. */
 private fun lineOf(
@@ -291,7 +299,8 @@ private class Declaration(
     val end: Int,
     val nameRange: IntRange?,
     /** The names of a destructuring declaration, like `val (a, b) = pair`. */
-    val destructuredNames: List<String> = emptyList()
+    val destructuredNames: List<String> = emptyList(),
+    val isClass: Boolean = false
 )
 
 private enum class DeclarationKind {
@@ -472,7 +481,9 @@ private class ScriptStructure(
         movedDeclarations = moved.map { it.toDeclaration() }
         endsWithMovedDeclaration = moved.any { it.psi == statements.lastOrNull() }
         bodyDeclarations = declarations
-            .filter { it !in moved && (it.kind == DeclarationKind.PROPERTY || it.kind == DeclarationKind.FUNCTION) }
+            .filter {
+                it !in moved && (it.kind == DeclarationKind.PROPERTY || it.kind == DeclarationKind.FUNCTION || it.kind == DeclarationKind.CLASS)
+            }
             .map { it.toDeclaration() }
         declarations.filter { it !in moved }.forEach { declaration ->
             declaration.psi.modifierList?.node?.getChildren(null).orEmpty()
@@ -509,7 +520,8 @@ private class ScriptStructure(
             start = start,
             end = end,
             nameRange = nameRange,
-            destructuredNames = destructuredNames
+            destructuredNames = destructuredNames,
+            isClass = kind == DeclarationKind.CLASS
         )
     }
 
@@ -586,7 +598,7 @@ private class ScriptStructure(
      * The declarations which cannot be local, together with the types and functions they refer to,
      * and the subtypes of moved sealed types, which cannot be local either.
      *
-     * Local functions are not visible before their declaration, so the ones referred to earlier are moved as well.
+     * Local functions and classes are not visible before their declaration, so the ones referred to earlier are moved as well.
      *
      * The references are recognized by the names only, which might be the names of members as well,
      * therefore a function is not moved if it, or the declarations it refers to, access the local properties of the script body.
@@ -660,13 +672,13 @@ private class ScriptStructure(
             reference.referenced().forEach { firstReferences.putIfAbsent(it, reference.offset) }
         }
         declarations.filter { declaration ->
-            declaration.kind == DeclarationKind.FUNCTION
+            (declaration.kind == DeclarationKind.FUNCTION || declaration.kind == DeclarationKind.CLASS)
                     && (firstReferences[declaration] ?: Int.MAX_VALUE) < declaration.start
-        }.forEach { function ->
-            // moving a function, which is not accessing, moves only the ones, which are not accessing either
-            if (function !in moved && function !in accessing) {
-                val queue = ArrayDeque(listOf(function))
-                moved += function
+        }.forEach { declaration ->
+            // moving a declaration, which is not accessing, moves only the ones, which are not accessing either
+            if (declaration !in moved && declaration !in accessing) {
+                val queue = ArrayDeque(listOf(declaration))
+                moved += declaration
                 while (queue.isNotEmpty()) {
                     references.getValue(queue.removeFirst()).forEach {
                         if (moved.add(it)) queue += it

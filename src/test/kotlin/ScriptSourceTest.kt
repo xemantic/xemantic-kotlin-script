@@ -66,6 +66,19 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should give distinct location ids to scripts of the same hash code`() {
+        // given
+        val scripts = listOf("\"Aa\"", "\"BB\"")
+
+        // when
+        val sources = scripts.map { ScriptSource(it) }
+
+        // then
+        assert(sources[0].text.hashCode() == sources[1].text.hashCode())
+        assert(sources[0].locationId != sources[1].locationId)
+    }
+
+    @Test
     fun `should parse scripts concurrently`() = runTest {
         // given
         val scripts = (0 until 200).map { "fun f$it() = E$it.A\nenum class E$it { A }\nf$it()" }

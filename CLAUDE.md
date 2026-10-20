@@ -48,6 +48,7 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 
 - An `object`, an `enum class` or a nested class declared in a test script cannot access the dependencies, nor call the functions moved out of the script body, which are the members of the script instance ("captures the script class instance") —
   to test a moved declaration accessing them, use a top-level class instead, moved e.g. by making it refer to an enum, or implement a sealed interface.
+  Moving a top-level property along with them does not help, not even a constant one: it becomes a member of the script instance too, and `const val` is rejected there — a plain `.kts` fails the same way.
 - After upgrading the Gradle wrapper, `test` may fail with `NoSuchFileException: build/test-results/test/binary/in-progress-results-generic.bin`, because the results of the previous Gradle version are stale — delete `build/test-results` (or run `clean`) and retry.
 - After a fresh Gradle daemon starts, the first build reports `configuration cache cannot be reused because file '.../caches/jreleaser/jreleaser/<version>/marker.txt' has changed` —
   the JReleaser plugin bumps a banner counter in that file behind Gradle's back on every configuration,
