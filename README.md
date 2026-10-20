@@ -106,6 +106,8 @@ The script body is compiled as a block, which differs from a regular script in h
 when the declarations of the script have the same names as each other, or as the dependencies.
 Most of these cases are reported as errors, while the following ones still resolve differently, without an error:
 
+* a property of the script body is resolved before a member of the same name of an implicit receiver,
+  like `name` in `user.run { name }` with `val name = "script"`, as it is a local variable of the block ([#36](https://github.com/xemantic/xemantic-kotlin-script/issues/36)),
 * overloads of a function, of which only some are compiled outside of the script body ([#30](https://github.com/xemantic/xemantic-kotlin-script/issues/30)),
 * a call preceding a local class named like a callable dependency ([#31](https://github.com/xemantic/xemantic-kotlin-script/issues/31)),
 * a call from outside of the script body to a local property, whose function type is known only to the compiler, like `val print = printer()` ([#32](https://github.com/xemantic/xemantic-kotlin-script/issues/32)),

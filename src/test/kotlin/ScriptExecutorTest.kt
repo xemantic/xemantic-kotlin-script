@@ -3493,12 +3493,14 @@ class ScriptExecutorTest {
     }
 
     @Test
-    fun `should execute declarations moved out of the script body reading constant properties, and inline functions reading local properties`() = runTest {
+    fun `should execute declarations moved out of the script body reading constant properties`() = runTest {
         // given
         val scripts = listOf(
             "val taxRate = 0.2\nclass Order(val amount: Double) { fun total() = amount * (1 + taxRate) + FEE; companion object { const val FEE = 1.0 } }\nOrder(10.0).total()",
             "val unit = \"cm\"\nsealed class Shape\nclass Sq(val s: Int) : Shape() { fun d() = \"${'$'}s${'$'}unit\" }\nSq(2).d()",
-            "val log = mutableListOf<String>()\ninline fun logged(crossinline block: () -> Unit) { log += \"start\"; block() }\nlogged { }\nlog"
+            "private const val TAX = 0.5\nsealed class Item { abstract val price: Double; fun taxed() = price * (1 + TAX) }\nclass Book(override val price: Double) : Item()\nBook(10.0).taxed()",
+            // the member of the receiver, not the local property of the same name
+            "val name = \"script\"\ndata class User(val name: String)\ninline fun User.describe() = \"user \" + name\nUser(\"alice\").describe()"
         )
         val executor = ScriptExecutor()
 
@@ -3506,7 +3508,7 @@ class ScriptExecutorTest {
         val results = scripts.map { executor.execute(it) }
 
         // then
-        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(13.0, "2cm", listOf("start")))
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(13.0, "2cm", 15.0, "user alice"))
     }
 
     @Test

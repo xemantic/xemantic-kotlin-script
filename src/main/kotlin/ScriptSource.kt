@@ -316,6 +316,8 @@ internal class ScriptSource(
         val excluded = BooleanArray(script.length)
         movedDeclarations.forEach { excluded.fill(true, it.start, it.end) }
         structure.blankedRanges.forEach { excluded.fill(true, it.first, it.last + 1) }
+        val movedExcluded = BooleanArray(script.length)
+        structure.movedBlankedRanges.forEach { movedExcluded.fill(true, it.first, it.last + 1) }
 
         val headerEnd = structure.headerEnd
         if (headerEnd > 0) {
@@ -368,7 +370,7 @@ internal class ScriptSource(
                 mapping += null
             }
             addLines(lineOf(declaration.start)..lineOf(declaration.end - 1)) {
-                it in declaration.start until declaration.end
+                it in declaration.start until declaration.end && !movedExcluded[it]
             }
         }
         lines += SCRIPT_BLOCK_START
@@ -527,9 +529,6 @@ internal enum class DeclarationKind {
     FUNCTION,
     PROPERTY
 }
-
-/** The modifiers of the inline functions, and of their parameters, which are blanked out to make them local. */
-private val inlineModifiers = setOf(KtTokens.INLINE_KEYWORD, KtTokens.CROSSINLINE_KEYWORD, KtTokens.NOINLINE_KEYWORD)
 
 private val visibilityModifiers = setOf(
     KtTokens.PUBLIC_KEYWORD, KtTokens.PRIVATE_KEYWORD, KtTokens.INTERNAL_KEYWORD, KtTokens.PROTECTED_KEYWORD
@@ -895,8 +894,8 @@ private class ScriptStructure(
     /** The modifiers which are not applicable to local declarations. */
     val blankedRanges = mutableListOf<IntRange>()
 
-    /** The inline functions, which access the local properties, so they are made local, see [inlineModifiers]. */
-    private val demotedInlines: Set<ParsedDeclaration>
+    /** The modifiers of the moved declarations, which are not applicable to the members of the script class, like `const`. */
+    val movedBlankedRanges = mutableListOf<IntRange>()
 
     private val declaredNames = DeclaredNames()
 
@@ -922,29 +921,28 @@ private class ScriptStructure(
         // only the properties which require it are moved
         val properties = declarations.filter { it.kind == DeclarationKind.PROPERTY && !it.requiresMove }
         val propertyNames = properties.flatMap { listOfNotNull(it.name) + it.destructuredNames }
+        val propertyNameSet = propertyNames.toSet()
+        val propertyNameCounts = propertyNames.groupingBy { it }.eachCount()
         // initialized with a literal, so they can be initialized at any time, moved with the declarations referring to them
         val constants = properties.filter { property ->
             val psi = property.psi as? KtProperty
             psi != null && !psi.isVar && psi.delegate == null && psi.initializer.isConstant() && property.accessors.isEmpty()
-                    && property.name !in dependencyNames && propertyNames.count { it == property.name } == 1
+                    && property.name !in dependencyNames && propertyNameCounts[property.name] == 1
         }
-        // not inline, unlike when moved, while they cannot be moved, as they access the local properties
-        demotedInlines = declarations.filter { declaration ->
-            val function = declaration.psi as? KtNamedFunction
-            function != null && function.hasModifier(KtTokens.INLINE_KEYWORD)
-                    && function.typeParameters.none { it.hasModifier(KtTokens.REIFIED_KEYWORD) }
-                    && function.memberOnlyAnnotationEntries().isEmpty()
-                    && declaration.references.any { it.refersToLocal(propertyNames.toSet()) }
-        }.toSet()
-        val selected = selectMovedDeclarations(declarations, bodyReferences, propertyNames.toSet(), demotedInlines)
+        val selected = selectMovedDeclarations(declarations, bodyReferences, propertyNameSet)
         // referred to by the moved declarations, which can access the members of the script, unlike e.g. an object
-        val movedConstants = constants.filter { constant ->
-            selected.any { declaration ->
-                declaration.references.any { it.canAccessScriptMembers && it.refersToLocal(setOf(constant.name!!)) }
+        val referredConstants = selected.flatMapTo(HashSet()) { declaration ->
+            declaration.references.filter { it.canAccessScriptMembers && it.refersToLocal(propertyNameSet) }.map { it.name }
+        }
+        val movedConstants = constants.filter { it.name in referredConstants }
+        val moved = (selected + movedConstants).sortedBy { it.start }.toCollection(LinkedHashSet())
+        // `const` is not applicable to the members of the script class
+        movedConstants.forEach { constant ->
+            constant.psi.modifierList?.getModifier(KtTokens.CONST_KEYWORD)?.let {
+                movedBlankedRanges += it.startOffset until it.endOffset
             }
         }
-        val moved = (selected + movedConstants).sortedBy { it.start }.toCollection(LinkedHashSet())
-        localProperties = propertyNames.toSet() - movedConstants.mapTo(HashSet()) { it.name!! }
+        localProperties = propertyNameSet - movedConstants.mapTo(HashSet()) { it.name!! }
         movedDeclarations = moved.map { it.toDeclaration(withNestedNames = true) }
         endsWithMovedDeclaration = moved.any { it.psi == statements.lastOrNull() }
         // unlike an extension function, which cannot be called like the dependency
@@ -1137,13 +1135,6 @@ private class ScriptStructure(
                 declaration.psi.memberOnlyAnnotationEntries().forEach { blankedRanges += it.startOffset until it.endOffset }
                 declaration.accessors.forEach { blankedRanges += it.startOffset until it.endOffset }
             }
-            if (declaration in demotedInlines) {
-                val function = declaration.psi as KtNamedFunction
-                (listOfNotNull(function.modifierList) + function.valueParameters.mapNotNull { it.modifierList })
-                    .flatMap { it.node.getChildren(null).toList() }
-                    .filter { it.elementType in inlineModifiers }
-                    .forEach { blankedRanges += it.startOffset until it.startOffset + it.textLength }
-            }
         }
     }
 
@@ -1278,9 +1269,7 @@ private class ScriptStructure(
     private fun selectMovedDeclarations(
         declarations: List<ParsedDeclaration>,
         bodyReferences: List<Reference>,
-        localProperties: Set<String>,
-        /** The declarations, which would require moving, but are made local instead. */
-        notRequired: Set<ParsedDeclaration>
+        localProperties: Set<String>
     ): Set<ParsedDeclaration> {
         val named = declarations.filter { it.name != null && it.kind != DeclarationKind.PROPERTY }
         val namedByName = named.groupBy { it.name!! }
@@ -1303,7 +1292,7 @@ private class ScriptStructure(
         references.forEach { (declaration, referenced) ->
             referenced.forEach { referrers.getOrPut(it) { mutableListOf() } += declaration }
         }
-        val required = declarations.filter { it.requiresMove && it !in notRequired }.toSet()
+        val required = declarations.filter { it.requiresMove }.toSet()
         val accessingLocalProperties = declarations.filter { declaration ->
             declaration.references.any { it.refersToLocal(localProperties) }
         }.toSet()
