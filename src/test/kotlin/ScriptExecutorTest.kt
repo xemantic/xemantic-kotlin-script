@@ -3093,4 +3093,47 @@ class ScriptExecutorTest {
         assert(result is ScriptResult.Error && result.phase == ExecutionPhase.EVALUATION)
     }
 
+    @Test
+    fun `should resolve references preceding local properties named like dependencies to other declarations`() = runTest {
+        // given
+        val scripts = listOf(
+            "print(\"a\")\nval print = 3\nprint" to listOf(dependency("print", 1)),
+            "require(true)\nval require = 1\nrequire" to listOf(dependency("require", "r")),
+            "val n = with(listOf(1, 2)) { size }\nval size = 3\nn + size" to listOf(dependency("size", 1))
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { (script, dependencies) -> executor.execute(script, dependencies) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(3, 1, 5))
+    }
+
+    @Test
+    fun `should report error at reference to dependency before annotated local property of the same name declared later`() = runTest {
+        // given
+        val script = """
+            fun show() = x
+            @Suppress("UNUSED")
+            val x = 2
+            show()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("x", 1)))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:14: error: 'x' refers to the dependency, as the property 'x' of the script body is declared later, at line 3.
+                  | fun show() = <error>x</error>
+                  hint: declare the property before line 1, or rename it.
+            """.trimIndent()
+        }
+    }
+
 }

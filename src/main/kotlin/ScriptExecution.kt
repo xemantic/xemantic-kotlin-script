@@ -106,7 +106,7 @@ internal class DefaultScriptExecutor(
 
     private val compilationCache = if (compilationCacheSize > 0) {
         ScriptCompilationCache<Compilation>(compilationCacheSize) {
-            it.result is ResultWithDiagnostics.Success
+            it.result is ResultWithDiagnostics.Success && it.laterDeclaredDependencyReferences.isEmpty()
         }
     } else {
         null
@@ -182,7 +182,9 @@ internal class DefaultScriptExecutor(
      */
     private class Compilation(
         val source: ScriptSource,
-        val result: ResultWithDiagnostics<CompiledScript>?
+        val result: ResultWithDiagnostics<CompiledScript>?,
+        /** The [ScriptSource.laterDeclaredDependencyCandidates] referring to the dependencies indeed. */
+        val laterDeclaredDependencyReferences: List<Pair<ScriptReference, Int>> = emptyList()
     )
 
     private inner class ScriptHandler(
@@ -214,6 +216,10 @@ internal class DefaultScriptExecutor(
             source = compilation.source
             val compilationResult = compilation.result ?: return ScriptResult.Error(
                 ScriptErrorReporter(source).toSourceFailureMessage(),
+                ExecutionPhase.COMPILATION
+            )
+            if (compilation.laterDeclaredDependencyReferences.isNotEmpty()) return ScriptResult.Error(
+                ScriptErrorReporter(source).toLaterDeclaredDependencyMessage(compilation.laterDeclaredDependencyReferences),
                 ExecutionPhase.COMPILATION
             )
             val result = when (compilationResult) {
@@ -268,22 +274,44 @@ internal class DefaultScriptExecutor(
 
         private suspend fun doCompile(): Compilation {
             val source = source()
-            if (
-                source.unmatchedClosingBrace != null
-                || source.conflictingDependencyDeclarations.isNotEmpty()
-                || source.laterDeclaredDependencyReferences.isNotEmpty()
-            ) {
+            if (source.unmatchedClosingBrace != null || source.conflictingDependencyDeclarations.isNotEmpty()) {
                 return Compilation(source, result = null)
             }
-            return Compilation(source, compile(source))
+            val result = compile(source)
+            return Compilation(
+                source,
+                result,
+                if (result is Success) laterDeclaredDependencyReferences(source) else emptyList()
+            )
         }
 
-        private fun source() = ScriptSource(
+        private fun source(
+            omittedDependency: String? = null
+        ) = ScriptSource(
             script,
             dependencies = allDependencies.filter { it.isHidden }.map { dependency ->
                 PreambleDependency(dependency.name, dependency.accessor, dependency.isCallable)
-            }
+            },
+            omittedDependency = omittedDependency
         )
+
+        /**
+         * The [ScriptSource.laterDeclaredDependencyCandidates], which are unresolved, when the script is compiled without their dependency,
+         * one by one, so the errors caused by omitting one of them are not attributed to the others.
+         */
+        private suspend fun laterDeclaredDependencyReferences(
+            source: ScriptSource
+        ): List<Pair<ScriptReference, Int>> = source.laterDeclaredDependencyCandidates.groupBy { (reference) ->
+            reference.name
+        }.flatMap { (name, candidates) ->
+            val probe = source(omittedDependency = name)
+            val unresolved = compile(probe).reports.filter {
+                it.severity == ScriptDiagnostic.Severity.ERROR && it.message == "Unresolved reference '$name'."
+            }.mapNotNull { diagnostic ->
+                diagnostic.location?.start?.let { probe.toScriptPosition(it.line, it.col) }
+            }
+            candidates.filter { (reference) -> unresolved.any { it in reference } }
+        }
 
         private suspend fun compile(
             source: ScriptSource

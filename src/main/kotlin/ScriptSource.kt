@@ -89,7 +89,14 @@ internal class ScriptReference(
     val name: String,
     val start: ScriptPosition,
     val end: ScriptPosition
-)
+) {
+
+    operator fun contains(
+        position: ScriptPosition
+    ): Boolean = (position.line > start.line || (position.line == start.line && position.column >= start.column))
+            && (position.line < end.line || (position.line == end.line && position.column < end.column))
+
+}
 
 /** A dependency, as declared in the preamble of the [ScriptSource]. */
 internal class PreambleDependency(
@@ -140,7 +147,9 @@ internal const val SCRIPT_BLOCK_END = "} }"
  */
 internal class ScriptSource(
     script: String,
-    dependencies: List<PreambleDependency> = emptyList()
+    dependencies: List<PreambleDependency> = emptyList(),
+    /** The dependency not declared for the script body, see [laterDeclaredDependencyCandidates]. */
+    val omittedDependency: String? = null
 ) : SourceCode {
 
     val scriptLines: List<String>
@@ -164,11 +173,13 @@ internal class ScriptSource(
     val conflictingDependencyDeclarations: List<ScriptReference>
 
     /**
-     * The references of the script body to the dependencies, preceding the declarations of the local properties of the same names,
+     * The references of the script body which might refer to the dependencies, preceding the declarations of the local properties of the same names,
      * by the 0-based lines of these declarations, like `x` in `fun show() = x` followed by `val x = 2`,
      * while in the script they refer to the properties.
+     * Recognized by the names only, they might refer e.g. to the members of the receivers instead,
+     * so they are confirmed by compiling the script without the dependency, see [omittedDependency].
      */
-    val laterDeclaredDependencyReferences: List<Pair<ScriptReference, Int>>
+    val laterDeclaredDependencyCandidates: List<Pair<ScriptReference, Int>>
 
     private val lineStarts: List<Int>
 
@@ -194,7 +205,7 @@ internal class ScriptSource(
         conflictingDependencyDeclarations = structure.conflictingDependencyDeclarations.map { (name, range) ->
             ScriptReference(name, position(range.first), position(range.last + 1))
         }
-        laterDeclaredDependencyReferences = structure.laterDeclaredDependencyReferences.map { (reference, declaration) ->
+        laterDeclaredDependencyCandidates = structure.laterDeclaredDependencyCandidates.map { (reference, declaration) ->
             ScriptReference(reference.name, position(reference.offset), position(reference.offset + reference.length)) to
                     position(declaration).line
         }
@@ -237,7 +248,9 @@ internal class ScriptSource(
         lines += "class $DEPENDENCIES_CLASS {"
         mapping += null
         // the members of the outer receiver of the script body would be called instead of the moved functions
-        shadowed.filterNot { it.isCallable && it.name in structure.movedFunctions }.forEach { addAccessor(it) }
+        shadowed.filterNot {
+            (it.isCallable && it.name in structure.movedFunctions) || it.name == omittedDependency
+        }.forEach { addAccessor(it) }
         lines += "}"
         mapping += null
         movedDeclarations.forEach { declaration ->
@@ -610,8 +623,8 @@ private class ScriptStructure(
     /** The names of the functions moved out of the script body. */
     val movedFunctions: Set<String>
 
-    /** See [ScriptSource.laterDeclaredDependencyReferences], with the offsets of the declarations. */
-    val laterDeclaredDependencyReferences: List<Pair<Reference, Int>>
+    /** See [ScriptSource.laterDeclaredDependencyCandidates], with the offsets of the declarations. */
+    val laterDeclaredDependencyCandidates: List<Pair<Reference, Int>>
 
     /** The names of the [ScriptSource.conflictingDependencyDeclarations], and their ranges. */
     val conflictingDependencyDeclarations: List<Pair<String, IntRange>>
@@ -636,9 +649,10 @@ private class ScriptStructure(
         val statements = block?.statements.orEmpty()
         val declarations = statements.mapNotNull { parseDeclaration(it) }
         val declarationsByPsi = declarations.associateBy { it.psi }
-        val bodyReferences = statements.flatMap { statement ->
+        val statementReferences = statements.map { statement ->
             declarationsByPsi[statement]?.references ?: statement.references(scope = statement.parent, declaredNames)
         }
+        val bodyReferences = statementReferences.flatten()
         // only the properties which require it are moved
         localProperties = declarations.filter { it.kind == DeclarationKind.PROPERTY && !it.requiresMove }
             .flatMapTo(HashSet()) { listOfNotNull(it.name) + it.destructuredNames }
@@ -646,12 +660,10 @@ private class ScriptStructure(
         movedDeclarations = moved.map { it.toDeclaration(withNestedNames = true) }
         endsWithMovedDeclaration = moved.any { it.psi == statements.lastOrNull() }
         // unlike an extension function, which cannot be called like the dependency
-        localFunctions = declarations.filter {
-            it.kind == DeclarationKind.FUNCTION && !it.isExtension && it !in moved
-        }.mapNotNullTo(HashSet()) { it.name }
-        movedFunctions = moved.filter { it.kind == DeclarationKind.FUNCTION }.mapNotNullTo(HashSet()) { it.name }
+        val (local, movedOut) = declarations.filter { it.kind == DeclarationKind.FUNCTION && !it.isExtension }.partition { it !in moved }
+        localFunctions = local.mapNotNullTo(HashSet()) { it.name }
+        movedFunctions = movedOut.mapNotNullTo(HashSet()) { it.name }
         // the first local property of each name of a dependency, by the index of its statement
-        val functions = declarations.filter { it.kind == DeclarationKind.FUNCTION }.mapNotNullTo(HashSet()) { it.name }
         val dependencyProperties = mutableMapOf<String, Pair<Int, ParsedDeclaration>>()
         statements.forEachIndexed { index, statement ->
             declarationsByPsi[statement]?.takeIf { it.kind == DeclarationKind.PROPERTY && it !in moved }?.let { declaration ->
@@ -660,15 +672,14 @@ private class ScriptStructure(
                     .forEach { dependencyProperties.putIfAbsent(it, index to declaration) }
             }
         }
-        laterDeclaredDependencyReferences = statements.withIndex().flatMap { (index, statement) ->
-            val declaration = declarationsByPsi[statement]
-            if (declaration in moved) return@flatMap emptyList()
-            (declaration?.references ?: statement.references(scope = statement.parent, declaredNames)).mapNotNull { reference ->
+        laterDeclaredDependencyCandidates = statements.withIndex().flatMap { (index, statement) ->
+            if (declarationsByPsi[statement] in moved) return@flatMap emptyList()
+            statementReferences[index].mapNotNull { reference ->
                 dependencyProperties[reference.name]?.takeIf { (declarationIndex) ->
                     declarationIndex > index && reference.refersToLocal(localProperties)
                             // calling the function of the script body
-                            && !(reference.isCall && reference.name in functions)
-                }?.let { (_, property) -> reference to property.start }
+                            && !(reference.isCall && (reference.name in localFunctions || reference.name in movedFunctions))
+                }?.let { (_, property) -> reference to (property.nameRange?.first ?: property.start) }
             }
         }
         // unlike an extension property, which does not conflict with the accessor of the dependency

@@ -94,14 +94,17 @@ internal class ScriptErrorReporter(
             appendSourceLines(declaration.start, declaration.end)
             +"  hint: '${declaration.name}' is compiled outside of the script body, together with the dependencies - rename it.\n"
         }
-    }.ifEmpty {
-        source.laterDeclaredDependencyReferences.joinToString(separator = "\n") { (reference, line) ->
-            buildString {
-                appendPosition(reference.start)
-                +"error: '${reference.name}' refers to the dependency, as the property '${reference.name}' of the script body is declared later, at line ${line + 1}.\n"
-                appendSourceLines(reference.start, reference.end)
-                +"  hint: declare the property before line ${reference.start.line + 1}, or rename it.\n"
-            }
+    }.trimEnd()
+
+    /** The [references] of the script body to the dependencies, preceding the local properties of their names, see [ScriptSource.laterDeclaredDependencyCandidates]. */
+    fun toLaterDeclaredDependencyMessage(
+        references: List<Pair<ScriptReference, Int>>
+    ): String = references.joinToString(separator = "\n") { (reference, line) ->
+        buildString {
+            appendPosition(reference.start)
+            +"error: '${reference.name}' refers to the dependency, as the property '${reference.name}' of the script body is declared later, at line ${line + 1}.\n"
+            appendSourceLines(reference.start, reference.end)
+            +"  hint: declare the property before line ${reference.start.line + 1}, or rename it.\n"
         }
     }.trimEnd()
 
