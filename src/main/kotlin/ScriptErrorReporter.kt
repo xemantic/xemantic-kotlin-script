@@ -87,14 +87,22 @@ internal class ScriptErrorReporter(
     fun toSourceFailureMessage(): String = source.unmatchedClosingBrace?.let {
         // the brace would close the script block, misplacing all the errors
         toUnmatchedClosingBraceMessage(it)
-    } ?: source.conflictingDependencyDeclarations.joinToString(separator = "\n") { declaration ->
+    } ?: (source.conflictingDependencyDeclarations.map { declaration ->
         buildString {
             appendPosition(declaration.start)
             +"error: Conflicting declaration of '${declaration.name}', which is also the name of a dependency.\n"
             appendSourceLines(declaration.start, declaration.end)
             +"  hint: '${declaration.name}' is compiled outside of the script body, together with the dependencies - rename it.\n"
         }
-    }.trimEnd()
+    } + source.propertyCallsShadowingFunctions.map { (reference, property, function) ->
+        buildString {
+            appendPosition(reference.start)
+            +"error: '${reference.name}' refers to the property of the script body declared at line ${property + 1}, "
+            +"instead of the function declared at line ${function + 1}, which a regular script calls.\n"
+            appendSourceLines(reference.start, reference.end)
+            +"  hint: rename the property or the function.\n"
+        }
+    }).joinToString(separator = "\n").trimEnd()
 
     /** The [references] of the declarations moved out of the script body to other functions, see [ScriptSource.hiddenLocalFunctionCandidates]. */
     fun toHiddenLocalFunctionMessage(

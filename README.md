@@ -96,7 +96,8 @@ when (result) {
   and referring to a local value or function of the same name as a dependency is reported as unresolved, instead of using the dependency,
   while an object, an enum class, an interface or a nested class cannot refer even to the dependencies,
   as they are the members of the script instance.
-  An error message will hint at this, if it happens.
+  An error message will hint at this, if it happens,
+  also when such a reference compiles, as it is resolved to another declaration of the same name, like `check` of the standard library.
 
 ### Error reporting
 

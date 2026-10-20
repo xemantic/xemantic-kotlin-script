@@ -3346,4 +3346,43 @@ class ScriptExecutorTest {
         })
     }
 
+    @Test
+    fun `should call library functions from declarations moved out of the script body when local properties of their names cannot be called`() = runTest {
+        // given
+        val scripts = listOf(
+            "val delay = 10L\nsealed class Task { suspend fun go(): String { delay(1); return \"done\" } }\nclass Job1 : Task()\nJob1().go() + delay" to emptyList(),
+            "val check = true\nsealed class C { fun f() { check(1 > 0) } }\nclass D : C()\nD().f()\ncheck" to emptyList(),
+            "import kotlin.Suppress as Q\nx + 1" to listOf(dependency("x", 1))
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { (script, dependencies) -> executor.execute(script, dependencies) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("done10", true, 2))
+    }
+
+    @Test
+    fun `should report wrongly resolved references of callable references, infix calls, trailing lambdas, aliased suppressions and constrained type parameters`() = runTest {
+        // given
+        val scripts = listOf(
+            "val log = mutableListOf<Any?>()\nfun println(x: Any?) { log += x }\nsealed interface S\nclass T : S { fun f() = listOf(1, 2).forEach(::println) }\nT().f()\nlog" to emptyList(),
+            "val k = 0\ninfix fun Int.until(to: Int) = listOf(this, to, k)\nsealed class S { fun f() = 0 until 20 }\nclass T : S()\nT().f()" to emptyList(),
+            "val log = mutableListOf<String>()\nval repeat = { n: Int, block: (Int) -> Unit -> log += \"local\"; block(n) }\nsealed class Shape { fun show() = repeat(2) { } }\nclass Circle : Shape()\nCircle().show()\nlog" to emptyList(),
+            "val suffix = \"!\"\nval trim: String.() -> String = { \"local\" + suffix }\nsealed class Shape { fun t() = \" a \".trim() }\nclass Circle : Shape()\nCircle().t()" to emptyList(),
+            "typealias Q = Suppress\n@Q(\"DEPRECATION_ERROR\") fun show() = x\nval x = 2\nshow()" to listOf(dependency("x", 1)),
+            "@[Suppress(\"UNUSED\")] fun show() = x\nval x = 2\nshow()" to listOf(dependency("x", 1)),
+            "val p = \"!\"\nfun <T> greet(t: T): String where T : CharSequence, T : Comparable<T> = \"local\" + t + p\nsealed interface S\nclass Q : S { fun f() = greet(StringBuilder(\"x\")) }\nfun greet(t: Any) = \"moved\" + t\nQ().f()" to emptyList(),
+            "val f = { x: Int -> \"lambda\" }\nsealed class S\nclass T : S() { fun h() = f(1) }\nfun f(x: Int) = \"function\"\nf(1)" to emptyList()
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { (script, dependencies) -> executor.execute(script, dependencies) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+    }
+
 }

@@ -60,6 +60,8 @@ import org.jetbrains.kotlin.psi.KtPropertyAccessor
 import org.jetbrains.kotlin.psi.KtPsiFactory
 import org.jetbrains.kotlin.psi.KtSimpleNameExpression
 import org.jetbrains.kotlin.psi.KtStringTemplateExpression
+import org.jetbrains.kotlin.psi.KtLambdaExpression
+import org.jetbrains.kotlin.psi.KtOperationReferenceExpression
 import org.jetbrains.kotlin.psi.KtTypeAlias
 import org.jetbrains.kotlin.psi.KtUserType
 import org.jetbrains.kotlin.psi.KtValueArgumentName
@@ -169,10 +171,10 @@ internal class ScriptSource(
     dependencies: List<PreambleDependency> = emptyList(),
     /**
      * Whether it is the source of the compilation confirming the [laterDeclaredDependencyCandidates]
-     * and the [hiddenLocalFunctionCandidates], with the declarations they might refer to deprecated with an error,
+     * and the [hiddenLocalFunctionCandidates], with the declarations they might refer to deprecated, with a warning, as the declarations deprecated with an error are less preferred by the overload resolution,
      * which does not change how the references are resolved, unlike omitting them,
      * while the declarations the candidates should refer to are declared as their deprecated copies,
-     * and the suppressions of the deprecation errors by the script are blanked out.
+     * and the suppressions by the script are blanked out.
      */
     confirming: Boolean = false
 ) : SourceCode {
@@ -196,6 +198,12 @@ internal class ScriptSource(
 
     /** The properties moved out of the script body, which have the names of the dependencies, conflicting with their accessors. */
     val conflictingDependencyDeclarations: List<ScriptReference>
+
+    /**
+     * The calls of the script body to the local properties, which have the names of the functions moved out of the script body,
+     * by the 0-based lines of the properties and the functions, while in the script they call the functions.
+     */
+    val propertyCallsShadowingFunctions: List<Triple<ScriptReference, Int, Int>>
 
     /**
      * The references of the script body which might refer to the dependencies, preceding the declarations
@@ -241,19 +249,14 @@ internal class ScriptSource(
         conflictingDependencyDeclarations = structure.conflictingDependencyDeclarations.map { (name, range) ->
             ScriptReference(name, position(range.first), position(range.last + 1))
         }
-        laterDeclaredDependencyCandidates = structure.laterDeclaredDependencyCandidates.map { (reference, declaration, isFunction) ->
-            LaterDeclaredReference(
-                ScriptReference(reference.name, position(reference.offset), position(reference.offset + reference.length)),
-                position(declaration).line,
-                isFunction
-            )
-        }
-        hiddenLocalFunctionCandidates = structure.hiddenLocalFunctionCandidates.map { (reference, declaration, isFunction) ->
-            LaterDeclaredReference(
-                ScriptReference(reference.name, position(reference.offset), position(reference.offset + reference.length)),
-                position(declaration).line,
-                isFunction
-            )
+        fun Reference.toScriptReference() = ScriptReference(name, position(offset), position(offset + length))
+        fun Triple<Reference, Int, Boolean>.toLaterDeclaredReference() = LaterDeclaredReference(
+            first.toScriptReference(), position(second).line, third
+        )
+        laterDeclaredDependencyCandidates = structure.laterDeclaredDependencyCandidates.map { it.toLaterDeclaredReference() }
+        hiddenLocalFunctionCandidates = structure.hiddenLocalFunctionCandidates.map { it.toLaterDeclaredReference() }
+        propertyCallsShadowingFunctions = structure.propertyCallsShadowingFunctions.map { (reference, property, function) ->
+            Triple(reference.toScriptReference(), position(property).line, position(function).line)
         }
         bodyDeclarations = structure.bodyDeclarations
         val deprecatedDependencies = if (confirming) {
@@ -264,7 +267,7 @@ internal class ScriptSource(
 
         val lines = mutableListOf<String>()
         val mapping = mutableListOf<Int?>()
-        // the confirming compilation reports the deprecation errors, even if suppressed by the script
+        // the confirming compilation reports the deprecations, even if suppressed by the script
         val unsuppressed = BooleanArray(script.length)
         if (confirming) structure.suppressions.forEach { unsuppressed.fill(true, it.first, it.last + 1) }
         fun addLines(
@@ -293,26 +296,20 @@ internal class ScriptSource(
         ) {
             preambleDependencies[lines.size] = dependency.name
             lines += if (dependency.name in deprecatedDependencies) {
-                // the qualified `kotlin.DeprecationLevel.ERROR` crashes the compiler
-                "@kotlin.Deprecated(\"$LATER_DECLARED_DEPENDENCY\", level = DeprecationLevel.ERROR) ${dependency.accessor}"
+                "@kotlin.Deprecated(\"$LATER_DECLARED_DEPENDENCY\") ${dependency.accessor}"
             } else {
                 dependency.accessor
             }
             mapping += null
         }
         fun addCopies(
-            names: Set<String>,
+            declarations: List<String>,
             message: String
-        ) = names.flatMap { structure.localFunctionSignatures[it].orEmpty() }.forEach {
-            lines += "@kotlin.Deprecated(\"$message\", level = DeprecationLevel.ERROR) $it"
+        ) = declarations.forEach {
+            lines += "@kotlin.Deprecated(\"$message\") $it"
             mapping += null
         }
-        if (confirming) {
-            structure.hiddenLocalFunctionCopies.forEach {
-                lines += "@kotlin.Deprecated(\"$HIDDEN_LOCAL_FUNCTION\", level = DeprecationLevel.ERROR) $it"
-                mapping += null
-            }
-        }
+        if (confirming) addCopies(structure.hiddenLocalFunctionCopies, HIDDEN_LOCAL_FUNCTION)
         val (shadowed, visible) = dependencies.partition {
             it.name in structure.localProperties || (it.isCallable && it.name in structure.localFunctions)
         }
@@ -323,7 +320,9 @@ internal class ScriptSource(
         shadowed.filterNot { it.isCallable && it.name in structure.movedFunctions }.forEach { addAccessor(it) }
         if (confirming) {
             addCopies(
-                laterDeclaredDependencyCandidates.filter { it.isFunction }.mapTo(HashSet()) { it.reference.name },
+                laterDeclaredDependencyCandidates.filter { it.isFunction }.mapTo(LinkedHashSet()) { it.reference.name }.flatMap {
+                    structure.localFunctionSignatures[it].orEmpty()
+                },
                 LATER_DECLARED_FUNCTION
             )
         }
@@ -510,11 +509,15 @@ private fun KtDeclaration.memberOnlyAnnotationEntries(): List<KtAnnotationEntry>
  * without the default values of the parameters, which might refer to the local declarations.
  */
 private fun KtNamedFunction.signature(): String = buildString {
-    if (hasModifier(KtTokens.SUSPEND_KEYWORD)) +"suspend "
+    listOf(KtTokens.SUSPEND_KEYWORD, KtTokens.INFIX_KEYWORD, KtTokens.OPERATOR_KEYWORD).filter { hasModifier(it) }.forEach {
+        +it.value
+        +" "
+    }
     +"fun "
     if (typeParameters.isNotEmpty()) {
         +typeParameters.joinToString(prefix = "<", postfix = "> ") { parameter ->
-            "`${parameter.name}`" + (parameter.extendsBound?.let { ": ${it.singleLineText()}" } ?: "")
+            // as written, as the quoted name is not recognized by the `where` constraints
+            parameter.nameIdentifier!!.text + (parameter.extendsBound?.let { ": ${it.singleLineText()}" } ?: "")
         }
     }
     receiverTypeReference?.let {
@@ -527,7 +530,26 @@ private fun KtNamedFunction.signature(): String = buildString {
         (if (parameter.isVarArg) "vararg " else "") + "`${parameter.name}`: ${parameter.typeReference?.singleLineText()}" +
                 (if (parameter.hasDefaultValue()) " = kotlin.TODO()" else "")
     }
-    +"): Nothing = kotlin.TODO()"
+    +"): Nothing"
+    typeConstraintList?.let {
+        +" where "
+        +it.singleLineText()
+    }
+    +" = kotlin.TODO()"
+}
+
+/**
+ * The function type of the property, which can be called, like `(String) -> Any?` of `val log = { m: String -> ... }`,
+ * declared, or of its lambda with the typed parameters, or `null`, if it is not known.
+ */
+private fun KtProperty.functionType(): String? {
+    typeReference?.let { type ->
+        return type.singleLineText().takeIf { "->" in it }
+    }
+    val lambda = (initializer as? KtLambdaExpression) ?: return null
+    val parameters = lambda.valueParameters
+    if (parameters.any { it.typeReference == null || it.destructuringDeclaration != null }) return null
+    return parameters.joinToString(prefix = "(", postfix = ") -> Any?") { it.typeReference!!.singleLineText() }
 }
 
 /** The text without the comments and the line breaks, as each declaration of the preamble is a single line. */
@@ -578,7 +600,7 @@ private class Reference(
     val length: Int,
     val isQualified: Boolean,
     val isBound: Boolean,
-    /** Whether it is called, like `foo` in `foo()`, so it might refer to a function. */
+    /** Whether it is called, like `foo` in `foo()`, or `foo` in `::foo`, or `until` in `0 until 20`, so it might refer to a function. */
     val isCall: Boolean
 ) {
 
@@ -609,7 +631,10 @@ private fun PsiElement.references(
                 callableReference?.callableReference == expression && callableReference.receiverExpression != null
         ),
         isBound = isBound(expression, name, scope, declaredNames),
+        // also referred to as a function, like `::println`, or called as infix, like `0 until 20`
         isCall = (expression.parent as? KtCallExpression)?.calleeExpression == expression
+                || callableReference?.callableReference == expression
+                || (expression is KtOperationReferenceExpression && expression.getReferencedNameElementType() == KtTokens.IDENTIFIER)
     )
 }
 
@@ -740,8 +765,11 @@ private class ScriptStructure(
     /** The deprecated copies of the local declarations, see [ScriptSource.hiddenLocalFunctionCandidates]. */
     val hiddenLocalFunctionCopies: List<String>
 
-    /** The ranges of the `@Suppress` annotations of the script, which might suppress the deprecation errors, see [ScriptSource.confirming]. */
+    /** The ranges of the `@Suppress` annotations of the script, which might suppress the deprecations, see [ScriptSource.confirming]. */
     val suppressions: List<IntRange>
+
+    /** See [ScriptSource.propertyCallsShadowingFunctions], with the offsets of the properties and the functions. */
+    val propertyCallsShadowingFunctions: List<Triple<Reference, Int, Int>>
 
     /** See [ScriptSource.laterDeclaredDependencyCandidates], with the offsets of the declarations, and whether they are functions. */
     val laterDeclaredDependencyCandidates: List<Triple<Reference, Int, Boolean>>
@@ -806,29 +834,62 @@ private class ScriptStructure(
             it.kind == DeclarationKind.FUNCTION && it.isExtension && it !in moved && it.name != null
         }.groupBy { it.name!! }
         val localFunctionsByName = local.filter { it.name != null }.groupBy { it.name!! }
-        val localPropertiesByName = declarations.filter { it.kind == DeclarationKind.PROPERTY && it !in moved && it.name != null }
-            .groupBy { it.name!! }
+        // the local properties of the known function types, which can be called
+        val callableProperties = declarations.filter {
+            it.kind == DeclarationKind.PROPERTY && it !in moved && it.name != null
+        }.mapNotNull { property ->
+            (property.psi as? KtProperty)?.functionType()?.let { property to it }
+        }.groupBy { it.first.name!! }
         hiddenLocalFunctionCandidates = moved.flatMap { declaration ->
-            declaration.references.filter { it.isCall }.mapNotNull { reference ->
+            declaration.references.filter { it.isCall && !it.isBound }.mapNotNull { reference ->
                 val name = reference.name
                 when {
                     reference.refersToLocal(localFunctions) -> localFunctionsByName.getValue(name).first() to true
                     // like `listOf(1, 2).sum()`
-                    !reference.isBound && name in localExtensions -> localExtensions.getValue(name).first() to true
-                    reference.refersToLocal(localProperties) -> localPropertiesByName[name]?.first()?.let { it to false }
+                    name in localExtensions -> localExtensions.getValue(name).first() to true
+                    // also with a receiver, like `" a ".trim()` of `val trim: String.() -> String`
+                    name in callableProperties -> callableProperties.getValue(name).first().first to false
                     else -> null
                 }?.let { (local, isFunction) -> Triple(reference, local.line(), isFunction) }
             }
         }
         hiddenLocalFunctionCopies = hiddenLocalFunctionCandidates.mapTo(LinkedHashSet()) { it.first.name }.flatMap { name ->
-            localFunctionsByName[name].orEmpty().map { (it.psi as KtNamedFunction).signature() } +
+            localFunctionSignatures[name].orEmpty() +
                     localExtensions[name].orEmpty().map { (it.psi as KtNamedFunction).signature() } +
-                    // calling the property of a function type, approximated by a function applicable to any arguments
-                    listOfNotNull(if (name in localPropertiesByName) "fun `$name`(vararg arguments: Any?): Nothing = kotlin.TODO()" else null)
+                    callableProperties[name].orEmpty().map { (_, type) -> "val `$name`: $type get() = kotlin.TODO()" }
         }
-        suppressions = file.collectDescendantsOfType<KtAnnotationEntry> {
-            it.shortName?.asString() == "Suppress"
-        }.map { it.startOffset until it.endOffset }
+        // also the aliases, like `typealias Q = Suppress` or `import kotlin.Suppress as Q`
+        val suppressNames = setOf("Suppress") +
+                file.collectDescendantsOfType<KtTypeAlias> {
+                    it.getTypeReference()?.text?.removePrefix("kotlin.") == "Suppress"
+                }.mapNotNull { it.name } +
+                file.importDirectives.filter { it.importedFqName?.asString() == "kotlin.Suppress" }.mapNotNull { it.aliasName }
+        fun KtAnnotationEntry.isSuppress() = shortName?.asString() in suppressNames
+        suppressions = file.collectDescendantsOfType<KtAnnotationEntry> { it.isSuppress() }.map { entry ->
+            // like `@[Suppress("X")]`, which would be invalid without the entries
+            val annotation = entry.parent as? KtAnnotation
+            if (annotation != null && annotation.entries.all { it.isSuppress() }) annotation else entry
+        }.distinct().map { it.startOffset until it.endOffset }
+        // the first local property of each name of a moved function, by the index of its statement
+        val movedFunctionsByName = movedOut.filter { it.name != null }.groupBy { it.name!! }
+        val shadowingProperties = mutableMapOf<String, Pair<Int, ParsedDeclaration>>()
+        statements.forEachIndexed { index, statement ->
+            declarationsByPsi[statement]?.takeIf { it.kind == DeclarationKind.PROPERTY && it !in moved }?.let { property ->
+                (listOfNotNull(property.name) + property.destructuredNames)
+                    .filter { it in movedFunctionsByName }
+                    .forEach { shadowingProperties.putIfAbsent(it, index to property) }
+            }
+        }
+        propertyCallsShadowingFunctions = statements.withIndex().flatMap { (index, statement) ->
+            if (declarationsByPsi[statement] in moved) return@flatMap emptyList()
+            statementReferences[index].mapNotNull { reference ->
+                shadowingProperties[reference.name]?.takeIf { (propertyIndex) ->
+                    propertyIndex < index && reference.isCall && reference.refersToLocal(localProperties)
+                }?.let { (_, property) ->
+                    Triple(reference, property.line(), movedFunctionsByName.getValue(reference.name).first().line())
+                }
+            }
+        }
         laterDeclaredDependencyCandidates = statements.withIndex().flatMap { (index, statement) ->
             if (declarationsByPsi[statement] in moved) return@flatMap emptyList()
             statementReferences[index].mapNotNull { reference ->

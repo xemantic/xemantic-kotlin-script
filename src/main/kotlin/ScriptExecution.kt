@@ -289,7 +289,11 @@ internal class DefaultScriptExecutor(
 
         private suspend fun doCompile(): Compilation {
             val source = source()
-            if (source.unmatchedClosingBrace != null || source.conflictingDependencyDeclarations.isNotEmpty()) {
+            if (
+                source.unmatchedClosingBrace != null
+                || source.conflictingDependencyDeclarations.isNotEmpty()
+                || source.propertyCallsShadowingFunctions.isNotEmpty()
+            ) {
                 return Compilation(source, result = null)
             }
             val result = compile(source)
@@ -299,11 +303,11 @@ internal class DefaultScriptExecutor(
             // recognizing the candidates referring to the wrong declarations indeed
             val probe = source(confirming = true)
             val reports = compile(probe).reports
-            /** The positions of the errors of the deprecated declarations of this [message]. */
+            /** The positions of the warnings of the deprecated declarations of this [message]. */
             fun deprecated(
                 message: String
             ) = reports.filter {
-                it.severity == ScriptDiagnostic.Severity.ERROR && message in it.message
+                it.severity == ScriptDiagnostic.Severity.WARNING && message in it.message
             }.mapNotNull { diagnostic ->
                 diagnostic.location?.start?.let { probe.toScriptPosition(it.line, it.col) }
             }
@@ -567,7 +571,7 @@ private val ScriptExecutor.Dependency<*>.providedType: KotlinType
 
 // with an initializer, unlike a getter, the dependency can be smart cast
 private val ScriptExecutor.Dependency<*>.accessor: String
-    get() = "@Suppress(\"UNCHECKED_CAST\") val `$name`: $type = `$providedName` as $type"
+    get() = "@kotlin.Suppress(\"UNCHECKED_CAST\") val `$name`: $type = `$providedName` as $type"
 
 /** Whether it is of a function type, or of a type with the public `invoke` operator, so the script can call it. */
 private val ScriptExecutor.Dependency<*>.isCallable: Boolean
