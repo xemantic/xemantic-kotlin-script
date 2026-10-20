@@ -1483,7 +1483,7 @@ class ScriptExecutorTest {
             message sameAs """
                 script.kts:2:8: error: Object 'Greeter' captures the script class instance. Try to use class or anonymous object instead.
                   | object <error>Greeter</error> {
-                  hint: 'Greeter' is compiled outside of the script body, where an object cannot access the dependencies - declare it as a class, or pass the dependencies as parameters.
+                  hint: 'Greeter' is compiled outside of the script body, where an object cannot access the dependencies, nor the functions of the script - declare it as a class, or pass them as parameters.
             """.trimIndent()
         }
     }
@@ -2418,7 +2418,7 @@ class ScriptExecutorTest {
             message sameAs """
                 script.kts:1:12: error: Enum class 'Mood' captures the script class instance. Try to use class or anonymous object instead.
                   | enum class <error>Mood</error> { HAPPY; fun greet() = greeting }
-                  hint: 'Mood' is compiled outside of the script body, where an enum class cannot access the dependencies - pass the dependencies as parameters.
+                  hint: 'Mood' is compiled outside of the script body, where an enum class cannot access the dependencies, nor the functions of the script - pass them as parameters.
             """.trimIndent()
         }
     }
@@ -2444,7 +2444,7 @@ class ScriptExecutorTest {
             message sameAs """
                 script.kts:2:11: error: Nested class 'Nested' captures the script class instance. Try to use the explicit 'inner' modifier for both the nested 'Nested' and outer 'Outer'.
                   |     class <error>Nested</error> { fun greet() = greeting }
-                  hint: 'Nested' is compiled outside of the script body, where a nested class cannot access the dependencies - pass the dependencies as parameters.
+                  hint: 'Nested' is compiled outside of the script body, where a nested class cannot access the dependencies, nor the functions of the script - pass them as parameters.
             """.trimIndent()
         }
     }
@@ -3403,20 +3403,23 @@ class ScriptExecutorTest {
     }
 
     @Test
-    fun `should report wrongly resolved callable references and values`() = runTest {
+    fun `should report wrongly resolved callable references and resolve the moved constants`() = runTest {
         // given
-        val scripts = listOf(
-            "val p = 1\nval g = ::x\nfun x() = p + 10\ng()" to listOf(dependency<() -> Int>("x") { 2 }),
-            "import kotlin.math.*\nval E = 2.0\nsealed interface S\nclass T : S { fun f() = E }\nT().f()" to emptyList(),
-            "import kotlin.math.PI\nval PI = 3.0\nsealed interface S\nclass T : S { fun f() = PI }\nT().f()" to emptyList()
+        val callableReference = "val p = 1\nval g = ::x\nfun x() = p + 10\ng()"
+        val constants = listOf(
+            "import kotlin.math.*\nval E = 2.0\nsealed interface S\nclass T : S { fun f() = E }\nT().f()",
+            "import kotlin.math.PI\nval PI = 3.0\nsealed interface S\nclass T : S { fun f() = PI }\nT().f()"
         )
         val executor = ScriptExecutor()
 
         // when
-        val results = scripts.map { (script, dependencies) -> executor.execute(script, dependencies) }
+        val result = executor.execute(callableReference, listOf(dependency<() -> Int>("x") { 2 }))
+        val results = constants.map { executor.execute(it) }
 
         // then
-        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+        assert(result is ScriptResult.Error && result.phase == ExecutionPhase.COMPILATION)
+        // moved together with the declarations referring to them, the constants are resolved before the imports, like in the script
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(2.0, 3.0))
     }
 
     @Test
@@ -3487,6 +3490,47 @@ class ScriptExecutorTest {
 
         // then
         assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("int!stra", 100, "done20", 8))
+    }
+
+    @Test
+    fun `should execute declarations moved out of the script body reading constant properties, and inline functions reading local properties`() = runTest {
+        // given
+        val scripts = listOf(
+            "val taxRate = 0.2\nclass Order(val amount: Double) { fun total() = amount * (1 + taxRate) + FEE; companion object { const val FEE = 1.0 } }\nOrder(10.0).total()",
+            "val unit = \"cm\"\nsealed class Shape\nclass Sq(val s: Int) : Shape() { fun d() = \"${'$'}s${'$'}unit\" }\nSq(2).d()",
+            "val log = mutableListOf<String>()\ninline fun logged(crossinline block: () -> Unit) { log += \"start\"; block() }\nlogged { }\nlog"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(13.0, "2cm", listOf("start")))
+    }
+
+    @Test
+    fun `should report error at companion object capturing the script class instance`() = runTest {
+        // given
+        val script = """
+            class User(val id: Int) { companion object { fun create() = User(input.length) } }
+            User.create().id
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("input", "abc")))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:27: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead.
+                  | class User(val id: Int) { <error>companion</error> object { fun create() = User(input.length) } }
+                  hint: 'Companion' is compiled outside of the script body, where an object cannot access the dependencies, nor the functions of the script - declare it as a class, or pass them as parameters.
+            """.trimIndent()
+        }
     }
 
 }

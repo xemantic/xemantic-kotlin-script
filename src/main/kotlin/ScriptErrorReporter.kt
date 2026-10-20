@@ -120,8 +120,7 @@ internal class ScriptErrorReporter(
             appendPosition(reference.start)
             +"error: '${reference.name}' does not refer to the $kind of the script body declared at line ${hidden.line + 1}, which is not visible in '$declaration'.\n"
             appendSourceLines(reference.start, reference.end)
-            +"  hint: '$declaration' is compiled outside of the script body, where '${reference.name}' (line ${hidden.line + 1}) is not visible"
-            +" - pass it as a parameter, or declare it within '$declaration'.\n"
+            appendNotVisibleHint(declaration, reference.name, hidden.line)
         }
     }.trimEnd()
 
@@ -374,9 +373,19 @@ internal class ScriptErrorReporter(
             val kind = capturing[1].lowercase()
             val article = if (kind[0] in "aeiou") "an" else "a"
             val alternative = if (kind == "object") "declare it as a class, or " else ""
-            +"  hint: '$capturingDeclaration' is compiled outside of the script body, where $article $kind cannot access the dependencies"
-            +" - ${alternative}pass the dependencies as parameters.\n"
+            +"  hint: '$capturingDeclaration' is compiled outside of the script body, where $article $kind cannot access the dependencies,"
+            +" nor the functions of the script - ${alternative}pass them as parameters.\n"
         }
+    }
+
+    /** The hint of the declaration moved out of the script body referring to the [name] declared at the 0-based [line] of the script body. */
+    private fun StringBuilder.appendNotVisibleHint(
+        declaration: String?,
+        name: String,
+        line: Int
+    ) {
+        +"  hint: '$declaration' is compiled outside of the script body, where '$name' (line ${line + 1}) is not visible"
+        +" - pass it as a parameter, or declare it within '$declaration'.\n"
     }
 
     private fun StringBuilder.appendSeverityAndMessage(
@@ -427,8 +436,7 @@ internal class ScriptErrorReporter(
             ?: source.bodyDeclarationLine(name) ?: return
         val declaration = source.movedDeclarationAt(position)
         if (declaration != null) {
-            +"  hint: '$declaration' is compiled outside of the script body, where '$name' (line ${line + 1}) is not visible"
-            +" - pass it as a parameter, or declare it within '$declaration'.\n"
+            appendNotVisibleHint(declaration, name, line)
         } else if (line > position.line) {
             val declarations = when (kind) {
                 CLASS -> "classes"

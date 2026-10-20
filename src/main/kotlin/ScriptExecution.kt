@@ -315,15 +315,19 @@ internal class DefaultScriptExecutor(
             }
             // recognizing the candidates referring to the wrong declarations indeed
             val probe = source(confirming = true)
-            val reports = compile(probe).reports
-            /** The positions of the warnings of the deprecated declarations of this [message]. */
-            fun deprecated(
+            /** The positions of the warnings of the marked declarations of this [message] in the [source], see [ScriptSource.confirming]. */
+            fun List<ScriptDiagnostic>.marked(
+                source: ScriptSource,
                 message: String
-            ) = reports.filter {
+            ) = filter {
                 it.severity == ScriptDiagnostic.Severity.WARNING && message in it.message
             }.mapNotNull { diagnostic ->
-                diagnostic.location?.start?.let { probe.toScriptPosition(it.line, it.col) }
+                diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }
             }
+            val reports = compile(probe).reports
+            fun deprecated(
+                message: String
+            ) = reports.marked(probe, message)
             val dependencies = deprecated(LATER_DECLARED_DEPENDENCY)
             // only the ones, which the local function applies to, unlike the dependency called anyway
             val functions = deprecated(LATER_DECLARED_FUNCTION)
@@ -333,11 +337,7 @@ internal class DefaultScriptExecutor(
             val toProperties = source.shadowedFunctionCandidates.filter { (reference) -> toFunctions.none { it in reference } }
             val shadowed = if (toProperties.isEmpty()) emptyList() else {
                 val copies = source(confirming = true, shadowedFunctionCopies = true)
-                compile(copies).reports.filter {
-                    it.severity == ScriptDiagnostic.Severity.WARNING && SHADOWED_FUNCTION in it.message
-                }.mapNotNull { diagnostic ->
-                    diagnostic.location?.start?.let { copies.toScriptPosition(it.line, it.col) }
-                }
+                compile(copies).reports.marked(copies, SHADOWED_FUNCTION)
             }
             return Compilation(
                 source,
