@@ -199,18 +199,34 @@ internal class DefaultScriptExecutor(
                 ScriptErrorReporter(source).toSourceFailureMessage(),
                 ExecutionPhase.COMPILATION
             )
+            val (shadowingWarnings, reports) = compilationResult.reports.partition {
+                SHADOWED_DEPENDENCY in it.message
+            }
+            // the other warnings are of the references of the script body, which refer to the dependencies indeed
+            val shadowed = source.shadowedDependencyCandidates.filter { candidate ->
+                shadowingWarnings.any { warning ->
+                    warning.location?.start?.let { candidate.contains(source.toScriptPosition(it.line, it.col)) } == true
+                }
+            }
+            if (shadowed.isNotEmpty()) return ScriptResult.Error(
+                listOfNotNull(
+                    ScriptErrorReporter(source).toShadowedDependencyMessage(shadowed),
+                    if (compilationResult is Failure) ScriptErrorReporter(source).toFailureMessage(reports.filterNonIgnorable()) else null
+                ).joinToString(separator = "\n\n"),
+                ExecutionPhase.COMPILATION
+            )
             val result = when (compilationResult) {
                 is Success -> {
                     evaluate(
                         compiledScript = compilationResult.value,
-                        warnings = compilationResult.reports.filter {
+                        warnings = reports.filter {
                             it.severity == ScriptDiagnostic.Severity.WARNING
                         }
                     )
                 }
                 is Failure -> {
                     val failureMessage = ScriptErrorReporter(source).toFailureMessage(
-                        compilationResult.reports.filterNonIgnorable()
+                        reports.filterNonIgnorable()
                     )
                     logger.debug {
                         "Script[$scriptId]: Compilation (1/2) failure message: $failureMessage"
@@ -257,7 +273,7 @@ internal class DefaultScriptExecutor(
                 }.toMap(),
                 dependencyNames = allDependencies.mapTo(HashSet()) { it.name }
             )
-            if (source.unmatchedClosingBrace != null || source.shadowedDependencyReferences.isNotEmpty()) {
+            if (source.unmatchedClosingBrace != null || source.conflictingDependencyDeclarations.isNotEmpty()) {
                 return Compilation(source, result = null)
             }
             @OptIn(ExperimentalAtomicApi::class)
@@ -472,7 +488,8 @@ private val ScriptExecutor.Dependency<*>.providedType: KotlinType
 
 private val ScriptExecutor.Dependency<*>.accessor: String?
     get() = if (isHidden) {
-        "@Suppress(\"UNCHECKED_CAST\") val `$name`: $type get() = `$providedName` as $type"
+        // with an initializer, unlike a getter, the dependency can be smart cast
+        "@Suppress(\"UNCHECKED_CAST\") val `$name`: $type = `$providedName` as $type"
     } else {
         null
     }

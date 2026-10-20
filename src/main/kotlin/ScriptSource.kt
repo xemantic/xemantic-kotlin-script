@@ -36,6 +36,7 @@ import org.jetbrains.kotlin.lexer.KtTokens
 import org.jetbrains.kotlin.psi.KtAnnotation
 import org.jetbrains.kotlin.psi.KtAnnotationEntry
 import org.jetbrains.kotlin.psi.KtBlockExpression
+import org.jetbrains.kotlin.psi.KtCallExpression
 import org.jetbrains.kotlin.psi.KtCallableReferenceExpression
 import org.jetbrains.kotlin.psi.KtCatchClause
 import org.jetbrains.kotlin.psi.KtClass
@@ -83,12 +84,18 @@ internal data class ScriptPosition(
     val column: Int
 )
 
-/** The reference to the [name] in the script, from the [start] to the [end], exclusive. */
+/** The reference to the [name] in the script, from the [start] to the [end], exclusive, within one line. */
 internal class ScriptReference(
     val name: String,
     val start: ScriptPosition,
     val end: ScriptPosition
-)
+) {
+
+    operator fun contains(
+        position: ScriptPosition
+    ): Boolean = position.line == start.line && position.column >= start.column && position.column < end.column
+
+}
 
 /**
  * The script turned into a block, which can be run in the coroutine of the caller:
@@ -131,10 +138,15 @@ internal class ScriptSource(
     val returnsUnit: Boolean
 
     /**
-     * The references of the declarations moved out of the script body to the properties of the script body,
-     * which compile, but refer to the dependencies of the same names instead.
+     * The references of the declarations moved out of the script body to the local declarations of the script body,
+     * which might compile, but refer to the dependencies of the same names instead.
+     * The accessors of these dependencies are deprecated with the [SHADOWED_DEPENDENCY],
+     * so the compiler warns at the references which actually refer to them.
      */
-    val shadowedDependencyReferences: List<ScriptReference>
+    val shadowedDependencyCandidates: List<ScriptReference>
+
+    /** The properties moved out of the script body, which have the names of the dependencies, conflicting with their accessors. */
+    val conflictingDependencyDeclarations: List<ScriptReference>
 
     private val lineStarts: List<Int>
 
@@ -159,9 +171,13 @@ internal class ScriptSource(
         unmatchedClosingBrace = structure.unmatchedClosingBrace?.let { position(it) }
         movedDeclarations = structure.movedDeclarations
         returnsUnit = structure.endsWithMovedDeclaration
-        shadowedDependencyReferences = structure.shadowedDependencyReferences.map {
+        shadowedDependencyCandidates = structure.shadowedDependencyCandidates.map {
             ScriptReference(it.name, position(it.offset), position(it.offset + it.length))
         }
+        conflictingDependencyDeclarations = structure.conflictingDependencyDeclarations.map { (name, range) ->
+            ScriptReference(name, position(range.first), position(range.last + 1))
+        }
+        val shadowedDependencies = structure.shadowedDependencyCandidates.mapTo(HashSet()) { it.name }
         bodyDeclarations = structure.bodyDeclarations
 
         val lines = mutableListOf<String>()
@@ -188,7 +204,9 @@ internal class ScriptSource(
             addLines(0..lineOf(headerEnd - 1)) { it < headerEnd }
         }
         preambleStart = lines.size
-        lines += preamble.values
+        lines += preamble.map { (name, accessor) ->
+            if (name in shadowedDependencies) "@Deprecated(\"$SHADOWED_DEPENDENCY\") $accessor" else accessor
+        }
         mapping += preamble.map { null }
         movedDeclarations.forEach { declaration ->
             addLines(lineOf(declaration.start)..lineOf(declaration.end - 1)) {
@@ -290,6 +308,9 @@ internal class ScriptSource(
 
 @OptIn(ExperimentalAtomicApi::class)
 private val sourceIdSeq = AtomicLong(0)
+
+/** The deprecation message of the accessors of the dependencies, which might be shadowed, see [ScriptSource.shadowedDependencyCandidates]. */
+internal const val SHADOWED_DEPENDENCY = "xemantic-kotlin-script: shadowed dependency"
 
 /** The index of the line containing the [offset], given the sorted [lineStarts]. */
 private fun lineOf(
@@ -403,7 +424,9 @@ private class Reference(
     val offset: Int,
     val length: Int,
     val isQualified: Boolean,
-    val isBound: Boolean
+    val isBound: Boolean,
+    /** Whether it is called, like `foo` in `foo()`, or referred to as a function, like `::foo`. */
+    val isCall: Boolean
 ) {
 
     /** Whether it might refer to one of the local declarations of the script body of these [names]. */
@@ -432,7 +455,9 @@ private fun PsiElement.references(
         isQualified = expression.getReceiverExpression() != null || (
                 callableReference?.callableReference == expression && callableReference.receiverExpression != null
         ),
-        isBound = isBound(expression, name, scope, declaredNames)
+        isBound = isBound(expression, name, scope, declaredNames),
+        isCall = (expression.parent as? KtCallExpression)?.calleeExpression == expression
+                || callableReference?.callableReference == expression
     )
 }
 
@@ -545,8 +570,11 @@ private class ScriptStructure(
     /** Whether the last statement of the script is a declaration moved out of the script body. */
     val endsWithMovedDeclaration: Boolean
 
-    /** See [ScriptSource.shadowedDependencyReferences]. */
-    val shadowedDependencyReferences: List<Reference>
+    /** See [ScriptSource.shadowedDependencyCandidates]. */
+    val shadowedDependencyCandidates: List<Reference>
+
+    /** The names of the [ScriptSource.conflictingDependencyDeclarations], and their ranges. */
+    val conflictingDependencyDeclarations: List<Pair<String, IntRange>>
 
     /** The modifiers which are not applicable to local declarations. */
     val blankedRanges = mutableListOf<IntRange>()
@@ -577,13 +605,18 @@ private class ScriptStructure(
         val moved = selectMovedDeclarations(declarations, bodyReferences, localProperties)
         movedDeclarations = moved.map { it.toDeclaration(withNestedNames = true) }
         endsWithMovedDeclaration = moved.any { it.psi == statements.lastOrNull() }
-        val localNames = localProperties + declarations.filter {
+        val localFunctions = declarations.filter {
             it.kind == DeclarationKind.FUNCTION && it !in moved
-        }.mapNotNull { it.name }
+        }.mapNotNullTo(HashSet()) { it.name }
         // without a dependency of the same name, the compiler reports them as unresolved
-        shadowedDependencyReferences = moved.flatMap { declaration ->
-            declaration.references.filter { it.refersToLocal(localNames) && it.name in dependencyNames }
+        shadowedDependencyCandidates = moved.flatMap { declaration ->
+            declaration.references.filter {
+                it.name in dependencyNames && (it.refersToLocal(localProperties) || (it.isCall && it.refersToLocal(localFunctions)))
+            }
         }
+        conflictingDependencyDeclarations = moved.filter {
+            it.kind == DeclarationKind.PROPERTY && it.name in dependencyNames
+        }.map { it.name!! to it.nameRange!! }
         bodyDeclarations = declarations
             .filter {
                 it !in moved && (it.kind == DeclarationKind.PROPERTY || it.kind == DeclarationKind.FUNCTION || it.kind == DeclarationKind.CLASS)

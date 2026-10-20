@@ -2663,4 +2663,93 @@ class ScriptExecutorTest {
         }
     }
 
+    @Test
+    fun `should smart cast dependencies`() = runTest {
+        // given
+        val script = """
+            val length = if (text != null) text.length else -1
+            if (data is String) length + data.length else length
+        """.trimIndent()
+        val dependencies = listOf(dependency<String?>("text", "abc"), dependency<Any>("data", "ab"))
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, dependencies)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 5)
+        }
+    }
+
+    @Test
+    fun `should resolve members of supertypes and receivers in declarations moved out of the script body before dependencies shadowed by local declarations`() = runTest {
+        // given
+        val scripts = listOf(
+            "val name = \"local\"\nenum class Color { RED; fun label() = name.lowercase() }\nColor.RED.label()",
+            "val message = \"local\"\nsealed class Failure(m: String) : Exception(m)\nclass Timeout : Failure(\"timeout\") { fun describe() = \"failed: \" + message }\nTimeout().describe()",
+            "val length = 1\nsealed interface S\nclass T : S { fun f() = buildString { append(\"ab\"); append(length) } }\nT().f()",
+            "val cap = 3\nfun limit(x: Int) = minOf(x, cap)\nsealed interface S\nclass T : S { fun f() = limit + 1 }\nT().f() + limit(5)"
+        )
+        val dependencies = listOf(
+            dependency("name", "dep"),
+            dependency("message", "dep"),
+            dependency("length", 42),
+            dependency("limit", 10)
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, dependencies) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("red", "failed: timeout", "ab2", 14))
+    }
+
+    @Test
+    fun `should report error at declaration moved out of the script body having the name of a dependency`() = runTest {
+        // given
+        val script = """
+            val total get() = 5
+            total
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("total", 1)))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:5: error: Conflicting declaration of 'total', which is also the name of a dependency.
+                  | val <error>total</error> get() = 5
+                  hint: 'total' is compiled outside of the script body, together with the dependencies - rename it.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should use dependency in the script body before the local property shadowing it without warnings`() = runTest {
+        // given
+        val script = """
+            val name = name.uppercase()
+            enum class Color { RED; fun label() = name.lowercase() }
+            name + Color.RED.label()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("name", "dep")))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "DEPred")
+            have(warnings == null)
+        }
+    }
+
 }
