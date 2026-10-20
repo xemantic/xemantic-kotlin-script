@@ -46,6 +46,10 @@ class Gadget
 
 class Widget(val name: String)
 
+class Logger {
+    operator fun invoke(message: String) = "dep:$message"
+}
+
 class ScriptExecutorTest {
 
     @Test
@@ -2829,9 +2833,9 @@ class ScriptExecutorTest {
     fun `should resolve dependencies before the extensions of the coroutine scope of the script body`() = runTest {
         // given
         val script = """
-            listOf(javaClass, isActive, launch + 1)
+            listOf(javaClass, launch + 1)
         """.trimIndent()
-        val dependencies = listOf(dependency("javaClass", "x"), dependency("isActive", "y"), dependency("launch", 1))
+        val dependencies = listOf(dependency("javaClass", "x"), dependency("launch", 1))
         val executor = ScriptExecutor()
 
         // when
@@ -2840,7 +2844,56 @@ class ScriptExecutorTest {
         // then
         result should {
             be<ScriptResult.Value>()
-            have(value == listOf("x", "y", 2))
+            have(value == listOf("x", 2))
+        }
+    }
+
+    @Test
+    fun `should report error at declaration moved out of the script body calling dependency with invoke operator shadowed by local function`() = runTest {
+        // given
+        val script = """
+            val prefix = ">"
+            fun log(message: String) = prefix + message
+            sealed interface S
+            class T : S { fun f() = log("hi") }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("log", Logger())))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:25: error: Unresolved reference 'log'.
+                  | class T : S { fun f() = <error>log</error>("hi") }
+                  hint: 'T' is compiled outside of the script body, where 'log' (line 2) is not visible - pass it as a parameter, or declare it within 'T'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call dependency from declaration moved out of the script body when local extension function has its name`() = runTest {
+        // given
+        val script = """
+            val k = 1
+            fun Int.log() = this + k
+            sealed interface S
+            class T : S { fun f() = log("x") }
+            T().f() + 1.log()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<(String) -> String>("log") { "dep:$it" }))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "dep:x2")
         }
     }
 

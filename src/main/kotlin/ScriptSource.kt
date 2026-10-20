@@ -100,7 +100,9 @@ internal class PreambleDependency(
 )
 
 /** The class of the receiver of the script body, see [ScriptSource]. */
-private const val DEPENDENCIES_CLASS = "`_ScriptDependencies`"
+internal const val DEPENDENCIES_CLASS_NAME = "_ScriptDependencies"
+
+private const val DEPENDENCIES_CLASS = "`$DEPENDENCIES_CLASS_NAME`"
 
 /** The line starting the script block in the [ScriptSource.text]. */
 internal const val SCRIPT_BLOCK_START = "_script({ $DEPENDENCIES_CLASS(it) }) {"
@@ -614,8 +616,9 @@ private class ScriptStructure(
         val moved = selectMovedDeclarations(declarations, bodyReferences, localProperties)
         movedDeclarations = moved.map { it.toDeclaration(withNestedNames = true) }
         endsWithMovedDeclaration = moved.any { it.psi == statements.lastOrNull() }
+        // unlike an extension function, which cannot be called like the dependency
         localFunctions = declarations.filter {
-            it.kind == DeclarationKind.FUNCTION && it !in moved
+            it.kind == DeclarationKind.FUNCTION && !it.isExtension && it !in moved
         }.mapNotNullTo(HashSet()) { it.name }
         // unlike an extension property, which does not conflict with the accessor of the dependency
         conflictingDependencyDeclarations = moved.filter {

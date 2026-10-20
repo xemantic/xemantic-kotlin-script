@@ -8,7 +8,10 @@ public final class com/xemantic/kotlin/script/ExecutionPhase : java/lang/Enum {
 
 public final class com/xemantic/kotlin/script/ScriptBlock {
 	public static final field INSTANCE Lcom/xemantic/kotlin/script/ScriptBlock;
-	public final fun invoke (Lkotlin/jvm/functions/Function2;)Lkotlin/jvm/functions/Function2;
+	public final fun invoke (Lkotlin/jvm/functions/Function1;Lkotlin/jvm/functions/Function2;)Lcom/xemantic/kotlin/script/ScriptBody;
+}
+
+public final class com/xemantic/kotlin/script/ScriptBody {
 }
 
 public final class com/xemantic/kotlin/script/ScriptDependencies {

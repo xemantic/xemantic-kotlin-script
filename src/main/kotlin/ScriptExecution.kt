@@ -34,6 +34,7 @@ import kotlin.concurrent.atomics.fetchAndIncrement
 import kotlin.concurrent.atomics.incrementAndFetch
 import kotlin.coroutines.CoroutineContext
 import kotlin.reflect.KClass
+import kotlin.reflect.KFunction
 import kotlin.reflect.typeOf
 import kotlin.script.experimental.api.CompiledScript
 import kotlin.script.experimental.api.KotlinType
@@ -151,11 +152,12 @@ internal class DefaultScriptExecutor(
 
         dependencies.groupBy { it.name }.forEach { (name, sameName) ->
             require(sameName.size == 1) { "Duplicate dependency name: $name" }
-            require(name != SCRIPT_BLOCK_NAME && !name.startsWith(HIDDEN_DEPENDENCY_PREFIX)) {
+            require(name != SCRIPT_BLOCK_NAME && name != DEPENDENCIES_CLASS_NAME && !name.startsWith(HIDDEN_DEPENDENCY_PREFIX)) {
                 "Reserved dependency name: $name"
             }
-            // the member of the receiver of the script body, which would conflict with the accessor of the dependency
-            require(name != "coroutineContext") {
+            // the member of the receiver of the script body, conflicting with the accessor of the dependency,
+            // and the extension of the coroutine scope, resolved instead within the nested ones, like `launch { }`
+            require(name != "coroutineContext" && name != "isActive") {
                 "Reserved dependency name: $name - it would be resolved to the CoroutineScope of the script body"
             }
         }
@@ -500,6 +502,9 @@ private val ScriptExecutor.Dependency<*>.providedType: KotlinType
 private val ScriptExecutor.Dependency<*>.accessor: String
     get() = "@Suppress(\"UNCHECKED_CAST\") val `$name`: $type = `$providedName` as $type"
 
-/** Whether it is of a function type, so the script can call it. */
+/** Whether it is of a function type, or of a type with the `invoke` operator, so the script can call it. */
 private val ScriptExecutor.Dependency<*>.isCallable: Boolean
-    get() = (type.classifier as? KClass<*>)?.java?.let { Function::class.java.isAssignableFrom(it) } == true
+    get() = (type.classifier as? KClass<*>)?.let { type ->
+        Function::class.java.isAssignableFrom(type.java)
+                || type.members.any { it is KFunction<*> && it.name == "invoke" && it.isOperator }
+    } == true

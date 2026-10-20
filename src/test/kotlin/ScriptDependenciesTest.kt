@@ -199,7 +199,7 @@ class ScriptDependenciesTest {
         val executor = ScriptExecutor()
 
         // when
-        val exceptions = listOf("_script", "_dependency_foo").map { name ->
+        val exceptions = listOf("_script", "_dependency_foo", "_ScriptDependencies").map { name ->
             assertFailsWith<IllegalArgumentException> {
                 executor.execute("foo", listOf(dependency(name, 1)))
             }
@@ -208,7 +208,8 @@ class ScriptDependenciesTest {
         // then
         assert(exceptions.map { it.message } == listOf(
             "Reserved dependency name: _script",
-            "Reserved dependency name: _dependency_foo"
+            "Reserved dependency name: _dependency_foo",
+            "Reserved dependency name: _ScriptDependencies"
         ))
     }
 
@@ -367,9 +368,9 @@ class ScriptDependenciesTest {
     }
 
     @Test
-    fun `should reject dependency name resolved to the coroutine scope of the script body instead`() = runTest {
+    fun `should reject dependency names resolved to the coroutine scope of the script body instead`() = runTest {
         // given
-        val names = listOf("coroutineContext")
+        val names = listOf("coroutineContext", "isActive")
         val executor = ScriptExecutor()
 
         // when

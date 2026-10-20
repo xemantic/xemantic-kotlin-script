@@ -321,8 +321,10 @@ internal class ScriptErrorReporter(
             appendHint(
                 name = match.groupValues[1],
                 position = start,
-                // unlike a property, a function of the same name is called
-                preferFunction = source.scriptLines[end.line].drop(end.column).trimStart().startsWith('(')
+                // unlike a property, a function of the same name is called, also with a trailing lambda
+                preferFunction = source.scriptLines[end.line].drop(end.column).trimStart().let {
+                    it.startsWith('(') || it.startsWith('{')
+                }
             )
         }
         if (capturing != null) {

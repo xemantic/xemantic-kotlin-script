@@ -64,7 +64,7 @@ when (result) {
 * The script body runs as a suspend block with a `CoroutineScope` receiver, in the coroutine of the caller:
   the caller awaits all the coroutines the script launches, and cancelling the caller cancels the script.
   Cancellation cannot interrupt a blocking call of the script though, like `Thread.sleep`.
-  Unlike in a regular `.kts` file, `this` in the script body is therefore this `CoroutineScope`, not the script instance.
+  Unlike in a regular `.kts` file, `this` in the script body is therefore a `CoroutineScope`, delegating to the one of the caller, not the script instance.
 * The script is compiled and evaluated on `Dispatchers.IO`, as both might block.
   Another dispatcher can be given as `ScriptExecutor(dispatcher = ...)`,
   e.g. `Dispatchers.IO.limitedParallelism(4)` to bound the threads used by scripts,
@@ -76,7 +76,7 @@ when (result) {
   A dependency list built dynamically can be passed instead, as `execute(script, listOf(dependency("greeting", "Hello")))`.
   Invalid dependencies are rejected with `IllegalArgumentException`:
   a name which is not a Kotlin identifier, a duplicate name, a value which is not of the type,
-  the name `coroutineContext`, which the script body would resolve to its `CoroutineScope` instead,
+  the names `coroutineContext` and `isActive`, which the script body would resolve to its `CoroutineScope` instead,
   or a type which the script cannot refer to, like a private or a local class.
 * Scripts executed repeatedly, like an agent harness defined as a script, can skip the recompilation
   with `ScriptExecutor(compilationCacheSize = ...)`, keeping that many compiled scripts, the least recently used evicted first.
