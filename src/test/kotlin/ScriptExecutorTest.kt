@@ -2102,6 +2102,124 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should call function declared later when its own names shadow local declarations of the script body`() = runTest {
+        // given
+        val script = """
+            val items = listOf(1, 2)
+            val n = 3
+            val result = total(items) + count(n) + doubled(items)
+            fun total(items: List<Int>) = items.sum()
+            fun count(limit: Int): Int {
+                var n = 0
+                for (i in 0 until limit) n++
+                return n
+            }
+            fun doubled(list: List<Int>) = list.sumOf { items -> items * 2 }
+            result
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 12)
+        }
+    }
+
+    @Test
+    fun `should move function referred to by declaration which cannot be local when its parameter shadows local declaration`() = runTest {
+        // given
+        val script = """
+            sealed interface Shape
+            class Square(val side: Int) : Shape {
+                fun area(scale: Int) = scaled(this, scale)
+            }
+            fun scaled(square: Square, scale: Int) = square.side * square.side * scale
+            val scale = 2
+            Square(3).area(scale)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 18)
+        }
+    }
+
+    @Test
+    fun `should initialize properties with annotations not applicable to local declarations in the order of the script`() = runTest {
+        // given
+        val script = """
+            log += "a"
+            @JvmField val x = run { log += "b"; 1 }
+            @Volatile var y = run { log += "c"; 2 }
+            @property:Suppress("unused") val z = run { log += "d"; 3 }
+            log += "e"
+            "${'$'}log ${'$'}{x + y + z}"
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("log", mutableListOf<String>())))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "[a, b, c, d, e] 6")
+        }
+    }
+
+    @Test
+    fun `should use dependency of generic type declared in package named with keyword`() = runTest {
+        // given
+        val script = """
+            box.value + 1
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("box", `in`.xemantic.Box(42))))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 43)
+        }
+    }
+
+    @Test
+    fun `should report frame of script function named lambda`() = runTest {
+        // given
+        val script = """
+            fun lambda(): Int = error("failure")
+            lambda()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: failure
+                  at lambda(script.kts:1)
+                  | fun lambda(): Int = error("failure")
+                  at <script body>(script.kts:2)
+                  | lambda()
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should cap JVM target of the script at the highest one supported by the compiler`() {
         // when
         val targets = listOf("17", "21", "999").map { scriptJvmTarget(it) }

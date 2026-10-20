@@ -23,15 +23,16 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlin.reflect.KType
-import kotlin.script.experimental.api.CompiledScript
-import kotlin.script.experimental.api.ResultWithDiagnostics
 
 /**
- * The least recently used compilation results of scripts,
+ * The least recently used compilations of scripts,
  * where the concurrent compilations of the same script are done only once.
+ *
+ * @param isReusable whether the compilation is kept, e.g. not the failed one.
  */
-internal class ScriptCompilationCache(
-    private val maxSize: Int
+internal class ScriptCompilationCache<T : Any>(
+    private val maxSize: Int,
+    private val isReusable: (T) -> Boolean
 ) {
 
     init {
@@ -46,26 +47,24 @@ internal class ScriptCompilationCache(
         val dependencies: List<Pair<String, KType>>
     )
 
-    /** The compilation results, completed with `null` when the compiling caller was cancelled. */
-    private val entries = object : LinkedHashMap<
-        Key, CompletableDeferred<ResultWithDiagnostics<CompiledScript>?>
-    >(16, 0.75f, true) {
-        override fun removeEldestEntry(
-            eldest: MutableMap.MutableEntry<Key, CompletableDeferred<ResultWithDiagnostics<CompiledScript>?>>
-        ) = size > maxSize
-    }
+    /**
+     * The compilations, completed with `null` when the compiling caller was cancelled,
+     * in the order of access, while the ones in progress are never evicted,
+     * so there might be more of them than the [maxSize].
+     */
+    private val entries = LinkedHashMap<Key, CompletableDeferred<T?>>(16, 0.75f, true)
 
     suspend fun getOrCompile(
         key: Key,
-        compile: suspend () -> ResultWithDiagnostics<CompiledScript>
-    ): ResultWithDiagnostics<CompiledScript> {
+        compile: suspend () -> T
+    ): T {
         while (true) {
             var owner = false
             val entry = synchronized(entries) {
                 entries.getOrPut(key) {
                     owner = true
                     CompletableDeferred()
-                }
+                }.also { evict() }
             }
             if (!owner) {
                 // the compiling caller was cancelled, compile again
@@ -73,8 +72,11 @@ internal class ScriptCompilationCache(
             }
             try {
                 val result = compile()
-                if (result is ResultWithDiagnostics.Failure) remove(key, entry)
-                entry.complete(result)
+                synchronized(entries) {
+                    if (!isReusable(result)) entries.remove(key, entry)
+                    entry.complete(result)
+                    evict()
+                }
                 return result
             } catch (e: Throwable) {
                 remove(key, entry)
@@ -92,9 +94,17 @@ internal class ScriptCompilationCache(
         }
     }
 
+    /** Evicts the least recently used compilations, which are completed, while holding the lock of the [entries]. */
+    private fun evict() {
+        val iterator = entries.values.iterator()
+        while (entries.size > maxSize && iterator.hasNext()) {
+            if (iterator.next().isCompleted) iterator.remove()
+        }
+    }
+
     private fun remove(
         key: Key,
-        entry: CompletableDeferred<ResultWithDiagnostics<CompiledScript>?>
+        entry: CompletableDeferred<T?>
     ) {
         synchronized(entries) {
             entries.remove(key, entry)

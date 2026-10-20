@@ -35,22 +35,34 @@ import org.jetbrains.kotlin.lexer.KotlinLexer
 import org.jetbrains.kotlin.lexer.KtTokens
 import org.jetbrains.kotlin.psi.KtAnnotation
 import org.jetbrains.kotlin.psi.KtAnnotationEntry
+import org.jetbrains.kotlin.psi.KtBlockExpression
 import org.jetbrains.kotlin.psi.KtCallableReferenceExpression
+import org.jetbrains.kotlin.psi.KtCatchClause
 import org.jetbrains.kotlin.psi.KtClass
+import org.jetbrains.kotlin.psi.KtClassBody
 import org.jetbrains.kotlin.psi.KtClassOrObject
+import org.jetbrains.kotlin.psi.KtConstantExpression
 import org.jetbrains.kotlin.psi.KtDeclaration
+import org.jetbrains.kotlin.psi.KtDeclarationWithBody
 import org.jetbrains.kotlin.psi.KtDestructuringDeclaration
 import org.jetbrains.kotlin.psi.KtExpression
+import org.jetbrains.kotlin.psi.KtForExpression
 import org.jetbrains.kotlin.psi.KtLabelReferenceExpression
 import org.jetbrains.kotlin.psi.KtNamedDeclaration
 import org.jetbrains.kotlin.psi.KtNamedFunction
 import org.jetbrains.kotlin.psi.KtObjectDeclaration
+import org.jetbrains.kotlin.psi.KtParameter
+import org.jetbrains.kotlin.psi.KtParenthesizedExpression
+import org.jetbrains.kotlin.psi.KtPrefixExpression
 import org.jetbrains.kotlin.psi.KtProperty
+import org.jetbrains.kotlin.psi.KtPropertyAccessor
 import org.jetbrains.kotlin.psi.KtPsiFactory
 import org.jetbrains.kotlin.psi.KtSimpleNameExpression
+import org.jetbrains.kotlin.psi.KtStringTemplateExpression
 import org.jetbrains.kotlin.psi.KtTypeAlias
 import org.jetbrains.kotlin.psi.KtUserType
 import org.jetbrains.kotlin.psi.KtValueArgumentName
+import org.jetbrains.kotlin.psi.KtWhenExpression
 import org.jetbrains.kotlin.psi.psiUtil.allChildren
 import org.jetbrains.kotlin.psi.psiUtil.collectDescendantsOfType
 import org.jetbrains.kotlin.psi.psiUtil.endOffset
@@ -309,6 +321,19 @@ private val nonLocalClassModifiers = listOf(
 /** The annotations, which are not applicable to local declarations. */
 private val memberOnlyAnnotations = setOf("Volatile", "Transient", "JvmField", "JvmName", "JvmOverloads")
 
+private fun KtDeclaration.memberOnlyAnnotationEntries(): List<KtAnnotationEntry> = annotationEntries.filter {
+    it.useSiteTarget != null || it.shortName?.asString() in memberOnlyAnnotations
+}
+
+/** Whether the expression is a literal, which can be evaluated at any time. */
+private fun KtExpression?.isConstant(): Boolean = when (this) {
+    is KtConstantExpression -> true
+    is KtStringTemplateExpression -> !hasInterpolation()
+    is KtPrefixExpression -> (operationToken == KtTokens.MINUS || operationToken == KtTokens.PLUS) && baseExpression.isConstant()
+    is KtParenthesizedExpression -> expression.isConstant()
+    else -> false
+}
+
 /**
  * Parses the scripts, without compiling them.
  *
@@ -332,25 +357,78 @@ private val psiFactory: KtPsiFactory by lazy {
  *
  * @param isQualified whether it has a receiver, like `size` in `list.size`,
  *   so it refers to a member, or an extension.
+ * @param isBound whether the name is declared in the element the references are collected from,
+ *   like a parameter, a local variable or a member, so it does not refer to a top-level declaration.
  */
 private class Reference(
     val name: String,
     val offset: Int,
-    val isQualified: Boolean
+    val isQualified: Boolean,
+    val isBound: Boolean
 )
 
-/** The references by name, in the order of the script, without the labels and the names of the arguments. */
-private fun PsiElement.references(): List<Reference> = collectDescendantsOfType<KtSimpleNameExpression> {
+/**
+ * The references by name, in the order of the script, without the labels and the names of the arguments,
+ * bound by the declarations within the [scope], exclusive.
+ */
+private fun PsiElement.references(
+    scope: PsiElement
+): List<Reference> = collectDescendantsOfType<KtSimpleNameExpression> {
     it !is KtLabelReferenceExpression && it.parent !is KtValueArgumentName
 }.map { expression ->
     val callableReference = expression.parent as? KtCallableReferenceExpression
+    val name = expression.getReferencedName()
     Reference(
-        name = expression.getReferencedName(),
+        name = name,
         offset = expression.startOffset,
         isQualified = expression.getReceiverExpression() != null || (
                 callableReference?.callableReference == expression && callableReference.receiverExpression != null
-        )
+        ),
+        isBound = isBound(expression, name, scope)
     )
+}
+
+/**
+ * Whether the [name] referred to by the [expression] is declared in the enclosing elements within the [scope], exclusive,
+ * recognized by the names only, without the declarations inherited from the supertypes.
+ */
+private fun isBound(
+    expression: PsiElement,
+    name: String,
+    scope: PsiElement
+): Boolean {
+    var child = expression
+    var parent = expression.parent
+    // the plain parameters of the primary constructor are not visible in the functions of the class
+    var inFunction = false
+    while (parent != null && parent !== scope) {
+        val declares = when (parent) {
+            is KtDeclarationWithBody -> parent.valueParameters.any { it.declares(name) }
+            is KtBlockExpression -> parent.statements.takeWhile { it !== child }.any { it.declares(name) }
+            is KtForExpression -> child === parent.body && parent.loopParameter?.declares(name) == true
+            is KtCatchClause -> child === parent.catchBody && parent.catchParameter?.name == name
+            is KtWhenExpression -> child !== parent.subjectVariable && parent.subjectVariable?.name == name
+            is KtClassBody -> parent.declarations.any { it.declares(name) }
+            is KtClassOrObject -> parent.primaryConstructorParameters.any {
+                it.name == name && (it.hasValOrVar() || !inFunction)
+            }
+            else -> false
+        }
+        if (declares) return true
+        if (parent is KtNamedFunction || parent is KtPropertyAccessor) inFunction = true
+        child = parent
+        parent = parent.parent
+    }
+    return false
+}
+
+private fun PsiElement.declares(
+    name: String
+): Boolean = when (this) {
+    is KtParameter -> this.name == name || destructuringDeclaration?.declares(name) == true
+    is KtDestructuringDeclaration -> entries.any { it.name == name }
+    is KtNamedDeclaration -> this.name == name
+    else -> false
 }
 
 /**
@@ -390,7 +468,7 @@ private class ScriptStructure(
         val block = file.script?.blockExpression
         val statements = block?.statements.orEmpty()
         val declarations = statements.mapNotNull { parseDeclaration(it) }
-        val moved = selectMovedDeclarations(declarations, block?.references().orEmpty())
+        val moved = selectMovedDeclarations(declarations, block?.references(scope = block).orEmpty())
         movedDeclarations = moved.map { it.toDeclaration() }
         endsWithMovedDeclaration = moved.any { it.psi == statements.lastOrNull() }
         bodyDeclarations = declarations
@@ -403,6 +481,9 @@ private class ScriptStructure(
                             && (declaration.kind == DeclarationKind.FUNCTION || declaration.kind == DeclarationKind.PROPERTY))
                 }
                 .forEach { blankedRanges += it.startOffset until it.startOffset + it.textLength }
+            if (declaration.kind == DeclarationKind.PROPERTY) {
+                declaration.psi.memberOnlyAnnotationEntries().forEach { blankedRanges += it.startOffset until it.endOffset }
+            }
         }
     }
 
@@ -422,7 +503,7 @@ private class ScriptStructure(
     ) {
         /** Without the comments preceding the declaration, which are left in the script body. */
         val start = psi.startOffsetSkippingComments
-        val references = psi.references()
+        val references = psi.references(scope = psi.parent)
         fun toDeclaration() = Declaration(
             name = name,
             start = start,
@@ -457,9 +538,7 @@ private class ScriptStructure(
                 it.endOffset <= firstOmitted.startOffset && it !is PsiWhiteSpace && it !is PsiComment
             }.endOffset
         } ?: declaration.endOffset
-        val hasMemberOnlyAnnotation = declaration.annotationEntries.any {
-            it.useSiteTarget != null || it.shortName?.asString() in memberOnlyAnnotations
-        }
+        val hasMemberOnlyAnnotation = declaration.memberOnlyAnnotationEntries().isNotEmpty()
         val requiresMove = when (declaration) {
             is KtClass -> declaration.isInterface()
                     || nonLocalClassModifiers.any { declaration.hasModifier(it) }
@@ -467,9 +546,11 @@ private class ScriptStructure(
             is KtObjectDeclaration,
             is KtTypeAlias -> true
             is KtNamedFunction -> declaration.hasModifier(KtTokens.INLINE_KEYWORD) || hasMemberOnlyAnnotation
+            // otherwise its initializer would run when the script class is constructed, before the script body,
+            // so instead its annotations are blanked out, unless the order does not matter
             is KtProperty -> declaration.receiverTypeReference != null
                     || accessors.isNotEmpty()
-                    || hasMemberOnlyAnnotation
+                    || (hasMemberOnlyAnnotation && declaration.initializer.isConstant())
             else -> false
         }
         return ParsedDeclaration(
@@ -540,7 +621,7 @@ private class ScriptStructure(
             it.kind == DeclarationKind.PROPERTY && it !in required
         }.flatMap { listOfNotNull(it.name) + it.destructuredNames }.toSet()
         val accessingLocalProperties = declarations.filter { declaration ->
-            declaration.references.any { !it.isQualified && it.name in localProperties }
+            declaration.references.any { !it.isQualified && !it.isBound && it.name in localProperties }
         }.toSet()
         /** The declarations not [moved] yet, which access the local properties, or refer to such ones not moved yet. */
         fun accessingLocalProperties(

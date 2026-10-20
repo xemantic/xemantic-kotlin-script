@@ -57,7 +57,10 @@ internal class ScriptErrorReporter(
 
     fun toFailureMessage(
         diagnostics: List<ScriptDiagnostic>
-    ): String = diagnostics.describe().joinToString(separator = "\n").trimEnd()
+    ): String = diagnostics.describe().joinToString(separator = "\n").trimEnd().ifEmpty {
+        // e.g. when all the diagnostics of the failure were ignorable
+        "error: Failed without any diagnostic message."
+    }
 
     fun toFailureMessage(
         throwable: Throwable,
@@ -89,7 +92,8 @@ internal class ScriptErrorReporter(
     }.trimEnd()
 
     /**
-     * @return `false`, if the [throwable] was omitted, as too many exceptions were reported already.
+     * @return `false`, if the [throwable], or any exception it refers to, was omitted,
+     *   as too many exceptions were reported already, so no further ones are reported.
      */
     private fun StringBuilder.appendThrowable(
         throwable: Throwable,
@@ -115,12 +119,11 @@ internal class ScriptErrorReporter(
         // the exception class of the script might override it to contain nulls
         appendFrames(throwable.read(emptyList()) { stackTrace.filterNotNull() }, indent)
         for (suppressed in throwable.read(emptyArray()) { suppressed }) {
-            if (!appendThrowable(suppressed, "Suppressed: ", "$indent  ", reported)) break
+            if (!appendThrowable(suppressed, "Suppressed: ", "$indent  ", reported)) return false
         }
-        throwable.read(null) { cause }?.let {
+        return throwable.read(null) { cause }?.let {
             appendThrowable(it, "Caused by: ", indent, reported)
-        }
-        return true
+        } ?: true
     }
 
     private fun StringBuilder.appendDescription(
@@ -219,8 +222,12 @@ internal class ScriptErrorReporter(
         // the local functions are named after their enclosing functions, like `invokeSuspend$outer$inner`
         val methodParts = frame.methodName.removeSuffix("\$default").split('$')
         val type = owner.split('$').lastOrNull { it.isNotEmpty() }
+        // the lambdas are named like `invokeSuspend$lambda$0`, unlike the functions named `lambda`
+        val isLambda = methodParts.zipWithNext().any { (name, index) ->
+            name == "lambda" && index.isNotEmpty() && index.all { it.isDigit() }
+        }
         return when {
-            "lambda" in methodParts || (type != null && type.all { it.isDigit() }) -> "<lambda>"
+            isLambda || (type != null && type.all { it.isDigit() }) -> "<lambda>"
             type == null && className == blockClassName && methodParts == listOf("invokeSuspend") -> "<script body>"
             type == null -> methodParts.last()
             else -> "$type.${methodParts.last()}"

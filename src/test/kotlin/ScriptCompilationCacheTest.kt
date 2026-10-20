@@ -24,6 +24,7 @@ import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -31,10 +32,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
-import kotlin.script.experimental.api.CompiledScript
-import kotlin.script.experimental.api.ResultWithDiagnostics
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
+import kotlin.time.Duration.Companion.milliseconds
 
 class ScriptCompilationCacheTest {
 
@@ -177,6 +177,32 @@ class ScriptCompilationCacheTest {
     }
 
     @Test
+    fun `should report unmatched closing brace of the script without compiling it`() = runTest {
+        // given
+        val script = """
+            42 }
+        """.trimIndent()
+        val executor = DefaultScriptExecutor(compilationCacheSize = 10)
+
+        // when
+        val result1 = executor.execute(script)
+        val result2 = executor.execute(script)
+
+        // then
+        listOf(result1, result2).forEach { result ->
+            result should {
+                be<ScriptResult.Error>()
+                have(phase == ExecutionPhase.COMPILATION)
+                message sameAs """
+                    script.kts:1:4: error: Syntax error: Unexpected '}' without matching '{'.
+                      | 42 <error>}</error>
+                """.trimIndent()
+            }
+        }
+        assert(executor.compilationCount == 0)
+    }
+
+    @Test
     fun `should evict the least recently used script`() = runTest {
         // given
         val script1 = """
@@ -252,12 +278,12 @@ class ScriptCompilationCacheTest {
     @Test
     fun `should fail concurrent callers without cancelling them when the compilation throws cancellation exception`() = runTest {
         // given
-        val cache = ScriptCompilationCache(maxSize = 10)
+        val cache = ScriptCompilationCache<String>(maxSize = 10) { true }
         val key = ScriptCompilationCache.Key(script = "foo", dependencies = emptyList())
         var compilations = 0
-        val compile: suspend () -> ResultWithDiagnostics<CompiledScript> = {
+        val compile: suspend () -> String = {
             compilations++
-            delay(1)
+            delay(1.milliseconds)
             throw CancellationException("compiler gave up")
         }
 
@@ -291,14 +317,13 @@ class ScriptCompilationCacheTest {
     @OptIn(ExperimentalCoroutinesApi::class)
     fun `should compile again when the compiling caller is cancelled`() = runTest {
         // given
-        val cache = ScriptCompilationCache(maxSize = 10)
+        val cache = ScriptCompilationCache<String>(maxSize = 10) { it != "failure" }
         val key = ScriptCompilationCache.Key(script = "foo", dependencies = emptyList())
-        val failure = ResultWithDiagnostics.Failure(emptyList())
         var compilations = 0
-        val compile: suspend () -> ResultWithDiagnostics<CompiledScript> = {
+        val compile: suspend () -> String = {
             compilations++
-            delay(1)
-            failure
+            delay(1.milliseconds)
+            "failure"
         }
         val owner = launch { cache.getOrCompile(key, compile) }
         val waiter = async { cache.getOrCompile(key, compile) }
@@ -309,7 +334,39 @@ class ScriptCompilationCacheTest {
         val result = waiter.await()
 
         // then
-        assert(result === failure)
+        assert(result == "failure")
+        assert(compilations == 2)
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun `should not evict the script still being compiled`() = runTest {
+        // given
+        val cache = ScriptCompilationCache<String>(maxSize = 1) { true }
+        val key1 = ScriptCompilationCache.Key(script = "foo", dependencies = emptyList())
+        val key2 = ScriptCompilationCache.Key(script = "bar", dependencies = emptyList())
+        val compiled = CompletableDeferred<Unit>()
+        var compilations = 0
+        val compile1: suspend () -> String = {
+            compilations++
+            compiled.await()
+            "foo"
+        }
+        val owner = async { cache.getOrCompile(key1, compile1) }
+        runCurrent()
+        cache.getOrCompile(key2) {
+            compilations++
+            "bar"
+        }
+
+        // when
+        val waiter = async { cache.getOrCompile(key1, compile1) }
+        runCurrent()
+        compiled.complete(Unit)
+        val results = listOf(owner.await(), waiter.await())
+
+        // then
+        assert(results == listOf("foo", "foo"))
         assert(compilations == 2)
     }
 

@@ -88,7 +88,9 @@ internal class DefaultScriptExecutor(
     }
 
     private val compilationCache = if (compilationCacheSize > 0) {
-        ScriptCompilationCache(compilationCacheSize)
+        ScriptCompilationCache<Compilation>(compilationCacheSize) {
+            it.result is ResultWithDiagnostics.Success
+        }
     } else {
         null
     }
@@ -145,10 +147,19 @@ internal class DefaultScriptExecutor(
         return result
     }
 
+    /**
+     * The [source] of the script, together with the [result] of its compilation,
+     * or `null`, if the script was not compiled because of the unmatched closing brace.
+     */
+    private class Compilation(
+        val source: ScriptSource,
+        val result: ResultWithDiagnostics<CompiledScript>?
+    )
+
     private inner class ScriptHandler(
         private val scriptId: Int,
         dependencies: List<ScriptExecutor.Dependency<*>>,
-        script: String
+        private val script: String
     ) {
 
         // in the order independent of the caller, as the source and the cache key are built from it
@@ -158,22 +169,18 @@ internal class DefaultScriptExecutor(
             value = ScriptBlock
         )).sortedBy { it.name }
 
-        private val source = ScriptSource(
-            script,
-            preamble = allDependencies.mapNotNull { dependency ->
-                dependency.accessor?.let { dependency.name to it }
-            }.toMap()
-        )
+        /** Parsed only when not compiled already, as the cached compilation keeps it. */
+        private lateinit var source: ScriptSource
 
         suspend fun handle(): ScriptResult {
-            source.unmatchedClosingBrace?.let {
+            val compilation = compile()
+            source = compilation.source
+            val compilationResult = compilation.result ?: return ScriptResult.Error(
                 // the brace would close the script block, misplacing all the errors
-                return ScriptResult.Error(
-                    ScriptErrorReporter(source).toUnmatchedClosingBraceMessage(it),
-                    ExecutionPhase.COMPILATION
-                )
-            }
-            val result = when (val compilationResult = compile()) {
+                ScriptErrorReporter(source).toUnmatchedClosingBraceMessage(source.unmatchedClosingBrace!!),
+                ExecutionPhase.COMPILATION
+            )
+            val result = when (compilationResult) {
                 is Success -> {
                     evaluate(
                         compiledScript = compilationResult.value,
@@ -196,38 +203,49 @@ internal class DefaultScriptExecutor(
             return result
         }
 
-        private suspend fun compile(): ResultWithDiagnostics<CompiledScript>  {
+        private suspend fun compile(): Compilation {
 
             logger.debug { "Script[$scriptId]: Compiling (1/2)" }
 
-            val (compilationResult, duration) = measureTimedValue {
+            val (compilation, duration) = measureTimedValue {
                 compilationCache?.getOrCompile(
+                    // the source is built from the script and the accessors of the dependencies of these types
                     ScriptCompilationCache.Key(
-                        script = source.text,
+                        script = script,
                         dependencies = allDependencies.map { it.name to it.type }
                     ),
                     ::doCompile
                 ) ?: doCompile()
             }
 
-            when (compilationResult) {
+            when (compilation.result) {
                 is Success -> logger.debug {
                     "Script[$scriptId]: Compilation (1/2) succeeded after $duration"
                 }
-                is Failure -> logger.debug {
+                else -> logger.debug {
                     "Script[$scriptId]: Compilation (1/2) failed after $duration"
                 }
             }
 
-            return compilationResult
+            return compilation
         }
 
-        private suspend fun doCompile(): ResultWithDiagnostics<CompiledScript> {
+        private suspend fun doCompile(): Compilation {
+            val source = ScriptSource(
+                script,
+                preamble = allDependencies.mapNotNull { dependency ->
+                    dependency.accessor?.let { dependency.name to it }
+                }.toMap()
+            )
+            if (source.unmatchedClosingBrace != null) return Compilation(source, result = null)
             @OptIn(ExperimentalAtomicApi::class)
             compilations.incrementAndFetch()
-            return scriptingHost.compiler(
-                script = source,
-                scriptCompilationConfiguration = compilationConfig()
+            return Compilation(
+                source,
+                scriptingHost.compiler(
+                    script = source,
+                    scriptCompilationConfiguration = compilationConfig()
+                )
             )
         }
 

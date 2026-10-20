@@ -18,6 +18,7 @@
 
 package com.xemantic.kotlin.script
 
+import com.xemantic.kotlin.test.assert
 import com.xemantic.kotlin.test.sameAs
 import kotlin.test.Test
 
@@ -39,6 +40,40 @@ class ScriptErrorReporterTest {
 
         // then
         message sameAs "Traceless: traceless"
+    }
+
+    @Test
+    fun `should report omitting further exceptions only once`() {
+        // given
+        val cause = IllegalStateException("cause")
+        val inner = RuntimeException("inner", cause)
+        repeat(40) { inner.addSuppressed(RuntimeException("suppressed $it")) }
+        val outer = RuntimeException("outer")
+        outer.addSuppressed(inner)
+        outer.addSuppressed(RuntimeException("sibling"))
+        val reporter = ScriptErrorReporter(ScriptSource("throw outer"))
+
+        // when
+        val message = reporter.toFailureMessage(outer, warnings = emptyList())
+
+        // then
+        val lines = message.lines()
+        val omittedLineCount = lines.count { it.endsWith("[FURTHER EXCEPTIONS OMITTED]") }
+        val lastLine = lines.last()
+        assert(omittedLineCount == 1)
+        assert(lastLine == "    Suppressed: [FURTHER EXCEPTIONS OMITTED]")
+    }
+
+    @Test
+    fun `should report failure without diagnostics`() {
+        // given
+        val reporter = ScriptErrorReporter(ScriptSource("foo"))
+
+        // when
+        val message = reporter.toFailureMessage(diagnostics = emptyList())
+
+        // then
+        message sameAs "error: Failed without any diagnostic message."
     }
 
 }

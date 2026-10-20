@@ -45,6 +45,8 @@ public interface ScriptExecutor {
      * @param type the type of the property as seen by the script,
      *   including its type arguments and nullability,
      *   where all the classes must be accessible to the script, i.e. public and not local.
+     *   Note that [typeOf] does not retain the receiver of a function type,
+     *   so a dependency of type `Int.() -> Int` is seen by the script as `(Int) -> Int`.
      * @param value the value of the property, of the [type].
      */
     public class Dependency<T>(
