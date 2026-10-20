@@ -370,23 +370,48 @@ class ScriptDependenciesTest {
     @Test
     fun `should reject dependency names resolved to the coroutine scope of the script body instead`() = runTest {
         // given
-        val names = listOf(
-            "coroutineContext", "isActive", "launch", "async", "cancel", "ensureActive", "plus", "newCoroutineContext",
-            "javaClass", "let", "run", "also", "apply", "takeIf", "takeUnless", "to", "runCatching", "toString", "hashCode", "equals"
+        val propertyNames = listOf("coroutineContext", "isActive", "javaClass")
+        val functionNames = listOf(
+            "launch", "async", "cancel", "ensureActive", "plus", "newCoroutineContext",
+            "let", "run", "also", "apply", "takeIf", "takeUnless", "to", "runCatching", "toString", "hashCode", "equals"
         )
         val executor = ScriptExecutor()
 
         // when
-        val exceptions = names.map { name ->
+        val exceptions = propertyNames.map { name ->
             assertFailsWith<IllegalArgumentException> {
                 executor.execute("foo", listOf(dependency(name, 1)))
+            }
+        } + functionNames.map { name ->
+            assertFailsWith<IllegalArgumentException> {
+                executor.execute("foo", listOf(dependency<() -> Int>(name) { 1 }))
             }
         }
 
         // then
-        assert(exceptions.map { it.message } == names.map {
+        assert(exceptions.map { it.message } == (propertyNames + functionNames).map {
             "Reserved dependency name: $it - it would be resolved to the CoroutineScope of the script body"
         })
+    }
+
+    @Test
+    fun `should provide dependency named like function of the coroutine scope when it cannot be called`() = runTest {
+        // given
+        val script = $$"""
+            "mail $to"
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "to" provides "alice"
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "mail alice")
+        }
     }
 
 }

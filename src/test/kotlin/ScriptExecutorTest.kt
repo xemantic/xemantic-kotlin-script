@@ -34,6 +34,7 @@ import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runTest
 import org.jetbrains.kotlin.config.JvmTarget
 import java.util.concurrent.Executors
+import kotlin.reflect.full.createType
 import kotlin.reflect.typeOf
 import kotlin.test.Test
 import kotlin.time.Duration.Companion.hours
@@ -48,6 +49,21 @@ class Widget(val name: String)
 
 class Logger {
     operator fun invoke(message: String) = "dep:$message"
+}
+
+class PrivateInvoke {
+    @Suppress("unused")
+    private operator fun invoke() = 1
+    override fun toString() = "private"
+}
+
+/** Not available to the class loader of [OptionalUser] in the test of a missing optional class. */
+class OptionalFeature
+
+class OptionalUser {
+    @Suppress("unused")
+    fun use(feature: OptionalFeature) = feature
+    override fun toString() = "optional"
 }
 
 class DurationLogger {
@@ -2975,6 +2991,106 @@ class ScriptExecutorTest {
                   hint: 'compute' is declared at line 4, while the functions of the script body are visible only after their declaration - move it before line 2.
             """.trimIndent()
         }
+    }
+
+    @Test
+    fun `should call function moved out of the script body instead of callable dependency shadowed by local property`() = runTest {
+        // given
+        val script = """
+            val r = g()
+            val g = 1
+            fun g(): Int = 10
+            r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<() -> Int>("g") { 2 }))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 10)
+        }
+    }
+
+    @Test
+    fun `should report error at reference to dependency before local property of the same name declared later`() = runTest {
+        // given
+        val script = $$"""
+            fun show() = "v=$x"
+            val x = 2
+            show()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("x", 1)))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs $$"""
+                script.kts:1:18: error: 'x' refers to the dependency, as the property 'x' of the script body is declared later, at line 2.
+                  | fun show() = "v=$<error>x</error>"
+                  hint: declare the property before line 1, or rename it.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not treat dependency with private invoke operator as callable`() = runTest {
+        // given
+        val script = $$"""
+            val p = ">"
+            fun d() = p
+            sealed interface S
+            class T : S { fun f() = "$d" }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("d", PrivateInvoke())))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "private")
+        }
+    }
+
+    @Test
+    fun `should execute script with dependency of class referring to missing optional class`() = runTest {
+        // given
+        val testClassLoader = OptionalUser::class.java.classLoader
+        val classLoader = object : ClassLoader(testClassLoader) {
+            override fun loadClass(name: String, resolve: Boolean): Class<*> = synchronized(getClassLoadingLock(name)) {
+                when (name) {
+                    OptionalFeature::class.java.name -> throw ClassNotFoundException(name)
+                    OptionalUser::class.java.name -> findLoadedClass(name) ?: testClassLoader
+                        .getResourceAsStream(name.replace('.', '/') + ".class")!!
+                        .use { it.readBytes() }
+                        .let { defineClass(name, it, 0, it.size) }
+                    else -> super.loadClass(name, resolve)
+                }
+            }
+        }
+        val type = classLoader.loadClass(OptionalUser::class.java.name).kotlin
+        val dependency = ScriptExecutor.Dependency(
+            name = "user",
+            type = type.createType(),
+            value = type.java.getDeclaredConstructor().newInstance()
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute("1", listOf(dependency))
+
+        // then
+        // evaluated, while the script is compiled against the class of the other class loader
+        assert(result is ScriptResult.Error && result.phase == ExecutionPhase.EVALUATION)
     }
 
 }

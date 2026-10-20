@@ -34,7 +34,10 @@ import kotlin.concurrent.atomics.fetchAndIncrement
 import kotlin.concurrent.atomics.incrementAndFetch
 import kotlin.coroutines.CoroutineContext
 import kotlin.reflect.KClass
+import java.lang.reflect.Modifier
 import kotlin.reflect.KFunction
+import kotlin.reflect.KVisibility
+import kotlin.reflect.full.extensionReceiverParameter
 import kotlin.reflect.typeOf
 import kotlin.script.experimental.api.CompiledScript
 import kotlin.script.experimental.api.KotlinType
@@ -149,7 +152,7 @@ internal class DefaultScriptExecutor(
             require(name != SCRIPT_BLOCK_NAME && name != DEPENDENCIES_CLASS_NAME && !name.startsWith(HIDDEN_DEPENDENCY_PREFIX)) {
                 "Reserved dependency name: $name"
             }
-            require(name !in coroutineScopeNames) {
+            require(name !in coroutineScopeProperties && (name !in coroutineScopeFunctions || !sameName.single().isCallable)) {
                 "Reserved dependency name: $name - it would be resolved to the CoroutineScope of the script body"
             }
         }
@@ -265,7 +268,11 @@ internal class DefaultScriptExecutor(
 
         private suspend fun doCompile(): Compilation {
             val source = source()
-            if (source.unmatchedClosingBrace != null || source.conflictingDependencyDeclarations.isNotEmpty()) {
+            if (
+                source.unmatchedClosingBrace != null
+                || source.conflictingDependencyDeclarations.isNotEmpty()
+                || source.laterDeclaredDependencyReferences.isNotEmpty()
+            ) {
                 return Compilation(source, result = null)
             }
             return Compilation(source, compile(source))
@@ -471,16 +478,20 @@ private const val SCRIPT_BLOCK_NAME = "_script"
 
 private const val HIDDEN_DEPENDENCY_PREFIX = "_dependency_"
 
-/**
+/*
  * The names the script body resolves on its receiver, the coroutine scope, or on the nested ones, like in `launch { }`,
  * instead of the dependencies of these names, as the receivers take precedence, like `size` in `list.run { size }`:
  * the members of `CoroutineScope` and `Any`, the extensions of `CoroutineScope` imported by default from `kotlinx.coroutines`,
  * and the extensions of any receiver imported by default from `kotlin`.
+ * The functions are resolved instead of the dependencies called like them only.
  */
-private val coroutineScopeNames = setOf(
-    "coroutineContext", "toString", "hashCode", "equals",
-    "isActive", "launch", "async", "cancel", "ensureActive", "plus", "newCoroutineContext",
-    "javaClass", "let", "run", "also", "apply", "takeIf", "takeUnless", "to", "runCatching"
+
+private val coroutineScopeProperties = setOf("coroutineContext", "isActive", "javaClass")
+
+private val coroutineScopeFunctions = setOf(
+    "toString", "hashCode", "equals",
+    "launch", "async", "cancel", "ensureActive", "plus", "newCoroutineContext",
+    "let", "run", "also", "apply", "takeIf", "takeUnless", "to", "runCatching"
 )
 
 /*
@@ -505,18 +516,22 @@ private val ScriptExecutor.Dependency<*>.providedType: KotlinType
 private val ScriptExecutor.Dependency<*>.accessor: String
     get() = "@Suppress(\"UNCHECKED_CAST\") val `$name`: $type = `$providedName` as $type"
 
-/** Whether it is of a function type, or of a type with the `invoke` operator, so the script can call it. */
+/** Whether it is of a function type, or of a type with the public `invoke` operator, so the script can call it. */
 private val ScriptExecutor.Dependency<*>.isCallable: Boolean
     get() = (type.classifier as? KClass<*>)?.let { type ->
         Function::class.java.isAssignableFrom(type.java) || try {
             if (type.java.isAnnotationPresent(Metadata::class.java)) {
                 // named like `invoke-LRDsOJo` in the bytecode, if it takes a value class
-                type.members.any { it is KFunction<*> && it.name == "invoke" && it.isOperator }
+                type.members.any {
+                    it is KFunction<*> && it.name == "invoke" && it.isOperator
+                            && it.visibility == KVisibility.PUBLIC && it.extensionReceiverParameter == null
+                }
             } else {
                 // every Java method named `invoke` is an operator
-                type.java.methods.any { it.name == "invoke" }
+                type.java.methods.any { it.name == "invoke" && !Modifier.isStatic(it.modifiers) }
             }
-        } catch (_: Throwable) {
+        } catch (e: Throwable) {
+            if (e is VirtualMachineError) throw e
             // e.g. a member referring to an optional class, which is missing, so it cannot be inspected
             false
         }

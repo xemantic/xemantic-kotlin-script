@@ -36,6 +36,7 @@ import org.jetbrains.kotlin.lexer.KtTokens
 import org.jetbrains.kotlin.psi.KtAnnotation
 import org.jetbrains.kotlin.psi.KtAnnotationEntry
 import org.jetbrains.kotlin.psi.KtBlockExpression
+import org.jetbrains.kotlin.psi.KtCallExpression
 import org.jetbrains.kotlin.psi.KtCallableReferenceExpression
 import org.jetbrains.kotlin.psi.KtCatchClause
 import org.jetbrains.kotlin.psi.KtClass
@@ -162,6 +163,13 @@ internal class ScriptSource(
     /** The properties moved out of the script body, which have the names of the dependencies, conflicting with their accessors. */
     val conflictingDependencyDeclarations: List<ScriptReference>
 
+    /**
+     * The references of the script body to the dependencies, preceding the declarations of the local properties of the same names,
+     * by the 0-based lines of these declarations, like `x` in `fun show() = x` followed by `val x = 2`,
+     * while in the script they refer to the properties.
+     */
+    val laterDeclaredDependencyReferences: List<Pair<ScriptReference, Int>>
+
     private val lineStarts: List<Int>
 
     /** For each line of the [text], the line of the script, or `null` for the lines of the block and the preamble. */
@@ -185,6 +193,10 @@ internal class ScriptSource(
         returnsUnit = structure.endsWithMovedDeclaration
         conflictingDependencyDeclarations = structure.conflictingDependencyDeclarations.map { (name, range) ->
             ScriptReference(name, position(range.first), position(range.last + 1))
+        }
+        laterDeclaredDependencyReferences = structure.laterDeclaredDependencyReferences.map { (reference, declaration) ->
+            ScriptReference(reference.name, position(reference.offset), position(reference.offset + reference.length)) to
+                    position(declaration).line
         }
         bodyDeclarations = structure.bodyDeclarations
 
@@ -224,7 +236,8 @@ internal class ScriptSource(
         visible.forEach { addAccessor(it) }
         lines += "class $DEPENDENCIES_CLASS {"
         mapping += null
-        shadowed.forEach { addAccessor(it) }
+        // the members of the outer receiver of the script body would be called instead of the moved functions
+        shadowed.filterNot { it.isCallable && it.name in structure.movedFunctions }.forEach { addAccessor(it) }
         lines += "}"
         mapping += null
         movedDeclarations.forEach { declaration ->
@@ -441,8 +454,11 @@ private val psiFactory: KtPsiFactory by lazy {
 private class Reference(
     val name: String,
     val offset: Int,
+    val length: Int,
     val isQualified: Boolean,
-    val isBound: Boolean
+    val isBound: Boolean,
+    /** Whether it is called, like `foo` in `foo()`, so it might refer to a function. */
+    val isCall: Boolean
 ) {
 
     /** Whether it might refer to one of the local declarations of the script body of these [names]. */
@@ -467,10 +483,12 @@ private fun PsiElement.references(
     Reference(
         name = name,
         offset = expression.startOffset,
+        length = expression.textLength,
         isQualified = expression.getReceiverExpression() != null || (
                 callableReference?.callableReference == expression && callableReference.receiverExpression != null
         ),
-        isBound = isBound(expression, name, scope, declaredNames)
+        isBound = isBound(expression, name, scope, declaredNames),
+        isCall = (expression.parent as? KtCallExpression)?.calleeExpression == expression
     )
 }
 
@@ -589,6 +607,12 @@ private class ScriptStructure(
     /** The names of the functions of the script body, which are local to the script block. */
     val localFunctions: Set<String>
 
+    /** The names of the functions moved out of the script body. */
+    val movedFunctions: Set<String>
+
+    /** See [ScriptSource.laterDeclaredDependencyReferences], with the offsets of the declarations. */
+    val laterDeclaredDependencyReferences: List<Pair<Reference, Int>>
+
     /** The names of the [ScriptSource.conflictingDependencyDeclarations], and their ranges. */
     val conflictingDependencyDeclarations: List<Pair<String, IntRange>>
 
@@ -625,6 +649,28 @@ private class ScriptStructure(
         localFunctions = declarations.filter {
             it.kind == DeclarationKind.FUNCTION && !it.isExtension && it !in moved
         }.mapNotNullTo(HashSet()) { it.name }
+        movedFunctions = moved.filter { it.kind == DeclarationKind.FUNCTION }.mapNotNullTo(HashSet()) { it.name }
+        // the first local property of each name of a dependency, by the index of its statement
+        val functions = declarations.filter { it.kind == DeclarationKind.FUNCTION }.mapNotNullTo(HashSet()) { it.name }
+        val dependencyProperties = mutableMapOf<String, Pair<Int, ParsedDeclaration>>()
+        statements.forEachIndexed { index, statement ->
+            declarationsByPsi[statement]?.takeIf { it.kind == DeclarationKind.PROPERTY && it !in moved }?.let { declaration ->
+                (listOfNotNull(declaration.name) + declaration.destructuredNames)
+                    .filter { it in dependencyNames }
+                    .forEach { dependencyProperties.putIfAbsent(it, index to declaration) }
+            }
+        }
+        laterDeclaredDependencyReferences = statements.withIndex().flatMap { (index, statement) ->
+            val declaration = declarationsByPsi[statement]
+            if (declaration in moved) return@flatMap emptyList()
+            (declaration?.references ?: statement.references(scope = statement.parent, declaredNames)).mapNotNull { reference ->
+                dependencyProperties[reference.name]?.takeIf { (declarationIndex) ->
+                    declarationIndex > index && reference.refersToLocal(localProperties)
+                            // calling the function of the script body
+                            && !(reference.isCall && reference.name in functions)
+                }?.let { (_, property) -> reference to property.start }
+            }
+        }
         // unlike an extension property, which does not conflict with the accessor of the dependency
         conflictingDependencyDeclarations = moved.filter {
             it.kind == DeclarationKind.PROPERTY && (it.psi as? KtProperty)?.receiverTypeReference == null && it.name in dependencyNames
