@@ -3385,4 +3385,54 @@ class ScriptExecutorTest {
         assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
     }
 
+    @Test
+    fun `should execute valid scripts with local declarations named like other declarations which do not apply`() = runTest {
+        // given
+        val scripts = listOf(
+            "val r = size(listOf(1, 2))\nval size = 10\nval q = size(listOf(1))\nfun size(xs: List<Int>) = xs.size\nr + q + size" to emptyList(),
+            "val greet = { s: String -> s }\nval r = greet(2)\nfun greet(n: Int) = n * 10\nr" to emptyList(),
+            "val p = 1\nclass P(val v: Int)\nval r = greet(\"hello\")\nfun greet(q: P) = q.v + p\nr" to listOf(dependency<(String) -> Int>("greet") { it.length })
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { (script, dependencies) -> executor.execute(script, dependencies) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(13, 20, 5))
+    }
+
+    @Test
+    fun `should report wrongly resolved callable references and values`() = runTest {
+        // given
+        val scripts = listOf(
+            "val p = 1\nval g = ::x\nfun x() = p + 10\ng()" to listOf(dependency<() -> Int>("x") { 2 }),
+            "import kotlin.math.*\nval E = 2.0\nsealed interface S\nclass T : S { fun f() = E }\nT().f()" to emptyList(),
+            "import kotlin.math.PI\nval PI = 3.0\nsealed interface S\nclass T : S { fun f() = PI }\nT().f()" to emptyList()
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { (script, dependencies) -> executor.execute(script, dependencies) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+    }
+
+    @Test
+    fun `should report error of type parameter without name`() = runTest {
+        // given
+        val script = """
+            fun <in> f() = 1
+            f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert(result is ScriptResult.Error && result.phase == ExecutionPhase.COMPILATION)
+    }
+
 }

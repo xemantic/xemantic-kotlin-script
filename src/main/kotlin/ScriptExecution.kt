@@ -187,7 +187,9 @@ internal class DefaultScriptExecutor(
         /** The [ScriptSource.laterDeclaredDependencyCandidates] referring to the dependencies indeed. */
         val laterDeclaredDependencyReferences: List<LaterDeclaredReference> = emptyList(),
         /** The [ScriptSource.hiddenLocalFunctionCandidates] referring to other functions indeed. */
-        val hiddenLocalFunctionReferences: List<LaterDeclaredReference> = emptyList()
+        val hiddenLocalFunctionReferences: List<LaterDeclaredReference> = emptyList(),
+        /** The [ScriptSource.shadowedFunctionCandidates] which would call the functions in the script. */
+        val shadowedFunctionReferences: List<Triple<ScriptReference, Int, Int>> = emptyList()
     )
 
     private inner class ScriptHandler(
@@ -221,8 +223,15 @@ internal class DefaultScriptExecutor(
                 ScriptErrorReporter(source).toSourceFailureMessage(),
                 ExecutionPhase.COMPILATION
             )
-            if (compilation.laterDeclaredDependencyReferences.isNotEmpty() || compilation.hiddenLocalFunctionReferences.isNotEmpty()) {
+            if (
+                compilation.laterDeclaredDependencyReferences.isNotEmpty()
+                || compilation.hiddenLocalFunctionReferences.isNotEmpty()
+                || compilation.shadowedFunctionReferences.isNotEmpty()
+            ) {
                 val failureMessage = listOfNotNull(
+                    compilation.shadowedFunctionReferences.takeIf { it.isNotEmpty() }?.let {
+                        ScriptErrorReporter(source).toShadowedFunctionMessage(it)
+                    },
                     compilation.hiddenLocalFunctionReferences.takeIf { it.isNotEmpty() }?.let {
                         ScriptErrorReporter(source).toHiddenLocalFunctionMessage(it)
                     },
@@ -289,15 +298,15 @@ internal class DefaultScriptExecutor(
 
         private suspend fun doCompile(): Compilation {
             val source = source()
-            if (
-                source.unmatchedClosingBrace != null
-                || source.conflictingDependencyDeclarations.isNotEmpty()
-                || source.propertyCallsShadowingFunctions.isNotEmpty()
-            ) {
+            if (source.unmatchedClosingBrace != null || source.conflictingDependencyDeclarations.isNotEmpty()) {
                 return Compilation(source, result = null)
             }
             val result = compile(source)
-            if (source.laterDeclaredDependencyCandidates.isEmpty() && source.hiddenLocalFunctionCandidates.isEmpty()) {
+            if (
+                source.laterDeclaredDependencyCandidates.isEmpty()
+                && source.hiddenLocalFunctionCandidates.isEmpty()
+                && source.shadowedFunctionCandidates.isEmpty()
+            ) {
                 return Compilation(source, result)
             }
             // recognizing the candidates referring to the wrong declarations indeed
@@ -319,11 +328,28 @@ internal class DefaultScriptExecutor(
                 diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }
             }
             val hidden = deprecated(HIDDEN_LOCAL_FUNCTION).filter { it !in errors }
+            // the calls not referring to the moved functions already, which would refer to them in the script, if they apply
+            val toFunctions = deprecated(SHADOWED_ORIGINAL)
+            val toProperties = source.shadowedFunctionCandidates.filter { (reference) -> toFunctions.none { it in reference } }
+            val shadowed = if (toProperties.isEmpty()) emptyList() else {
+                val copies = source(confirming = true, shadowedFunctionCopies = true)
+                compile(copies).reports.filter {
+                    it.severity == ScriptDiagnostic.Severity.WARNING && SHADOWED_FUNCTION in it.message
+                }.mapNotNull { diagnostic ->
+                    diagnostic.location?.start?.let { copies.toScriptPosition(it.line, it.col) }
+                }
+            }
             return Compilation(
                 source,
                 result,
                 laterDeclaredDependencyReferences = source.laterDeclaredDependencyCandidates.filter { candidate ->
-                    (if (candidate.isFunction) functions else dependencies).any { it in candidate.reference }
+                    (functions.takeIf { candidate.isFunction }.orEmpty()
+                            // like `::x`, resolved to the property of the dependency instead of the local function
+                            + dependencies.takeIf { !candidate.isFunction || candidate.isCallableReference }.orEmpty())
+                        .any { it in candidate.reference }
+                },
+                shadowedFunctionReferences = toProperties.filter { (reference) ->
+                    shadowed.any { it in reference }
                 },
                 hiddenLocalFunctionReferences = source.hiddenLocalFunctionCandidates.filter { candidate ->
                     hidden.any { it in candidate.reference }
@@ -339,8 +365,9 @@ internal class DefaultScriptExecutor(
         }
 
         private fun source(
-            confirming: Boolean = false
-        ) = ScriptSource(script, preambleDependencies, confirming)
+            confirming: Boolean = false,
+            shadowedFunctionCopies: Boolean = false
+        ) = ScriptSource(script, preambleDependencies, confirming, shadowedFunctionCopies)
 
         private suspend fun compile(
             source: ScriptSource
