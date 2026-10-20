@@ -2545,4 +2545,55 @@ class ScriptExecutorTest {
         }
     }
 
+    @Test
+    fun `should report error at declaration moved out of the script body referring to dependency shadowed by local property`() = runTest {
+        // given
+        val script = """
+            val limit = 5
+            sealed interface Check
+            class Below : Check { fun ok(v: Int) = v < limit }
+            Below().ok(7)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("limit", 10)))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:44: error: 'limit' refers to the dependency, not to the property of the script body declared at line 1.
+                  | class Below : Check { fun ok(v: Int) = v < <error>limit</error> }
+                  hint: 'Below' is compiled outside of the script body, where 'limit' (line 1) is not visible - pass it as a parameter, or declare it within 'Below'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at property accessor referring to dependency shadowed by local property`() = runTest {
+        // given
+        val script = $$"""
+            val prefix = "local"
+            val greeting get() = "$prefix!"
+            greeting
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("prefix", "dep")))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs $$"""
+                script.kts:2:24: error: 'prefix' refers to the dependency, not to the property of the script body declared at line 1.
+                  | val greeting get() = "$<error>prefix</error>!"
+                  hint: 'greeting' is compiled outside of the script body, where 'prefix' (line 1) is not visible - pass it as a parameter, or declare it within 'greeting'.
+            """.trimIndent()
+        }
+    }
+
 }

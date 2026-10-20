@@ -160,7 +160,7 @@ internal class DefaultScriptExecutor(
 
     /**
      * The [source] of the script, together with the [result] of its compilation,
-     * or `null`, if the script was not compiled because of the unmatched closing brace.
+     * or `null`, if the script was not compiled because of the failure recognized in its source.
      */
     private class Compilation(
         val source: ScriptSource,
@@ -195,8 +195,7 @@ internal class DefaultScriptExecutor(
             }
             source = compilation.source
             val compilationResult = compilation.result ?: return ScriptResult.Error(
-                // the brace would close the script block, misplacing all the errors
-                ScriptErrorReporter(source).toUnmatchedClosingBraceMessage(source.unmatchedClosingBrace!!),
+                ScriptErrorReporter(source).toSourceFailureMessage(),
                 ExecutionPhase.COMPILATION
             )
             val result = when (compilationResult) {
@@ -254,9 +253,12 @@ internal class DefaultScriptExecutor(
                 script,
                 preamble = allDependencies.mapNotNull { dependency ->
                     dependency.accessor?.let { dependency.name to it }
-                }.toMap()
+                }.toMap(),
+                dependencyNames = allDependencies.mapTo(HashSet()) { it.name }
             )
-            if (source.unmatchedClosingBrace != null) return Compilation(source, result = null)
+            if (source.unmatchedClosingBrace != null || source.shadowedDependencyReferences.isNotEmpty()) {
+                return Compilation(source, result = null)
+            }
             @OptIn(ExperimentalAtomicApi::class)
             compilations.incrementAndFetch()
             val result = try {

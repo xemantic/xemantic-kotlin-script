@@ -83,6 +83,13 @@ internal data class ScriptPosition(
     val column: Int
 )
 
+/** The reference to the [name] in the script, from the [start] to the [end], exclusive. */
+internal class ScriptReference(
+    val name: String,
+    val start: ScriptPosition,
+    val end: ScriptPosition
+)
+
 /**
  * The script turned into a block, which can be run in the coroutine of the caller:
  *
@@ -102,7 +109,8 @@ internal data class ScriptPosition(
 internal class ScriptSource(
     script: String,
     /** The declarations of the dependency accessors, by the names of the dependencies. */
-    preamble: Map<String, String> = emptyMap()
+    preamble: Map<String, String> = emptyMap(),
+    dependencyNames: Set<String> = preamble.keys
 ) : SourceCode {
 
     val scriptLines: List<String>
@@ -121,6 +129,12 @@ internal class ScriptSource(
      * while the block returns `null` instead, as `Unit` might be shadowed by a declaration or a dependency of the script.
      */
     val returnsUnit: Boolean
+
+    /**
+     * The references of the declarations moved out of the script body to the properties of the script body,
+     * which compile, but refer to the dependencies of the same names instead.
+     */
+    val shadowedDependencyReferences: List<ScriptReference>
 
     private val lineStarts: List<Int>
 
@@ -141,10 +155,13 @@ internal class ScriptSource(
         lineStarts = lineBounds.map { it.first }
         scriptLines = lineBounds.map { script.substring(it.first, it.last + 1) }
         // the parser recognizes only `\n` as a line terminator, replacing each character keeps the offsets
-        val structure = ScriptStructure(script.replace('\r', '\n'))
+        val structure = ScriptStructure(script.replace('\r', '\n'), dependencyNames)
         unmatchedClosingBrace = structure.unmatchedClosingBrace?.let { position(it) }
         movedDeclarations = structure.movedDeclarations
         returnsUnit = structure.endsWithMovedDeclaration
+        shadowedDependencyReferences = structure.shadowedDependencyReferences.map {
+            ScriptReference(it.name, position(it.offset), position(it.offset + it.length))
+        }
         bodyDeclarations = structure.bodyDeclarations
 
         val lines = mutableListOf<String>()
@@ -384,6 +401,7 @@ private val psiFactory: KtPsiFactory by lazy {
 private class Reference(
     val name: String,
     val offset: Int,
+    val length: Int,
     val isQualified: Boolean,
     val isBound: Boolean
 )
@@ -403,6 +421,7 @@ private fun PsiElement.references(
     Reference(
         name = name,
         offset = expression.startOffset,
+        length = expression.textLength,
         isQualified = expression.getReceiverExpression() != null || (
                 callableReference?.callableReference == expression && callableReference.receiverExpression != null
         ),
@@ -504,7 +523,8 @@ private class DeclaredNames {
  * which cannot be local to the script block, see [ScriptSource].
  */
 private class ScriptStructure(
-    private val script: String
+    private val script: String,
+    dependencyNames: Set<String>
 ) {
 
     val headerEnd: Int
@@ -517,6 +537,9 @@ private class ScriptStructure(
 
     /** Whether the last statement of the script is a declaration moved out of the script body. */
     val endsWithMovedDeclaration: Boolean
+
+    /** See [ScriptSource.shadowedDependencyReferences]. */
+    val shadowedDependencyReferences: List<Reference>
 
     /** The modifiers which are not applicable to local declarations. */
     val blankedRanges = mutableListOf<IntRange>()
@@ -544,6 +567,14 @@ private class ScriptStructure(
         val moved = selectMovedDeclarations(declarations, bodyReferences)
         movedDeclarations = moved.map { it.toDeclaration(withNestedNames = true) }
         endsWithMovedDeclaration = moved.any { it.psi == statements.lastOrNull() }
+        val localProperties = declarations.filter { it.kind == DeclarationKind.PROPERTY && it !in moved }
+            .flatMapTo(HashSet()) { listOfNotNull(it.name) + it.destructuredNames }
+        // without a dependency of the same name, the compiler reports them as unresolved
+        shadowedDependencyReferences = moved.flatMap { declaration ->
+            declaration.references.filter {
+                !it.isQualified && !it.isBound && it.name in localProperties && it.name in dependencyNames
+            }
+        }
         bodyDeclarations = declarations
             .filter {
                 it !in moved && (it.kind == DeclarationKind.PROPERTY || it.kind == DeclarationKind.FUNCTION || it.kind == DeclarationKind.CLASS)

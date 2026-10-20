@@ -83,7 +83,22 @@ internal class ScriptErrorReporter(
         buildString { appendDiagnostic(diagnostic) }
     }.distinct()
 
-    fun toUnmatchedClosingBraceMessage(
+    /** The failure recognized in the [source] before compiling it. */
+    fun toSourceFailureMessage(): String = source.unmatchedClosingBrace?.let {
+        // the brace would close the script block, misplacing all the errors
+        toUnmatchedClosingBraceMessage(it)
+    } ?: source.shadowedDependencyReferences.joinToString(separator = "\n") { reference ->
+        buildString {
+            appendPosition(reference.start)
+            +"error: '${reference.name}' refers to the dependency, not to the property of the script body"
+            source.bodyDeclarationLine(reference.name)?.let { (line) -> +" declared at line ${line + 1}" }
+            +".\n"
+            appendSourceLines(reference.start, reference.end)
+            appendHint(reference.name, reference.start)
+        }
+    }.trimEnd()
+
+    private fun toUnmatchedClosingBraceMessage(
         position: ScriptPosition
     ): String = buildString {
         appendPosition(position)

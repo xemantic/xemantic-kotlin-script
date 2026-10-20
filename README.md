@@ -88,6 +88,7 @@ when (result) {
   are compiled outside of the script body, together with the types and functions they refer to.
   So is a property with a getter or a setter having a body, like `val total get() = items.size`, as a local property cannot have one.
   Therefore, they cannot refer to the local values of the script body, only to the dependencies,
+  and referring to a local value of the same name as a dependency is reported as an error, instead of reading the dependency,
   while an object, an enum class, an interface or a nested class cannot refer even to the dependencies,
   as they are the members of the script instance.
   An error message will hint at this, if it happens.
