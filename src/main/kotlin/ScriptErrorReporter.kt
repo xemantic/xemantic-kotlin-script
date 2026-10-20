@@ -96,6 +96,20 @@ internal class ScriptErrorReporter(
         }
     }.joinToString(separator = "\n").trimEnd()
 
+    /** The [references] of the script body to its coroutine scope, see [ScriptSource.coroutineScopeCandidates]. */
+    fun toCoroutineScopeMessage(
+        references: List<LaterDeclaredReference>
+    ): String = references.joinToString(separator = "\n") { scope ->
+        val reference = scope.reference
+        buildString {
+            appendPosition(reference.start)
+            +"error: '${reference.name}' refers to the coroutine scope of the script body, instead of the ${scope.kind} declared at line ${scope.line + 1}, "
+            +"which is compiled outside of the script body.\n"
+            appendSourceLines(reference.start, reference.end)
+            +"  hint: rename the ${scope.kind}.\n"
+        }
+    }.trimEnd()
+
     /** The [references] of the script body to the local properties instead of the functions, see [ScriptSource.shadowedFunctionCandidates]. */
     fun toShadowedFunctionMessage(
         references: List<Triple<ScriptReference, Int, Int>>
@@ -233,6 +247,11 @@ internal class ScriptErrorReporter(
                 scriptLine != null -> Frame(
                     location = "${functionName(element)}(script.kts:${scriptLine + 1})",
                     sourceLine = source.scriptLines[scriptLine]
+                )
+                // like a static initializer of an object declared in the script
+                index == 0 && element.fileName == source.locationId -> Frame(
+                    location = "${functionName(element)}(script.kts)",
+                    sourceLine = null
                 )
                 index == 0 -> Frame(
                     location = "${element.className}.${element.methodName}(${sourceOf(element)})",

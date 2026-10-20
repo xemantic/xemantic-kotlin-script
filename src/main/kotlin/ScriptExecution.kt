@@ -188,6 +188,8 @@ internal class DefaultScriptExecutor(
         val laterDeclaredDependencyReferences: List<LaterDeclaredReference> = emptyList(),
         /** The [ScriptSource.hiddenLocalFunctionCandidates] referring to other functions indeed. */
         val hiddenLocalFunctionReferences: List<LaterDeclaredReference> = emptyList(),
+        /** The [ScriptSource.coroutineScopeCandidates] resolved to the coroutine scope indeed. */
+        val coroutineScopeReferences: List<LaterDeclaredReference> = emptyList(),
         /** The [ScriptSource.shadowedFunctionCandidates] which would call the functions in the script. */
         val shadowedFunctionReferences: List<Triple<ScriptReference, Int, Int>> = emptyList()
     )
@@ -227,8 +229,12 @@ internal class DefaultScriptExecutor(
                 compilation.laterDeclaredDependencyReferences.isNotEmpty()
                 || compilation.hiddenLocalFunctionReferences.isNotEmpty()
                 || compilation.shadowedFunctionReferences.isNotEmpty()
+                || compilation.coroutineScopeReferences.isNotEmpty()
             ) {
                 val failureMessage = listOfNotNull(
+                    compilation.coroutineScopeReferences.takeIf { it.isNotEmpty() }?.let {
+                        ScriptErrorReporter(source).toCoroutineScopeMessage(it)
+                    },
                     compilation.shadowedFunctionReferences.takeIf { it.isNotEmpty() }?.let {
                         ScriptErrorReporter(source).toShadowedFunctionMessage(it)
                     },
@@ -310,6 +316,7 @@ internal class DefaultScriptExecutor(
                 source.laterDeclaredDependencyCandidates.isEmpty()
                 && source.hiddenLocalFunctionCandidates.isEmpty()
                 && source.shadowedFunctionCandidates.isEmpty()
+                && source.coroutineScopeCandidates.isEmpty()
             ) {
                 return Compilation(source, result)
             }
@@ -332,6 +339,11 @@ internal class DefaultScriptExecutor(
             // only the ones, which the local function applies to, unlike the dependency called anyway
             val functions = deprecated(LATER_DECLARED_FUNCTION)
             val hidden = deprecated(HIDDEN_LOCAL_FUNCTION).filter { it !in errors }
+            // the references not resolved to the moved declarations, unless already reported as errors
+            val toDeclarations = deprecated(COROUTINE_SCOPE_ORIGINAL)
+            val coroutineScope = source.coroutineScopeCandidates.filter { candidate ->
+                toDeclarations.none { it in candidate.reference } && errors.none { it in candidate.reference }
+            }
             // the calls not referring to the moved functions already, which would refer to them in the script, if they apply
             val toFunctions = deprecated(SHADOWED_ORIGINAL)
             val toProperties = source.shadowedFunctionCandidates.filter { (reference) -> toFunctions.none { it in reference } }
@@ -348,6 +360,7 @@ internal class DefaultScriptExecutor(
                             + dependencies.takeIf { !candidate.isFunction || candidate.isCallableReference }.orEmpty())
                         .any { it in candidate.reference }
                 },
+                coroutineScopeReferences = coroutineScope,
                 shadowedFunctionReferences = toProperties.filter { (reference) ->
                     shadowed.any { it in reference }
                 },
@@ -561,22 +574,6 @@ internal fun scriptJvmTarget(
 private const val SCRIPT_BLOCK_NAME = "_script"
 
 private const val HIDDEN_DEPENDENCY_PREFIX = "_dependency_"
-
-/*
- * The names the script body resolves on its receiver, the coroutine scope, or on the nested ones, like in `launch { }`,
- * instead of the dependencies of these names, as the receivers take precedence, like `size` in `list.run { size }`:
- * the members of `CoroutineScope` and `Any`, the extensions of `CoroutineScope` imported by default from `kotlinx.coroutines`,
- * and the extensions of any receiver imported by default from `kotlin`.
- * The functions are resolved instead of the dependencies called like them only.
- */
-
-private val coroutineScopeProperties = setOf("coroutineContext", "isActive", "javaClass")
-
-private val coroutineScopeFunctions = setOf(
-    "toString", "hashCode", "equals",
-    "launch", "async", "cancel", "ensureActive", "plus", "newCoroutineContext",
-    "let", "run", "also", "apply", "takeIf", "takeUnless", "to", "runCatching"
-)
 
 /*
  * The scripting host erases the type arguments of a provided property,

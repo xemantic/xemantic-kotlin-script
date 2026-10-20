@@ -131,4 +131,23 @@ class ScriptErrorReporterTest {
         """.trimIndent()
     }
 
+    @Test
+    fun `should report script frame without line number by its function name`() {
+        // given
+        val source = ScriptSource("throw Boom")
+        val throwable = RuntimeException("b").apply {
+            stackTrace = arrayOf(StackTraceElement("_\$Boom", "<clinit>", source.locationId, -1))
+        }
+        val reporter = ScriptErrorReporter(source, scriptClassName = "_")
+
+        // when
+        val message = reporter.toFailureMessage(throwable, warnings = emptyList())
+
+        // then
+        message sameAs """
+            java.lang.RuntimeException: b
+              at Boom.<clinit>(script.kts)
+        """.trimIndent()
+    }
+
 }

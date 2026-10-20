@@ -127,6 +127,25 @@ internal const val HIDDEN_LOCAL_FUNCTION = "xemantic-kotlin-script: hidden local
 /** The deprecation message of the copies of the moved functions, see [ScriptSource.shadowedFunctionCandidates]. */
 internal const val SHADOWED_FUNCTION = "xemantic-kotlin-script: shadowed function"
 
+/*
+ * The names the script body resolves on its receiver, the coroutine scope, or on the nested ones, like in `launch { }`,
+ * instead of the dependencies, or the declarations moved out of the script body, of these names, as the receivers take precedence, like `size` in `list.run { size }`:
+ * the members of `CoroutineScope` and `Any`, the extensions of `CoroutineScope` imported by default from `kotlinx.coroutines`,
+ * and the extensions of any receiver imported by default from `kotlin`.
+ * The functions are resolved instead of the dependencies called like them only.
+ */
+
+internal val coroutineScopeProperties = setOf("coroutineContext", "isActive", "javaClass")
+
+internal val coroutineScopeFunctions = setOf(
+    "toString", "hashCode", "equals",
+    "launch", "async", "cancel", "ensureActive", "plus", "newCoroutineContext",
+    "let", "run", "also", "apply", "takeIf", "takeUnless", "to", "runCatching"
+)
+
+/** The deprecation message of the moved declarations, see [ScriptSource.coroutineScopeCandidates]. */
+internal const val COROUTINE_SCOPE_ORIGINAL = "xemantic-kotlin-script: coroutine scope original"
+
 /** The deprecation message of the moved functions, see [ScriptSource.shadowedFunctionCandidates]. */
 internal const val SHADOWED_ORIGINAL = "xemantic-kotlin-script: shadowed original"
 
@@ -231,6 +250,15 @@ internal class ScriptSource(
     val shadowedFunctionCandidates: List<Triple<ScriptReference, Int, Int>>
 
     /**
+     * The references of the script body to the declarations moved out of it, named like the members or the extensions
+     * of its coroutine scope receiver, like `cancel`, by the 0-based lines of the declarations, which might be resolved
+     * to the coroutine scope instead, while in the script they refer to the declarations.
+     * They are confirmed by compiling the script with the declarations deprecated, see [confirming],
+     * reporting the ones not referring to them.
+     */
+    val coroutineScopeCandidates: List<LaterDeclaredReference>
+
+    /**
      * The references of the script body which might refer to the dependencies, preceding the declarations
      * of the local properties of the same names, like `x` in `fun show() = x` followed by `val x = 2`,
      * or of the local functions, when called, while in the script they refer to these declarations.
@@ -288,6 +316,7 @@ internal class ScriptSource(
         shadowedFunctionCandidates = structure.shadowedFunctionCandidates.map { (reference, property, function) ->
             Triple(reference.toScriptReference(), position(property).line, position(function).line)
         }
+        coroutineScopeCandidates = structure.coroutineScopeCandidates.map { it.toLaterDeclaredReference() }
         bodyDeclarations = structure.bodyDeclarations
         val deprecatedDependencies = if (confirming) {
             laterDeclaredDependencyCandidates.mapTo(HashSet()) { it.reference.name }
@@ -364,9 +393,18 @@ internal class ScriptSource(
         } else {
             emptySet()
         }
+        val coroutineScopeDeclarations = if (confirming && !shadowedFunctionCopies) {
+            coroutineScopeCandidates.mapTo(HashSet()) { it.reference.name }
+        } else {
+            emptySet()
+        }
         movedDeclarations.forEach { declaration ->
             if (declaration.kind == DeclarationKind.FUNCTION && declaration.name in deprecatedFunctions) {
                 lines += "@kotlin.Deprecated(\"$SHADOWED_ORIGINAL\")"
+                mapping += null
+            }
+            if (declaration.name in coroutineScopeDeclarations) {
+                lines += "@kotlin.Deprecated(\"$COROUTINE_SCOPE_ORIGINAL\")"
                 mapping += null
             }
             addLines(lineOf(declaration.start)..lineOf(declaration.end - 1)) {
@@ -877,6 +915,9 @@ private class ScriptStructure(
     /** See [ScriptSource.shadowedFunctionCandidates], with the offsets of the properties and the functions. */
     val shadowedFunctionCandidates: List<Triple<Reference, Int, Int>>
 
+    /** See [ScriptSource.coroutineScopeCandidates], with the offsets of the declarations, and whether they are functions. */
+    val coroutineScopeCandidates: List<Triple<Reference, Int, Boolean>>
+
 
     /**
      * The deprecated copies of the local functions, see [ScriptSource.laterDeclaredDependencyCandidates],
@@ -927,7 +968,8 @@ private class ScriptStructure(
         val constants = properties.filter { property ->
             val psi = property.psi as? KtProperty
             psi != null && !psi.isVar && psi.delegate == null && psi.initializer.isConstant() && property.accessors.isEmpty()
-                    && property.name !in dependencyNames && propertyNameCounts[property.name] == 1
+                    && property.name !in dependencyNames && property.name !in coroutineScopeProperties
+                    && propertyNameCounts[property.name] == 1
         }
         val selected = selectMovedDeclarations(declarations, bodyReferences, propertyNameSet)
         // referred to by the moved declarations, which can access the members of the script, unlike e.g. an object
@@ -1064,6 +1106,17 @@ private class ScriptStructure(
             }
         }
         shadowedFunctionCandidates = shadowedFunctionCandidatesByStatement.values.flatten()
+        val coroutineScopeDeclarations = moved.filter {
+            (it.kind == DeclarationKind.FUNCTION || it.kind == DeclarationKind.PROPERTY) && it.name != null
+                    && (it.name in coroutineScopeProperties || it.name in coroutineScopeFunctions)
+        }.groupBy { it.name!! }
+        coroutineScopeCandidates = statements.indices.flatMap { index ->
+            if (declarationsByPsi[statements[index]] in moved) return@flatMap emptyList()
+            statementReferences[index].filter { !it.isQualified && !it.isBound && it.name in coroutineScopeDeclarations }.map {
+                val declaration = coroutineScopeDeclarations.getValue(it.name).first()
+                Triple(it, declaration.line(), declaration.kind == DeclarationKind.FUNCTION)
+            }
+        }
         val laterDeclaredCandidatesByStatement = statements.indices.associateWith { index ->
             if (declarationsByPsi[statements[index]] in moved) return@associateWith emptyList()
             statementReferences[index].mapNotNull { reference ->

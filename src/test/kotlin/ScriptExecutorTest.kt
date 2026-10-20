@@ -3535,4 +3535,40 @@ class ScriptExecutorTest {
         }
     }
 
+    @Test
+    fun `should report references to declarations moved out of the script body resolved to its coroutine scope instead`() = runTest {
+        // given
+        val scripts = listOf(
+            "cancel()\nfun cancel() { println(\"order cancelled\") }\n\"done\"",
+            "ensureActive()\nfun ensureActive() { println(\"mine\") }\n1",
+            "val isActive get() = false\nisActive",
+            "val coroutineContext get() = \"mine\"\ncoroutineContext"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+    }
+
+    @Test
+    fun `should call declarations moved out of the script body named like functions of its coroutine scope when they apply, and not move constants named like them`() = runTest {
+        // given
+        val scripts = listOf(
+            "val r = cancel(\"too late\")\nfun cancel(reason: String) = \"cancelled: \" + reason\nr",
+            "val isActive = false\nval status get() = if (isActive) \"on\" else \"off\"\nstatus + isActive"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert((results[0] as? ScriptResult.Value)?.value == "cancelled: too late")
+        // not moved, unlike other constants, as the script body would refer to its coroutine scope instead, so not visible to the getter
+        assert((results[1] as? ScriptResult.Error)?.message?.lines()?.first() == "script.kts:2:24: error: Unresolved reference 'isActive'.")
+    }
+
 }
