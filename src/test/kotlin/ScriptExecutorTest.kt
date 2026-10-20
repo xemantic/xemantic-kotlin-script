@@ -3689,4 +3689,42 @@ class ScriptExecutorTest {
         assert(result is ScriptResult.Error && "'get'" in result.message && "'set'" !in result.message)
     }
 
+    @Test
+    fun `should move operator functions of compound assignments, increments and for loops`() = runTest {
+        // given
+        val scripts = listOf(
+            "class Grid { val cells = IntArray(4) }\nval grid = Grid()\ngrid[0] += 5\ngrid[1]++\nval r = grid[0] + grid[1]\noperator fun Grid.get(i: Int) = cells[i]\noperator fun Grid.set(i: Int, v: Int) { cells[i] = v }\nr",
+            "class Counter(var n: Int)\nclass It(val c: Counter)\nvar s = 0\nfor (x in Counter(3)) s += x\noperator fun Counter.iterator() = It(this)\noperator fun It.hasNext() = c.n > 0\noperator fun It.next() = c.n--\ns"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(6, 6))
+    }
+
+    @Test
+    fun `should hint at operator function of array access not visible in declaration moved out of the script body`() = runTest {
+        // given
+        val script = """
+            val scale = listOf(10).first()
+            class Grid
+            operator fun Grid.get(i: Int) = i * scale
+            val g get() = Grid().let { it[1] }
+            g
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert(
+            (result as? ScriptResult.Error)?.message?.lines()?.first() ==
+                    "script.kts:4:28: error: 'get' does not refer to the function of the script body declared at line 3, which is not visible in 'g'."
+        )
+    }
+
 }

@@ -67,6 +67,7 @@ import org.jetbrains.kotlin.psi.KtStringTemplateExpression
 import org.jetbrains.kotlin.psi.KtLambdaExpression
 import org.jetbrains.kotlin.psi.KtOperationReferenceExpression
 import org.jetbrains.kotlin.psi.KtTypeAlias
+import org.jetbrains.kotlin.psi.KtUnaryExpression
 import org.jetbrains.kotlin.psi.KtUserType
 import org.jetbrains.kotlin.psi.KtValueArgumentName
 import org.jetbrains.kotlin.psi.KtWhenExpression
@@ -269,7 +270,7 @@ internal class ScriptSource(
      * to the coroutine scope instead, while in the script they refer to the declarations.
      * They are confirmed by compiling the script with the declarations marked with an opt-in, see [confirming],
      * reporting the ones not referring to them, the properties, and the functions, which apply, recognized by their copies,
-     * see [shadowedFunctionCopies], while the ones within the lambdas are not reported, as they might have the receivers.
+     * see [coroutineScopeCopies], while the ones within the lambdas are not reported, as they might have the receivers.
      */
     val coroutineScopeCandidates: List<LaterDeclaredReference>
 
@@ -816,23 +817,22 @@ private fun PsiElement.operatorReferences(
     fun add(
         names: List<String>,
         element: PsiElement,
-        position: PsiElement = element
+        offset: Int = element.startOffset,
+        length: Int = element.textLength
     ) {
         val canAccessScriptMembers = canAccessScriptMembers(element, scope)
-        val inLambda = isInLambda(element, scope)
         names.forEach { name ->
             add(
                 Reference(
                     name = name,
-                    offset = position.startOffset,
-                    length = position.textLength,
+                    offset = offset,
+                    length = length,
                     isQualified = true,
                     isBound = false,
                     isCall = true,
                     isCallableReference = false,
                     canAccessScriptMembers = canAccessScriptMembers,
-                    isOperator = true,
-                    isInLambda = inLambda
+                    isOperator = true
                 )
             )
         }
@@ -845,18 +845,24 @@ private fun PsiElement.operatorReferences(
                     (if (element.parent is KtPrefixExpression) prefixOperatorNames[token] else operatorNames[token])?.let { add(it, element) }
                 }
             }
+            // at the first character, where the compiler reports the call, which does not contain the operands
             is KtArrayAccessExpression -> {
-                val assigned = (element.parent as? KtBinaryExpression)?.let {
-                    it.left == element && it.operationToken == KtTokens.EQ
-                } == true
-                add(listOf(if (assigned) "set" else "get"), element, element.indicesNode.firstChild ?: element)
+                val parent = element.parent
+                val names = when {
+                    parent is KtBinaryExpression && parent.left == element ->
+                        if (parent.operationToken == KtTokens.EQ) listOf("set") else listOf("get", "set")
+                    parent is KtUnaryExpression -> listOf("get", "set")
+                    else -> listOf("get")
+                }
+                add(names, element, length = 1)
             }
-            is KtForExpression -> element.loopRange?.let { add(listOf("iterator"), element, it) }
+            is KtForExpression -> element.loopRange?.let { add(listOf("iterator", "hasNext", "next"), element, it.startOffset, it.textLength) }
             is KtDestructuringDeclaration -> element.entries.forEachIndexed { index, entry ->
-                add(listOf("component${index + 1}"), element, entry)
+                add(listOf("component${index + 1}"), element, entry.startOffset, entry.textLength)
             }
             is KtCallExpression -> if (element.calleeExpression !is KtSimpleNameExpression && element.calleeExpression != null) {
-                add(listOf("invoke"), element, element.valueArgumentList ?: element.lambdaArguments.firstOrNull() ?: element)
+                val arguments = element.valueArgumentList ?: element.lambdaArguments.firstOrNull() ?: element
+                add(listOf("invoke"), element, arguments.startOffset, arguments.textLength)
             }
             is KtPropertyDelegate -> add(listOf("getValue", "setValue", "provideDelegate"), element)
             else -> {}
@@ -1296,12 +1302,11 @@ private class ScriptStructure(
             }
         }.let { copies ->
             // the same signature once, preceding its first use, as declaring it twice would make the calls ambiguous
-            val first = mutableMapOf<String, Int>()
-            copies.entries.sortedBy { it.key }.forEach { (offset, declarations) ->
-                declarations.forEach { (_, declaration) -> first.putIfAbsent(declaration, offset) }
-            }
-            copies.entries.flatMap { (_, declarations) -> declarations }.groupBy({ it.second }) { it.first }
-                .entries.groupBy({ first.getValue(it.key) }) { (declaration, messages) -> messages.distinct() to declaration }
+            copies.entries.sortedBy { it.key }
+                .flatMap { (offset, declarations) -> declarations.map { (message, declaration) -> Triple(offset, message, declaration) } }
+                .groupBy { it.third }
+                .map { (declaration, uses) -> uses.first().first to (uses.map { it.second }.distinct() to declaration) }
+                .groupBy({ it.first }) { it.second }
         }
         // unlike an extension property, which does not conflict with the accessor of the dependency
         conflictingDependencyDeclarations = moved.filter {

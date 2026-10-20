@@ -24,6 +24,8 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ThreadContextElement
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
@@ -349,13 +351,21 @@ internal class DefaultScriptExecutor(
             val toProperties = source.shadowedFunctionCandidates.filter { (reference) -> toFunctions.none { it in reference } }
             // the remaining calls of the functions, which would refer to them in the script, if they apply, like the properties
             val functionCandidates = coroutineScope.filter { it.isFunction }
-            val shadowed = if (toProperties.isEmpty()) emptyList() else {
-                val copies = source(confirming = true, shadowedFunctionCopies = true)
-                compile(copies).reports.marked(copies, SHADOWED_FUNCTION)
-            }
-            val toCoroutineScope = if (functionCandidates.isEmpty()) emptyList() else {
-                val copies = source(confirming = true, coroutineScopeCopies = true)
-                compile(copies).reports.marked(copies, COROUTINE_SCOPE_FUNCTION)
+            // independent of each other
+            val (shadowed, toCoroutineScope) = coroutineScope {
+                val shadowed = async {
+                    if (toProperties.isEmpty()) emptyList() else {
+                        val copies = source(confirming = true, shadowedFunctionCopies = true)
+                        compile(copies).reports.marked(copies, SHADOWED_FUNCTION)
+                    }
+                }
+                val toCoroutineScope = async {
+                    if (functionCandidates.isEmpty()) emptyList() else {
+                        val copies = source(confirming = true, coroutineScopeCopies = true)
+                        compile(copies).reports.marked(copies, COROUTINE_SCOPE_FUNCTION)
+                    }
+                }
+                shadowed.await() to toCoroutineScope.await()
             }
             return Compilation(
                 source,
