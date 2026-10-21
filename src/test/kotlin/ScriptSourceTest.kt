@@ -276,6 +276,25 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should keep many properties with accessors reading local property in the script body as delegated properties`() {
+        // given
+        val count = 50_000
+        val script = buildString {
+            appendLine("var x = 1")
+            (0 until count).forEach { appendLine("val p$it: Int get() = x + $it") }
+            append("p0 + p${count - 1}")
+        }
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        assert("val p" !in moved)
+        assert(body.lines().count { it == " by object {" } == count)
+    }
+
+    @Test
     fun `should keep moving property with accessors which cannot be delegated or do not read local properties`() {
         // given
         val scripts = listOf(

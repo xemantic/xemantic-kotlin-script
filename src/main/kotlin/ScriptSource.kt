@@ -1791,13 +1791,9 @@ private class ScriptStructure(
         val variableProperties = properties.filterNot { it.isConstant(dependencyNames, propertyNameCounts) }
         val variables = variableProperties.flatMapTo(HashSet()) { it.names }
         // the local variables declared before, which take precedence over the receivers, unlike the ones declared later
-        val firstVariableStarts = mutableMapOf<String, Int>()
-        variableProperties.forEach { property -> property.names.forEach { firstVariableStarts.merge(it, property.start, ::minOf) } }
+        val firstVariableStarts = variableProperties.startsByName(::minOf)
         // the properties declared after, which are not visible to the local ones, unlike in the script
-        val lastPropertyStarts = mutableMapOf<String, Int>()
-        declarations.filter { it.kind == DeclarationKind.PROPERTY }.forEach { property ->
-            property.names.forEach { lastPropertyStarts.merge(it, property.start, ::maxOf) }
-        }
+        val lastPropertyStarts = declarations.filter { it.kind == DeclarationKind.PROPERTY }.startsByName(::maxOf)
         val candidates = declarations.filter { declaration ->
             declaration.isDelegable && declaration.name !in callableReferences && declaration.references.filter { reference ->
                 declaration.accessors.any { reference.offset in it.startOffset until it.endOffset }
@@ -1853,16 +1849,14 @@ private class ScriptStructure(
         val variableProperties = properties.filterNot { it.isConstant(dependencyNames, propertyNameCounts) }
         val variables = variableProperties.flatMapTo(HashSet()) { it.names }
         // the local variables declared before, which take precedence over the receivers, unlike the ones declared later
-        val firstVariableStarts = mutableMapOf<String, Int>()
-        variableProperties.forEach { property -> property.names.forEach { firstVariableStarts.putIfAbsent(it, property.start) } }
+        val firstVariableStarts = variableProperties.startsByName(::minOf)
         // resolved before the members of the receivers, if local, like `name` in `user.run { name }`, unlike in the script
         val localDeclarations = declarations.filter {
             it.kind == DeclarationKind.PROPERTY || (it.kind == DeclarationKind.FUNCTION && !it.isExtension)
         }
         val localNames = localDeclarations.flatMapTo(HashSet()) { it.names }
         // not visible to the local function, if declared after it, which would refer to other declarations of these names, like `check` of the standard library
-        val lastStarts = mutableMapOf<String, Int>()
-        localDeclarations.forEach { declaration -> declaration.names.forEach { lastStarts.merge(it, declaration.start, ::maxOf) } }
+        val lastStarts = localDeclarations.startsByName(::maxOf)
         // the overloads staying local would hide the moved ones
         val functionNameCounts = declarations.filter { it.kind == DeclarationKind.FUNCTION }.groupingBy { it.name }.eachCount()
         val referencesByName = bodyReferences.filter { !it.isQualified && !it.isBound }.groupBy { it.name }
@@ -1990,6 +1984,13 @@ private class ScriptStructure(
                 && accessors.none { it.anyDescendantOfType<KtThisExpression>() || it.anyDescendantOfType<KtSuperExpression>() }
     }
 
+    /** The start of the first, or of the last, of the declarations of each name, as chosen by the [select], like [minOf]. */
+    private fun List<ParsedDeclaration>.startsByName(
+        select: (Int, Int) -> Int
+    ): Map<String, Int> = buildMap {
+        this@startsByName.forEach { declaration -> declaration.names.forEach { merge(it, declaration.start, select) } }
+    }
+
     /** Whether the [offset] is preceded only by whitespaces in its line. */
     private fun isOnNewLine(
         offset: Int
@@ -2032,11 +2033,11 @@ private class ScriptStructure(
         }
         // the operator functions called on the result of `iterator`, like by a for loop
         val iteratorOperators = named.filter { it.isOperator && it.isExtension && (it.name == "hasNext" || it.name == "next") }
-        // not by the operators, which refer to the operator functions by their names only, whatever the types of the operands,
-        // so an operator function accessing the local properties would make all the declarations using such an operator accessing,
-        // while the ones calling it indeed are reported, see ScriptSource.hiddenLocalFunctionCandidates
-        val plainReferences = LinkedHashMap<ParsedDeclaration, Set<ParsedDeclaration>>()
         val references = LinkedHashMap<ParsedDeclaration, Set<ParsedDeclaration>>()
+        // the declarations referring to each one, not by the operators, which refer to the operator functions by their names only,
+        // whatever the types of the operands, so an operator function accessing the local properties would make all the declarations
+        // using such an operator accessing, while the ones calling it indeed are reported, see ScriptSource.hiddenLocalFunctionCandidates
+        val referrers = mutableMapOf<ParsedDeclaration, MutableList<ParsedDeclaration>>()
         declarations.forEach { declaration ->
             val (operatorReferences, otherReferences) = declaration.references.partition { it.isOperator }
             val plain = buildSet {
@@ -2044,7 +2045,7 @@ private class ScriptStructure(
                 if (declaration.isSealed) addAll(subtypesByName[declaration.name].orEmpty())
                 remove(declaration)
             }
-            plainReferences[declaration] = plain
+            plain.forEach { referrers.getOrPut(it) { mutableListOf() } += declaration }
             references[declaration] = buildSet {
                 addAll(plain)
                 operatorReferences.forEach { addAll(it.referenced()) }
@@ -2052,10 +2053,6 @@ private class ScriptStructure(
                 if (declaration.isOperator && declaration.isExtension && declaration.name == "iterator") addAll(iteratorOperators)
                 remove(declaration)
             }
-        }
-        val referrers = mutableMapOf<ParsedDeclaration, MutableList<ParsedDeclaration>>()
-        plainReferences.forEach { (declaration, referenced) ->
-            referenced.forEach { referrers.getOrPut(it) { mutableListOf() } += declaration }
         }
         val required = declarations.filter { it.mustMove }.toSet()
         val variables = localProperties - constants
@@ -2116,10 +2113,14 @@ private class ScriptStructure(
             if (queue.isEmpty() && movedAccessing) {
                 accessing = accessingLocalProperties(moved)
                 movedAccessing = false
-                val unblocked = rejected.filter { it !in accessing }
-                rejected.retainAll { it in accessing }
-                moved += unblocked
-                queue += unblocked
+                val remaining = rejected.iterator()
+                remaining.forEach { declaration ->
+                    if (declaration !in accessing) {
+                        remaining.remove()
+                        moved += declaration
+                        queue += declaration
+                    }
+                }
             }
         }
         val firstReferences = mutableMapOf<ParsedDeclaration, Int>()
@@ -2149,7 +2150,6 @@ private class ScriptStructure(
         }
         return moved.sortedBy { it.start }.toCollection(LinkedHashSet())
     }
-
 
 }
 
