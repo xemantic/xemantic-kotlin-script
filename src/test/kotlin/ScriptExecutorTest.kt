@@ -87,6 +87,13 @@ class DurationLogger {
     operator fun invoke(duration: kotlin.time.Duration) = "dep:$duration"
 }
 
+/** The value, or the message of the error, so that an assertion on the values shows why the script failed. */
+private val ScriptResult.valueOrMessage: Any?
+    get() = when (this) {
+        is ScriptResult.Value -> value
+        is ScriptResult.Error -> message
+    }
+
 /** Fails with whatever the [failure] throws, instead of compiling the script. */
 class FailingCompiler(
     private val failure: suspend () -> Nothing
@@ -3731,13 +3738,12 @@ class ScriptExecutorTest {
         val executor = ScriptExecutor()
 
         // when
-        val result = executor.execute(script, listOf(dependency<(() -> Int)?>("launch") { 2 }))
+        val results = listOf<(() -> Int)?>({ 2 }, null).map { value ->
+            executor.execute(script, listOf(dependency<(() -> Int)?>("launch", value)))
+        }
 
         // then
-        result should {
-            be<ScriptResult.Value>()
-            have(value == listOf(2, 1))
-        }
+        assert(results.map { it.valueOrMessage } == listOf(listOf(2, 1), listOf(null, 1)))
     }
 
     @Test
@@ -3745,7 +3751,7 @@ class ScriptExecutorTest {
         // given
         val script = """
             fun f() = 1
-            listOf(f?.invoke(), f ?: { 3 }, f())
+            listOf(f?.invoke(), (f ?: { 3 })(), f())
         """.trimIndent()
         val executor = ScriptExecutor()
 
@@ -3755,15 +3761,11 @@ class ScriptExecutorTest {
         }
 
         // then
-        assert(results.map { result ->
-            ((result as? ScriptResult.Value)?.value as? List<*>)?.let { (invoked, elvis, called) ->
-                listOf(invoked, (elvis as () -> Int)(), called)
-            }
-        } == listOf(listOf(2, 2, 1), listOf(null, 3, 1)))
+        assert(results.map { it.valueOrMessage } == listOf(listOf(2, 2, 1), listOf(null, 3, 1)))
     }
 
     @Test
-    fun `should resolve value of dependency of nullable function type named like local function from declaration moved out of the script body`() = runTest {
+    fun `should resolve value of dependency of nullable function type from declaration moved out of the script body declaring function of its name`() = runTest {
         // given
         val script = """
             val offset = 10
@@ -3780,7 +3782,7 @@ class ScriptExecutorTest {
         }
 
         // then
-        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(listOf(2, 2), listOf(null, 3)))
+        assert(results.map { it.valueOrMessage } == listOf(listOf(2, 2), listOf(null, 3)))
     }
 
     @Test
@@ -3790,16 +3792,37 @@ class ScriptExecutorTest {
             fun logger() = 1
             listOf(logger?.invoke("a"), logger ?: "none", logger())
         """.trimIndent()
+        val logger = Logger()
         val executor = ScriptExecutor()
 
         // when
-        val result = executor.execute(script, listOf(dependency<Logger?>("logger", null)))
+        val results = listOf(logger, null).map { value ->
+            executor.execute(script, listOf(dependency<Logger?>("logger", value)))
+        }
 
         // then
-        result should {
-            be<ScriptResult.Value>()
-            have(value == listOf(null, "none", 1))
+        assert(results.map { it.valueOrMessage } == listOf(listOf("dep:a", logger, 1), listOf(null, "none", 1)))
+    }
+
+    @Test
+    fun `should resolve value of dependency of nullable type with invoke operator from declaration moved out of the script body declaring function of its name`() = runTest {
+        // given
+        val script = """
+            val prefix = "local:"
+            fun logger(message: String) = prefix + message
+            sealed interface S
+            class T : S { fun g() = logger?.invoke("a") ?: "none" }
+            listOf(T().g(), logger("b"))
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val results = listOf(Logger(), null).map { value ->
+            executor.execute(script, listOf(dependency<Logger?>("logger", value)))
         }
+
+        // then
+        assert(results.map { it.valueOrMessage } == listOf(listOf("dep:a", "local:b"), listOf("none", "local:b")))
     }
 
     @Test
