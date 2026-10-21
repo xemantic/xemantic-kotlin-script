@@ -104,6 +104,25 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should strip UTF-8 byte order mark starting script`() {
+        // given
+        val scripts = listOf(
+            "\uFEFF1 + 1",
+            "\uFEFF@file:Suppress(\"UNUSED\")\n1 + 1",
+            "\uFEFFpackage foo\n1 + 1"
+        )
+
+        // when
+        val sources = scripts.map { ScriptSource(it) }
+
+        // then
+        assert(sources.none { '\uFEFF' in it.text || '\uFEFF' in it.scriptLines.first() })
+        assert(sources.zip(scripts).all { (source, script) ->
+            source.scriptLines.first() == script.lines().first().removePrefix("\uFEFF")
+        })
+    }
+
+    @Test
     fun `should give distinct location ids to scripts of the same hash code`() {
         // given
         val scripts = listOf("\"Aa\"", "\"BB\"")

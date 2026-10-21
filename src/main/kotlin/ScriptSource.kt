@@ -219,7 +219,7 @@ internal const val SCRIPT_BLOCK_END = "} }"
  * while each line of the [text] maps back to the line of the script.
  */
 internal class ScriptSource(
-    script: String,
+    source: String,
     dependencies: List<PreambleDependency> = emptyList(),
     /**
      * Whether it is the source of the compilation confirming the [laterDeclaredDependencyCandidates]
@@ -315,6 +315,8 @@ internal class ScriptSource(
     private val bodyDeclarations: List<Declaration>
 
     init {
+        // dropped like by kotlinc, which would otherwise report it as a syntax error, counting it in the columns of the first line
+        val script = source.removePrefix("\uFEFF")
         val lineBounds = lineBounds(script)
         lineStarts = lineBounds.map { it.first }
         scriptLines = lineBounds.map { script.substring(it.first, it.last + 1) }
