@@ -4415,6 +4415,74 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report invisible delegate conventions of any delegate expression`() = runTest {
+        // given
+        val members = "operator fun plus(o: Cfg) = this; operator fun unaryMinus() = this; operator fun not() = this; " +
+                "infix fun with(o: Cfg) = this; operator fun rangeTo(o: Cfg) = this; operator fun invoke() = this"
+        val declarations = "import kotlin.reflect.KProperty\nval scale = listOf(10).first()\nclass Cfg { $members }\n" +
+                "class D(val n: Int) { operator fun getValue(t: Any?, p: KProperty<*>) = n }\nfun mk(block: () -> Unit) = Cfg()\nfun mkf(c: Cfg) = { c }\n"
+        val operators = mapOf(
+            "getValue" to "operator fun Cfg.getValue(t: Any?, p: KProperty<*>): Int = scale\n",
+            "provideDelegate" to "operator fun Cfg.provideDelegate(t: Any?, p: KProperty<*>) = D(scale)\n"
+        )
+        val delegates = listOf(
+            "cfg", "Cfg()", "(Cfg())", "Cfg().let { it }", "listOf(Cfg()).first()", "if (cfg is Cfg) Cfg() else cfg", "mk { }",
+            "Cfg()!!", "cfg as Cfg", "null ?: cfg", "when { cfg is Cfg -> cfg else -> Cfg() }", "@Deprecated(\"x\") cfg", "l@ cfg", "mkf(cfg)()",
+            "cfg + cfg", "-cfg", "!cfg", "cfg with cfg", "cfg..cfg", "(cfg)()", "(mkf(cfg))()", "@Suppress(\"x\") Cfg()",
+            // the call of the same name, bound by name to the member of the enum class
+            "mapOf(1 to cfg).getValue(1)", "l@ (mapOf(1 to cfg)).getValue(1)"
+        )
+        val scripts = operators.flatMap { (name, operator) ->
+            delegates.map { delegate ->
+                "$declarations${operator}enum class E { A; fun getValue() = 0; fun f(): Int { val cfg = Cfg(); val v: Int by $delegate; return v } }\nE.A.f()" to name
+            }
+        } + delegates.map { delegate ->
+            val variable = "class Cfg { $members; operator fun getValue(t: Any?, p: KProperty<*>) = 1 }\n" +
+                    "operator fun Cfg.setValue(t: Any?, p: KProperty<*>, v: Int) { println(scale) }\n"
+            "${declarations.replace("class Cfg { $members }\n", variable)}enum class E { A; fun getValue() = 0; fun f(): Int { val cfg = Cfg(); var v: Int by $delegate; v = 2; return v } }\nE.A.f()" to "setValue"
+        }
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { (script) -> executor.execute(script) }
+
+        // then
+        assert(results.zip(scripts).filterNot { (result, script) ->
+            result is ScriptResult.Error && "'${script.second}' does not refer to the function of the script body" in result.message
+        }.map { (_, script) -> script.second to script.first.substringAfter(" by ").substringBefore(";") }.isEmpty())
+    }
+
+    @Test
+    fun `should not hint at delegate convention enclosing unresolved call of the same name`() = runTest {
+        // given
+        val call = "lazy { \"a\".getValue(null, Foo::v) }"
+        val delegates = listOf(
+            call, "$call!!", "$call as Lazy<Int>", "null ?: $call", "($call)", "if (scale > 0) $call else lazy { 1 }",
+            "when { scale > 0 -> $call else -> lazy { 1 } }", "@Deprecated(\"x\") $call", "l@ $call", "mk(\"a\".getValue(null, Foo::v))()"
+        )
+        val scripts = delegates.map { delegate ->
+            """
+                import kotlin.reflect.KProperty
+                val scale = listOf(10).first()
+                operator fun String.getValue(t: Any?, p: KProperty<*>): Int = scale
+                fun mk(n: Int) = { lazy { n } }
+                object Foo {
+                    fun getValue(n: Int) = n
+                    val v: Int by $delegate
+                }
+                Foo.v
+            """.trimIndent()
+        }
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.all { it is ScriptResult.Error && "does not refer to the function" !in it.message })
+    }
+
+    @Test
     fun `should move operator extensions of the iterator returned by a member`() = runTest {
         // given
         val script = """

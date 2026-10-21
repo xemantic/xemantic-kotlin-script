@@ -55,12 +55,15 @@ import org.jetbrains.kotlin.psi.KtLabelReferenceExpression
 import org.jetbrains.kotlin.psi.KtNamedDeclaration
 import org.jetbrains.kotlin.psi.KtNamedFunction
 import org.jetbrains.kotlin.psi.KtObjectDeclaration
+import org.jetbrains.kotlin.psi.KtOperationExpression
 import org.jetbrains.kotlin.psi.KtParameter
 import org.jetbrains.kotlin.psi.KtParenthesizedExpression
 import org.jetbrains.kotlin.psi.KtPrefixExpression
 import org.jetbrains.kotlin.psi.KtProperty
 import org.jetbrains.kotlin.psi.KtPropertyDelegate
 import org.jetbrains.kotlin.psi.KtPropertyAccessor
+import org.jetbrains.kotlin.psi.KtPsiUtil
+import org.jetbrains.kotlin.psi.KtQualifiedExpression
 import org.jetbrains.kotlin.psi.KtPsiFactory
 import org.jetbrains.kotlin.psi.KtSimpleNameExpression
 import org.jetbrains.kotlin.psi.KtStringTemplateExpression
@@ -123,7 +126,9 @@ internal class LaterDeclaredReference(
     /** Whether it refers to the declaration as a function, like `::foo`, which might be resolved to a property instead. */
     val isCallableReference: Boolean = false,
     /** Whether it is an operator, or a convention, like `[]` of `get`, sharing its position with other ones, like `set`. */
-    val isOperator: Boolean = false
+    val isOperator: Boolean = false,
+    /** The references of its name within it, the warnings at which are of them, see [Reference.inner]. */
+    val inner: List<ScriptReference> = emptyList()
 ) {
     val kind: String get() = if (isFunction) "function" else "property"
 }
@@ -346,7 +351,8 @@ internal class ScriptSource(
         }
         fun Reference.toScriptReference() = ScriptReference(name, position(offset), position(offset + length))
         fun Triple<Reference, Int, Boolean>.toLaterDeclaredReference() = LaterDeclaredReference(
-            first.toScriptReference(), position(second).line, third, first.isCallableReference, first.isOperator
+            first.toScriptReference(), position(second).line, third, first.isCallableReference, first.isOperator,
+            first.inner.map { ScriptReference(first.name, position(it.first), position(it.last + 1)) }
         )
         laterDeclaredDependencyCandidates = structure.laterDeclaredDependencyCandidates.map { it.toLaterDeclaredReference() }
         hiddenLocalFunctionCandidates = structure.hiddenLocalFunctionCandidates.map { it.toLaterDeclaredReference() }
@@ -763,7 +769,13 @@ private class Reference(
     /** Whether it is an operator, or a convention, like `+`, referring to the operator functions only, like `plus`. */
     val isOperator: Boolean = false,
     /** Whether it is within a lambda, which might have a receiver, so its resolution is not known without compiling. */
-    val isInLambda: Boolean = false
+    val isInLambda: Boolean = false,
+    /**
+     * The ranges of the references of its [name] within it, unless the compiler reports it at one of them,
+     * like `getValue` of `by lazy { "a".getValue(null, p) }`, the warnings at which are of them,
+     * even if not candidates themselves, like when bound by name to a member, which does not apply.
+     */
+    val inner: List<IntRange> = emptyList()
 ) {
 
     /** Whether it might refer to one of the local declarations of the script body of these [names]. */
@@ -837,7 +849,8 @@ private fun PsiElement.operatorReferences(
         names: List<String>,
         element: PsiElement,
         offset: Int = element.startOffset,
-        length: Int = element.textLength
+        length: Int = element.textLength,
+        inner: (String) -> List<IntRange> = { emptyList() }
     ) {
         val canAccessScriptMembers = canAccessScriptMembers(element, scope)
         names.forEach { name ->
@@ -851,7 +864,8 @@ private fun PsiElement.operatorReferences(
                     isCall = true,
                     isCallableReference = false,
                     canAccessScriptMembers = canAccessScriptMembers,
-                    isOperator = true
+                    isOperator = true,
+                    inner = inner(name)
                 )
             )
         }
@@ -885,10 +899,26 @@ private fun PsiElement.operatorReferences(
                 val arguments = element.valueArgumentList ?: element.lambdaArguments.firstOrNull() ?: element
                 add(listOf("invoke"), element, arguments.startOffset, arguments.textLength)
             }
-            is KtPropertyDelegate -> add(listOf("getValue", "setValue", "provideDelegate"), element)
+            // the compiler reports the calls on the delegate expression, or at its callee, like `let` of `by Cfg().let { it }`,
+            // which might be a reference of the same name, like in `by map.getValue("a")`
+            is KtPropertyDelegate -> {
+                val callee = element.expression?.reportedCallee()
+                val names = element.collectDescendantsOfType<KtSimpleNameExpression> { it !== callee }.groupBy { it.getReferencedName() }
+                add(listOf("getValue", "setValue", "provideDelegate"), element) { name ->
+                    names[name].orEmpty().map { it.startOffset until it.endOffset }
+                }
+            }
             else -> {}
         }
     }
+}
+
+/** The callee reported as the position of the call of this expression, like `let` of `Cfg().let { it }`, or `+` of `a + b`. */
+private fun KtExpression.reportedCallee(): KtExpression? = when (val expression = KtPsiUtil.safeDeparenthesize(this)) {
+    is KtQualifiedExpression -> expression.selectorExpression?.reportedCallee()
+    is KtCallExpression -> expression.calleeExpression?.reportedCallee()
+    is KtOperationExpression -> expression.operationReference
+    else -> expression
 }
 
 /** Whether the [expression] is within a lambda, which might have a receiver, within the [scope], exclusive. */
