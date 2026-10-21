@@ -102,6 +102,19 @@ when (result) {
   It is still compiled outside of the script body, when it reads the local values only through the local functions,
   or only the values initialized with a literal, or a local value named `field`,
   or within a lambda with a receiver, like `buildString { append(prefix) }` or `with(items) { size }`.
+  So is an inline function, as a local function cannot be inline,
+  unless it reads the local values of the script body outside of a lambda, directly or through the local functions,
+  like `inline fun logged(block: () -> Unit) { log += "start"; block() }`,
+  which compiles it as a local function without the `inline`, `noinline` and `crossinline` modifiers,
+  as long as it is not an extension function, nor overloaded, nor recursive, has no reified type parameters, no context parameters,
+  no annotations but `@Suppress`, no modifiers but the visibility and `suspend`, does not refer to `this` or `super`,
+  is not called before its declaration, nor where a receiver might resolve the call instead, like `run` in `class A { fun go() = run { } }`,
+  does not refer within a lambda to a name declared by the script, which might be resolved on its receiver instead, like `name` in `user.run { name }`,
+  nor to a name, which might be resolved on the receivers of the script body instead, like `isActive`, unless it is a local value declared before,
+  nor to a property or a function declared after,
+  and the lambdas passed to it do not return, break or continue to outside of them, like `return` in `fun first(): Int { logged { return 1 }; return 0 }`.
+  Unlike when inlined, these lambdas cannot call the suspending functions, which is reported as an error with a hint,
+  and the warning of an inline function without parameters of function types is not reported.
   Therefore, they cannot refer to the local values of the script body, only to the dependencies,
   except the ones initialized with a literal, like `val taxRate = 0.2`, which are moved together with them,
   unless their type names a local class staying in the script body, like `val x: Foo? = null`,
