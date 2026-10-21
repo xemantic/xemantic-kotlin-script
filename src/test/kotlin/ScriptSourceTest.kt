@@ -66,6 +66,102 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should move function reading only constants together with them when called by declaration which cannot be local`() {
+        // given
+        val script = """
+            val RATE = 0.2
+            fun tax(x: Double) = x * RATE
+            sealed class Item { abstract val price: Double; fun total() = price + tax(price) }
+            class Book(override val price: Double) : Item()
+            Book(10.0).total()
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        assert("val RATE = 0.2" in moved && "fun tax(x: Double) = x * RATE" in moved)
+        assert(body.removeSuffix(SCRIPT_BLOCK_END).trim() == "Book(10.0).total()")
+    }
+
+    @Test
+    fun `should not move function reading property which is not constant`() {
+        // given
+        val scripts = listOf(
+            "var RATE = 0.2\nfun tax(x: Double) = x * RATE\nsealed class Item { fun total() = tax(1.0) }\nRATE = 0.5",
+            "val RATE = 0.2\nval BASE = RATE * 2\nfun tax(x: Double) = x * RATE + BASE\nsealed class Item { fun total() = tax(1.0) }\n1"
+        )
+
+        // when
+        val sources = scripts.map { ScriptSource(it) }
+
+        // then
+        sources.forEach { source ->
+            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            assert("fun tax(x: Double)" !in moved && "fun tax(x: Double)" in body)
+        }
+    }
+
+    @Test
+    fun `should not move constant of type of local class together with function reading it`() {
+        // given
+        val script = """
+            class Foo
+            val x: Foo? = null
+            val s = describe()
+            fun describe() = "d" + x
+            s
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        assert("class Foo" in body && "val x: Foo? = null" in body && "fun describe()" in body)
+        assert("class Foo" !in moved && "val x: Foo? = null" !in moved && "fun describe()" !in moved)
+    }
+
+    @Test
+    fun `should move constant of type of local class moved together with function reading it`() {
+        // given
+        val scripts = listOf(
+            "class Foo\nval x: Foo? = null\nsealed interface S\nclass T : S { fun f() = x; fun g() = Foo() }\nT().f()",
+            "data class Foo(val a: Int)\nval x: Foo? = null\nsealed class S { fun g() = \"g\" + x + h() }\nclass T : S()\nfun h() = Foo(1)\nT().g()"
+        )
+
+        // when
+        val sources = scripts.map { ScriptSource(it) }
+
+        // then
+        sources.forEach { source ->
+            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            assert("class Foo" in moved && "val x: Foo? = null" in moved && "val x" !in body)
+        }
+    }
+
+    @Test
+    fun `should not move function reading constant called before its declaration only where receiver might resolve it`() {
+        // given
+        val scripts = listOf(
+            "val k = \"!\"\nval s = buildString { append(\"x\") }\nfun append(t: String) = t + k\nappend(s)",
+            "val k = 10\nval r = with(listOf(1, 2)) { sum() }\nfun sum() = k\nr",
+            "val k = \"!\"\nval o = object { fun f() = describe(1) }\nfun describe(i: Int) = \"n${'$'}i${'$'}k\"\no.f()",
+            "val k = 2\nclass Box(val n: Int)\nfun Box.twice() = scale(n)\nfun scale(n: Int) = n * k\nBox(1).twice()"
+        )
+
+        // when
+        val sources = scripts.map { ScriptSource(it) }
+
+        // then
+        sources.forEach { source ->
+            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            assert("val k" !in moved && "val k" in body)
+        }
+    }
+
+    @Test
     fun `should give distinct location ids to scripts of the same hash code`() {
         // given
         val scripts = listOf("\"Aa\"", "\"BB\"")

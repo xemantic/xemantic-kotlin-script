@@ -750,13 +750,26 @@ private class Reference(
     /** Whether it is an operator, or a convention, like `+`, referring to the operator functions only, like `plus`. */
     val isOperator: Boolean = false,
     /** Whether it is within a lambda, which might have a receiver, so its resolution is not known without compiling. */
-    val isInLambda: Boolean = false
+    val isInLambda: Boolean = false,
+    /**
+     * Whether it is within a lambda, a class, an object, or an extension function,
+     * so it might resolve to a member of their receivers, like `append` in `buildString { append("x") }`.
+     */
+    val mightResolveOnReceiver: Boolean = false
 ) {
 
     /** Whether it might refer to one of the local declarations of the script body of these [names]. */
     fun refersToLocal(
         names: Set<String>
     ): Boolean = !isQualified && !isBound && name in names
+
+    /**
+     * Whether it might refer to one of these [constants] of the script body, moved together with the declaration it is within,
+     * which can access the members of the script, unlike e.g. an object.
+     */
+    fun refersToConstant(
+        constants: Set<String>
+    ): Boolean = canAccessScriptMembers && refersToLocal(constants)
 
 }
 
@@ -787,7 +800,8 @@ private fun PsiElement.references(
                 || (expression is KtOperationReferenceExpression && expression.getReferencedNameElementType() == KtTokens.IDENTIFIER),
         isCallableReference = callableReference?.callableReference == expression,
         canAccessScriptMembers = canAccessScriptMembers(expression, scope),
-        isInLambda = isInLambda(expression, scope)
+        isInLambda = isInLambda(expression, scope),
+        mightResolveOnReceiver = mightResolveOnReceiver(expression, scope)
     )
 } + operatorReferences(scope)
 
@@ -883,6 +897,14 @@ private fun isInLambda(
     expression: PsiElement,
     scope: PsiElement
 ): Boolean = expression.parents.takeWhile { it !== scope }.any { it is KtLambdaExpression }
+
+/** See [Reference.mightResolveOnReceiver]. */
+private fun mightResolveOnReceiver(
+    expression: PsiElement,
+    scope: PsiElement
+): Boolean = expression.parents.takeWhile { it !== scope }.any {
+    it is KtLambdaExpression || it is KtClassOrObject || (it is KtNamedFunction && it.receiverTypeReference != null)
+}
 
 /** See [Reference.canAccessScriptMembers]. */
 private fun canAccessScriptMembers(
@@ -1083,22 +1105,40 @@ private class ScriptStructure(
             declarationsByPsi[statement]?.references ?: statement.references(scope = statement.parent, declaredNames)
         }
         val bodyReferences = statementReferences.flatten()
+        // the ones of the declarations which cannot be local keep their order, when moved, also relative to the ones they refer to
+        val receiverReferences = statements.zip(statementReferences).flatMap { (statement, references) ->
+            if (declarationsByPsi[statement]?.requiresMove == true) emptyList() else references.filter { it.mightResolveOnReceiver }
+        }
         // only the properties which require it are moved
         val properties = declarations.filter { it.kind == DeclarationKind.PROPERTY && !it.requiresMove }
         val propertyNames = properties.flatMap { listOfNotNull(it.name) + it.destructuredNames }
         val propertyNameSet = propertyNames.toSet()
         val propertyNameCounts = propertyNames.groupingBy { it }.eachCount()
         // initialized with a literal, so they can be initialized at any time, moved with the declarations referring to them
-        val constants = properties.filter { property ->
+        var constants = properties.filter { property ->
             val psi = property.psi as? KtProperty
             psi != null && !psi.isVar && psi.delegate == null && psi.initializer.isConstant() && property.accessors.isEmpty()
                     && property.name !in dependencyNames && property.name !in coroutineScopeProperties
                     && propertyNameCounts[property.name] == 1
         }
-        val selected = selectMovedDeclarations(declarations, bodyReferences, propertyNameSet)
-        // referred to by the moved declarations, which can access the members of the script, unlike e.g. an object
+        val typeNames = constants.associateWith { constant ->
+            (constant.psi as KtProperty).typeReference?.collectDescendantsOfType<KtUserType>().orEmpty().mapNotNull { it.referencedName }
+        }
+        val classes = declarations.filter { it.kind == DeclarationKind.CLASS && it.name != null }
+        var constantNames: Set<String>
+        var selected: Set<ParsedDeclaration>
+        // unless their type names a local class, like `val x: Foo? = null`, which would not be visible to them,
+        // while the fewer constants, the fewer declarations are moved, possibly not the classes of the remaining ones
+        while (true) {
+            constantNames = constants.mapTo(HashSet()) { it.name!! }
+            selected = selectMovedDeclarations(declarations, bodyReferences, receiverReferences, propertyNameSet, constantNames)
+            val localClassNames = classes.filter { it !in selected }.mapTo(HashSet()) { it.name!! }
+            val remaining = constants.filter { constant -> typeNames.getValue(constant).none { it in localClassNames } }
+            if (remaining.size == constants.size) break
+            constants = remaining
+        }
         val referredConstants = selected.flatMapTo(HashSet()) { declaration ->
-            declaration.references.filter { it.canAccessScriptMembers && it.refersToLocal(propertyNameSet) }.map { it.name }
+            declaration.references.filter { it.refersToConstant(constantNames) }.map { it.name }
         }
         val movedConstants = constants.filter { it.name in referredConstants }
         val moved = (selected + movedConstants).sortedBy { it.start }.toCollection(LinkedHashSet())
@@ -1469,12 +1509,17 @@ private class ScriptStructure(
      * Local functions and classes are not visible before their declaration, so the ones referred to earlier are moved as well.
      *
      * The references are recognized by the names only, which might be the names of members as well,
-     * therefore a function is not moved if it, or the declarations it refers to, access the local properties of the script body.
+     * therefore a function is not moved if it, or the declarations it refers to, access the local properties of the script body,
+     * except the [constants], which are moved together with the declarations referring to them,
+     * unless referred to from where the members of the script are not accessible, like an object.
      */
     private fun selectMovedDeclarations(
         declarations: List<ParsedDeclaration>,
         bodyReferences: List<Reference>,
-        localProperties: Set<String>
+        /** The [bodyReferences] which might resolve on receivers, outside of the declarations which cannot be local. */
+        receiverReferences: List<Reference>,
+        localProperties: Set<String>,
+        constants: Set<String>
     ): Set<ParsedDeclaration> {
         val named = declarations.filter { it.name != null && it.kind != DeclarationKind.PROPERTY }
         val namedByName = named.groupBy { it.name!! }
@@ -1512,8 +1557,25 @@ private class ScriptStructure(
             referenced.forEach { referrers.getOrPut(it) { mutableListOf() } += declaration }
         }
         val required = declarations.filter { it.requiresMove }.toSet()
+        val variables = localProperties - constants
+        // the declarations reading the constants, or referring to such ones, which would be local, if the constants were
+        val readingConstants = declarations.filterTo(mutableSetOf()) { declaration ->
+            declaration.references.any { it.refersToConstant(constants) }
+        }
+        ArrayDeque(readingConstants).let { queue ->
+            while (queue.isNotEmpty()) {
+                referrers[queue.removeFirst()].orEmpty().forEach { if (readingConstants.add(it)) queue += it }
+            }
+        }
+        // referred to before their declaration where a receiver might resolve them instead, like `append` in `buildString { append("x") }`,
+        // which resolves to the declaration once moved, so they stay local, as if the constants were local
+        val referredToOnReceivers = receiverReferences.flatMapTo(HashSet()) { reference ->
+            reference.referenced().filter { it in readingConstants && reference.offset < it.start }
+        }
         val accessingLocalProperties = declarations.filter { declaration ->
-            declaration.references.any { it.refersToLocal(localProperties) }
+            declaration in referredToOnReceivers || declaration.references.any {
+                it.refersToLocal(variables) || (!it.canAccessScriptMembers && it.refersToLocal(constants))
+            }
         }.toSet()
         /** The declarations not [moved] yet, which access the local properties, or refer to such ones not moved yet. */
         fun accessingLocalProperties(
