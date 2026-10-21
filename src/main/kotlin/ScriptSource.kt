@@ -301,6 +301,17 @@ internal class ScriptSource(
      */
     val hiddenLocalFunctionCandidates: List<LaterDeclaredReference>
 
+    /**
+     * The callable references of the classes moved out of the script body to the moved functions and properties, or to the dependencies,
+     * like `::log`, or to the moved extensions, like `String::up`, which are the members of the script class, crashing the compiler backend,
+     * from the whole callable reference to the end of the name, recognized by the names only, without the ones bound in the classes,
+     * with their texts in a single line.
+     */
+    val scriptMemberCallableReferences: List<Pair<ScriptReference, String>>
+
+    /** The package of the script, like `foo.bar`, or an empty string, if it has none. */
+    val packageName: String
+
     private val lineStarts: List<Int>
 
     /** For each line of the [text], the line of the script, or `null` for the lines of the block and the preamble. */
@@ -328,9 +339,9 @@ internal class ScriptSource(
         unmatchedClosingBrace = structure.unmatchedClosingBrace?.let { position(it) }
         movedDeclarations = structure.movedDeclarations
         returnsUnit = structure.endsWithMovedDeclaration
-        conflictingDependencyDeclarations = structure.conflictingDependencyDeclarations.map { (name, range) ->
-            ScriptReference(name, position(range.first), position(range.last + 1))
-        }
+        packageName = structure.packageName
+        fun Pair<String, IntRange>.toScriptReference() = ScriptReference(first, position(second.first), position(second.last + 1))
+        conflictingDependencyDeclarations = structure.conflictingDependencyDeclarations.map { it.toScriptReference() }
         fun Reference.toScriptReference() = ScriptReference(name, position(offset), position(offset + length))
         fun Triple<Reference, Int, Boolean>.toLaterDeclaredReference() = LaterDeclaredReference(
             first.toScriptReference(), position(second).line, third, first.isCallableReference, first.isOperator
@@ -341,6 +352,10 @@ internal class ScriptSource(
             Triple(reference.toScriptReference(), position(property).line, position(function).line)
         }
         coroutineScopeCandidates = structure.coroutineScopeCandidates.map { it.toLaterDeclaredReference() }
+        scriptMemberCallableReferences = structure.scriptMemberCallableReferences.map { reference ->
+            // like `String::up` split across lines
+            reference.toScriptReference() to script.substring(reference.second).split(lineBreak).joinToString("")
+        }
         bodyDeclarations = structure.bodyDeclarations
         val deprecatedDependencies = if (confirming) {
             laterDeclaredDependencyCandidates.mapTo(HashSet()) { it.reference.name }
@@ -518,6 +533,19 @@ internal class ScriptSource(
     }
 
     /**
+     * The start and the end of the name of the innermost declaration of the [path] found in the script,
+     * like `I` of `T.I.f`, starting with the declaration moved out of the script body, like `T`.
+     */
+    fun movedDeclarationPath(
+        path: List<String>
+    ): Pair<ScriptPosition, ScriptPosition>? = movedDeclarations.find { it.name == path.firstOrNull() }?.let { declaration ->
+        (path.lastIndex downTo 1).firstNotNullOfOrNull { declaration.nestedPathRanges[path.subList(1, it + 1).joinToString(".")] }
+            ?: declaration.nameRange
+    }?.let {
+        position(it.first) to position(it.last + 1)
+    }
+
+    /**
      * The 0-based line of the declaration of the [name] in the script body, and its kind.
      */
     fun bodyDeclarationLine(
@@ -537,6 +565,8 @@ internal class ScriptSource(
     }
 
 }
+
+private val lineBreak = Regex("\\s*\n\\s*")
 
 @OptIn(ExperimentalAtomicApi::class)
 private val sourceIdSeq = AtomicLong(0)
@@ -579,7 +609,12 @@ private class Declaration(
     /** The names of a destructuring declaration, like `val (a, b) = pair`. */
     val destructuredNames: List<String> = emptyList(),
     /** The ranges of the names of the classes nested in the declaration, by these names, the first one of each name. */
-    val nestedNameRanges: Map<String, IntRange> = emptyMap()
+    val nestedNameRanges: Map<String, IntRange> = emptyMap(),
+    /**
+     * The ranges of the names of the classes and the functions nested in the declaration, by their paths within it, like `I.f`,
+     * as the compiler names them in the failures of its backend, the first one of each path.
+     */
+    val nestedPathRanges: Map<String, IntRange> = emptyMap()
 )
 
 internal enum class DeclarationKind {
@@ -608,6 +643,13 @@ private val nonLocalClassModifiers = listOf(
 
 /** The annotations, which are not applicable to local declarations. */
 private val memberOnlyAnnotations = setOf("Volatile", "Transient", "JvmField", "JvmName", "JvmOverloads")
+
+/** Whether it is named in the path of the code, which the compiler reports in the failures of its backend, unlike e.g. an object literal. */
+private fun KtNamedDeclaration.isPathElement(): Boolean =
+    (this is KtClassOrObject && !(this is KtObjectDeclaration && isObjectLiteral())) || this is KtNamedFunction
+
+private fun KtNamedDeclaration.pathName(): String? =
+    name ?: if (this is KtObjectDeclaration && isCompanion()) "Companion" else null
 
 private fun KtDeclaration.memberOnlyAnnotationEntries(): List<KtAnnotationEntry> = annotationEntries.filter {
     it.useSiteTarget != null || it.shortName?.asString() in memberOnlyAnnotations
@@ -742,6 +784,8 @@ private class Reference(
     val isCall: Boolean,
     /** Whether it is a callable reference, like `foo` in `::foo`. */
     val isCallableReference: Boolean,
+    /** The start of the whole callable reference, like `String::foo`, or the [offset], if it is not one. */
+    val expressionOffset: Int,
     /**
      * Whether it is within a declaration, which can access the members of the script, when moved out of the script body,
      * unlike e.g. an object, an enum class, an interface, or a nested class.
@@ -786,6 +830,7 @@ private fun PsiElement.references(
                 || callableReference?.callableReference == expression
                 || (expression is KtOperationReferenceExpression && expression.getReferencedNameElementType() == KtTokens.IDENTIFIER),
         isCallableReference = callableReference?.callableReference == expression,
+        expressionOffset = callableReference?.takeIf { it.callableReference == expression }?.startOffset ?: expression.startOffset,
         canAccessScriptMembers = canAccessScriptMembers(expression, scope),
         isInLambda = isInLambda(expression, scope)
     )
@@ -837,6 +882,7 @@ private fun PsiElement.operatorReferences(
                     isBound = false,
                     isCall = true,
                     isCallableReference = false,
+                    expressionOffset = offset,
                     canAccessScriptMembers = canAccessScriptMembers,
                     isOperator = true
                 )
@@ -1042,6 +1088,11 @@ private class ScriptStructure(
     /** See [ScriptSource.coroutineScopeCandidates], with the offsets of the declarations, and whether they are functions. */
     val coroutineScopeCandidates: List<Triple<Reference, Int, Boolean>>
 
+    /** See [ScriptSource.packageName]. */
+    val packageName: String
+
+    /** The names and the ranges of the [ScriptSource.scriptMemberCallableReferences]. */
+    val scriptMemberCallableReferences: List<Pair<String, IntRange>>
 
     /**
      * The deprecated copies of the local functions, see [ScriptSource.laterDeclaredDependencyCandidates],
@@ -1066,6 +1117,7 @@ private class ScriptStructure(
 
     init {
         val file = psiFactory.createFile("script.kts", script)
+        packageName = file.packageFqName.asString()
         headerEnd = listOfNotNull(
             file.firstChild?.takeIf { it.node.elementType == KtTokens.SHEBANG_COMMENT },
             // like `@file:JvmName("x")`, while the parser takes there also a stray `@` of the script body
@@ -1111,6 +1163,21 @@ private class ScriptStructure(
         localProperties = propertyNameSet - movedConstants.mapTo(HashSet()) { it.name!! }
         movedDeclarations = moved.map { it.toDeclaration(withNestedNames = true) }
         endsWithMovedDeclaration = moved.any { it.psi == statements.lastOrNull() }
+        val (movedExtensions, movedMembers) = moved
+            .filter { it.kind == DeclarationKind.FUNCTION || it.kind == DeclarationKind.PROPERTY }
+            .partition { it.isExtension || (it.psi as? KtProperty)?.receiverTypeReference != null }
+        val scriptMemberNames = movedMembers.flatMapTo(HashSet(dependencyNames)) { listOfNotNull(it.name) + it.destructuredNames }
+        val scriptExtensionNames = movedExtensions.mapNotNullTo(HashSet()) { it.name }
+        scriptMemberCallableReferences = moved.filter { it.kind == DeclarationKind.CLASS }.flatMap { declaration ->
+            declaration.references.filter {
+                it.isCallableReference && it.canAccessScriptMembers && if (it.isQualified) {
+                    // like `String::up`, where the members of the class do not apply
+                    it.name in scriptExtensionNames
+                } else {
+                    !it.isBound && it.name in scriptMemberNames
+                }
+            }
+        }.map { it.name to (it.expressionOffset until it.offset + it.length) }
         // unlike an extension function, which cannot be called like the dependency
         val (local, movedOut) = declarations.filter { it.kind == DeclarationKind.FUNCTION && !it.isExtension }.partition { it !in moved }
         localFunctions = local.mapNotNullTo(HashSet()) { it.name }
@@ -1380,6 +1447,21 @@ private class ScriptStructure(
                                 putIfAbsent("Companion", it.startOffset until it.endOffset)
                             }
                         }
+                    }
+                }
+            } else {
+                emptyMap()
+            },
+            nestedPathRanges = if (withNestedNames) {
+                buildMap {
+                    psi.collectDescendantsOfType<KtNamedDeclaration> { it.isPathElement() }.forEach { nested ->
+                        val path = (nested.parents.takeWhile { it !== psi }.filterIsInstance<KtNamedDeclaration>()
+                            .filter { it.isPathElement() }.toList().asReversed() + nested)
+                            .map { it.pathName() ?: return@forEach }
+                        val name = nested.nameIdentifier
+                            ?: nested.modifierList?.getModifier(KtTokens.COMPANION_KEYWORD)
+                            ?: return@forEach
+                        putIfAbsent(path.joinToString("."), name.startOffset until name.endOffset)
                     }
                 }
             } else {
