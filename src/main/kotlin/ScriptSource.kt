@@ -1790,17 +1790,18 @@ private class ScriptStructure(
         // the properties, which might be the constants moved together with the declarations reading them, are not variables
         val variableProperties = properties.filterNot { it.isConstant(dependencyNames, propertyNameCounts) }
         val variables = variableProperties.flatMapTo(HashSet()) { it.names }
+        // the local variables declared before, which take precedence over the receivers, unlike the ones declared later
+        val firstVariableStarts = variableProperties.startsByName(::minOf)
+        // the properties declared after, which are not visible to the local ones, unlike in the script
+        val lastPropertyStarts = declarations.filter { it.kind == DeclarationKind.PROPERTY }.startsByName(::maxOf)
         val candidates = declarations.filter { declaration ->
-            // the local variables declared before, which take precedence over the receivers, unlike the ones declared later
-            val earlierVariables = variableProperties.filter { it.start < declaration.start }.flatMapTo(HashSet()) { it.names }
-            val laterProperties = declarations.filter { it.kind == DeclarationKind.PROPERTY && it.start > declaration.start }
-                .flatMapTo(HashSet()) { it.names }
             declaration.isDelegable && declaration.name !in callableReferences && declaration.references.filter { reference ->
                 declaration.accessors.any { reference.offset in it.startOffset until it.endOffset }
             }.all {
                 it.isQualified || it.isBound || (
-                        it.name != declaration.name && it.name !in excludedNames && it.name !in laterProperties
-                                && (it.name !in receiverNames || it.name in earlierVariables)
+                        it.name != declaration.name && it.name !in excludedNames
+                                && (lastPropertyStarts[it.name] ?: -1) <= declaration.start
+                                && (it.name !in receiverNames || (firstVariableStarts[it.name] ?: Int.MAX_VALUE) < declaration.start)
                                 && (it.name in allowedNames || it.name.first().isUpperCase())
                         )
             }
@@ -1848,16 +1849,14 @@ private class ScriptStructure(
         val variableProperties = properties.filterNot { it.isConstant(dependencyNames, propertyNameCounts) }
         val variables = variableProperties.flatMapTo(HashSet()) { it.names }
         // the local variables declared before, which take precedence over the receivers, unlike the ones declared later
-        val firstVariableStarts = mutableMapOf<String, Int>()
-        variableProperties.forEach { property -> property.names.forEach { firstVariableStarts.putIfAbsent(it, property.start) } }
+        val firstVariableStarts = variableProperties.startsByName(::minOf)
         // resolved before the members of the receivers, if local, like `name` in `user.run { name }`, unlike in the script
         val localDeclarations = declarations.filter {
             it.kind == DeclarationKind.PROPERTY || (it.kind == DeclarationKind.FUNCTION && !it.isExtension)
         }
         val localNames = localDeclarations.flatMapTo(HashSet()) { it.names }
         // not visible to the local function, if declared after it, which would refer to other declarations of these names, like `check` of the standard library
-        val lastStarts = mutableMapOf<String, Int>()
-        localDeclarations.forEach { declaration -> declaration.names.forEach { lastStarts.merge(it, declaration.start, ::maxOf) } }
+        val lastStarts = localDeclarations.startsByName(::maxOf)
         // the overloads staying local would hide the moved ones
         val functionNameCounts = declarations.filter { it.kind == DeclarationKind.FUNCTION }.groupingBy { it.name }.eachCount()
         val referencesByName = bodyReferences.filter { !it.isQualified && !it.isBound }.groupBy { it.name }
@@ -1985,6 +1984,13 @@ private class ScriptStructure(
                 && accessors.none { it.anyDescendantOfType<KtThisExpression>() || it.anyDescendantOfType<KtSuperExpression>() }
     }
 
+    /** The start of the first, or of the last, of the declarations of each name, as chosen by the [select], like [minOf]. */
+    private fun List<ParsedDeclaration>.startsByName(
+        select: (Int, Int) -> Int
+    ): Map<String, Int> = buildMap {
+        this@startsByName.forEach { declaration -> declaration.names.forEach { merge(it, declaration.start, select) } }
+    }
+
     /** Whether the [offset] is preceded only by whitespaces in its line. */
     private fun isOnNewLine(
         offset: Int
@@ -2027,28 +2033,26 @@ private class ScriptStructure(
         }
         // the operator functions called on the result of `iterator`, like by a for loop
         val iteratorOperators = named.filter { it.isOperator && it.isExtension && (it.name == "hasNext" || it.name == "next") }
-        // not by the operators, which refer to the operator functions by their names only, whatever the types of the operands,
-        // so an operator function accessing the local properties would make all the declarations using such an operator accessing,
-        // while the ones calling it indeed are reported, see ScriptSource.hiddenLocalFunctionCandidates
-        val plainReferences = declarations.associateWith { declaration ->
-            buildSet {
-                declaration.references.filter { !it.isOperator }.forEach { addAll(it.referenced()) }
+        val references = LinkedHashMap<ParsedDeclaration, Set<ParsedDeclaration>>()
+        // the declarations referring to each one, not by the operators, which refer to the operator functions by their names only,
+        // whatever the types of the operands, so an operator function accessing the local properties would make all the declarations
+        // using such an operator accessing, while the ones calling it indeed are reported, see ScriptSource.hiddenLocalFunctionCandidates
+        val referrers = mutableMapOf<ParsedDeclaration, MutableList<ParsedDeclaration>>()
+        declarations.forEach { declaration ->
+            val (operatorReferences, otherReferences) = declaration.references.partition { it.isOperator }
+            val plain = buildSet {
+                otherReferences.forEach { addAll(it.referenced()) }
                 if (declaration.isSealed) addAll(subtypesByName[declaration.name].orEmpty())
                 remove(declaration)
             }
-        }
-        // the operator functions called on the result of the `iterator` extension, like by a for loop
-        val references = declarations.associateWith { declaration ->
-            buildSet {
-                addAll(plainReferences.getValue(declaration))
-                declaration.references.filter { it.isOperator }.forEach { addAll(it.referenced()) }
+            plain.forEach { referrers.getOrPut(it) { mutableListOf() } += declaration }
+            references[declaration] = buildSet {
+                addAll(plain)
+                operatorReferences.forEach { addAll(it.referenced()) }
+                // the operator functions called on the result of the `iterator` extension, like by a for loop
                 if (declaration.isOperator && declaration.isExtension && declaration.name == "iterator") addAll(iteratorOperators)
                 remove(declaration)
             }
-        }
-        val referrers = mutableMapOf<ParsedDeclaration, MutableList<ParsedDeclaration>>()
-        plainReferences.forEach { (declaration, referenced) ->
-            referenced.forEach { referrers.getOrPut(it) { mutableListOf() } += declaration }
         }
         val required = declarations.filter { it.mustMove }.toSet()
         val variables = localProperties - constants
@@ -2086,19 +2090,35 @@ private class ScriptStructure(
         }
         val moved = required.toMutableSet()
         var accessing = accessingLocalProperties(moved)
+        // the accessing functions referred to by the moved declarations
+        val rejected = mutableSetOf<ParsedDeclaration>()
+        var movedAccessing = false
         val queue = ArrayDeque(moved)
         while (queue.isNotEmpty()) {
             references.getValue(queue.removeFirst()).forEach { declaration ->
-                if (declaration !in moved && (declaration.kind != DeclarationKind.FUNCTION || declaration !in accessing)) {
-                    moved += declaration
-                    queue += declaration
-                    // moving a declaration, which is not accessing, cannot change the accessing ones,
-                    // as they refer to the local properties only through the accessing ones
-                    if (declaration in accessing) {
-                        accessing = accessingLocalProperties(moved)
-                        // the functions rejected before might not be accessing anymore
-                        queue.clear()
-                        queue += moved
+                if (declaration !in moved) {
+                    if (declaration.kind == DeclarationKind.FUNCTION && declaration in accessing) {
+                        rejected += declaration
+                    } else {
+                        moved += declaration
+                        queue += declaration
+                        // moving a declaration, which is not accessing, cannot change the accessing ones,
+                        // as they refer to the local properties only through the accessing ones
+                        if (declaration in accessing) movedAccessing = true
+                    }
+                }
+            }
+            // the accessing ones only shrink as more declarations are moved, so the moves allowed by the ones computed before stay allowed,
+            // and they are recomputed only once no more moves are allowed, after which only the rejected functions might be moved
+            if (queue.isEmpty() && movedAccessing) {
+                accessing = accessingLocalProperties(moved)
+                movedAccessing = false
+                val remaining = rejected.iterator()
+                remaining.forEach { declaration ->
+                    if (declaration !in accessing) {
+                        remaining.remove()
+                        moved += declaration
+                        queue += declaration
                     }
                 }
             }

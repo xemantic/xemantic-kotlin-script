@@ -47,6 +47,46 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should move many classes accessing local property referred to by declaration which cannot be local`() {
+        // given
+        val count = 50_000
+        val script = buildString {
+            appendLine("var x = 1")
+            appendLine("enum class All { A; fun all() = listOf(${(0 until count).joinToString { "C$it()" }}) }")
+            (0 until count).forEach { appendLine("class C$it { fun v() = x }") }
+            append("All.A.all()")
+        }
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        assert("class C0 { fun v() = x }" in moved && "class C${count - 1} { fun v() = x }" in moved)
+        assert(body.removeSuffix(SCRIPT_BLOCK_END).lines().filter { it.isNotBlank() } == listOf("var x = 1", "All.A.all()"))
+    }
+
+    @Test
+    fun `should move function referring to class accessing local property once the class is moved`() {
+        // given
+        val script = """
+            var x = 1
+            enum class All { A; fun all() = describe() + Counter().v() }
+            fun describe() = "c" + Counter().v()
+            class Counter { fun v() = x }
+            All.A.all()
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        assert("fun describe()" in moved && "class Counter" in moved)
+        assert(body.removeSuffix(SCRIPT_BLOCK_END).lines().filter { it.isNotBlank() } == listOf("var x = 1", "All.A.all()"))
+    }
+
+    @Test
     fun `should move many functions referred to before their declaration among many accessing local property`() {
         // given
         val count = 50_000
@@ -233,6 +273,25 @@ class ScriptSourceTest {
         // the accessor ends with the semicolon
         assert(" ".repeat(21) + "= items.sum();" in lines && " ".repeat(36) + "total + first" in lines)
         assert(source.text.lines().indices.mapNotNull { source.toScriptLine(it + 1) } == listOf(0, 1, 1, 2, 1, 2, 3, 3, 1, 3, 3, 4, 4, 4, 4, 4, 4, 4))
+    }
+
+    @Test
+    fun `should keep many properties with accessors reading local property in the script body as delegated properties`() {
+        // given
+        val count = 50_000
+        val script = buildString {
+            appendLine("var x = 1")
+            (0 until count).forEach { appendLine("val p$it: Int get() = x + $it") }
+            append("p0 + p${count - 1}")
+        }
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        assert("val p" !in moved)
+        assert(body.lines().count { it == " by object {" } == count)
     }
 
     @Test
