@@ -128,7 +128,9 @@ internal class LaterDeclaredReference(
     /** Whether it is an operator, or a convention, like `[]` of `get`, sharing its position with other ones, like `set`. */
     val isOperator: Boolean = false,
     /** The references of its name within it, the warnings at which are of them, see [Reference.inner]. */
-    val inner: List<ScriptReference> = emptyList()
+    val inner: List<ScriptReference> = emptyList(),
+    /** Whether it is within a lambda, which might have a receiver, see [ScriptSource.coroutineScopeCandidates]. */
+    val isInLambda: Boolean = false
 ) {
     val kind: String get() = if (isFunction) "function" else "property"
 }
@@ -177,7 +179,7 @@ internal val coroutineScopeFunctions = setOf(
 /** The opt-in message of the moved declarations, see [ScriptSource.coroutineScopeCandidates]. */
 internal const val COROUTINE_SCOPE_ORIGINAL = "xemantic-kotlin-script: coroutine scope original"
 
-/** The opt-in message of the copies of the moved functions, see [ScriptSource.coroutineScopeCandidates]. */
+/** The opt-in message of the copies of the moved declarations, see [ScriptSource.coroutineScopeCandidates]. */
 internal const val COROUTINE_SCOPE_FUNCTION = "xemantic-kotlin-script: coroutine scope function"
 
 /** The opt-in message of the moved functions, see [ScriptSource.shadowedFunctionCandidates]. */
@@ -207,6 +209,9 @@ internal const val SCRIPT_BLOCK_START = "_script($DEPENDENCIES_CLASS()) { {"
 
 /** The line ending the script block in the [ScriptSource.text]. */
 internal const val SCRIPT_BLOCK_END = "} }"
+
+/** The type of the coroutine scope of the script body, declaring the copies of the moved declarations, see [ScriptSource.coroutineScopeCopies]. */
+private const val BODY_SCOPE_CLASS = "`_ScriptBodyScope`"
 
 /**
  * The script turned into a block, which can be run in the coroutine of the caller:
@@ -254,9 +259,11 @@ internal class ScriptSource(
      */
     private val shadowedFunctionCopies: Boolean = false,
     /**
-     * Whether the confirming compilation declares the copies of the moved functions preceding the [coroutineScopeCandidates],
-     * recognizing whether they apply, in a compilation of its own, as they precede the local properties shadowing them,
-     * unlike the copies of [shadowedFunctionCopies].
+     * Whether the confirming compilation declares the copies of the moved declarations of the [coroutineScopeCandidates]
+     * as the members of a subtype of `CoroutineScope`, which the script body is given as its receiver instead,
+     * so the candidates refer to them, if they are resolved to this receiver, where the copies apply,
+     * and like the members of the script class in a regular script, they are preferred to its extensions, like `launch`,
+     * while the receivers of the lambdas, like `coroutineScope { launch { } }`, take precedence, as in a regular script.
      */
     private val coroutineScopeCopies: Boolean = false
 ) : SourceCode {
@@ -296,7 +303,8 @@ internal class ScriptSource(
      * to the coroutine scope instead, while in the script they refer to the declarations.
      * They are confirmed by compiling the script with the declarations marked with an opt-in, see [confirming],
      * reporting the ones not referring to them, the properties, and the functions, which apply, recognized by their copies,
-     * see [coroutineScopeCopies], while the ones within the lambdas are not reported, as they might have the receivers.
+     * see [coroutineScopeCopies], which also tell whether the references within the lambdas, like the properties there,
+     * are resolved to the coroutine scope of the script body, rather than to the receivers of the lambdas.
      */
     val coroutineScopeCandidates: List<LaterDeclaredReference>
 
@@ -361,7 +369,8 @@ internal class ScriptSource(
         fun Reference.toScriptReference() = ScriptReference(name, position(offset), position(offset + length))
         fun Triple<Reference, Int, Boolean>.toLaterDeclaredReference() = LaterDeclaredReference(
             first.toScriptReference(), position(second).line, third, first.isCallableReference, first.isOperator,
-            first.inner.map { ScriptReference(first.name, position(it.first), position(it.last + 1)) }
+            first.inner.map { ScriptReference(first.name, position(it.first), position(it.last + 1)) },
+            first.isInLambda
         )
         laterDeclaredDependencyCandidates = structure.laterDeclaredDependencyCandidates.map { it.toLaterDeclaredReference() }
         hiddenLocalFunctionCandidates = structure.hiddenLocalFunctionCandidates.map { it.toLaterDeclaredReference() }
@@ -427,6 +436,12 @@ internal class ScriptSource(
                 mapping += null
             }
         }
+        if (coroutineScopeCopies) {
+            lines += "abstract class $BODY_SCOPE_CLASS : kotlinx.coroutines.CoroutineScope {"
+            lines += structure.coroutineScopeMembers.map { "@${optInMarker(COROUTINE_SCOPE_FUNCTION)} $it" }
+            lines += "}"
+            repeat(structure.coroutineScopeMembers.size + 2) { mapping += null }
+        }
         // a callable one is visible to the moved declarations referring to it as a value, like `map(log)`, as in the script,
         // while their calls, which in the script call the local function, if it applies, are confirmed, see hiddenLocalFunctionCandidates
         val (shadowed, visible) = dependencies.partition {
@@ -465,7 +480,8 @@ internal class ScriptSource(
                 it in declaration.start until declaration.end && !movedExcluded[it]
             }
         }
-        lines += SCRIPT_BLOCK_START
+        // qualified, as the script might declare a function of its name
+        lines += if (coroutineScopeCopies) "$SCRIPT_BLOCK_START kotlin.with(this as $BODY_SCOPE_CLASS) {" else SCRIPT_BLOCK_START
         mapping += null
         // the copies preceding the statements, where the local classes declared before them are visible
         val blockCopies = structure.blockCopies.entries.groupBy({ lineOf(it.key) }) { it.value }
@@ -483,7 +499,7 @@ internal class ScriptSource(
             lines += "null"
             mapping += null
         }
-        lines += SCRIPT_BLOCK_END
+        lines += if (coroutineScopeCopies) "} $SCRIPT_BLOCK_END" else SCRIPT_BLOCK_END
         mapping += null
 
         text = lines.joinToString(separator = "\n")
@@ -1106,6 +1122,9 @@ private class ScriptStructure(
     /** See [ScriptSource.coroutineScopeCandidates], with the offsets of the declarations, and whether they are functions. */
     val coroutineScopeCandidates: List<Triple<Reference, Int, Boolean>>
 
+    /** The copies of the moved declarations, the members of the coroutine scope of the script body, see [ScriptSource.coroutineScopeCopies]. */
+    val coroutineScopeMembers: List<String>
+
 
     /**
      * The deprecated copies of the local functions, see [ScriptSource.laterDeclaredDependencyCandidates],
@@ -1315,8 +1334,6 @@ private class ScriptStructure(
             if (declarationsByPsi[statements[index]] in moved) return@associateWith emptyList()
             statementReferences[index].filter { reference ->
                 !reference.isQualified && !reference.isBound && reference.name in coroutineScopeDeclarations
-                        // like in `coroutineScope { launch { } }`, where the nested coroutine scope is resolved also in the script
-                        && !reference.isInLambda
                         // refers to the local property shadowing the function, see shadowedFunctionCandidates
                         && shadowingProperties[reference.name]?.let { (propertyIndex) -> propertyIndex < index } != true
             }.map {
@@ -1375,14 +1392,6 @@ private class ScriptStructure(
                 LATER_DECLARED_FUNCTION
             )
             if (shadowedFunctionCopies) addCopies(shadowedFunctionCandidatesByStatement, movedFunctionsByName, SHADOWED_FUNCTION)
-            if (coroutineScopeCopies) {
-                // also the extension ones, which might not apply, like `fun Robot.launch()` to `launch { }`
-                addCopies(
-                    coroutineScopeCandidatesByStatement.mapValues { (_, candidates) -> candidates.filter { it.third } },
-                    moved.filter { it.kind == DeclarationKind.FUNCTION && it.name != null }.groupBy { it.name!! },
-                    COROUTINE_SCOPE_FUNCTION
-                )
-            }
         }.let { copies ->
             // the same signature once, preceding its first use, as declaring it twice would make the calls ambiguous
             copies.entries.sortedBy { it.key }
@@ -1390,6 +1399,26 @@ private class ScriptStructure(
                 .groupBy { it.third }
                 .map { (declaration, uses) -> uses.first().first to (uses.map { it.second }.distinct() to declaration) }
                 .groupBy({ it.first }) { it.second }
+        }
+        coroutineScopeMembers = if (!coroutineScopeCopies) emptyList() else {
+            // the properties, which always apply, only within the lambdas, see ScriptSource.coroutineScopeCandidates
+            val names = coroutineScopeCandidates.filter { (reference, _, isFunction) -> isFunction || reference.isInLambda }
+                .mapTo(HashSet()) { it.first.name }
+            // also the extension functions, which might not apply, like `fun Robot.launch()` to `launch { }`
+            moved.filter { it.name in names }.mapNotNull { declaration ->
+                val property = declaration.psi as? KtProperty
+                when {
+                    declaration.kind == DeclarationKind.FUNCTION ->
+                        if (declaration.refersToTypes(localClassNames)) null else declaration.signature()
+                    // overriding the inherited member, of the type compatible with any, as the copies are never evaluated
+                    property != null && property.receiverTypeReference == null && property.name == "coroutineContext" ->
+                        "override val `coroutineContext`: Nothing get() = kotlin.TODO()"
+                    // of the declared type, which might be called, like a function type
+                    property != null && property.receiverTypeReference == null ->
+                        "val `${property.name}`: ${property.typeReference?.singleLineText() ?: "Nothing"} get() = kotlin.TODO()"
+                    else -> null
+                }
+            }.distinct()
         }
         // unlike an extension property, which does not conflict with the accessor of the dependency
         conflictingDependencyDeclarations = moved.filter {

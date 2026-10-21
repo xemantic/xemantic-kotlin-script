@@ -4389,6 +4389,50 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report references within lambdas resolved to the coroutine scope of the script body instead of moved declarations`() = runTest {
+        // given
+        val scripts = listOf(
+            "val r = run { launch { } }\nfun launch(block: () -> Unit): String = \"mine\"\nr",
+            "val r = listOf(1).map { cancel() }\nfun cancel(): String = \"mine\"\nr",
+            "val r = \"x\".let { isActive }\nval isActive get() = \"mine\"\nr",
+            "val r = with(this) { launch { } }\nfun launch(block: () -> Unit): String = \"mine\"\nr"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+        results[0] should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                script.kts:1:15: error: 'launch' refers to the coroutine scope of the script body, instead of the function declared at line 2, which is compiled outside of the script body.
+                  | val r = run { <error>launch</error> { } }
+                  hint: rename the function.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should execute references within nested coroutine scopes next to moved declarations of their names`() = runTest {
+        // given
+        val scripts = listOf(
+            "val r = coroutineScope { launch { } }\nfun launch(block: () -> Unit): String = \"mine\"\nr is Job",
+            "val r = withContext(Dispatchers.Default) { async { 1 } }.await()\nfun async(block: () -> Int): Int = 2\nr",
+            "val r = supervisorScope { run { isActive } }\nval isActive get() = \"mine\"\nr",
+            "val r = Job().apply { cancel() }.isCancelled\nfun cancel(): String = \"mine\"\nr"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(true, 1, true, true))
+    }
+
+    @Test
     fun `should report calls resolved to the coroutine scope after comments and shadowed functions in the order of the script`() = runTest {
         // given
         val scripts = listOf(
