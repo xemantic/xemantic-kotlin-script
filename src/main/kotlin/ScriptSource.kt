@@ -2030,18 +2030,20 @@ private class ScriptStructure(
         // not by the operators, which refer to the operator functions by their names only, whatever the types of the operands,
         // so an operator function accessing the local properties would make all the declarations using such an operator accessing,
         // while the ones calling it indeed are reported, see ScriptSource.hiddenLocalFunctionCandidates
-        val plainReferences = declarations.associateWith { declaration ->
-            buildSet {
-                declaration.references.filter { !it.isOperator }.forEach { addAll(it.referenced()) }
+        val plainReferences = LinkedHashMap<ParsedDeclaration, Set<ParsedDeclaration>>()
+        val references = LinkedHashMap<ParsedDeclaration, Set<ParsedDeclaration>>()
+        declarations.forEach { declaration ->
+            val (operatorReferences, otherReferences) = declaration.references.partition { it.isOperator }
+            val plain = buildSet {
+                otherReferences.forEach { addAll(it.referenced()) }
                 if (declaration.isSealed) addAll(subtypesByName[declaration.name].orEmpty())
                 remove(declaration)
             }
-        }
-        // the operator functions called on the result of the `iterator` extension, like by a for loop
-        val references = declarations.associateWith { declaration ->
-            buildSet {
-                addAll(plainReferences.getValue(declaration))
-                declaration.references.filter { it.isOperator }.forEach { addAll(it.referenced()) }
+            plainReferences[declaration] = plain
+            references[declaration] = buildSet {
+                addAll(plain)
+                operatorReferences.forEach { addAll(it.referenced()) }
+                // the operator functions called on the result of the `iterator` extension, like by a for loop
                 if (declaration.isOperator && declaration.isExtension && declaration.name == "iterator") addAll(iteratorOperators)
                 remove(declaration)
             }
@@ -2086,21 +2088,33 @@ private class ScriptStructure(
         }
         val moved = required.toMutableSet()
         var accessing = accessingLocalProperties(moved)
+        // the accessing functions referred to by the moved declarations
+        val rejected = mutableSetOf<ParsedDeclaration>()
+        var movedAccessing = false
         val queue = ArrayDeque(moved)
         while (queue.isNotEmpty()) {
             references.getValue(queue.removeFirst()).forEach { declaration ->
-                if (declaration !in moved && (declaration.kind != DeclarationKind.FUNCTION || declaration !in accessing)) {
-                    moved += declaration
-                    queue += declaration
-                    // moving a declaration, which is not accessing, cannot change the accessing ones,
-                    // as they refer to the local properties only through the accessing ones
-                    if (declaration in accessing) {
-                        accessing = accessingLocalProperties(moved)
-                        // the functions rejected before might not be accessing anymore
-                        queue.clear()
-                        queue += moved
+                if (declaration !in moved) {
+                    if (declaration.kind == DeclarationKind.FUNCTION && declaration in accessing) {
+                        rejected += declaration
+                    } else {
+                        moved += declaration
+                        queue += declaration
+                        // moving a declaration, which is not accessing, cannot change the accessing ones,
+                        // as they refer to the local properties only through the accessing ones
+                        if (declaration in accessing) movedAccessing = true
                     }
                 }
+            }
+            // the accessing ones only shrink as more declarations are moved, so the moves allowed by the ones computed before stay allowed,
+            // and they are recomputed only once no more moves are allowed, after which only the rejected functions might be moved
+            if (queue.isEmpty() && movedAccessing) {
+                accessing = accessingLocalProperties(moved)
+                movedAccessing = false
+                val unblocked = rejected.filter { it !in accessing }
+                rejected.retainAll { it in accessing }
+                moved += unblocked
+                queue += unblocked
             }
         }
         val firstReferences = mutableMapOf<ParsedDeclaration, Int>()
@@ -2130,6 +2144,7 @@ private class ScriptStructure(
         }
         return moved.sortedBy { it.start }.toCollection(LinkedHashSet())
     }
+
 
 }
 
