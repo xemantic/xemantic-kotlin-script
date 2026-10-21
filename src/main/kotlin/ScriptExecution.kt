@@ -22,6 +22,7 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ThreadContextElement
 import kotlinx.coroutines.async
@@ -324,20 +325,32 @@ internal class DefaultScriptExecutor(
         }
 
         private suspend fun doCompile(): Compilation {
-            val source = source()
+            // the sources of all the compilations are derived from the script parsed once
+            val parsed = ScriptSource.Parsed(script, preambleDependencies)
+            val source = parsed.source()
             if (source.unmatchedClosingBrace != null || source.conflictingDependencyDeclarations.isNotEmpty()) {
                 return Compilation(source, result = null)
             }
-            val result = compile(source)
-            // unless already reported as unresolved
-            val errors = result.reports.filter { it.severity == ScriptDiagnostic.Severity.ERROR }.mapNotNull { diagnostic ->
-                diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }
+            if (source.candidates.isEmpty()) return Compilation(source, compile(source))
+            // the confirming compilations do not depend on this one
+            return coroutineScope {
+                confirm(parsed, source, async { compile(source) })
             }
+        }
+
+        /**
+         * The compilation of the [source], with its [ScriptSource.candidates] confirmed by the confirming compilations,
+         * while it is being [compiled].
+         */
+        private suspend fun confirm(
+            parsed: ScriptSource.Parsed,
+            source: ScriptSource,
+            compiled: Deferred<ResultWithDiagnostics<CompiledScript>>
+        ): Compilation {
             val candidates = source.candidates
-            if (candidates.isEmpty()) return Compilation(source, result)
             // the types of the local properties, which are known only to the compiler, see ScriptSource.untypedPropertyCalls
             val propertyTypes = if (source.untypedProperties.isEmpty()) emptyMap() else {
-                val typeProbes = source(propertyTypeProbes = true)
+                val typeProbes = parsed.source(propertyTypeProbes = true)
                 val unexpected = mutableListOf<String>()
                 val types = typeProbes.propertyTypes(compile(typeProbes).reports) { unexpected += it.message }
                 val (mismatches, others) = unexpected.partition { it.startsWith("Initializer type mismatch") }
@@ -348,10 +361,10 @@ internal class DefaultScriptExecutor(
                 types
             }
             // recognizing the candidates referring to the wrong declarations indeed
-            val probe = source(confirming = true, propertyTypes = propertyTypes)
+            val probe = parsed.source(confirming = true, propertyTypes = propertyTypes)
             // only the calls of the properties of unknown types, which cannot be confirmed without their copies
             if (probe.copiedProperties.isEmpty() && candidates.all { it in source.untypedPropertyCalls }) {
-                return Compilation(source, result)
+                return Compilation(source, compiled.await())
             }
             /**
              * The positions, from the start to the end, if known, of the warnings of the deprecated,
@@ -376,6 +389,11 @@ internal class DefaultScriptExecutor(
                 message: String
             ) = markedRanges(source, message).map { it.first }
             val reports = compile(probe).reports
+            val result = compiled.await()
+            // unless already reported as unresolved
+            val errors = result.reports.filter { it.severity == ScriptDiagnostic.Severity.ERROR }.mapNotNull { diagnostic ->
+                diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }
+            }
             // unlike the other ones, the calls of which cannot be confirmed
             val confirmedTypes = probe.confirmedPropertyTypes(reports)
             fun deprecated(
@@ -434,13 +452,13 @@ internal class DefaultScriptExecutor(
                         }
                     }
                 }
-                val inferred = copies(inInferredTypes) { source(confirming = true, overloadingFunctionCopies = true) }
-                val declared = copies(inDeclaredTypes) { source(confirming = true, shadowedFunctionCopies = true) }
+                val inferred = copies(inInferredTypes) { parsed.source(confirming = true, overloadingFunctionCopies = true) }
+                val declared = copies(inDeclaredTypes) { parsed.source(confirming = true, shadowedFunctionCopies = true) }
                 val shadowed = async { (inferred.await() + declared.await()).distinctBy { it.reference } }
                 // also declaring the copies of the constructors of the local classes, see ScriptSource.laterDeclaredClassCandidates
                 val scopeCopies = async {
                     if (confirmedCandidates.isEmpty() && source.laterDeclaredClassCandidates.isEmpty()) null else {
-                        val copies = source(confirming = true, coroutineScopeCopies = true)
+                        val copies = parsed.source(confirming = true, coroutineScopeCopies = true)
                         copies to compile(copies).reports
                     }
                 }
@@ -504,24 +522,6 @@ internal class DefaultScriptExecutor(
                 PreambleDependency(dependency.name, dependency.accessor, dependency.isCallable)
             }
         }
-
-        private fun source(
-            confirming: Boolean = false,
-            shadowedFunctionCopies: Boolean = false,
-            overloadingFunctionCopies: Boolean = false,
-            coroutineScopeCopies: Boolean = false,
-            propertyTypeProbes: Boolean = false,
-            propertyTypes: Map<String, String> = emptyMap()
-        ) = ScriptSource(
-            script = script,
-            dependencies = preambleDependencies,
-            confirming = confirming,
-            shadowedFunctionCopies = shadowedFunctionCopies,
-            overloadingFunctionCopies = overloadingFunctionCopies,
-            coroutineScopeCopies = coroutineScopeCopies,
-            propertyTypeProbes = propertyTypeProbes,
-            propertyTypes = propertyTypes
-        )
 
         private suspend fun compile(
             source: ScriptSource
