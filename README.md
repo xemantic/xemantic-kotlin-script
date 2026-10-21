@@ -94,6 +94,9 @@ when (result) {
   So is a property with a getter or a setter having a body, like `val total get() = items.size`, as a local property cannot have one.
   Therefore, they cannot refer to the local values of the script body, only to the dependencies,
   except the ones initialized with a literal, like `val taxRate = 0.2`, which are moved together with them,
+  unless their type names a local class staying in the script body, like `val x: Foo? = null`,
+  so a function reading only such values, like `fun tax(x: Double) = x * taxRate`, is moved together with them as well,
+  when they call it, or when it is called before its declaration, though not when called before its declaration where a receiver might resolve the call instead, like `append` in `buildString { append("x") }`,
   and referring to a local value or function of the same name as a dependency is reported as unresolved, instead of using the dependency,
   while an object, an enum class, an interface or a nested class cannot refer even to the dependencies,
   as they are the members of the script instance.
