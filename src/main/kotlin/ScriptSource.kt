@@ -862,10 +862,17 @@ private class Reference(
     val length: Int,
     val isQualified: Boolean,
     val isBound: Boolean,
+    /**
+     * Whether it is [isBound] by a declaration other than a function or an extension property, like a parameter, a local variable, or a class,
+     * as these, requiring the arguments or a receiver, do not shadow a class of the same name, like `Regex` in `Regex::class` after `fun Regex() = 1`.
+     */
+    val isBoundByNonFunction: Boolean,
     /** Whether it is called, like `foo` in `foo()`, or `foo` in `::foo`, or `until` in `0 until 20`, so it might refer to a function. */
     val isCall: Boolean,
     /** Whether it is a callable reference, like `foo` in `::foo`. */
     val isCallableReference: Boolean,
+    /** Whether it names a type, like `Foo` in `x: Foo`, which a value of the same name, like a parameter, does not shadow. */
+    val isType: Boolean,
     /**
      * Whether it is within a declaration, which can access the members of the script, when moved out of the script body,
      * unlike e.g. an object, an enum class, an interface, or a nested class.
@@ -910,6 +917,7 @@ private fun PsiElement.references(
 }.map { expression ->
     val callableReference = expression.parent as? KtCallableReferenceExpression
     val name = expression.getReferencedName()
+    val bound = binding(expression, name, scope, declaredNames)
     Reference(
         name = name,
         offset = expression.startOffset,
@@ -917,12 +925,14 @@ private fun PsiElement.references(
         isQualified = expression.getReceiverExpression() != null || (
                 callableReference?.callableReference == expression && callableReference.receiverExpression != null
         ),
-        isBound = isBound(expression, name, scope, declaredNames),
+        isBound = bound != Binding.NONE,
+        isBoundByNonFunction = bound == Binding.OTHER,
         // also referred to as a function, like `::println`, or called as infix, like `0 until 20`
         isCall = (expression.parent as? KtCallExpression)?.calleeExpression == expression
                 || callableReference?.callableReference == expression
                 || (expression is KtOperationReferenceExpression && expression.getReferencedNameElementType() == KtTokens.IDENTIFIER),
         isCallableReference = callableReference?.callableReference == expression,
+        isType = expression.parent is KtUserType,
         canAccessScriptMembers = canAccessScriptMembers(expression, scope),
         isInLambda = isInLambda(expression, scope),
         mightResolveOnReceiver = mightResolveOnReceiver(expression, scope)
@@ -973,8 +983,10 @@ private fun PsiElement.operatorReferences(
                     length = length,
                     isQualified = true,
                     isBound = false,
+                    isBoundByNonFunction = false,
                     isCall = true,
                     isCallableReference = false,
+                    isType = false,
                     canAccessScriptMembers = canAccessScriptMembers,
                     isOperator = true
                 )
@@ -1049,40 +1061,53 @@ private fun canAccessScriptMembers(
     return true
 }
 
+/** How a name is declared in the enclosing elements, see [binding]. */
+private enum class Binding {
+    NONE,
+    /** By the functions or the extension properties only, see [Reference.isBoundByNonFunction]. */
+    FUNCTION,
+    OTHER
+}
+
 /**
- * Whether the [name] referred to by the [expression] is declared in the enclosing elements within the [scope], exclusive,
+ * How the [name] referred to by the [expression] is declared in the enclosing elements within the [scope], exclusive,
  * recognized by the names only, without the declarations inherited from the supertypes.
  */
-private fun isBound(
+private fun binding(
     expression: PsiElement,
     name: String,
     scope: PsiElement,
     declaredNames: DeclaredNames
-): Boolean {
+): Binding {
+    var binding = Binding.NONE
     var child = expression
     var parent = expression.parent
     // the plain parameters of the primary constructor are not visible in the functions of the class
     var inFunction = false
     while (parent != null && parent !== scope) {
         val declares = when (parent) {
-            is KtDeclarationWithBody -> parent.valueParameters.any { it.declares(name) }
-            is KtBlockExpression -> declaredNames.isDeclaredBefore(parent, child, name)
-            is KtForExpression -> child === parent.body && parent.loopParameter?.declares(name) == true
-            is KtCatchClause -> child === parent.catchBody && parent.catchParameter?.name == name
-            is KtWhenExpression -> child !== parent.subjectVariable && parent.subjectVariable?.name == name
-            is KtClassBody -> declaredNames.isDeclared(parent, name)
+            is KtDeclarationWithBody -> parent.valueParameters.any { it.declares(name) }.toBinding()
+            is KtBlockExpression -> declaredNames.bindingBefore(parent, child, name)
+            // the body is wrapped in a container
+            is KtForExpression -> ((child === parent.body || child === parent.body?.parent) && parent.loopParameter?.declares(name) == true).toBinding()
+            is KtCatchClause -> (child === parent.catchBody && parent.catchParameter?.name == name).toBinding()
+            is KtWhenExpression -> (child !== parent.subjectVariable && parent.subjectVariable?.name == name).toBinding()
+            is KtClassBody -> declaredNames.binding(parent, name)
             is KtClassOrObject -> parent.primaryConstructorParameters.any {
                 it.name == name && (it.hasValOrVar() || !inFunction)
-            }
-            else -> false
+            }.toBinding()
+            else -> Binding.NONE
         }
-        if (declares) return true
+        if (declares == Binding.OTHER) return declares
+        if (declares == Binding.FUNCTION) binding = declares
         if (parent is KtNamedFunction || parent is KtPropertyAccessor) inFunction = true
         child = parent
         parent = parent.parent
     }
-    return false
+    return binding
 }
+
+private fun Boolean.toBinding(): Binding = if (this) Binding.OTHER else Binding.NONE
 
 private fun PsiElement.declares(
     name: String
@@ -1095,45 +1120,66 @@ private fun PsiElement.declaredNames(): List<String> = when (this) {
     else -> emptyList()
 }
 
+/** How the [declaredNames] bind them, see [Binding.FUNCTION]. */
+private val PsiElement.namesBinding: Binding
+    get() = if (this is KtNamedFunction || (this is KtProperty && receiverTypeReference != null)) Binding.FUNCTION else Binding.OTHER
+
 /**
  * The names declared in the blocks and the class bodies, collected once for each of them,
  * as otherwise every reference would scan all the declarations of its enclosing ones.
  */
 private class DeclaredNames {
 
-    /** The index of the first statement declaring each name, by the blocks. */
-    private val blockNames = IdentityHashMap<KtBlockExpression, Map<String, Int>>()
+    /** The index of the first statement declaring each name, by the blocks, also of the one which is not [Binding.FUNCTION]. */
+    private val blockNames = IdentityHashMap<KtBlockExpression, Map<String, FirstDeclarations>>()
+
+    private class FirstDeclarations(
+        val any: Int,
+        var other: Int = Int.MAX_VALUE
+    )
 
     /** The index of each statement in its block. */
     private val statementIndices = IdentityHashMap<PsiElement, Int>()
 
-    private val classBodyNames = IdentityHashMap<KtClassBody, Set<String>>()
+    private val classBodyNames = IdentityHashMap<KtClassBody, Map<String, Binding>>()
 
-    /** Whether the [name] is declared in the [block] by a statement preceding the [child] of the block. */
-    fun isDeclaredBefore(
+    /** How the [name] is declared in the [block] by the statements preceding the [child] of the block. */
+    fun bindingBefore(
         block: KtBlockExpression,
         child: PsiElement,
         name: String
-    ): Boolean {
+    ): Binding {
         val names = blockNames.getOrPut(block) {
-            buildMap {
+            buildMap<String, FirstDeclarations> {
                 block.statements.forEachIndexed { index, statement ->
                     statementIndices[statement] = index
-                    statement.declaredNames().forEach { putIfAbsent(it, index) }
+                    statement.declaredNames().forEach {
+                        val first = getOrPut(it) { FirstDeclarations(index) }
+                        if (statement.namesBinding == Binding.OTHER && first.other == Int.MAX_VALUE) first.other = index
+                    }
                 }
             }
         }
-        val declaration = names[name] ?: return false
+        val declarations = names[name] ?: return Binding.NONE
         // a child which is not a statement, e.g. of an erroneous script, sees all the statements
-        return declaration < (statementIndices[child] ?: Int.MAX_VALUE)
+        val childIndex = statementIndices[child] ?: Int.MAX_VALUE
+        return when {
+            declarations.other < childIndex -> Binding.OTHER
+            declarations.any < childIndex -> Binding.FUNCTION
+            else -> Binding.NONE
+        }
     }
 
-    fun isDeclared(
+    fun binding(
         classBody: KtClassBody,
         name: String
-    ): Boolean = name in classBodyNames.getOrPut(classBody) {
-        classBody.declarations.flatMapTo(HashSet()) { it.declaredNames() }
-    }
+    ): Binding = classBodyNames.getOrPut(classBody) {
+        buildMap<String, Binding> {
+            classBody.declarations.forEach { declaration ->
+                declaration.declaredNames().forEach { merge(it, declaration.namesBinding) { a, b -> maxOf(a, b) } }
+            }
+        }
+    }[name] ?: Binding.NONE
 
 }
 
@@ -2058,7 +2104,9 @@ private class ScriptStructure(
             }
         }
         val firstReferences = mutableMapOf<ParsedDeclaration, Int>()
-        bodyReferences.forEach { reference ->
+        // not the values bound by the same names, like `format` in `{ format -> format }`, unlike the calls,
+        // which might still refer to the function, when the inner declaration is not applicable, like `format()` of an `Int` parameter
+        bodyReferences.filter { !it.isBoundByNonFunction || it.isCall || it.isType }.forEach { reference ->
             reference.referenced().forEach { firstReferences.putIfAbsent(it, reference.offset) }
         }
         declarations.filter { declaration ->

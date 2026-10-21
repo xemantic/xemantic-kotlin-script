@@ -162,6 +162,54 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should not move function referred to before its declaration only by locally bound names`() {
+        // given
+        val scripts = listOf(
+            "val m = listOf(1).map { format -> format }\nfun format() = 7\nm",
+            "val m = listOf(1 to 2).map { (format, b) -> format + b }\nfun format() = 7\nm",
+            "fun twice(format: Int) = format * 2\nfun format() = 7\ntwice(format())",
+            "val m = run { val format = 1; format }\nfun format() = 7\nm",
+            "var s = 0\nfor (format in listOf(1, 2)) s += format\nfun format() = 7\ns",
+            "val m = try { error(\"x\") } catch (format: Exception) { format.message }\nfun format() = 7\nm",
+            "val m = when (val format = 1) { else -> format }\nfun format() = 7\nm",
+            "class Box { val format = 1; fun get() = format }\nfun format() = 7\nBox().get()"
+        )
+
+        // when
+        val sources = scripts.map { ScriptSource(it) }
+
+        // then
+        sources.forEach { source ->
+            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            assert("fun format()" !in moved && "fun format()" in body)
+        }
+    }
+
+    @Test
+    fun `should move declaration referred to before its declaration by locally bound name called, naming type, or bound by function only`() {
+        // given
+        val scripts = listOf(
+            "val m = listOf(1).map { format -> format() }\nfun format() = 7\nm" to "fun format()",
+            "val m = listOf(1).map { format -> ::format }\nfun format() = 7\nm" to "fun format()",
+            "val m = listOf(1).map { Foo -> val f: Foo? = null; f }\nclass Foo\nm" to "class Foo",
+            "val m = listOf(1).map { Foo -> Foo() }\nclass Foo\nm" to "class Foo",
+            "val m = run {\n    fun Regex() = 1\n    Regex::class.qualifiedName\n}\nclass Regex\nm" to "class Regex",
+            "class Box { fun Regex() = 1; val k = Regex::class.qualifiedName }\nclass Regex\nBox().k" to "class Regex",
+            "class Box {\n    val Int.Regex get() = 1\n    val k = Regex::class.qualifiedName\n}\nclass Regex\nBox().k" to "class Regex",
+            "val m = run {\n    fun Foo() = 1\n    Foo::toString\n}\nclass Foo\nm" to "class Foo"
+        )
+
+        // when
+        val sources = scripts.map { (script, declaration) -> ScriptSource(script) to declaration }
+
+        // then
+        sources.forEach { (source, declaration) ->
+            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            assert(declaration in moved && declaration !in body)
+        }
+    }
+
+    @Test
     fun `should keep property with accessors reading local property in the script body as delegated property`() {
         // given
         val script = """
