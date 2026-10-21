@@ -393,6 +393,8 @@ internal class DefaultScriptExecutor(
             val hidden = hiddenWarnings.mapNotNullTo(HashSet()) { (start, end, message) ->
                 hiddenCandidates.filter { candidate ->
                     start in candidate.reference && hiddenLocalFunctionMessage(candidate.reference.name) in message
+                            // like a delegate convention, not of a call of the same name within it
+                            && candidate.inner.none { start in it }
                 }.let { matching ->
                     // the innermost one, nested ones start later, or at the same position, ending earlier
                     matching.firstOrNull { it.reference.end == end } ?: matching.maxWithOrNull(
