@@ -631,9 +631,11 @@ private val ScriptExecutor.Dependency<*>.providedName: String
 private val ScriptExecutor.Dependency<*>.providedType: KotlinType
     get() = if (isHidden) KotlinType(typeOf<Any?>()) else KotlinType(type)
 
-// with an initializer, unlike a getter, the dependency can be smart cast
+// with an initializer, unlike a getter, the dependency can be smart cast,
+// while the getter is renamed, as a function moved out of the script body might be named like it, e.g. `getFoo` or `isFoo`,
+// to a name with `$`, which no function of the script can have, unless quoted in backticks
 private val ScriptExecutor.Dependency<*>.accessor: String
-    get() = "@kotlin.Suppress(\"UNCHECKED_CAST\") val `$name`: $type = `$providedName` as $type"
+    get() = "@kotlin.Suppress(\"UNCHECKED_CAST\") @get:kotlin.jvm.JvmName(\"$name\\\$dependency\") val `$name`: $type = `$providedName` as $type"
 
 /** Whether it is of a function type, or of a type with the public `invoke` operator, so the script can call it. */
 private val ScriptExecutor.Dependency<*>.isCallable: Boolean

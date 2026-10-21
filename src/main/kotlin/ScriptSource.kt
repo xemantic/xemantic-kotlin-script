@@ -174,7 +174,7 @@ private fun optInMarker(
 /** A dependency, as declared in the preamble of the [ScriptSource]. */
 internal class PreambleDependency(
     val name: String,
-    /** The declaration of the property of the dependency, like `val x: T = _dependency_x as T`. */
+    /** The declaration of the property of the dependency, like `@get:JvmName("x\$dependency") val x: T = _dependency_x as T`. */
     val accessor: String,
     /** Whether it can be called like a function, so a local function of the same name shadows it. */
     val isCallable: Boolean = false

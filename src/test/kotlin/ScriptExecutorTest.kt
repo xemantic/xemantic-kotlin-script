@@ -2984,6 +2984,138 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should use function moved out of the script body named like the getter of a dependency`() = runTest {
+        // given
+        val script = """
+            val r = getFoo()
+            fun getFoo() = 2
+            r + foo
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("foo", 40)))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+            have(warnings == null)
+        }
+    }
+
+    @Test
+    fun `should use function moved out of the script body named like the getter of a dependency starting with is`() = runTest {
+        // given
+        val script = """
+            val r = isReady()
+            fun isReady() = !isReady
+            r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("isReady", true)))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == false)
+            have(warnings == null)
+        }
+    }
+
+    @Test
+    fun `should use function moved out of the script body named like the hidden name of a dependency`() = runTest {
+        // given
+        val script = """
+            val r = _dependency_foo()
+            fun _dependency_foo() = 2
+            r + foo
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("foo", 40)))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+            have(warnings == null)
+        }
+    }
+
+    @Test
+    fun `should use function moved out of the script body named like the getter of a shadowed dependency`() = runTest {
+        // given
+        val script = """
+            val r = getFoo()
+            fun getFoo() = 2
+            val foo = 1
+            r + foo
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("foo", 40)))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 3)
+            have(warnings == null)
+        }
+    }
+
+    @Test
+    fun `should report dependency used before the local property shadowing it next to function moved out of the script body named like its getter`() = runTest {
+        // given
+        val script = """
+            val r = getFoo() + foo
+            fun getFoo() = 2
+            val foo = 1
+            r + foo
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("foo", 40)))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:20: error: 'foo' refers to the dependency, as the property 'foo' of the script body is declared later, at line 3.
+                  | val r = getFoo() + <error>foo</error>
+                  hint: declare the property before line 1, or rename it.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should use function moved out of the script body named like the getter of a dependency of value class type`() = runTest {
+        // given
+        val script = """
+            val r = getTimeout()
+            fun getTimeout() = 2L
+            r + timeout.inWholeHours
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("timeout", 5.hours)))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 7L)
+            have(warnings == null)
+        }
+    }
+
+    @Test
     fun `should recognize declarations of the script named with backticks`() = runTest {
         // given
         val scripts = listOf(
