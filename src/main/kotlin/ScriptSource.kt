@@ -230,6 +230,7 @@ internal const val SCRIPT_BLOCK_END = "} }"
  * as in the script they refer to the local declaration,
  * while the script body refers to it as the member of the outer receiver of the script block,
  * the inner one being the coroutine scope of the caller.
+ * A callable dependency shadowed by a local function only is declared there nevertheless, see [calledInsteadDependencies].
  *
  * Declarations are moved by blanking them out with spaces in one copy of their lines,
  * and everything else in the other, so the columns of the script are retained,
@@ -318,6 +319,14 @@ internal class ScriptSource(
      * as the members of the script, which the calls refer to, unless they refer e.g. to the inherited members.
      */
     val hiddenLocalFunctionCandidates: List<LaterDeclaredReference>
+
+    /**
+     * The names of the callable dependencies visible to the declarations moved out of the script body, even though local functions have their names,
+     * so the moved declarations refer to them as values, like `map(log)`, and call them, when the local functions do not apply, as in the script,
+     * while the [hiddenLocalFunctionCandidates] calling the local functions in the script call the dependencies instead,
+     * or fail, when the dependencies do not apply, rather than being unresolved.
+     */
+    val calledInsteadDependencies: Set<String>
 
     private val lineStarts: List<Int>
 
@@ -418,9 +427,12 @@ internal class ScriptSource(
                 mapping += null
             }
         }
+        // a callable one is visible to the moved declarations referring to it as a value, like `map(log)`, as in the script,
+        // while their calls, which in the script call the local function, if it applies, are confirmed, see hiddenLocalFunctionCandidates
         val (shadowed, visible) = dependencies.partition {
-            it.name in structure.localProperties || (it.isCallable && it.name in structure.localFunctions)
+            it.name in structure.localProperties || (it.isCallable && it.name in structure.unconfirmedLocalFunctions)
         }
+        calledInsteadDependencies = visible.filter { it.isCallable && it.name in structure.localFunctions }.mapTo(HashSet()) { it.name }
         visible.forEach { addAccessor(it) }
         lines += "class $DEPENDENCIES_CLASS {"
         mapping += null
@@ -1070,6 +1082,15 @@ private class ScriptStructure(
     /** The names of the functions moved out of the script body. */
     val movedFunctions: Set<String>
 
+    /**
+     * The names of the [localFunctions], which the references of the moved declarations cannot be confirmed to refer to,
+     * see [ScriptSource.hiddenLocalFunctionCandidates], as they cannot be copied, like the ones referring to the local classes or the type aliases,
+     * or as they are referred to as functions, like `::log`, which would be resolved to the dependency of the same name instead,
+     * or as their names are bound within the moved declarations, which are not candidates.
+     * Only the ones named like the dependencies are checked for the copies.
+     */
+    val unconfirmedLocalFunctions: Set<String>
+
     /** See [ScriptSource.hiddenLocalFunctionCandidates], with the offsets of the first local declarations, and whether they are functions. */
     val hiddenLocalFunctionCandidates: List<Triple<Reference, Int, Boolean>>
 
@@ -1228,6 +1249,16 @@ private class ScriptStructure(
                     else -> null
                 }?.let { (local, isFunction) -> Triple(reference, local.line(), isFunction) }
             }
+        }
+        // the copies precede the type aliases, which are not visible before their declarations
+        val uncopiedTypes = localClassNames + declarations.mapNotNull { (it.psi as? KtTypeAlias)?.name }
+        unconfirmedLocalFunctions = localFunctionsByName.filter { (name, functions) ->
+            name in dependencyNames && functions.any { it.refersToTypes(uncopiedTypes) || it.signature() == null }
+        }.keys + hiddenLocalFunctionCandidates.filter { (reference) ->
+            reference.isCallableReference && reference.refersToLocal(localFunctions)
+        }.map { it.first.name } + moved.flatMap { declaration ->
+            // like `log("x")` of `fun f(log: Int)`, calling the local function in the script, if the inner declaration does not apply
+            declaration.references.filter { it.isBound && it.isCall && !it.isQualified && it.name in localFunctions && it.name in dependencyNames }.map { it.name }
         }
         hiddenLocalFunctionCopies = if (!confirming) emptyList() else {
             hiddenLocalFunctionCandidates.mapTo(LinkedHashSet()) { it.first.name }.flatMap { name ->
