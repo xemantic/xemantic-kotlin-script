@@ -118,9 +118,12 @@ public interface ScriptExecutor {
  *   evicting the least recently used one, `0` by default, which disables the cache, must not be negative.
  *   A compiled script is reused when the script text is the same,
  *   and so are the names and types of its dependencies, while their values might differ.
- *   A script which failed to compile is not cached,
- *   unlike a compiled one, which might still be reported as a [ExecutionPhase.COMPILATION] error every time,
- *   e.g. for referring to a dependency before the declaration of the same name.
+ *   Any result of a successful compilation is cached,
+ *   even when the script is rejected by the checks of its source following the compilation,
+ *   e.g. for referring to a dependency before the declaration of the same name,
+ *   which is then reported as a [ExecutionPhase.COMPILATION] error every time, without invoking the compiler again, not even to confirm the references.
+ *   A script which failed to compile, even because of an internal failure of the compiler, is not cached,
+ *   so it is compiled again when executed again, even when these checks reject it too.
  * @param maxConcurrentCompilations the maximal number of the invocations of the compiler running at the same time
  *   in this executor, the number of the available processors by default, must be positive.
  *   A script might invoke the compiler more than once, e.g. to confirm the references to the dependencies,
