@@ -77,8 +77,9 @@ internal class ScriptCompilationCache<T : Any>(
                 val result = compile()
                 synchronized(entries) {
                     if (isReusable(result)) evict() else entries.remove(key, entry)
-                    entry.complete(result)
                 }
+                // outside the lock, as the waiting callers might be resumed in place
+                entry.complete(result)
                 return result
             } catch (e: Throwable) {
                 remove(key, entry)
