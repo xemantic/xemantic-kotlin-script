@@ -66,6 +66,32 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should declare the copies of the local functions with the return types inferred only if inferred in the script`() {
+        // given
+        val script = """
+            val p = "!".trim()
+            fun show(x: Int) = "int${'$'}p"
+            fun show(x: Long): String = "long${'$'}p"
+            fun show(x: Short) { println(x.toString() + p) }
+            fun show(x: Any) = "any"
+            sealed interface S
+            class T : S { fun f() = show(1) }
+            T().f()
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script, confirming = true)
+
+        // then
+        val copies = source.text.lines().filter { "fun `show`" in it }.map { it.substringAfter(") fun ") }
+        assert(copies == listOf(
+            "`show`(`x`: Int) = kotlin.TODO()",
+            "`show`(`x`: Long): String = kotlin.TODO()",
+            "`show`(`x`: Short): Nothing = kotlin.TODO()"
+        ))
+    }
+
+    @Test
     fun `should give distinct location ids to scripts of the same hash code`() {
         // given
         val scripts = listOf("\"Aa\"", "\"BB\"")

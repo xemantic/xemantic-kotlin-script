@@ -34,6 +34,7 @@ import org.jetbrains.kotlin.config.CompilerConfiguration
 import org.jetbrains.kotlin.lexer.KotlinLexer
 import org.jetbrains.kotlin.lexer.KtTokens
 import org.jetbrains.kotlin.psi.KtAnnotation
+import org.jetbrains.kotlin.psi.KtAnonymousInitializer
 import org.jetbrains.kotlin.psi.KtAnnotationEntry
 import org.jetbrains.kotlin.psi.KtArrayAccessExpression
 import org.jetbrains.kotlin.psi.KtBinaryExpression
@@ -61,9 +62,12 @@ import org.jetbrains.kotlin.psi.KtParenthesizedExpression
 import org.jetbrains.kotlin.psi.KtPrefixExpression
 import org.jetbrains.kotlin.psi.KtProperty
 import org.jetbrains.kotlin.psi.KtPropertyDelegate
+import org.jetbrains.kotlin.psi.KtPrimaryConstructor
 import org.jetbrains.kotlin.psi.KtPropertyAccessor
 import org.jetbrains.kotlin.psi.KtPsiUtil
 import org.jetbrains.kotlin.psi.KtQualifiedExpression
+import org.jetbrains.kotlin.psi.KtScriptInitializer
+import org.jetbrains.kotlin.psi.KtSecondaryConstructor
 import org.jetbrains.kotlin.psi.KtPsiFactory
 import org.jetbrains.kotlin.psi.KtSimpleNameExpression
 import org.jetbrains.kotlin.psi.KtStringTemplateExpression
@@ -122,7 +126,7 @@ internal class ScriptReference(
 internal class LaterDeclaredReference(
     val reference: ScriptReference,
     val line: Int,
-    val isFunction: Boolean,
+    override val isFunction: Boolean,
     /** Whether it refers to the declaration as a function, like `::foo`, which might be resolved to a property instead. */
     val isCallableReference: Boolean = false,
     /** Whether it is an operator, or a convention, like `[]` of `get`, sharing its position with other ones, like `set`. */
@@ -131,9 +135,31 @@ internal class LaterDeclaredReference(
     val inner: List<ScriptReference> = emptyList(),
     /** Whether it is within a lambda, which might have a receiver, see [ScriptSource.coroutineScopeCandidates]. */
     val isInLambda: Boolean = false
-) {
+) : LocalDeclarationReference
+
+/** A reference to a local declaration of the script body, a function, if [isFunction], or a property. */
+internal interface LocalDeclarationReference {
+    val isFunction: Boolean
     val kind: String get() = if (isFunction) "function" else "property"
 }
+
+/**
+ * The [reference] of the script body to the local property, or to one of the local functions, if [isFunction], at the 0-based [lines],
+ * instead of the function moved out of the script body at the 0-based [functionLine], see [ScriptSource.shadowedFunctionCandidates].
+ */
+internal data class ShadowedFunctionReference(
+    val reference: ScriptReference,
+    val lines: List<Int>,
+    override val isFunction: Boolean,
+    val functionLine: Int,
+    /**
+     * Whether it calls the local function within a declaration of an inferred type, like `fun h() = show(1)`, or within a statement,
+     * while the overloads are of both inferred and declared types, as a regular script prefers the ones of inferred types there,
+     * see [ScriptSource.overloadingFunctionCopies], unlike within the declarations of declared types, like `fun h(): String = show(1)`,
+     * or among the overloads of the same kind of types, see [ScriptSource.shadowedFunctionCopies].
+     */
+    val isInInferredType: Boolean = false
+) : LocalDeclarationReference
 
 /** The deprecation message of the dependencies, see [ScriptSource.laterDeclaredDependencyCandidates]. */
 internal const val LATER_DECLARED_DEPENDENCY = "xemantic-kotlin-script: later declared dependency"
@@ -159,6 +185,17 @@ private fun stringLiteral(
 
 /** The deprecation message of the copies of the moved functions, see [ScriptSource.shadowedFunctionCandidates]. */
 internal const val SHADOWED_FUNCTION = "xemantic-kotlin-script: shadowed function"
+
+/** The opt-in message of the moved function, or of its copy, declared at the [offset] of the script, see [ScriptSource.shadowedFunctionLine]. */
+private fun shadowedFunctionMessage(
+    offset: Int
+): String = "$SHADOWED_FUNCTION at $offset;"
+
+/** The offset in the message of [shadowedFunctionMessage]. */
+private val shadowedFunctionOffset = Regex("${Regex.escape(SHADOWED_FUNCTION)} at (\\d+);")
+
+/** The first of the letters replacing the names of the local functions overloading the moved ones, see [ScriptSource.overloadingFunctionCopies]. */
+private const val RENAMED_CHARS = '\u4E00'
 
 /*
  * The names the script body resolves on its receiver, the coroutine scope, or on the nested ones, like in `launch { }`,
@@ -188,7 +225,9 @@ internal const val SHADOWED_ORIGINAL = "xemantic-kotlin-script: shadowed origina
 /** The opt-in annotation marking the local copies of the declarations, reporting this [message] where they are used. */
 private fun optInMarker(
     message: String
-): String = "`_OptIn_${message.substringAfter(": ").replace(' ', '_')}`"
+): String = "`_OptIn_${message.substringAfter(": ").replace(nonIdentifierChars, "_")}`"
+
+private val nonIdentifierChars = Regex("[^A-Za-z0-9_]")
 
 /** A dependency, as declared in the preamble of the [ScriptSource]. */
 internal class PreambleDependency(
@@ -255,9 +294,17 @@ internal class ScriptSource(
     /**
      * Whether the confirming compilation declares the copies of the moved functions preceding the [shadowedFunctionCandidates],
      * recognizing whether they apply, instead of deprecating the moved functions themselves,
-     * recognizing whether the candidates refer to them already.
+     * recognizing whether the candidates refer to them already, each marked with its line.
      */
     private val shadowedFunctionCopies: Boolean = false,
+    /**
+     * Whether the confirming compilation renames the local functions overloading the functions moved out of the script body,
+     * which the [shadowedFunctionCandidates] within the declarations of inferred types call, see [ShadowedFunctionReference.isInInferredType],
+     * declaring their copies next to the moved functions, each marked with its line instead,
+     * so the candidates are resolved among all of them, like among the members of the script class in the script,
+     * as the compiler prefers the ones of inferred types there, unlike among the local functions, see CLAUDE.md.
+     */
+    private val overloadingFunctionCopies: Boolean = false,
     /**
      * Whether the confirming compilation declares the copies of the moved declarations of the [coroutineScopeCandidates]
      * as the members of a subtype of `CoroutineScope`, which the script body is given as its receiver instead,
@@ -290,12 +337,13 @@ internal class ScriptSource(
 
     /**
      * The calls of the script body to the local properties, which have the names of the functions moved out of the script body,
-     * by the 0-based lines of the properties and the functions, while in the script they call the functions, if they apply.
+     * or to the local functions overloading them, which hide them there, while in the script they call the moved functions,
+     * if they apply, or if they are more specific than the local overloads.
      * They are confirmed by compiling the script with the functions marked with an opt-in, see [confirming],
-     * reporting the calls referring to them already, and the remaining ones by compiling it with their copies,
+     * not reporting the calls referring to them already, and the remaining ones by compiling it with their copies,
      * declared as the local functions preceding the calls, which they refer to, if the functions apply, see [shadowedFunctionCopies].
      */
-    val shadowedFunctionCandidates: List<Triple<ScriptReference, Int, Int>>
+    val shadowedFunctionCandidates: List<ShadowedFunctionReference>
 
     /**
      * The references of the script body to the declarations moved out of it, named like the members or the extensions
@@ -358,6 +406,7 @@ internal class ScriptSource(
             dependencies.mapTo(HashSet()) { it.name },
             confirming,
             shadowedFunctionCopies,
+            overloadingFunctionCopies,
             coroutineScopeCopies
         )
         unmatchedClosingBrace = structure.unmatchedClosingBrace?.let { position(it) }
@@ -374,8 +423,14 @@ internal class ScriptSource(
         )
         laterDeclaredDependencyCandidates = structure.laterDeclaredDependencyCandidates.map { it.toLaterDeclaredReference() }
         hiddenLocalFunctionCandidates = structure.hiddenLocalFunctionCandidates.map { it.toLaterDeclaredReference() }
-        shadowedFunctionCandidates = structure.shadowedFunctionCandidates.map { (reference, property, function) ->
-            Triple(reference.toScriptReference(), position(property).line, position(function).line)
+        shadowedFunctionCandidates = structure.shadowedFunctionCandidates.map { candidate ->
+            ShadowedFunctionReference(
+                candidate.reference.toScriptReference(),
+                candidate.locals.map { position(it).line },
+                candidate.isFunction,
+                position(candidate.function).line,
+                candidate.isInInferredType
+            )
         }
         coroutineScopeCandidates = structure.coroutineScopeCandidates.map { it.toLaterDeclaredReference() }
         bodyDeclarations = structure.bodyDeclarations
@@ -390,6 +445,8 @@ internal class ScriptSource(
         // the confirming compilation reports the deprecations, even if suppressed by the script
         val unsuppressed = BooleanArray(script.length)
         if (confirming) structure.suppressions.forEach { unsuppressed.fill(true, it.first, it.last + 1) }
+        val renamed = CharArray(script.length)
+        structure.renamedRanges.forEach { (range, char) -> renamed.fill(char, range.first, range.last + 1) }
         fun addLines(
             range: IntRange,
             keep: (offset: Int) -> Boolean
@@ -397,7 +454,7 @@ internal class ScriptSource(
             val bounds = lineBounds[line]
             lines += buildString {
                 bounds.forEach { offset ->
-                    +(if (keep(offset) && !unsuppressed[offset]) script[offset] else ' ')
+                    +(if (keep(offset) && !unsuppressed[offset]) (if (renamed[offset] != '\u0000') renamed[offset] else script[offset]) else ' ')
                 }
             }
             mapping += line
@@ -430,8 +487,14 @@ internal class ScriptSource(
                 lines += "@kotlin.Deprecated(${stringLiteral(hiddenLocalFunctionMessage(name))}) $declaration"
                 mapping += null
             }
+            // resolved together with the moved functions they overload, as in the script, see shadowedFunctionCopies
+            structure.overloadingCopies.forEach {
+                lines += it
+                mapping += null
+            }
             // the deprecation of the local functions, like the copies in the script block, is not reported, unlike their opt-in
-            listOf(LATER_DECLARED_FUNCTION, SHADOWED_FUNCTION, SHADOWED_ORIGINAL, COROUTINE_SCOPE_ORIGINAL, COROUTINE_SCOPE_FUNCTION).forEach { message ->
+            val blockCopyMessages = structure.blockCopies.values.flatten().flatMap { it.first }
+            (listOf(LATER_DECLARED_FUNCTION, SHADOWED_FUNCTION, SHADOWED_ORIGINAL, COROUTINE_SCOPE_ORIGINAL, COROUTINE_SCOPE_FUNCTION) + blockCopyMessages).distinct().forEach { message ->
                 lines += "@kotlin.RequiresOptIn(${stringLiteral(message)}, level = RequiresOptIn.Level.WARNING) annotation class ${optInMarker(message)}"
                 mapping += null
             }
@@ -449,9 +512,9 @@ internal class ScriptSource(
         shadowed.filterNot { it.isCallable && it.name in structure.movedFunctions }.forEach { addAccessor(it) }
         lines += "}"
         mapping += null
-        val markedOriginals = confirming && !shadowedFunctionCopies && !coroutineScopeCopies
+        val markedOriginals = confirming && !shadowedFunctionCopies && !overloadingFunctionCopies && !coroutineScopeCopies
         val deprecatedFunctions = if (markedOriginals) {
-            shadowedFunctionCandidates.mapTo(HashSet()) { it.first.name }
+            shadowedFunctionCandidates.mapTo(HashSet()) { it.reference.name }
         } else {
             emptySet()
         }
@@ -464,6 +527,14 @@ internal class ScriptSource(
             // opt-in markers, which can mark the same declaration, unlike the deprecations
             if (declaration.kind == DeclarationKind.FUNCTION && declaration.name in deprecatedFunctions) {
                 lines += "@${optInMarker(SHADOWED_ORIGINAL)}"
+                mapping += null
+            }
+            // each marked, as the message tells which one is called
+            if (declaration.kind == DeclarationKind.FUNCTION && declaration.name in structure.overloadedFunctions) {
+                val message = shadowedFunctionMessage(declaration.nameRange?.first ?: declaration.start)
+                lines += "@kotlin.RequiresOptIn(${stringLiteral(message)}, level = RequiresOptIn.Level.WARNING) annotation class ${optInMarker(message)}"
+                lines += "@${optInMarker(message)}"
+                mapping += null
                 mapping += null
             }
             if (declaration.name in coroutineScopeDeclarations) {
@@ -565,6 +636,12 @@ internal class ScriptSource(
         position(it.first) to position(it.last + 1)
     }
 
+    /** The 0-based line of the moved function, or of its copy, named in this opt-in [message], see [shadowedFunctionCopies]. */
+    fun shadowedFunctionLine(
+        message: String
+    ): Int? = shadowedFunctionOffset.find(message)?.groupValues?.get(1)?.toInt()
+        ?.let { position(it).line }
+
     /**
      * The 0-based line of the declaration of the [name] in the script body, and its kind.
      */
@@ -617,6 +694,16 @@ private fun lineBounds(
     }
     add(start until script.length)
 }
+
+/** See [ScriptSource.shadowedFunctionCandidates], with the offsets of the local declarations and of the first moved function. */
+private class ShadowedCandidate(
+    val reference: Reference,
+    val locals: List<Int>,
+    val function: Int,
+    val isFunction: Boolean,
+    /** See [ShadowedFunctionReference.isInInferredType]. */
+    val isInInferredType: Boolean = false
+)
 
 private class Declaration(
     val name: String?,
@@ -692,8 +779,14 @@ private fun KtNamedFunction.signature(): String? = if (
         (if (parameter.isVarArg) "vararg " else "") + "`${parameter.name}`: ${parameter.typeReference?.singleLineText()}" +
                 (if (parameter.hasDefaultValue()) " = kotlin.TODO()" else "")
     }
-    // keeping the type of the call, which might be an argument of another one
-    +"): ${typeReference?.singleLineText() ?: "Nothing"}"
+    +")"
+    // keeping the type of the call, which might be an argument of another one, inferred if it is inferred from the expression,
+    // as the compiler prefers the script functions of the inferred types to the other ones, see CLAUDE.md,
+    // so the confirming compilation reports that the inferred `Nothing` should be declared, an error ignored there
+    when {
+        typeReference != null -> +": ${typeReference!!.singleLineText()}"
+        !isOfInferredType() -> +": Nothing"
+    }
     typeConstraintList?.let {
         +" where "
         +it.singleLineText()
@@ -971,6 +1064,38 @@ private fun isInLambda(
     scope: PsiElement
 ): Boolean = expression.parents.takeWhile { it !== scope }.any { it is KtLambdaExpression }
 
+/** Whether the return type of the function is inferred from its expression body, unlike a declared one, or `Unit` of a block body. */
+private fun KtNamedFunction.isOfInferredType(): Boolean = typeReference == null && bodyBlockExpression == null && bodyExpression != null
+
+/**
+ * Whether the [element] is within a declaration of a declared type, like `fun h(): String = show(1)`, which would be a member in the script,
+ * rather than the local declaration of another one, within the [scope], exclusive, see [ShadowedFunctionReference.isInInferredType].
+ * The `init` blocks, the constructors, and the default values of the parameters of the primary constructors are resolved like them.
+ */
+private fun isInDeclaredType(
+    element: PsiElement,
+    scope: PsiElement
+): Boolean {
+    /** Whether it would be a member in the script, of the script class, or of a class which would be its member. */
+    fun KtDeclaration.isMember(): Boolean = parent === scope || (parent as? KtClassBody)?.parent.let { owner ->
+        owner is KtClassOrObject && !(owner is KtObjectDeclaration && owner.isObjectLiteral()) && owner.isMember()
+    }
+    val declaration = element.parents.takeWhile { it !== scope }.firstOrNull {
+        when (it) {
+            // like the top-level statements, which are the initializers of the script
+            is KtScriptInitializer -> false
+            is KtNamedFunction, is KtProperty, is KtAnonymousInitializer, is KtSecondaryConstructor -> (it as KtDeclaration).isMember()
+            is KtParameter -> (it.parent?.parent as? KtPrimaryConstructor)?.getContainingClassOrObject()?.isMember() == true
+            else -> false
+        }
+    }
+    return when (declaration) {
+        is KtNamedFunction -> !declaration.isOfInferredType()
+        is KtProperty -> declaration.typeReference != null
+        else -> declaration != null
+    }
+}
+
 /** See [Reference.canAccessScriptMembers]. */
 private fun canAccessScriptMembers(
     expression: PsiElement,
@@ -1090,6 +1215,8 @@ private class ScriptStructure(
     confirming: Boolean,
     /** See [ScriptSource.shadowedFunctionCopies]. */
     shadowedFunctionCopies: Boolean,
+    /** See [ScriptSource.overloadingFunctionCopies]. */
+    overloadingFunctionCopies: Boolean,
     /** See [ScriptSource.coroutineScopeCopies]. */
     coroutineScopeCopies: Boolean
 ) {
@@ -1132,8 +1259,17 @@ private class ScriptStructure(
     /** The ranges of the `@Suppress` annotations of the script, which might suppress the deprecations, see [ScriptSource.confirming]. */
     val suppressions: List<IntRange>
 
-    /** See [ScriptSource.shadowedFunctionCandidates], with the offsets of the properties and the functions. */
-    val shadowedFunctionCandidates: List<Triple<Reference, Int, Int>>
+    /** See [ScriptSource.shadowedFunctionCandidates]. */
+    val shadowedFunctionCandidates: List<ShadowedCandidate>
+
+    /** The names of the moved functions overloaded by the local ones, which the [shadowedFunctionCandidates] call, see [ScriptSource.overloadingFunctionCopies]. */
+    val overloadedFunctions: Set<String>
+
+    /** The copies of the local functions overloading the [overloadedFunctions], see [ScriptSource.overloadingFunctionCopies]. */
+    val overloadingCopies: List<String>
+
+    /** The names of the local functions overloading the [overloadedFunctions], renamed with these letters, see [ScriptSource.overloadingFunctionCopies]. */
+    val renamedRanges: List<Pair<IntRange, Char>>
 
     /** See [ScriptSource.coroutineScopeCandidates], with the offsets of the declarations, and whether they are functions. */
     val coroutineScopeCandidates: List<Triple<Reference, Int, Boolean>>
@@ -1295,7 +1431,8 @@ private class ScriptStructure(
             // like `log("x")` of `fun f(log: Int)`, calling the local function in the script, if the inner declaration does not apply
             declaration.references.filter { it.isBound && it.isCall && !it.isQualified && it.name in localFunctions && it.name in dependencyNames }.map { it.name }
         }
-        hiddenLocalFunctionCopies = if (!confirming) emptyList() else {
+        // unlike the copies of the local functions overloading the moved ones, see ScriptSource.overloadingFunctionCopies
+        hiddenLocalFunctionCopies = if (!confirming || overloadingFunctionCopies) emptyList() else {
             hiddenLocalFunctionCandidates.mapTo(LinkedHashSet()) { it.first.name }.flatMap { name ->
                 // the moved declarations cannot refer to the values of the local classes
                 ((localFunctionsByName[name].orEmpty() + localExtensions[name].orEmpty())
@@ -1330,17 +1467,60 @@ private class ScriptStructure(
                     .forEach { shadowingProperties.putIfAbsent(it, index to property) }
             }
         }
-        val shadowedFunctionCandidatesByStatement = statements.indices.associateWith { index ->
-            if (declarationsByPsi[statements[index]] in moved) return@associateWith emptyList()
-            statementReferences[index].mapNotNull { reference ->
-                shadowingProperties[reference.name]?.takeIf { (propertyIndex) ->
-                    propertyIndex < index && reference.isCall && reference.refersToLocal(localProperties)
-                }?.let { (_, property) ->
-                    Triple(reference, property.line(), movedFunctionsByName.getValue(reference.name).first().line())
+        // the local functions overloading the moved functions, by the indices of their statements
+        val overloadingFunctions = buildMap<String, MutableList<Pair<Int, ParsedDeclaration>>> {
+            statements.forEachIndexed { index, statement ->
+                declarationsByPsi[statement]?.takeIf { it in local && it.name in movedFunctionsByName }?.let { function ->
+                    getOrPut(function.name!!) { mutableListOf() } += index to function
                 }
             }
         }
+        // the names of the overloads of both inferred and declared types, which a regular script resolves differently
+        // within the declarations of inferred types, see ScriptSource.overloadingFunctionCopies
+        val mixedOverloads = overloadingFunctions.filter { (name, functions) ->
+            (functions.map { it.second } + movedFunctionsByName.getValue(name)).map { (it.psi as KtNamedFunction).isOfInferredType() }.distinct().size > 1
+        }.keys
+        // unless they cannot be copied preceding the moved declarations, see ScriptSource.overloadingFunctionCopies
+        val uncopiedOverloads = overloadingFunctions.filter { (_, functions) ->
+            functions.any { (_, function) -> function.refersToTypes(uncopiedTypes) || function.signature() == null }
+        }.keys
+        val shadowedFunctionCandidatesByStatement = statements.indices.associateWith { index ->
+            if (declarationsByPsi[statements[index]] in moved) return@associateWith emptyList()
+            statementReferences[index].mapNotNull { reference ->
+                val function = movedFunctionsByName[reference.name]?.first()?.line() ?: return@mapNotNull null
+                shadowingProperties[reference.name]?.takeIf { (propertyIndex) ->
+                    propertyIndex < index && reference.isCall && reference.refersToLocal(localProperties)
+                }?.let { (_, property) ->
+                    ShadowedCandidate(reference, listOf(property.line()), function, isFunction = false)
+                } ?: overloadingFunctions[reference.name]
+                    // also within the function itself, which is visible there
+                    ?.filter { (functionIndex) -> functionIndex <= index }
+                    ?.takeIf { it.isNotEmpty() && reference.isCall && reference.refersToLocal(localFunctions) }
+                    ?.let { visible ->
+                        val isInInferredType = reference.name in mixedOverloads
+                                && file.findElementAt(reference.offset)?.let { isInDeclaredType(it, statements[index].parent) } != true
+                        if (isInInferredType && reference.name in uncopiedOverloads) null else {
+                            ShadowedCandidate(reference, visible.map { it.second.line() }, function, isFunction = true, isInInferredType)
+                        }
+                    }
+            }
+        }
         shadowedFunctionCandidates = shadowedFunctionCandidatesByStatement.values.flatten()
+        val overloadedNames = shadowedFunctionCandidates.filter { it.isInInferredType }.mapTo(HashSet()) { it.reference.name }
+        overloadedFunctions = if (overloadingFunctionCopies) overloadedNames else emptySet()
+        val overloading = if (!overloadingFunctionCopies) emptyMap() else overloadingFunctions.filterKeys { it in overloadedNames }
+        overloadingCopies = overloading.values.flatten().mapNotNull { it.second.signature() }
+        // a distinct letter for each name, so the renamed functions of different names do not overload each other
+        renamedRanges = overloading.values.flatMapIndexed { index, functions ->
+            functions.mapNotNull { (_, function) ->
+                (function.psi as KtNamedFunction).nameIdentifier?.let { identifier ->
+                    // within the backticks, if quoted
+                    val quoted = identifier.text.length > 1 && identifier.text.startsWith('`')
+                    val range = if (quoted) identifier.startOffset + 1 until identifier.endOffset - 1 else identifier.startOffset until identifier.endOffset
+                    range to RENAMED_CHARS + index
+                }
+            }
+        }
         // unlike the extension properties, which do not apply without their receivers
         val coroutineScopeDeclarations = moved.filter {
             (it.kind == DeclarationKind.FUNCTION || (it.kind == DeclarationKind.PROPERTY && (it.psi as? KtProperty)?.receiverTypeReference == null))
@@ -1377,7 +1557,7 @@ private class ScriptStructure(
             fun addCopies(
                 candidatesByStatement: Map<Int, List<Triple<Reference, Int, *>>>,
                 functions: Map<String, List<ParsedDeclaration>>,
-                message: String
+                message: (ParsedDeclaration) -> String
             ) = candidatesByStatement.entries.sortedBy { it.key }.flatMap { (index, candidates) ->
                 candidates.map { it.first.name to index }
             }.distinctBy { it.first }.forEach { (name, index) ->
@@ -1399,15 +1579,19 @@ private class ScriptStructure(
                 val invisibleClasses = localClasses.filter { statementIndices.getValue(it.psi) >= first }.mapTo(HashSet()) { it.name!! }
                 getOrPut(leadingStart(first)) { mutableListOf() } += functions[name].orEmpty()
                     .filterNot { it.refersToTypes(invisibleClasses) }
-                    .mapNotNull { it.signature() }
-                    .map { message to it }
+                    .mapNotNull { function -> function.signature()?.let { message(function) to it } }
             }
             addCopies(
                 laterDeclaredCandidatesByStatement.mapValues { (_, candidates) -> candidates.filter { it.third } },
-                localFunctionsByName,
-                LATER_DECLARED_FUNCTION
-            )
-            if (shadowedFunctionCopies) addCopies(shadowedFunctionCandidatesByStatement, movedFunctionsByName, SHADOWED_FUNCTION)
+                localFunctionsByName
+            ) { LATER_DECLARED_FUNCTION }
+            // resolved among the local functions, like among the members of the script class in the declarations of declared types
+            if (shadowedFunctionCopies) addCopies(
+                shadowedFunctionCandidatesByStatement.mapValues { (_, candidates) ->
+                    candidates.filterNot { it.isInInferredType }.map { Triple(it.reference, it.locals.first(), it.function) }
+                },
+                movedFunctionsByName
+            ) { shadowedFunctionMessage(it.line()) }
         }.let { copies ->
             // the same signature once, preceding its first use, as declaring it twice would make the calls ambiguous
             copies.entries.sortedBy { it.key }
