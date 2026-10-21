@@ -23,19 +23,29 @@ import com.xemantic.kotlin.test.be
 import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CompletableJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.currentTime
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.jetbrains.kotlin.config.JvmTarget
 import java.util.concurrent.Executors
 import kotlin.reflect.full.createType
 import kotlin.reflect.typeOf
+import kotlin.script.experimental.api.CompiledScript
+import kotlin.script.experimental.api.ResultWithDiagnostics
+import kotlin.script.experimental.api.ScriptCompilationConfiguration
+import kotlin.script.experimental.api.SourceCode
+import kotlin.script.experimental.jvmhost.JvmScriptCompiler
 import kotlin.test.Test
 import kotlin.time.Clock
 import kotlin.time.Duration.Companion.hours
@@ -70,6 +80,16 @@ class OptionalUser {
 
 class DurationLogger {
     operator fun invoke(duration: kotlin.time.Duration) = "dep:$duration"
+}
+
+/** Fails with whatever the [failure] throws, instead of compiling the script. */
+class FailingCompiler(
+    private val failure: suspend () -> Nothing
+) : JvmScriptCompiler() {
+    override suspend fun invoke(
+        script: SourceCode,
+        scriptCompilationConfiguration: ScriptCompilationConfiguration
+    ): ResultWithDiagnostics<CompiledScript> = failure()
 }
 
 class ScriptExecutorTest {
@@ -2381,6 +2401,109 @@ class ScriptExecutorTest {
                 error: The script is nested too deeply to be parsed.
             """.trimIndent()
         }
+    }
+
+    @Test
+    fun `should report internal failure of the compiler as compilation error`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            compiler = FailingCompiler { throw IllegalStateException("compiler crashed") }
+        )
+
+        // when
+        val result = executor.execute("42")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                error: The script could not be compiled because of an internal failure of the compiler: java.lang.IllegalStateException: compiler crashed
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report compilation cancelled by the compiler while the caller is active as compilation error`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            compiler = FailingCompiler { throw CancellationException("compiler cancelled") }
+        )
+
+        // when
+        val result = executor.execute("42")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                error: The script could not be compiled because of an internal failure of the compiler: java.lang.IllegalStateException: The compilation of the script was cancelled
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun `should report internal failure of the compiler as compilation error to all the callers waiting for the cached compilation`() = runTest {
+        // given
+        val failing = CompletableDeferred<Unit>()
+        val executor = DefaultScriptExecutor(
+            // so the waiter is waiting in the cache before the compiler fails
+            dispatcher = StandardTestDispatcher(testScheduler),
+            compilationCacheSize = 10,
+            compiler = FailingCompiler {
+                failing.await()
+                throw IllegalStateException("compiler crashed")
+            }
+        )
+        val owner = async { executor.execute("42") }
+        runCurrent()
+        val waiter = async { executor.execute("42") }
+        runCurrent()
+
+        // when
+        failing.complete(Unit)
+        val results = listOf(owner.await(), waiter.await())
+
+        // then
+        assert(results.all { it is ScriptResult.Error && it.phase == ExecutionPhase.COMPILATION })
+        assert(executor.compilationCount == 1)
+    }
+
+    @Test
+    fun `should not report VirtualMachineError of the compiler as compilation error`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            compiler = FailingCompiler { throw OutOfMemoryError("compiler out of memory") }
+        )
+
+        // when
+        val failure = runCatching { executor.execute("42") }.exceptionOrNull()
+
+        // then
+        assert(failure is OutOfMemoryError && failure.message == "compiler out of memory")
+    }
+
+    @Test
+    fun `should cancel the compilation when its caller is cancelled`() = runTest {
+        // given
+        val compiling = CompletableDeferred<Unit>()
+        val executor = DefaultScriptExecutor(
+            compiler = FailingCompiler {
+                compiling.complete(Unit)
+                awaitCancellation()
+            }
+        )
+        var result: ScriptResult? = null
+        val execution = launch { result = executor.execute("42") }
+        compiling.await()
+
+        // when
+        execution.cancelAndJoin()
+
+        // then
+        assert(execution.isCancelled && result == null)
     }
 
     @Test

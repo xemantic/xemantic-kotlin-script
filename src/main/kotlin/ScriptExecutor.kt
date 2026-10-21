@@ -95,6 +95,9 @@ public interface ScriptExecutor {
      * Executes the [script] in the coroutine of the caller, with a [CoroutineScope] receiver,
      * so the caller awaits all the coroutines it launched, and its cancellation cancels them.
      * Note that cancellation cannot interrupt a blocking call of the script, like `Thread.sleep`.
+     *
+     * Even an internal failure of the compiler is reported as a [ExecutionPhase.COMPILATION] error,
+     * while only the cancellation of the caller, and a [VirtualMachineError] other than [StackOverflowError], are thrown.
      */
     public suspend fun execute(
         @Language("kotlin") script: String,
