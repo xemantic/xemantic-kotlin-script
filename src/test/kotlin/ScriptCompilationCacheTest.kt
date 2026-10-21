@@ -177,6 +177,58 @@ class ScriptCompilationCacheTest {
     }
 
     @Test
+    fun `should count the compilation confirming the reference to later declared dependency`() = runTest {
+        // given
+        val script = """
+            fun show() = x
+            val x = 2
+            show()
+        """.trimIndent()
+        val executor = DefaultScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("x", 1)))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+        }
+        assert(executor.compilationCount == 2)
+    }
+
+    @Test
+    fun `should serve the compiled script rejected for referring to later declared dependency from the cache`() = runTest {
+        // given
+        val script = """
+            fun show() = x
+            val x = 2
+            show()
+        """.trimIndent()
+        val dependencies = listOf(dependency("x", 1))
+        val executor = DefaultScriptExecutor(compilationCacheSize = 10)
+
+        // when
+        val result1 = executor.execute(script, dependencies)
+        val result2 = executor.execute(script, dependencies)
+
+        // then
+        listOf(result1, result2).forEach { result ->
+            result should {
+                be<ScriptResult.Error>()
+                have(phase == ExecutionPhase.COMPILATION)
+                message sameAs """
+                    script.kts:1:14: error: 'x' refers to the dependency, as the property 'x' of the script body is declared later, at line 2.
+                      | fun show() = <error>x</error>
+                      hint: declare the property before line 1, or rename it.
+                """.trimIndent()
+            }
+        }
+        // the compilation and the confirming one, only for the first execution
+        assert(executor.compilationCount == 2)
+    }
+
+    @Test
     fun `should report unmatched closing brace of the script without compiling it`() = runTest {
         // given
         val script = """

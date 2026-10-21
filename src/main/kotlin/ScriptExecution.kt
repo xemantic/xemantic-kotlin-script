@@ -103,8 +103,9 @@ internal class DefaultScriptExecutor(
     private val compilations = AtomicInt(0)
 
     /**
-     * The number of the actual compilations, not served by the cache,
-     * including the ones confirming the [ScriptSource.laterDeclaredDependencyCandidates].
+     * The number of the invocations of the compiler, the ones bounded by the `maxConcurrentCompilations`,
+     * so not counting the compilations served by the cache,
+     * while counting each confirming one of a compiled script, see [ScriptSource.confirming].
      */
     @OptIn(ExperimentalAtomicApi::class)
     internal val compilationCount: Int get() = compilations.load()
