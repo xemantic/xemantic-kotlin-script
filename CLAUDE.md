@@ -62,6 +62,9 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   An exception whose `getStackTrace()` contains `null` crashes the recovery itself, so such a case can only be tested by calling `ScriptErrorReporter` directly.
   The same applies to a compilation failure shared through the compilation cache: the waiters receive such a copy, while the compiling caller gets the original, so a message built from its `cause` differs between them unless unwrapped.
 
+- The script compilation does not resolve a backticked import alias, not even a plain one like ``import kotlin.check as `verify` `` (`Unresolved reference`), while the same alias without backticks works —
+  so a test needing a library function of a name with special characters, like `` `say$hi` ``, declares it in the test sources, see `StringLiteralNames.kt`, and star-imports its package.
+
 ## Anti-patterns to avoid
 
 - Inside a lambda walking a chain of exceptions in a `Throwable` extension, like `generateSequence(this) { read(null) { cause } }`,

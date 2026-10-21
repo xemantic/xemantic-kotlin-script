@@ -142,6 +142,14 @@ internal fun hiddenLocalFunctionMessage(
     name: String
 ): String = "$HIDDEN_LOCAL_FUNCTION: $name;"
 
+/**
+ * The string literal of this [value], escaping the characters ending it, or starting an escape, or a template,
+ * which a backticked name can contain, like `` `say "hi"` `` or `` `$x` ``.
+ */
+private fun stringLiteral(
+    value: String
+): String = "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"").replace("$", "\\$") + "\""
+
 /** The deprecation message of the copies of the moved functions, see [ScriptSource.shadowedFunctionCandidates]. */
 internal const val SHADOWED_FUNCTION = "xemantic-kotlin-script: shadowed function"
 
@@ -386,7 +394,7 @@ internal class ScriptSource(
         ) {
             preambleDependencies[lines.size] = dependency.name
             lines += if (dependency.name in deprecatedDependencies) {
-                "@kotlin.Deprecated(\"$LATER_DECLARED_DEPENDENCY\") ${dependency.accessor}"
+                "@kotlin.Deprecated(${stringLiteral(LATER_DECLARED_DEPENDENCY)}) ${dependency.accessor}"
             } else {
                 dependency.accessor
             }
@@ -395,12 +403,12 @@ internal class ScriptSource(
         if (confirming) {
             // named in the message, as the operators of the same position refer to different functions, like `get` and `set`
             structure.hiddenLocalFunctionCopies.forEach { (name, declaration) ->
-                lines += "@kotlin.Deprecated(\"${hiddenLocalFunctionMessage(name)}\") $declaration"
+                lines += "@kotlin.Deprecated(${stringLiteral(hiddenLocalFunctionMessage(name))}) $declaration"
                 mapping += null
             }
             // the deprecation of the local functions, like the copies in the script block, is not reported, unlike their opt-in
             listOf(LATER_DECLARED_FUNCTION, SHADOWED_FUNCTION, SHADOWED_ORIGINAL, COROUTINE_SCOPE_ORIGINAL, COROUTINE_SCOPE_FUNCTION).forEach { message ->
-                lines += "@kotlin.RequiresOptIn(\"$message\", level = RequiresOptIn.Level.WARNING) annotation class ${optInMarker(message)}"
+                lines += "@kotlin.RequiresOptIn(${stringLiteral(message)}, level = RequiresOptIn.Level.WARNING) annotation class ${optInMarker(message)}"
                 mapping += null
             }
         }

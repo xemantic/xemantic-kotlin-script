@@ -3853,6 +3853,63 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report error at declaration moved out of the script body calling local function with dollar in name named like imported function`() = runTest {
+        // given
+        // the name is pasted into the string literal of the deprecation message of its copy
+        val script = """
+            import com.xemantic.kotlin.script.names.*
+            val strict = true
+            fun `say${'$'}hi`(flag: Boolean) { if (strict && !flag) throw IllegalStateException("strict") }
+            sealed interface S
+            class T : S { fun f() = `say${'$'}hi`(false) }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:5:25: error: 'say${'$'}hi' does not refer to the function of the script body declared at line 3, which is not visible in 'T'.
+                  | class T : S { fun f() = <error>`say${'$'}hi`</error>(false) }
+                  hint: 'T' is compiled outside of the script body, where 'say${'$'}hi' (line 3) is not visible - pass it as a parameter, or declare it within 'T'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at declaration moved out of the script body calling local function with quotes in name named like imported function`() = runTest {
+        // given
+        val script = """
+            import com.xemantic.kotlin.script.names.*
+            val strict = true
+            fun `say"hi"`(flag: Boolean) { if (strict && !flag) throw IllegalStateException("strict") }
+            sealed interface S
+            class T : S { fun f() = `say"hi"`(false) }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:5:25: error: 'say"hi"' does not refer to the function of the script body declared at line 3, which is not visible in 'T'.
+                  | class T : S { fun f() = <error>`say"hi"`</error>(false) }
+                  hint: 'T' is compiled outside of the script body, where 'say"hi"' (line 3) is not visible - pass it as a parameter, or declare it within 'T'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should call member of supertype from declaration moved out of the script body when local function has its name`() = runTest {
         // given
         val script = """
