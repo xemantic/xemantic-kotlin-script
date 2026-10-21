@@ -64,6 +64,8 @@ import org.jetbrains.kotlin.psi.KtPropertyAccessor
 import org.jetbrains.kotlin.psi.KtPsiFactory
 import org.jetbrains.kotlin.psi.KtSimpleNameExpression
 import org.jetbrains.kotlin.psi.KtStringTemplateExpression
+import org.jetbrains.kotlin.psi.KtSuperExpression
+import org.jetbrains.kotlin.psi.KtThisExpression
 import org.jetbrains.kotlin.psi.KtLambdaExpression
 import org.jetbrains.kotlin.psi.KtOperationReferenceExpression
 import org.jetbrains.kotlin.psi.KtTypeAlias
@@ -72,6 +74,7 @@ import org.jetbrains.kotlin.psi.KtUserType
 import org.jetbrains.kotlin.psi.KtValueArgumentName
 import org.jetbrains.kotlin.psi.KtWhenExpression
 import org.jetbrains.kotlin.psi.psiUtil.allChildren
+import org.jetbrains.kotlin.psi.psiUtil.anyDescendantOfType
 import org.jetbrains.kotlin.psi.psiUtil.collectDescendantsOfType
 import org.jetbrains.kotlin.psi.psiUtil.endOffset
 import org.jetbrains.kotlin.psi.psiUtil.getReceiverExpression
@@ -155,6 +158,29 @@ internal val coroutineScopeFunctions = setOf(
     "launch", "async", "cancel", "ensureActive", "plus", "newCoroutineContext",
     "let", "run", "also", "apply", "takeIf", "takeUnless", "to", "runCatching"
 )
+
+/**
+ * The names, which are not resolved on any receiver of the script body, like the functions imported by default,
+ * not extending anything, the implicit parameter of a lambda, and the root packages, see [ScriptStructure.delegatedProperties].
+ */
+private val nonReceiverNames = setOf(
+    "it", "java", "javax", "kotlin", "kotlinx",
+    "listOf", "listOfNotNull", "mutableListOf", "arrayListOf", "emptyList", "setOf", "setOfNotNull", "mutableSetOf", "hashSetOf",
+    "linkedSetOf", "emptySet", "mapOf", "mutableMapOf", "hashMapOf", "linkedMapOf", "emptyMap", "arrayOf", "emptyArray",
+    "intArrayOf", "longArrayOf", "doubleArrayOf", "sequenceOf", "generateSequence", "buildString", "buildList", "buildSet", "buildMap",
+    "print", "println", "require", "requireNotNull", "check", "checkNotNull", "error", "maxOf", "minOf", "repeat", "with"
+)
+
+/**
+ * The names, which might be resolved on the receivers of the script body, or of an object,
+ * before any declaration of the script, but the local ones, see [ScriptStructure.delegatedProperties].
+ */
+private val receiverNames = coroutineScopeProperties + coroutineScopeFunctions + setOf("produce", "actor", "future", "promise")
+
+/** The names of the parameters of the operators of the delegated properties, see [ScriptStructure.insertions]. */
+private const val DELEGATE_THIS_REF = "\$thisRef"
+
+private const val DELEGATE_PROPERTY = "\$property"
 
 /** The opt-in message of the moved declarations, see [ScriptSource.coroutineScopeCandidates]. */
 internal const val COROUTINE_SCOPE_ORIGINAL = "xemantic-kotlin-script: coroutine scope original"
@@ -355,11 +381,13 @@ internal class ScriptSource(
         if (confirming) structure.suppressions.forEach { unsuppressed.fill(true, it.first, it.last + 1) }
         fun addLines(
             range: IntRange,
+            /** The end of the last line, exclusive, if it is split, see [ScriptStructure.insertions]. */
+            end: Int = Int.MAX_VALUE,
             keep: (offset: Int) -> Boolean
         ) = range.forEach { line ->
             val bounds = lineBounds[line]
             lines += buildString {
-                bounds.forEach { offset ->
+                bounds.takeWhile { it < end }.forEach { offset ->
                     +(if (keep(offset) && !unsuppressed[offset]) script[offset] else ' ')
                 }
             }
@@ -438,13 +466,31 @@ internal class ScriptSource(
         mapping += null
         // the copies preceding the statements, where the local classes declared before them are visible
         val blockCopies = structure.blockCopies.entries.groupBy({ lineOf(it.key) }) { it.value }
+        val insertions = structure.insertions.entries.sortedBy { it.key }.groupBy { lineOf(it.key) }
         (lineOf(headerEnd)..lineBounds.lastIndex).forEach { line ->
             blockCopies[line]?.flatten()?.forEach { (messages, declaration) ->
                 lines += messages.joinToString(separator = " ", postfix = " ") { "@${optInMarker(it)}" } + declaration
                 mapping += null
             }
-            addLines(line..line) { offset ->
-                offset >= headerEnd && !excluded[offset]
+            // split at the insertions, each part of the line keeping its columns, omitted if blank
+            val splits = insertions[line].orEmpty()
+            fun removeBlankPart() {
+                if (splits.isNotEmpty() && lines.last().isBlank()) {
+                    lines.removeAt(lines.lastIndex)
+                    mapping.removeAt(mapping.lastIndex)
+                }
+            }
+            var start = lineStarts[line]
+            (splits + null).forEach { split ->
+                addLines(line..line, end = split?.key ?: Int.MAX_VALUE) { offset ->
+                    offset >= start && offset >= headerEnd && !excluded[offset]
+                }
+                removeBlankPart()
+                split?.value?.forEach { (inserted, offset) ->
+                    lines += inserted
+                    mapping += lineOf(offset)
+                }
+                start = split?.key ?: start
             }
         }
         if (returnsUnit) {
@@ -1078,6 +1124,33 @@ private class ScriptStructure(
     /** The names of the [ScriptSource.conflictingDependencyDeclarations], and their ranges. */
     val conflictingDependencyDeclarations: List<Pair<String, IntRange>>
 
+    /**
+     * The lines inserted into the script body, by the offsets of the script the lines containing them are split at,
+     * each with the offset of the script, which the line maps to,
+     * turning the properties with the accessors reading the local properties into the local ones delegated to the objects,
+     * like `val total: Int get() = items.sum()` into:
+     *
+     * ```
+     * val total: Int
+     *  by object {
+     * operator fun getValue(`$thisRef`: kotlin.Any?, `$property`: kotlin.Any?)
+     *          : Int
+     *                      = items.sum()
+     * }
+     * ```
+     *
+     * reading them when accessed, like in the script, where they are the members of the script class,
+     * while the accessors are blanked out up to their parameters, keeping the columns of the rest,
+     * see [delegatedProperties].
+     */
+    val insertions: Map<Int, List<Pair<String, Int>>>
+
+    /** See [delegatedProperties]. */
+    private val delegatedProperties: Set<ParsedDeclaration>
+
+    /** Whether it cannot be local, as it requires it, unless it is one of the [delegatedProperties]. */
+    private val ParsedDeclaration.mustMove: Boolean get() = requiresMove && this !in delegatedProperties
+
     /** The modifiers which are not applicable to local declarations. */
     val blankedRanges = mutableListOf<IntRange>()
 
@@ -1105,22 +1178,55 @@ private class ScriptStructure(
             declarationsByPsi[statement]?.references ?: statement.references(scope = statement.parent, declaredNames)
         }
         val bodyReferences = statementReferences.flatten()
+        val importedNames = file.importDirectives.filter { !it.isAllUnder }.mapNotNullTo(HashSet()) {
+            it.aliasName ?: it.importedFqName?.shortName()?.asString()
+        }
+        delegatedProperties = delegatedProperties(declarations, bodyReferences, dependencyNames, importedNames)
+        insertions = buildMap<Int, MutableList<Pair<String, Int>>> {
+            fun insert(
+                offset: Int,
+                line: String,
+                lineOffset: Int = offset
+            ) {
+                getOrPut(offset) { mutableListOf() } += line to lineOffset
+            }
+            delegatedProperties.forEach { property ->
+                val psi = property.psi as KtProperty
+                property.accessors.forEachIndexed { index, accessor ->
+                    // at the line of the name of the property, like the function reading it in the stack traces
+                    if (index == 0) insert(accessor.startOffset, " by object {", property.nameRange!!.first)
+                    val parameters = "`$DELEGATE_THIS_REF`: kotlin.Any?, `$DELEGATE_PROPERTY`: kotlin.Any?"
+                    if (accessor.isGetter) {
+                        insert(accessor.startOffset, "operator fun getValue($parameters)")
+                        // so a mismatch is reported at the body of the getter, like in the script
+                        if (accessor.returnTypeReference == null && psi.typeReference != null) {
+                            typeCopy(psi, accessor.startOffset).let { (line, offset) -> insert(accessor.startOffset, line, offset) }
+                        }
+                        blankedRanges += accessor.startOffset until accessor.rightParenthesis!!.endOffset
+                    } else {
+                        // the parameter stays in place
+                        insert(accessor.startOffset, "operator fun setValue($parameters,")
+                        val parameter = accessor.parameter!!
+                        if (parameter.typeReference == null) {
+                            typeCopy(psi, accessor.startOffset).let { (line, offset) -> insert(parameter.endOffset, line, offset) }
+                        }
+                        blankedRanges += accessor.startOffset until accessor.leftParenthesis!!.endOffset
+                    }
+                }
+                insert(property.accessors.last().endOffset, "}")
+            }
+        }
         // the ones of the declarations which cannot be local keep their order, when moved, also relative to the ones they refer to
         val receiverReferences = statements.zip(statementReferences).flatMap { (statement, references) ->
-            if (declarationsByPsi[statement]?.requiresMove == true) emptyList() else references.filter { it.mightResolveOnReceiver }
+            if (declarationsByPsi[statement]?.mustMove == true) emptyList() else references.filter { it.mightResolveOnReceiver }
         }
         // only the properties which require it are moved
-        val properties = declarations.filter { it.kind == DeclarationKind.PROPERTY && !it.requiresMove }
-        val propertyNames = properties.flatMap { listOfNotNull(it.name) + it.destructuredNames }
+        val properties = declarations.filter { it.kind == DeclarationKind.PROPERTY && !it.mustMove }
+        val propertyNames = properties.flatMap { it.names }
         val propertyNameSet = propertyNames.toSet()
         val propertyNameCounts = propertyNames.groupingBy { it }.eachCount()
         // initialized with a literal, so they can be initialized at any time, moved with the declarations referring to them
-        var constants = properties.filter { property ->
-            val psi = property.psi as? KtProperty
-            psi != null && !psi.isVar && psi.delegate == null && psi.initializer.isConstant() && property.accessors.isEmpty()
-                    && property.name !in dependencyNames && property.name !in coroutineScopeProperties
-                    && propertyNameCounts[property.name] == 1
-        }
+        var constants = properties.filter { it.isConstant(dependencyNames, propertyNameCounts) }
         val typeNames = constants.associateWith { constant ->
             (constant.psi as KtProperty).typeReference?.collectDescendantsOfType<KtUserType>().orEmpty().mapNotNull { it.referencedName }
         }
@@ -1161,7 +1267,7 @@ private class ScriptStructure(
         statements.forEachIndexed { index, statement ->
             val declaration = declarationsByPsi[statement]?.takeIf { it !in moved } ?: return@forEachIndexed
             when {
-                declaration.kind == DeclarationKind.PROPERTY -> listOfNotNull(declaration.name) + declaration.destructuredNames
+                declaration.kind == DeclarationKind.PROPERTY -> declaration.names
                 declaration in local -> listOfNotNull(declaration.name)
                 else -> emptyList()
             }.filter { it in dependencyNames }.forEach {
@@ -1197,7 +1303,7 @@ private class ScriptStructure(
         val localPropertyDeclarations = declarations.filter { it.kind == DeclarationKind.PROPERTY && it !in moved }
         val localPropertiesByName = buildMap<String, MutableList<ParsedDeclaration>> {
             localPropertyDeclarations.forEach { property ->
-                (listOfNotNull(property.name) + property.destructuredNames).forEach { getOrPut(it) { mutableListOf() } += property }
+                property.names.forEach { getOrPut(it) { mutableListOf() } += property }
             }
         }
         // the local properties of the known types, which might be called, unless they refer to the local classes
@@ -1256,7 +1362,7 @@ private class ScriptStructure(
         val shadowingProperties = mutableMapOf<String, Pair<Int, ParsedDeclaration>>()
         statements.forEachIndexed { index, statement ->
             declarationsByPsi[statement]?.takeIf { it.kind == DeclarationKind.PROPERTY && it !in moved }?.let { property ->
-                (listOfNotNull(property.name) + property.destructuredNames)
+                property.names
                     .filter { it in movedFunctionsByName }
                     .forEach { shadowingProperties.putIfAbsent(it, index to property) }
             }
@@ -1375,7 +1481,7 @@ private class ScriptStructure(
                 .forEach { blankedRanges += it.startOffset until it.startOffset + it.textLength }
             if (declaration.kind == DeclarationKind.PROPERTY) {
                 declaration.psi.memberOnlyAnnotationEntries().forEach { blankedRanges += it.startOffset until it.endOffset }
-                declaration.accessors.forEach { blankedRanges += it.startOffset until it.endOffset }
+                if (declaration !in delegatedProperties) declaration.accessors.forEach { blankedRanges += it.startOffset until it.endOffset }
             }
         }
     }
@@ -1386,9 +1492,12 @@ private class ScriptStructure(
         val kind: DeclarationKind,
         val name: String?,
         val nameRange: IntRange?,
+        /** Whether it cannot be local, unless it is a property kept local as a delegated one, see [mustMove]. */
         val requiresMove: Boolean,
         /** The accessors of the property, which are its part. */
         val accessors: List<KtPropertyAccessor>,
+        /** Whether it is a property, which can be local as a delegated one, see [ScriptStructure.delegatedProperties]. */
+        val isDelegable: Boolean,
         val destructuredNames: List<String>,
         val isSealed: Boolean,
         /** Whether it is a function with a receiver, like `fun Int.double()`. */
@@ -1401,6 +1510,8 @@ private class ScriptStructure(
     ) {
         /** Without the comments preceding the declaration, which are left in the script body. */
         val start = psi.startOffsetSkippingComments
+        /** The declared names, also the destructured ones. */
+        val names: List<String> get() = listOfNotNull(name) + destructuredNames
         fun toDeclaration(
             withNestedNames: Boolean = false
         ) = Declaration(
@@ -1478,6 +1589,7 @@ private class ScriptStructure(
             nameRange = nameIdentifier?.let { it.startOffset until it.endOffset },
             requiresMove = requiresMove,
             accessors = accessors,
+            isDelegable = declaration is KtProperty && requiresMove && isDelegable(declaration, accessors),
             destructuredNames = (declaration as? KtDestructuringDeclaration)?.entries.orEmpty()
                 .mapNotNull { it.name }
                 .filter { it != "_" },
@@ -1489,6 +1601,129 @@ private class ScriptStructure(
             },
             references = declaration.references(scope = declaration.parent, declaredNames)
         )
+    }
+
+    /**
+     * The properties, which can be local as the delegated ones, see [isDelegable], reading the local properties of the script body,
+     * which would not be visible to them, if moved out of it, together with the ones reading them, see [insertions].
+     * The ones referring to the local properties only where a receiver might resolve them, like `name` in `user.run { name }`,
+     * stay moved, as there they refer to the member of the receiver, like in the script, see [Reference.mightResolveOnReceiver],
+     * and so do the ones, which might resolve a name on the implicit receivers of the object, or of the script block,
+     * like `javaClass`, `let { }` or `launch { }`, which are not resolved in the script,
+     * as their accessors may refer without a receiver only to the declarations of the script, the dependencies, the explicit imports,
+     * the names declared within the accessors, the [nonReceiverNames], and the capitalized names, like the classes,
+     * though never to the [receiverNames], unless declared before as the local variables, which take precedence over the receivers,
+     * nor to the properties declared after, which are not visible to the local ones, unlike in the script,
+     * nor to the members of the object, like `toString`, nor to the extensions of the script, nor to the backing `field`,
+     * nor to the property itself, which is not visible in its own accessors either,
+     * while the property cannot be referred to by a callable reference, unsupported for the local properties.
+     */
+    private fun delegatedProperties(
+        declarations: List<ParsedDeclaration>,
+        bodyReferences: List<Reference>,
+        dependencyNames: Set<String>,
+        importedNames: Set<String>
+    ): Set<ParsedDeclaration> {
+        val extensionNames = declarations.filter {
+            it.isExtension || (it.psi as? KtProperty)?.receiverTypeReference != null
+        }.mapNotNullTo(HashSet()) { it.name }
+        val excludedNames = setOf("field", "toString", "equals", "hashCode", DELEGATE_THIS_REF, DELEGATE_PROPERTY) + extensionNames
+        val allowedNames = declarations.flatMapTo(HashSet()) { it.names } + dependencyNames + importedNames + nonReceiverNames
+        val callableReferences = bodyReferences.filter { it.isCallableReference && !it.isQualified }.mapTo(HashSet()) { it.name }
+        val properties = declarations.filter { it.kind == DeclarationKind.PROPERTY && !it.requiresMove }
+        val propertyNameCounts = properties.flatMap { it.names }.groupingBy { it }.eachCount()
+        // the properties, which might be the constants moved together with the declarations reading them, are not variables
+        val variableProperties = properties.filterNot { it.isConstant(dependencyNames, propertyNameCounts) }
+        val variables = variableProperties.flatMapTo(HashSet()) { it.names }
+        val candidates = declarations.filter { declaration ->
+            // the local variables declared before, which take precedence over the receivers, unlike the ones declared later
+            val earlierVariables = variableProperties.filter { it.start < declaration.start }.flatMapTo(HashSet()) { it.names }
+            val laterProperties = declarations.filter { it.kind == DeclarationKind.PROPERTY && it.start > declaration.start }
+                .flatMapTo(HashSet()) { it.names }
+            declaration.isDelegable && declaration.name !in callableReferences && declaration.references.filter { reference ->
+                declaration.accessors.any { reference.offset in it.startOffset until it.endOffset }
+            }.all {
+                it.isQualified || it.isBound || (
+                        it.name != declaration.name && it.name !in excludedNames && it.name !in laterProperties
+                                && (it.name !in receiverNames || it.name in earlierVariables)
+                                && (it.name in allowedNames || it.name.first().isUpperCase())
+                        )
+            }
+        }
+        val delegated = mutableSetOf<ParsedDeclaration>()
+        do {
+            val reading = candidates.filter { candidate ->
+                candidate !in delegated && candidate.references.any { it.refersToLocal(variables) && !it.mightResolveOnReceiver }
+            }
+            delegated += reading
+            reading.forEach { variables += it.name!! }
+        } while (reading.isNotEmpty())
+        return delegated
+    }
+
+    /**
+     * The copy of the type of the [property], like `: Int`, at its columns, with the offset of its line,
+     * so its errors are reported once, at the type of the property, unless it spans more lines,
+     * where it is copied as a single line, mapped to the line of the [accessorStart].
+     */
+    private fun typeCopy(
+        property: KtProperty,
+        accessorStart: Int
+    ): Pair<String, Int> {
+        val type = property.typeReference!!
+        val start = generateSequence(type.prevSibling) { it.prevSibling }
+            .firstOrNull { it.node.elementType == KtTokens.COLON }?.startOffset
+        val text = start?.let { script.substring(it, type.endOffset) }
+        return if (start == null || text == null || '\n' in text) {
+            ": ${type.singleLineText()}" to accessorStart
+        } else {
+            " ".repeat(columnOf(start)) + text to start
+        }
+    }
+
+    /** Whether the property is initialized with a literal, so it can be initialized at any time, see [selectMovedDeclarations]. */
+    private fun ParsedDeclaration.isConstant(
+        dependencyNames: Set<String>,
+        propertyNameCounts: Map<String, Int>
+    ): Boolean {
+        val psi = psi as? KtProperty
+        return psi != null && !psi.isVar && psi.delegate == null && psi.initializer.isConstant() && accessors.isEmpty()
+                && name !in dependencyNames && name !in coroutineScopeProperties
+                && propertyNameCounts[name] == 1
+    }
+
+    /**
+     * Whether the [property] could be local as the property delegated to an object, with the [accessors] turned into its operators,
+     * as all of them have the bodies, without the annotations and the modifiers, like `private set`,
+     * and do not refer to `this` or `super`, which would refer to the object instead,
+     * while a `var` declares its type, which its setter needs, the getter is not omitted, using the backing field,
+     * nor has a block body without the type, which is an error of the property in the script.
+     */
+    private fun isDelegable(
+        property: KtProperty,
+        accessors: List<KtPropertyAccessor>
+    ): Boolean {
+        val getter = property.getter
+        val setter = property.setter
+        val type = property.typeReference?.singleLineText()
+        return property.receiverTypeReference == null && property.typeParameters.isEmpty()
+                && !property.hasInitializer() && !property.hasDelegate()
+                && accessors.size == property.accessors.size && getter != null && property.isVar == (setter != null)
+                && (!getter.hasBlockBody() || getter.returnTypeReference != null || property.typeReference != null)
+                && accessors.all { it.hasBody() && it.modifierList == null && it.leftParenthesis != null && it.rightParenthesis != null }
+                // of the same types, as otherwise the error would be reported at the delegate, unlike in the script
+                && (type == null || getter.returnTypeReference.let { it == null || it.singleLineText() == type })
+                && (setter == null || (setter.returnTypeReference == null && type != null && setter.parameter?.let { parameter ->
+                    parameter.name != null && parameter.typeReference.let { it == null || it.singleLineText() == type }
+                } == true))
+                // like `inline`, which is not applicable to a local property
+                && property.modifierList?.node?.getChildren(null).orEmpty().none {
+                    it.elementType in KtTokens.MODIFIER_KEYWORDS && it.elementType !in visibilityModifiers
+                }
+                && property.memberOnlyAnnotationEntries().isEmpty()
+                // like `val x: Int; get() = 1`, which would end the declaration before the delegate
+                && property.allChildren.takeWhile { it !== accessors.first() }.none { it.node.elementType == KtTokens.SEMICOLON }
+                && accessors.none { it.anyDescendantOfType<KtThisExpression>() || it.anyDescendantOfType<KtSuperExpression>() }
     }
 
     /** Whether the [offset] is preceded only by whitespaces in its line. */
@@ -1556,7 +1791,7 @@ private class ScriptStructure(
         plainReferences.forEach { (declaration, referenced) ->
             referenced.forEach { referrers.getOrPut(it) { mutableListOf() } += declaration }
         }
-        val required = declarations.filter { it.requiresMove }.toSet()
+        val required = declarations.filter { it.mustMove }.toSet()
         val variables = localProperties - constants
         // the declarations reading the constants, or referring to such ones, which would be local, if the constants were
         val readingConstants = declarations.filterTo(mutableSetOf()) { declaration ->

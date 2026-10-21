@@ -162,6 +162,91 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should keep property with accessors reading local property in the script body as delegated property`() {
+        // given
+        val script = """
+            val items = mutableListOf(1, 2)
+            var first: Int
+                get() = items.first()
+                set(v) { items[0] = v }
+            val total: Int get() = items.sum(); total + first
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        assert("items" !in moved)
+        val lines = body.lines()
+        // the accessors retain their columns, like the copies of the types, mapped to their lines
+        assert(" ".repeat(10) + "= items.first()" in lines && " ".repeat(8) + "v" in lines && " ".repeat(9) + ") { items[0] = v }" in lines)
+        assert(lines.count { it == " ".repeat(9) + ": Int" } == 3)
+        // the accessor ends with the semicolon
+        assert(" ".repeat(21) + "= items.sum();" in lines && " ".repeat(36) + "total + first" in lines)
+        assert(source.text.lines().indices.mapNotNull { source.toScriptLine(it + 1) } == listOf(0, 1, 1, 2, 1, 2, 3, 3, 1, 3, 3, 4, 4, 4, 4, 4, 4, 4))
+    }
+
+    @Test
+    fun `should keep moving property with accessors which cannot be delegated or do not read local properties`() {
+        // given
+        val scripts = listOf(
+            "val items = listOf(1)\nvar c = 0\n    set(value) { field = value + items.size }\nc",
+            "val items = listOf(1)\nval Int.plusSize get() = this + items.size\n1.plusSize",
+            "val items = listOf(1)\nval described get() = items.size.toString() + toString()\ndescribed",
+            "val items = listOf(1)\nval self get() = this.hashCode() + items.size\nself",
+            "val items = listOf(1)\nval total: Int\n    @Suppress(\"unused\") get() = items.sum()\ntotal",
+            "val items = listOf(1)\nvar total\n    get() = items.sum()\n    set(v) { }\ntotal",
+            "fun Any.describe() = this::class.simpleName\nval items = listOf(1)\nval d get() = items.size.toString() + describe()\nd",
+            "val total get() = 42\ntotal",
+            "class User(val name: String)\nval name = \"script\"\nval greeting get() = User(\"user\").run { name }\ngreeting",
+            // resolved on the implicit receivers of the object, or of the script block, unlike in the script
+            "val items = listOf(1)\nval t get() = items.size.toString() + javaClass.name\nt",
+            "val items = listOf(1)\nval t get() = items.size.toString() + let { 1 }\nt",
+            "val items = listOf(1)\nval t get() = items.isEmpty() || isActive\nt",
+            "val items = listOf(1)\nval t get() = items.size.also { launch { } }\nt",
+            // a local property is not visible in its own accessors, nor can be referred to by a callable reference
+            "val items = listOf(1)\nval countdown: Int get() = if (items.isEmpty()) 0 else items.size + countdown\ncountdown",
+            "val items = listOf(1)\nval total get() = items.size\nval r = ::total\nr.get()",
+            // resolved on the implicit receivers, even if imported or declared, unless declared before as a local property
+            "import kotlinx.coroutines.launch\nval items = mutableListOf(1, 2)\nval t: Int\n    get() { launch { items += 5 }; return items.size }\nt",
+            "import kotlinx.coroutines.isActive\nval items = listOf(1, 2)\nval t get() = items.isEmpty() || isActive\nt",
+            "import kotlin.let\nval items = listOf(1, 2)\nval t get() = items.size.toString() + let { 1 }\nt",
+            "import kotlin.jvm.javaClass\nval items = listOf(1, 2)\nval t get() = items.size.toString() + javaClass.name\nt",
+            "fun let(x: Int) = x\nval items = listOf(1, 2)\nval t get() = items.size.toString() + let { it::class.simpleName }\nt",
+            // not visible in the accessors, if declared after them, unlike in the script
+            "val items = listOf(1)\nval t get() = items.size.toString() + isActive\nval isActive = \"mine\"\nt",
+            "val items = listOf(1)\nval t get() = items.size.toString() + javaClass\nval javaClass = \"mine\"\nt",
+            "val items = listOf(1)\nval t get() = items.size.toString() + coroutineContext\nval coroutineContext = \"mine\"\nt",
+            "val items = listOf(1)\nval t get() = items.size.toString() + ensureActive()\nfun ensureActive() = \"mine\"\nt",
+            "val items = listOf(1)\nval t get() = items.size.toString() + suffix\nval suffix = \"mine\"\nt"
+        )
+
+        // when
+        val sources = scripts.map { ScriptSource(it) }
+
+        // then
+        sources.forEach { source ->
+            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            assert("get()" in moved || "set(value)" in moved)
+            assert(" by object " !in body)
+        }
+    }
+
+    @Test
+    fun `should keep moving property with accessor calling dependency named like extension applicable to any receiver`() {
+        // given
+        val script = "val items = listOf(1, 2)\nval t get() = items.size.toString() + let { it::class.simpleName }\nt"
+
+        // when
+        val source = ScriptSource(script, listOf(PreambleDependency("let", "val let: Int = 1")))
+
+        // then
+        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        assert("get()" in moved && " by object " !in body)
+    }
+
+    @Test
     fun `should give distinct location ids to scripts of the same hash code`() {
         // given
         val scripts = listOf("\"Aa\"", "\"BB\"")
