@@ -32,7 +32,7 @@ private const val MAX_REPORTED_EXCEPTIONS = 32
 private val unresolvedReference = Regex("Unresolved reference '(.+)'\\.")
 
 /** Reported without a location, e.g. for an object accessing the dependencies, which are the members of the script class. */
-private val declarationCapturingScript = Regex("(Object|Enum class|Interface|Nested class) '(.+)' captures the script class instance\\..*")
+private val declarationCapturingScript = Regex("(Object|Enum class|Enum entry|Interface|Nested class) '(.+)' captures the script class instance\\..*")
 
 /**
  * The first line of the failure of the compiler backend, reported without a location, followed by the intermediate representation of the code,
@@ -85,9 +85,20 @@ internal class ScriptErrorReporter(
     }.trimEnd()
 
     /** The descriptions of the diagnostics, without the repeated ones, e.g. of the same type used twice in an accessor. */
-    private fun List<ScriptDiagnostic>.describe(): List<String> = map { diagnostic ->
-        buildString { appendDiagnostic(diagnostic) }
-    }.distinct()
+    private fun List<ScriptDiagnostic>.describe(): List<String> {
+        // reported without a location, the classes of the same name, like the companion objects, are told by their order
+        val capturingClasses = map { diagnostic ->
+            diagnostic.takeIf { it.location == null }?.let { declarationCapturingScript.matchEntire(it.message)?.groupValues?.subList(1, 3) }
+        }
+        val counts = capturingClasses.filterNotNull().groupingBy { it }.eachCount()
+        val indices = HashMap<List<String>, Int>()
+        return mapIndexed { index, diagnostic ->
+            val occurrence = capturingClasses[index]?.let { kindAndName ->
+                indices.merge(kindAndName, 1, Int::plus)!! - 1 to counts.getValue(kindAndName)
+            }
+            buildString { appendDiagnostic(diagnostic, occurrence) }
+        }.distinct()
+    }
 
     /** The failure recognized in the [source] before compiling it. */
     fun toSourceFailureMessage(): String = source.unmatchedClosingBrace?.let {
@@ -335,9 +346,13 @@ internal class ScriptErrorReporter(
     /**
      * In the format of kotlinc, `script.kts:line:column: severity: message`, followed by the source lines,
      * or `dependency 'name': severity: message`, if reported in the accessor of the dependency.
+     *
+     * @param capturingOccurrence the index of the diagnostic of the class capturing the script class instance reported without a location,
+     *   among the ones of the same kind and name, and their count.
      */
     private fun StringBuilder.appendDiagnostic(
-        diagnostic: ScriptDiagnostic
+        diagnostic: ScriptDiagnostic,
+        capturingOccurrence: Pair<Int, Int>?
     ) {
         val location = diagnostic.location
         location?.let { source.preambleDependencyAt(it.start.line) }?.let { dependency ->
@@ -358,7 +373,7 @@ internal class ScriptErrorReporter(
             }
         }
         val capturing = declarationCapturingScript.matchEntire(diagnostic.message)?.groupValues
-        val capturingDeclaration = capturing?.get(2)
+        var capturingDeclaration = capturing?.get(2)
         val range = if (location != null) {
             val start = source.toScriptPosition(location.start.line, location.start.col)
             val end = location.end?.let {
@@ -368,7 +383,13 @@ internal class ScriptErrorReporter(
             } ?: start
             start to end
         } else {
-            capturingDeclaration?.let { source.movedDeclarationName(it) }
+            capturingDeclaration?.let { name ->
+                capturingOccurrence?.let { (index, count) -> source.movedClassName(name, index, count) }
+            }?.let { (declared, start, end) ->
+                // like `Factory`, which the compiler calls `Companion`
+                capturingDeclaration = declared
+                start to end
+            }
         }
         range?.let { appendPosition(it.first) }
         appendSeverityAndMessage(diagnostic)

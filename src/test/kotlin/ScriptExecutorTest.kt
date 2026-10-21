@@ -3739,6 +3739,213 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report error only at companion objects capturing the script class instance`() = runTest {
+        // given
+        val script = """
+            class Plain(val id: Int) { companion object { fun create() = Plain(1) } }
+            class User(val id: Int) { companion object { fun create() = User(input.length) } }
+            class Admin(val id: Int) {
+                companion object Factory { fun create() = Admin(input.length) }
+            }
+            User.create().id + Admin.create().id + Plain.create().id
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("input", "abc")))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:27: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead.
+                  | class User(val id: Int) { <error>companion</error> object { fun create() = User(input.length) } }
+                  hint: 'Companion' is compiled outside of the script body, where an object cannot access the dependencies, nor the functions of the script - declare it as a class, or pass them as parameters.
+
+                script.kts:4:22: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead.
+                  |     companion object <error>Factory</error> { fun create() = Admin(input.length) }
+                  hint: 'Factory' is compiled outside of the script body, where an object cannot access the dependencies, nor the functions of the script - declare it as a class, or pass them as parameters.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at each companion object capturing the script class instance`() = runTest {
+        // given
+        val script = """
+            class User(val id: Int) { companion object { fun create() = User(input.length) } }
+            class Admin(val id: Int) {
+                companion object { fun create() = Admin(input.length) }
+            }
+            User.create().id + Admin.create().id
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("input", "abc")))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:27: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead.
+                  | class User(val id: Int) { <error>companion</error> object { fun create() = User(input.length) } }
+                  hint: 'Companion' is compiled outside of the script body, where an object cannot access the dependencies, nor the functions of the script - declare it as a class, or pass them as parameters.
+
+                script.kts:3:5: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead.
+                  |     <error>companion</error> object { fun create() = Admin(input.length) }
+                  hint: 'Companion' is compiled outside of the script body, where an object cannot access the dependencies, nor the functions of the script - declare it as a class, or pass them as parameters.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at object named like a companion object, both capturing the script class instance`() = runTest {
+        // given
+        val script = """
+            class A { companion object Factory { fun f() = input.length } }
+            object Factory { fun f() = input.length }
+            Factory.f() + A.f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("input", "abc")))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:28: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead.
+                  | class A { companion object <error>Factory</error> { fun f() = input.length } }
+                  hint: 'Factory' is compiled outside of the script body, where an object cannot access the dependencies, nor the functions of the script - declare it as a class, or pass them as parameters.
+
+                script.kts:2:8: error: Object 'Factory' captures the script class instance. Try to use class or anonymous object instead.
+                  | object <error>Factory</error> { fun f() = input.length }
+                  hint: 'Factory' is compiled outside of the script body, where an object cannot access the dependencies, nor the functions of the script - declare it as a class, or pass them as parameters.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at companion object capturing the script class instance, not at the one containing a capturing object`() = runTest {
+        // given
+        val script = """
+            class A { companion object { object Inner { fun f() = input.length } } }
+            class B { companion object { fun f() = input.length } }
+            A.Companion.Inner.f() + B.f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("input", "abc")))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:37: error: Object 'Inner' captures the script class instance. Try to use class or anonymous object instead.
+                  | class A { companion object { object <error>Inner</error> { fun f() = input.length } } }
+                  hint: 'Inner' is compiled outside of the script body, where an object cannot access the dependencies, nor the functions of the script - declare it as a class, or pass them as parameters.
+
+                script.kts:2:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead.
+                  | class B { <error>companion</error> object { fun f() = input.length } }
+                  hint: 'Companion' is compiled outside of the script body, where an object cannot access the dependencies, nor the functions of the script - declare it as a class, or pass them as parameters.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at each companion object capturing the script class instance, also when calling own member named like script function`() = runTest {
+        // given
+        val script = """
+            fun helper() = 1
+            class A { companion object { fun helper() = 2; fun f() = helper() } }
+            class B { companion object { fun f() = input.length } }
+            class C { companion object { fun f() = 3 } }
+            A.f() + B.f() + C.f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("input", "abc")))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead.
+                  | class A { <error>companion</error> object { fun helper() = 2; fun f() = helper() } }
+                  hint: 'Companion' is compiled outside of the script body, where an object cannot access the dependencies, nor the functions of the script - declare it as a class, or pass them as parameters.
+
+                script.kts:3:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead.
+                  | class B { <error>companion</error> object { fun f() = input.length } }
+                  hint: 'Companion' is compiled outside of the script body, where an object cannot access the dependencies, nor the functions of the script - declare it as a class, or pass them as parameters.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at distinct companion objects, when more of them refer to names of the script class members than capture it`() = runTest {
+        // given
+        val script = """
+            open class Base { val input = "z" }
+            class A { companion object : Base() { fun f() = input.length } }
+            class B { companion object { fun f() = input.length } }
+            class C { companion object { fun f() = input.length } }
+            A.f() + B.f() + C.f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("input", "abc")))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            // told by the names only, the inherited member is not known
+            assert(message.lines().filter { "captures the script class instance" in it } == listOf(
+                "script.kts:2:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead.",
+                "script.kts:3:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead."
+            ))
+        }
+    }
+
+    @Test
+    fun `should report error at enum entry capturing the script class instance, and at its enum class`() = runTest {
+        // given
+        val script = """
+            enum class E { X { override fun f() = input }; abstract fun f(): String }
+            E.X.f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("input", "abc")))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:12: error: Enum class 'E' captures the script class instance. Try to use class or anonymous object instead.
+                  | enum class <error>E</error> { X { override fun f() = input }; abstract fun f(): String }
+                  hint: 'E' is compiled outside of the script body, where an enum class cannot access the dependencies, nor the functions of the script - pass them as parameters.
+
+                script.kts:1:16: error: Enum entry 'X' captures the script class instance. Try to use class or anonymous object instead.
+                  | enum class E { <error>X</error> { override fun f() = input }; abstract fun f(): String }
+                  hint: 'X' is compiled outside of the script body, where an enum entry cannot access the dependencies, nor the functions of the script - pass them as parameters.
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should report references to declarations moved out of the script body resolved to its coroutine scope instead`() = runTest {
         // given
         val scripts = listOf(
