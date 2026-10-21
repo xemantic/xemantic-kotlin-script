@@ -79,7 +79,9 @@ internal class ScriptErrorReporter(
     }.trimEnd()
 
     /** The descriptions of the diagnostics, without the repeated ones, e.g. of the same type used twice in an accessor. */
-    private fun List<ScriptDiagnostic>.describe(): List<String> = map { diagnostic ->
+    private fun List<ScriptDiagnostic>.describe(): List<String> = filterNot { diagnostic ->
+        diagnostic.location?.start?.line?.let { source.isGeneratedImport(it) } == true
+    }.map { diagnostic ->
         buildString { appendDiagnostic(diagnostic) }
     }.distinct()
 

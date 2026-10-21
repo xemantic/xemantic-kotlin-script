@@ -18,6 +18,8 @@
 
 package com.xemantic.kotlin.script
 
+import RootConfig
+import `in`
 import com.xemantic.kotlin.test.assert
 import com.xemantic.kotlin.test.be
 import com.xemantic.kotlin.test.have
@@ -411,6 +413,353 @@ class ScriptDependenciesTest {
         result should {
             be<ScriptResult.Value>()
             have(value == "mail alice")
+        }
+    }
+
+    @Test
+    fun `should provide dependency of root package type to script referring to it`() = runTest {
+        // given
+        val script = """
+            RootConfig(1).v + cfg.v
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "cfg" provides RootConfig(41)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+        }
+    }
+
+    @Test
+    fun `should provide dependency of root package type shadowed by script class`() = runTest {
+        // given
+        val script = """
+            enum class RootConfig { A }
+            configs.first().v + RootConfig.A.ordinal
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "configs" provides listOf(RootConfig(42))
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+        }
+    }
+
+    @Test
+    fun `should provide dependency of root package type shadowed by script class to script referring to other root package class`() = runTest {
+        // given
+        val script = """
+            interface RootConfig
+            RootLabel("x").text + cfg.v
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "cfg" provides RootConfig(42)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "x42")
+        }
+    }
+
+    @Test
+    fun `should provide dependency of root package type shadowed by script class after file annotation and import`() = runTest {
+        // given
+        val script = """
+            @file:Suppress("UNUSED_VARIABLE") import kotlin.math.abs
+            object RootConfig
+            abs(-cfg.v)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "cfg" provides RootConfig(42)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+        }
+    }
+
+    @Test
+    fun `should provide dependency of root package type shadowed by script class to script naming file facade of root package`() = runTest {
+        // given
+        val script = """
+            // see RootPackageKt
+            enum class RootConfig { A }
+            cfg.v
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "cfg" provides RootConfig(42)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+        }
+    }
+
+    @Test
+    fun `should provide dependency of root package type named like keyword shadowed by script class`() = runTest {
+        // given
+        val script = """
+            object RootConfig
+            box.v + cfg.v
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "box" provides `in`(1)
+            "cfg" provides RootConfig(41)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+        }
+    }
+
+    @Test
+    fun `should report compilation error of script with class shadowing root package type of dependency`() = runTest {
+        // given
+        val script = """
+            typealias RootConfig = String
+            val x: RootConfig = cfg
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "cfg" provides RootConfig(42)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:19: error: Initializer type mismatch: expected 'String', actual 'RootConfig'.
+                  | val x: RootConfig <error>=</error> cfg
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report exception of script with class shadowing root package type of dependency`() = runTest {
+        // given
+        val script = """
+            enum class RootConfig { A }
+            class Failure(val code: Int) : RuntimeException("failure ${'$'}code")
+            fun fail(): Nothing = throw Failure(cfg.v)
+            fail()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "cfg" provides RootConfig(42)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                Failure: failure 42
+                  at fail(script.kts:3)
+                  | fun fail(): Nothing = throw Failure(cfg.v)
+                  at <script body>(script.kts:4)
+                  | fail()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should provide dependency of root package type to script importing class of the same name`() = runTest {
+        // given
+        val script = """
+            import `in`.xemantic.RootConfig
+            RootConfig("x").name + cfg.v
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "cfg" provides RootConfig(42)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "x42")
+        }
+    }
+
+    @Test
+    fun `should provide dependency of root package type to script importing other class under its alias`() = runTest {
+        // given
+        val script = """
+            package foo
+
+            import kotlin.String as _root_RootConfig
+
+            val text: _root_RootConfig = "x"
+            text + cfg.v
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "cfg" provides RootConfig(42)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "x42")
+        }
+    }
+
+    @Test
+    fun `should provide dependency of root package type shadowed by script class in package`() = runTest {
+        // given
+        val script = """
+            package foo
+
+            enum class RootConfig { A }
+            cfg.v + RootConfig.A.ordinal
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "cfg" provides RootConfig(42)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+        }
+    }
+
+    @Test
+    fun `should provide dependency of root package type to script with package directive`() = runTest {
+        // given
+        val script = """
+            package foo
+
+            import RootConfig
+import `in`
+
+            RootConfig(1).v + cfg.v
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "cfg" provides RootConfig(41)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+        }
+    }
+
+    @Test
+    fun `should provide dependency of nullable root package type`() = runTest {
+        // given
+        val script = """
+            package foo
+
+            object RootConfig
+            cfg?.v ?: 0
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            provide<RootConfig?>("cfg", RootConfig(42))
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+        }
+    }
+
+    @Test
+    fun `should provide dependency of generic type with root package type arguments`() = runTest {
+        // given
+        val script = """
+            package foo
+
+            interface RootConfig
+            configs.getValue("a").sumOf { it?.v ?: 0 } + entries.single().config.v
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "configs" provides mapOf("a" to listOf(RootConfig(40), null, RootConfig(1)))
+            "entries" provides arrayOf(RootConfig.Entry(RootConfig(1)))
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+        }
+    }
+
+    @Test
+    fun `should provide dependencies of types whose packages are named like script declarations`() = runTest {
+        // given
+        val script = """
+            class com
+            object kotlin
+            box.items.size + text.length
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "box" provides Outer.Box(listOf(1, 2))
+            "text" provides "foo"
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 5)
         }
     }
 

@@ -49,6 +49,11 @@ public interface ScriptExecutor {
      *   It cannot be a type parameter, or a platform type, like the types of the Java members obtained by reflection.
      *   Note that [typeOf] does not retain the receiver of a function type,
      *   so a dependency of type `Int.() -> Int` is seen by the script as `(Int) -> Int`.
+     *   A script without a `package` directive, declaring a classifier named like a class of the root package of the type,
+     *   which is compiled outside of the script body, like an enum class, an object, a type alias,
+     *   or a class referred to by a declaration compiled there, is compiled in a generated package,
+     *   where it cannot refer to the top-level functions and properties of the root package,
+     *   and the names of its classes at runtime include the package.
      * @param value the value of the property, of the [type].
      */
     public class Dependency<T>(
@@ -149,7 +154,7 @@ private fun KType.inaccessibleClass(): Class<*>? =
     (classifier as? KClass<*>)?.java?.takeUnless { it.isAccessible() }
         ?: arguments.firstNotNullOfOrNull { it.type?.inaccessibleClass() }
 
-private fun Class<*>.isAccessible(): Boolean = if (isArray) {
+internal fun Class<*>.isAccessible(): Boolean = if (isArray) {
     componentType.isAccessible()
 } else {
     !isLocalClass

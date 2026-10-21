@@ -37,7 +37,9 @@ import kotlin.concurrent.atomics.incrementAndFetch
 import kotlin.coroutines.CoroutineContext
 import kotlin.reflect.KClass
 import java.lang.reflect.Modifier
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.reflect.KFunction
+import kotlin.reflect.KType
 import kotlin.reflect.KVisibility
 import kotlin.reflect.full.extensionReceiverParameter
 import kotlin.reflect.typeOf
@@ -123,6 +125,23 @@ internal class DefaultScriptExecutor(
     private val classLoader: ClassLoader = Thread.currentThread().contextClassLoader
         ?: DefaultScriptExecutor::class.java.classLoader
 
+    /** Whether the names are of the classes of the root package, by these names, see [ScriptSource]. */
+    private val rootPackageClassNames = ConcurrentHashMap<String, Boolean>()
+
+    private fun isRootPackageClass(
+        name: String
+    ): Boolean = rootPackageClassNames.computeIfAbsent(name) {
+        try {
+            Class.forName(name, false, classLoader).let {
+                // unlike a file facade, like `MainKt`, which cannot be imported
+                it.isAccessible() && it.getAnnotation(Metadata::class.java)?.kind.let { kind -> kind == null || kind == 1 }
+            }
+        } catch (e: Throwable) {
+            if (e is VirtualMachineError) throw e
+            // e.g. a class referring to an optional class, which is missing
+            false
+        }
+    }
 
     private val compilationConfigurationTemplate = ScriptCompilationConfiguration {
         jvm {
@@ -409,16 +428,14 @@ internal class DefaultScriptExecutor(
 
         /** Inspected once, as recognizing a callable dependency might inspect its members by reflection. */
         private val preambleDependencies by lazy {
-            allDependencies.filter { it.isHidden }.map { dependency ->
-                PreambleDependency(dependency.name, dependency.accessor, dependency.isCallable)
-            }
+            allDependencies.filter { it.isHidden }.map { it.preambleDependency }
         }
 
         private fun source(
             confirming: Boolean = false,
             shadowedFunctionCopies: Boolean = false,
             coroutineScopeCopies: Boolean = false
-        ) = ScriptSource(script, preambleDependencies, confirming, shadowedFunctionCopies, coroutineScopeCopies)
+        ) = ScriptSource(script, preambleDependencies, ::isRootPackageClass, confirming, shadowedFunctionCopies, coroutineScopeCopies)
 
         private suspend fun compile(
             source: ScriptSource
@@ -632,8 +649,52 @@ private val ScriptExecutor.Dependency<*>.providedType: KotlinType
     get() = if (isHidden) KotlinType(typeOf<Any?>()) else KotlinType(type)
 
 // with an initializer, unlike a getter, the dependency can be smart cast
-private val ScriptExecutor.Dependency<*>.accessor: String
-    get() = "@kotlin.Suppress(\"UNCHECKED_CAST\") val `$name`: $type = `$providedName` as $type"
+private fun ScriptExecutor.Dependency<*>.accessor(
+    type: String
+) = "@kotlin.Suppress(\"UNCHECKED_CAST\") val `$name`: $type = `$providedName` as $type"
+
+/**
+ * The names of the top-level classes of the root package, which the type of the dependency refers to,
+ * by the qualified names of the classes they are or they nest, like `Outer.Nested`, as rendered by [KType.toString],
+ * see [ScriptSource].
+ */
+private val ScriptExecutor.Dependency<*>.rootPackageClasses: Map<String, String>
+    get() = buildMap {
+        fun KType.collect() {
+            (classifier as? KClass<*>)?.let { kClass ->
+                val qualifiedName = kClass.qualifiedName
+                val topLevelClass = generateSequence(kClass.java) { it.declaringClass }.last()
+                if (qualifiedName != null && !kClass.java.isArray && topLevelClass.packageName.isEmpty()) {
+                    put(qualifiedName, topLevelClass.simpleName)
+                }
+            }
+            arguments.forEach { it.type?.collect() }
+        }
+        type.collect()
+    }
+
+/** A qualified name, like `kotlin.collections.List`, in the [KType.toString] rendering, capturing its first segment. */
+private val renderedQualifiedName = Regex("""(`[^`]*`|[\p{L}\p{N}_]+)(?:\.(?:`[^`]*`|[\p{L}\p{N}_]+))*""")
+
+/** The dependency, as declared in the preamble of the script. */
+private val ScriptExecutor.Dependency<*>.preambleDependency: PreambleDependency
+    get() {
+        val rootPackageClasses = rootPackageClasses
+        val type = type.toString()
+        return PreambleDependency(
+            name = name,
+            accessor = { aliases ->
+                accessor(if (aliases.isEmpty()) type else type.replace(renderedQualifiedName) { match ->
+                    // the names like `in` are quoted in backticks
+                    rootPackageClasses[match.value.replace("`", "")]?.let { name ->
+                        aliases[name]?.let { it + match.value.substring(match.groupValues[1].length) }
+                    } ?: match.value
+                })
+            },
+            isCallable = isCallable,
+            rootPackageClasses = rootPackageClasses.values.toSet()
+        )
+    }
 
 /** Whether it is of a function type, or of a type with the public `invoke` operator, so the script can call it. */
 private val ScriptExecutor.Dependency<*>.isCallable: Boolean

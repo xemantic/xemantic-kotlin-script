@@ -174,11 +174,19 @@ private fun optInMarker(
 /** A dependency, as declared in the preamble of the [ScriptSource]. */
 internal class PreambleDependency(
     val name: String,
-    /** The declaration of the property of the dependency, like `val x: T = _dependency_x as T`. */
-    val accessor: String,
+    /**
+     * The declaration of the property of the dependency, like `val x: T = _dependency_x as T`,
+     * referring to the [rootPackageClasses] by the given aliases, if any, see [ScriptSource].
+     */
+    val accessor: (aliases: Map<String, String>) -> String,
     /** Whether it can be called like a function, so a local function of the same name shadows it. */
-    val isCallable: Boolean = false
+    val isCallable: Boolean = false,
+    /** The names of the top-level classes of the root package, which the type of the dependency refers to. */
+    val rootPackageClasses: Set<String> = emptySet()
 )
+
+/** The package of a script without a `package` directive, compiled in a package, see [ScriptSource]. */
+private const val GENERATED_PACKAGE = "_script_package"
 
 /** The class of the outer receiver of the script body, declaring the shadowed dependencies, see [ScriptSource]. */
 internal const val DEPENDENCIES_CLASS_NAME = "_ScriptDependencies"
@@ -196,6 +204,7 @@ internal const val SCRIPT_BLOCK_END = "} }"
  *
  * ```
  * <file annotations, package and imports>
+ * <the imports of the root package classes of the dependency types under their aliases>
  * <the dependency accessors, unless shadowed by the local declarations of the script body>
  * class _ScriptDependencies {
  * <the accessors of the shadowed dependencies>
@@ -214,6 +223,13 @@ internal const val SCRIPT_BLOCK_END = "} }"
  * while the script body refers to it as the member of the outer receiver of the script block,
  * the inner one being the coroutine scope of the caller.
  *
+ * The accessors refer to the classes of the root package by their imported aliases,
+ * where the script could not refer to them by their names: in a script with a `package` directive,
+ * or importing a class of the same name, while otherwise an alias would hide the name of the class from the script.
+ * A script without a `package` directive, declaring a classifier moved out of the script body
+ * named like such a class, is compiled in a package, as the classifier has the same qualified name,
+ * which no import can tell apart, importing also the other classes of the root package the script might refer to.
+ *
  * Declarations are moved by blanking them out with spaces in one copy of their lines,
  * and everything else in the other, so the columns of the script are retained,
  * while each line of the [text] maps back to the line of the script.
@@ -221,6 +237,8 @@ internal const val SCRIPT_BLOCK_END = "} }"
 internal class ScriptSource(
     source: String,
     dependencies: List<PreambleDependency> = emptyList(),
+    /** Whether this name is of a public class of the root package, which a script compiled in a package imports. */
+    isRootPackageClass: (name: String) -> Boolean = { false },
     /**
      * Whether it is the source of the compilation confirming the [laterDeclaredDependencyCandidates]
      * and the [hiddenLocalFunctionCandidates], with the declarations they might refer to deprecated, with a warning, as the declarations deprecated with an error are less preferred by the overload resolution,
@@ -307,6 +325,9 @@ internal class ScriptSource(
     /** For each line of the [text], the line of the script, or `null` for the lines of the block and the preamble. */
     private val lineMapping: List<Int?>
 
+    /** The 0-based lines of the [text] of the imports of the classes of the root package, see [isGeneratedImport]. */
+    private val generatedImportLines = mutableSetOf<Int>()
+
     /** The names of the dependencies, by the 0-based lines of the [text] declaring their accessors. */
     private val preambleDependencies = mutableMapOf<Int, String>()
 
@@ -345,6 +366,26 @@ internal class ScriptSource(
         }
         coroutineScopeCandidates = structure.coroutineScopeCandidates.map { it.toLaterDeclaredReference() }
         bodyDeclarations = structure.bodyDeclarations
+        val rootPackageClasses = dependencies.flatMapTo(HashSet()) { it.rootPackageClasses }
+        val movedClassifiers = movedDeclarations.filter {
+            it.kind != DeclarationKind.FUNCTION && it.kind != DeclarationKind.PROPERTY
+        }.mapNotNullTo(HashSet()) { it.name }
+        val inGeneratedPackage = !structure.isPackaged && rootPackageClasses.any { it in movedClassifiers }
+        // not quoted in backticks, as the compiler does not resolve an import of a quoted alias
+        val rootPackageAliases = rootPackageClasses.filter {
+            structure.isPackaged || inGeneratedPackage || it in structure.importedNames
+        }.sorted().associateWith { name ->
+            generateSequence("_root_$name") { "${it}_" }.first { it !in structure.identifiers }
+        }
+        // the imported name quoted, as it might be a keyword, like `in`
+        val rootPackageImports = rootPackageAliases.map { (name, alias) -> "import `$name` as $alias" } + if (inGeneratedPackage) {
+            // the names referring to the classes of the root package, unless to the declarations of the script
+            structure.identifiers.filter {
+                it !in structure.importedNames && it !in movedClassifiers && isRootPackageClass(it)
+            }.sorted().map { "import `$it`" }
+        } else {
+            emptyList()
+        }
         val deprecatedDependencies = if (confirming) {
             laterDeclaredDependencyCandidates.mapTo(HashSet()) { it.reference.name }
         } else {
@@ -381,17 +422,34 @@ internal class ScriptSource(
         structure.movedBlankedRanges.forEach { movedExcluded.fill(true, it.first, it.last + 1) }
 
         val headerEnd = structure.headerEnd
-        if (headerEnd > 0) {
+        if (inGeneratedPackage) {
+            // following the file annotations, and preceding the imports, which might be on the same line
+            val annotationsEnd = structure.annotationsEnd
+            if (annotationsEnd > 0) {
+                addLines(0..lineOf(annotationsEnd - 1)) { it < annotationsEnd && !excluded[it] }
+            }
+            lines += "package $GENERATED_PACKAGE"
+            mapping += null
+            if (headerEnd > annotationsEnd) {
+                addLines(lineOf(annotationsEnd)..lineOf(headerEnd - 1)) { it in annotationsEnd until headerEnd && !excluded[it] }
+            }
+        } else if (headerEnd > 0) {
             addLines(0..lineOf(headerEnd - 1)) { it < headerEnd && !excluded[it] }
+        }
+        rootPackageImports.forEach {
+            generatedImportLines += lines.size
+            lines += it
+            mapping += null
         }
         fun addAccessor(
             dependency: PreambleDependency
         ) {
             preambleDependencies[lines.size] = dependency.name
+            val accessor = dependency.accessor(rootPackageAliases)
             lines += if (dependency.name in deprecatedDependencies) {
-                "@kotlin.Deprecated(\"$LATER_DECLARED_DEPENDENCY\") ${dependency.accessor}"
+                "@kotlin.Deprecated(\"$LATER_DECLARED_DEPENDENCY\") $accessor"
             } else {
-                dependency.accessor
+                accessor
             }
             mapping += null
         }
@@ -498,6 +556,14 @@ internal class ScriptSource(
      * The name of the dependency, whose accessor is declared at the 1-based [line] of the [text],
      * or `null`, if it is not a line of the preamble.
      */
+    /**
+     * Whether the 1-based [line] of the [text] is an import of a class of the root package, which is not a line of the script,
+     * while a failure to import it is reported also where the script, or the accessor of a dependency, refers to the class.
+     */
+    fun isGeneratedImport(
+        line: Int
+    ): Boolean = (line - 1) in generatedImportLines
+
     fun preambleDependencyAt(
         line: Int
     ): String? = preambleDependencies[line - 1]
@@ -1017,6 +1083,27 @@ private class ScriptStructure(
 
     val headerEnd: Int
 
+    /** The end of the shebang and of the file annotations, preceding the `package` directive. */
+    val annotationsEnd: Int
+
+    /** Whether the script starts with a `package` directive. */
+    val isPackaged: Boolean
+
+    /** The names the script imports, like `B` of `import a.B`, or `C` of `import a.B as C`. */
+    val importedNames: Set<String>
+
+    /** The identifiers of the script, not quoted in backticks, except the ones of the comments and the strings. */
+    val identifiers: Set<String> by lazy {
+        val lexer = KotlinLexer()
+        lexer.start(script)
+        buildSet {
+            while (lexer.tokenType != null) {
+                if (lexer.tokenType == KtTokens.IDENTIFIER) add(lexer.tokenText.removeSurrounding("`"))
+                lexer.advance()
+            }
+        }
+    }
+
     private val lexed = lexScript(script)
 
     /** The offset of the first `}` closing the script block, which would otherwise end the script early. */
@@ -1080,15 +1167,19 @@ private class ScriptStructure(
 
     init {
         val file = psiFactory.createFile("script.kts", script)
-        headerEnd = listOfNotNull(
+        fun List<PsiElement?>.end() = filterNotNull().filter { it.textLength > 0 }.maxOfOrNull { it.endOffset } ?: 0
+        annotationsEnd = listOf(
             file.firstChild?.takeIf { it.node.elementType == KtTokens.SHEBANG_COMMENT },
             // like `@file:JvmName("x")`, while the parser takes there also a stray `@` of the script body
             file.fileAnnotationList?.children?.lastOrNull {
                 (it as? KtAnnotationEntry)?.useSiteTarget != null || (it as? KtAnnotation)?.useSiteTarget != null
-            },
-            file.packageDirective,
-            file.importList
-        ).filter { it.textLength > 0 }.maxOfOrNull { it.endOffset } ?: 0
+            }
+        ).end()
+        headerEnd = maxOf(annotationsEnd, listOf(file.packageDirective, file.importList).end())
+        isPackaged = file.packageDirective?.isRoot == false
+        importedNames = file.importDirectives.filter { !it.isAllUnder }.mapNotNullTo(HashSet()) {
+            it.aliasName ?: it.importedFqName?.shortName()?.asString()
+        }
         val block = file.script?.blockExpression
         val statements = block?.statements.orEmpty()
         val declarations = statements.mapNotNull { parseDeclaration(it) }
