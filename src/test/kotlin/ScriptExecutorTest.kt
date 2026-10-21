@@ -1584,6 +1584,344 @@ class ScriptExecutorTest {
         }
     }
 
+    @Test
+    fun `should call function accessing local declarations of the script body from function declared before it`() = runTest {
+        // given
+        val script = """
+            val factor = 2
+            fun a(x: Int) = b(x) + 1
+            fun b(x: Int) = x * factor
+            a(3)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 7)
+        }
+    }
+
+    @Test
+    fun `should call multi-line functions accessing local declarations of the script body from functions declared before them`() = runTest {
+        // given
+        val script = """
+            val factor = 2
+            /** Sums both. */
+            fun a(x: Int): Int {
+                return b(x) + c(x)
+            }
+            // doubles
+            private fun b(x: Int) =
+                c(x) * factor
+            fun c(x: Int) = x + factor
+            a(3)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 15)
+        }
+    }
+
+    @Test
+    fun `should return Unit from script ending with function called from function declared before it`() = runTest {
+        // given
+        val script = """
+            val factor = 2
+            fun a(x: Int) = b(x) + 1
+            println(a(3))
+            fun b(x: Int) = x * factor
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value === Unit)
+        }
+    }
+
+    @Test
+    fun `should report frames of function called from function declared before it at their lines`() = runTest {
+        // given
+        val script = """
+            val limit = 2
+            fun check(x: Int) = verify(x)
+            val ok = check(1)
+            fun verify(x: Int) {
+                require(x > limit) { "too small: ${'$'}x" }
+            }
+            check(0)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IllegalArgumentException: too small: 1
+                  at verify(script.kts:5)
+                  |     require(x > limit) { "too small: ${'$'}x" }
+                  at check(script.kts:2)
+                  | fun check(x: Int) = verify(x)
+                  at <script body>(script.kts:3)
+                  | val ok = check(1)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint that mutually recursive functions cannot access local declarations of the script body`() = runTest {
+        // given
+        val script = """
+            val limit = 10
+            fun isEven(n: Int): Boolean = n <= limit && (n == 0 || isOdd(n - 1))
+            fun isOdd(n: Int): Boolean = n != 0 && isEven(n - 1)
+            isEven(4)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:56: error: Unresolved reference 'isOdd'.
+                  | fun isEven(n: Int): Boolean = n <= limit && (n == 0 || <error>isOdd</error>(n - 1))
+                  hint: 'isOdd' is declared at line 3, while the functions of the script body are visible only after their declaration, and it cannot be declared before line 2, as 'isEven' -> 'isOdd' -> 'isEven' call each other - mutually recursive functions cannot access the local declarations of the script body, pass them as parameters instead.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint at cycles of mutually recursive functions called by the function declared before them`() = runTest {
+        // given
+        val scripts = listOf(
+            """
+                val limit = 10
+                fun a(n: Int): Int = if (n > limit) n else b(n + 1)
+                fun b(n: Int): Int = c(n + 1)
+                fun c(n: Int): Int = a(n + 1)
+                a(0)
+            """.trimIndent(),
+            """
+                val limit = 10
+                fun a(n: Int): Int = b(n)
+                fun b(n: Int): Int = if (n > limit) n else c(n + 1)
+                fun c(n: Int): Int = b(n + 1)
+                a(0)
+            """.trimIndent()
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message } == listOf(
+            """
+                script.kts:2:44: error: Unresolved reference 'b'.
+                  | fun a(n: Int): Int = if (n > limit) n else <error>b</error>(n + 1)
+                  hint: 'b' is declared at line 3, while the functions of the script body are visible only after their declaration, and it cannot be declared before line 2, as 'a' -> 'b' -> 'c' -> 'a' call each other - mutually recursive functions cannot access the local declarations of the script body, pass them as parameters instead.
+            """.trimIndent(),
+            """
+                script.kts:2:22: error: Unresolved reference 'b'.
+                  | fun a(n: Int): Int = <error>b</error>(n)
+                  hint: 'b' is declared at line 3, while the functions of the script body are visible only after their declaration, and it cannot be declared before line 2, as 'b' -> 'c' -> 'b' call each other - mutually recursive functions cannot access the local declarations of the script body, pass them as parameters instead.
+
+                script.kts:3:44: error: Unresolved reference 'c'.
+                  | fun b(n: Int): Int = if (n > limit) n else <error>c</error>(n + 1)
+                  hint: 'c' is declared at line 4, while the functions of the script body are visible only after their declaration, and it cannot be declared before line 3, as 'b' -> 'c' -> 'b' call each other - mutually recursive functions cannot access the local declarations of the script body, pass them as parameters instead.
+            """.trimIndent()
+        ))
+    }
+
+    @Test
+    fun `should hint at declaration preventing function called by function declared before it from being declared before it`() = runTest {
+        // given
+        val script = """
+            val x = 1
+            fun a() = b()
+            class Box(val v: Int)
+            val y = 2
+            fun b() = x + c()
+            fun c() = Box(y).v
+            a()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:11: error: Unresolved reference 'b'.
+                  | fun a() = <error>b</error>()
+                  hint: 'b' is declared at line 5, while the functions of the script body are visible only after their declaration, and it cannot be declared before line 2, as 'c', which it calls, refers to 'Box' declared at line 3, and 'y' declared at line 4 - declare them before line 2.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not hoist function called within lambda or extension function which might resolve it on its receiver`() = runTest {
+        // given
+        val scripts = listOf(
+            """
+                val factor = 2
+                class Obj { fun b() = "member" }
+                fun a() = with(Obj()) { b() }
+                fun b() = "local ${'$'}factor"
+                a()
+            """.trimIndent(),
+            """
+                val factor = 2
+                fun a() = buildString { append("x") }
+                fun append(s: String) = "local ${'$'}s ${'$'}factor"
+                a()
+            """.trimIndent(),
+            """
+                val factor = 2
+                class Obj { fun b() = "member" }
+                fun Obj.a() = b()
+                fun b() = "local ${'$'}factor"
+                Obj().a()
+            """.trimIndent()
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("member", "x", "member"))
+    }
+
+    @Test
+    fun `should not hoist function called before its declaration within lambda which might resolve it on its receiver`() = runTest {
+        // given
+        val script = """
+            class Obj { fun b() = "member" }
+            val factor = 2
+            fun a() = b()
+            val m = with(Obj()) { b() }
+            fun b() = "local ${'$'}factor"
+            m + a()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            have(message.lines().first() == "script.kts:3:11: error: Unresolved reference 'b'.")
+        }
+    }
+
+    @Test
+    fun `should hint to declare property before the function calling the hoisted function referring to it`() = runTest {
+        // given
+        val script = """
+            val x = 1
+            fun a() = b()
+            fun b() = x + z
+            val z = 2
+            a()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:15: error: Unresolved reference 'z'.
+                  | fun b() = x + <error>z</error>
+                  hint: 'z' is declared at line 4, while the properties of the script body are visible only after their declaration - move it before line 2.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call function accessing local declarations of the script body from function declared before it after declaration on the same line`() = runTest {
+        // given
+        val script = """
+            val f = 2; fun a() = b()
+            fun b() = f
+            a()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should report calls of function called from function declared before it resolved to other declarations than in regular script`() = runTest {
+        // given
+        val scripts = listOf(
+            """
+                val greet = { s: String -> "prop " + s }
+                val factor = 2
+                fun a() = b()
+                fun b() = greet("x") + factor
+                fun greet(s: String) = "fun " + s
+                a()
+            """.trimIndent(),
+            """
+                val factor = 2
+                fun a() = b()
+                val r = a()
+                fun b(): String { ensureActive(); return "x" + factor }
+                fun ensureActive() { println("mine") }
+                r
+            """.trimIndent()
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.first() } == listOf(
+            "script.kts:4:11: error: 'greet' refers to the property of the script body declared at line 1, instead of the function declared at line 5, which a regular script calls.",
+            "script.kts:4:19: error: 'ensureActive' refers to the coroutine scope of the script body, instead of the function declared at line 5, which is compiled outside of the script body."
+        ))
+    }
+
 
     @Test
     fun `should report compiler warnings of successfully executed script`() = runTest {

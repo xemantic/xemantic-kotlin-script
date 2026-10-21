@@ -216,6 +216,7 @@ internal const val SCRIPT_BLOCK_END = "} }"
  * Declarations are moved by blanking them out with spaces in one copy of their lines,
  * and everything else in the other, so the columns of the script are retained,
  * while each line of the [text] maps back to the line of the script.
+ * The same way the local functions called by the local functions declared before them are hoisted within the script block.
  */
 internal class ScriptSource(
     script: String,
@@ -313,6 +314,10 @@ internal class ScriptSource(
 
     private val bodyDeclarations: List<Declaration>
 
+    private val unhoistedCalls: List<UnhoistedCall>
+
+    private val hoistedFunctions: Map<Int, List<Declaration>>
+
     init {
         val lineBounds = lineBounds(script)
         lineStarts = lineBounds.map { it.first }
@@ -342,6 +347,8 @@ internal class ScriptSource(
         }
         coroutineScopeCandidates = structure.coroutineScopeCandidates.map { it.toLaterDeclaredReference() }
         bodyDeclarations = structure.bodyDeclarations
+        unhoistedCalls = structure.unhoistedCalls
+        hoistedFunctions = structure.hoistedFunctions
         val deprecatedDependencies = if (confirming) {
             laterDeclaredDependencyCandidates.mapTo(HashSet()) { it.reference.name }
         } else {
@@ -369,6 +376,8 @@ internal class ScriptSource(
         val excluded = BooleanArray(script.length)
         movedDeclarations.forEach { excluded.fill(true, it.start, it.end) }
         structure.blankedRanges.forEach { excluded.fill(true, it.first, it.last + 1) }
+        val hoisted = BooleanArray(script.length)
+        structure.hoistedFunctions.values.flatten().forEach { hoisted.fill(true, it.start, it.end) }
         val movedExcluded = BooleanArray(script.length)
         structure.movedBlankedRanges.forEach { movedExcluded.fill(true, it.first, it.last + 1) }
 
@@ -438,14 +447,28 @@ internal class ScriptSource(
         mapping += null
         // the copies preceding the statements, where the local classes declared before them are visible
         val blockCopies = structure.blockCopies.entries.groupBy({ lineOf(it.key) }) { it.value }
+        // keeping the lines of the script, which the errors and the frames of the hoisted functions are reported at
+        val hoistedByLine = structure.hoistedFunctions.entries.sortedBy { it.key }.groupBy { lineOf(it.key) }
         (lineOf(headerEnd)..lineBounds.lastIndex).forEach { line ->
             blockCopies[line]?.flatten()?.forEach { (messages, declaration) ->
                 lines += messages.joinToString(separator = " ", postfix = " ") { "@${optInMarker(it)}" } + declaration
                 mapping += null
             }
-            addLines(line..line) { offset ->
-                offset >= headerEnd && !excluded[offset]
+            fun keep(offset: Int) = offset >= headerEnd && !excluded[offset] && !hoisted[offset]
+            // splitting the line, when it starts with other statements, like `val f = 2; fun a() = b()`
+            var segmentStart = lineBounds[line].first
+            hoistedByLine[line]?.forEach { (offset, functions) ->
+                if ((segmentStart until offset).any { keep(it) && !script[it].isWhitespace() }) {
+                    addLines(line..line) { it in segmentStart until offset && keep(it) }
+                }
+                functions.forEach { function ->
+                    addLines(lineOf(function.start)..lineOf(function.end - 1)) {
+                        it in function.start until function.end && !excluded[it]
+                    }
+                }
+                segmentStart = offset
             }
+            addLines(line..line) { it >= segmentStart && keep(it) }
         }
         if (returnsUnit) {
             // the block would return the value of the statement before the declaration, unlike the script
@@ -529,6 +552,40 @@ internal class ScriptSource(
         position(it.start).line to it.kind
     }
 
+    /**
+     * Why the local function of this [name] cannot be declared before the local function containing the [position],
+     * which calls it, or `null`, if the reason is its name, or it is not called there.
+     */
+    fun unhoistableFunction(
+        name: String,
+        position: ScriptPosition
+    ): UnhoistableFunction? {
+        val offset = lineStarts[position.line] + position.column
+        val call = unhoistedCalls.find { it.name == name && offset in it.caller.start until it.caller.end } ?: return null
+        val callerLine = position(call.caller.start).line
+        return when (val reason = call.reason) {
+            is Unhoisted.Cycle -> UnhoistableFunction.MutualRecursion(callerLine, reason.functions)
+            // the ones declared before the caller do not prevent it
+            is Unhoisted.Blocked -> UnhoistableFunction.DeclaredBetween(
+                callerLine, reason.function,
+                reason.declarations.filter { it.second >= call.caller.start }.map { (name, offset) -> name to position(offset).line }
+            )
+        }
+    }
+
+    /**
+     * The 0-based line of the statement, which the local function containing the [position] is hoisted before, see [ScriptSource],
+     * or `null`, if it is not hoisted.
+     */
+    fun hoistedBefore(
+        position: ScriptPosition
+    ): Int? {
+        val offset = lineStarts[position.line] + position.column
+        return hoistedFunctions.entries.find { (_, functions) ->
+            functions.any { offset in it.start until it.end }
+        }?.let { position(it.key).line }
+    }
+
     private fun position(
         offset: Int
     ): ScriptPosition {
@@ -581,6 +638,50 @@ private class Declaration(
     /** The ranges of the names of the classes nested in the declaration, by these names, the first one of each name. */
     val nestedNameRanges: Map<String, IntRange> = emptyMap()
 )
+
+/** A local function called by the local function declared before it, which cannot be hoisted, see [ScriptStructure.unhoistedCalls]. */
+private class UnhoistedCall(
+    val name: String,
+    val caller: Declaration,
+    val reason: Unhoisted
+)
+
+/** Why a local function cannot be hoisted, see [UnhoistedCall]. */
+private sealed interface Unhoisted {
+
+    /** The names of the [functions] calling each other, from the first one back to it. */
+    class Cycle(
+        val functions: List<String>
+    ) : Unhoisted
+
+    /** The [function], which it is or calls, refers to the [declarations] of these names, at these offsets, following the caller. */
+    class Blocked(
+        val function: String,
+        val declarations: List<Pair<String, Int>>
+    ) : Unhoisted
+
+}
+
+/** Why a local function cannot be declared before the local function calling it, see [ScriptSource.unhoistableFunction]. */
+internal sealed class UnhoistableFunction(
+    /** The 0-based line of the function calling it. */
+    val callerLine: Int
+) {
+
+    /** The names of the [functions] calling each other, from the first one back to it. */
+    class MutualRecursion(
+        callerLine: Int,
+        val functions: List<String>
+    ) : UnhoistableFunction(callerLine)
+
+    /** The [function], which it is or calls, refers to the [declarations] of these names, at these 0-based lines, following the caller. */
+    class DeclaredBetween(
+        callerLine: Int,
+        val function: String,
+        val declarations: List<Pair<String, Int>>
+    ) : UnhoistableFunction(callerLine)
+
+}
 
 internal enum class DeclarationKind {
     CLASS,
@@ -750,7 +851,12 @@ private class Reference(
     /** Whether it is an operator, or a convention, like `+`, referring to the operator functions only, like `plus`. */
     val isOperator: Boolean = false,
     /** Whether it is within a lambda, which might have a receiver, so its resolution is not known without compiling. */
-    val isInLambda: Boolean = false
+    val isInLambda: Boolean = false,
+    /**
+     * Whether it is within a lambda, a class, an object, or an extension function, which might resolve it on their receivers,
+     * before the local declarations of the script body, but not before the ones declared within them.
+     */
+    val mightResolveOnReceiver: Boolean = false
 ) {
 
     /** Whether it might refer to one of the local declarations of the script body of these [names]. */
@@ -787,7 +893,10 @@ private fun PsiElement.references(
                 || (expression is KtOperationReferenceExpression && expression.getReferencedNameElementType() == KtTokens.IDENTIFIER),
         isCallableReference = callableReference?.callableReference == expression,
         canAccessScriptMembers = canAccessScriptMembers(expression, scope),
-        isInLambda = isInLambda(expression, scope)
+        isInLambda = isInLambda(expression, scope),
+        mightResolveOnReceiver = expression.parents.takeWhile { it !== scope }.any {
+            it is KtLambdaExpression || it is KtClassOrObject || (it is KtNamedFunction && it.receiverTypeReference != null)
+        }
     )
 } + operatorReferences(scope)
 
@@ -1050,6 +1159,19 @@ private class ScriptStructure(
      */
     val blockCopies: Map<Int, List<Pair<List<String>, String>>>
 
+    /**
+     * The local functions called by the local functions declared before them, where they would not be visible,
+     * so they are declared before the first ones instead, by the offsets of the statements they precede, see [ScriptSource.text],
+     * unless they refer there to other declarations, or to none, like the functions calling each other.
+     */
+    val hoistedFunctions: Map<Int, List<Declaration>>
+
+    /** The local functions called by the local functions declared before them, which cannot be hoisted, see [hoistedFunctions]. */
+    val unhoistedCalls: List<UnhoistedCall>
+
+    /** The indices of the statements before which the statements of these indices are hoisted, see [hoistedFunctions]. */
+    private val hoistedAt: Map<Int, Int>
+
     /** See [ScriptSource.laterDeclaredDependencyCandidates], with the offsets of the declarations, and whether they are functions. */
     val laterDeclaredDependencyCandidates: List<Triple<Reference, Int, Boolean>>
 
@@ -1110,11 +1232,150 @@ private class ScriptStructure(
         }
         localProperties = propertyNameSet - movedConstants.mapTo(HashSet()) { it.name!! }
         movedDeclarations = moved.map { it.toDeclaration(withNestedNames = true) }
-        endsWithMovedDeclaration = moved.any { it.psi == statements.lastOrNull() }
         // unlike an extension function, which cannot be called like the dependency
         val (local, movedOut) = declarations.filter { it.kind == DeclarationKind.FUNCTION && !it.isExtension }.partition { it !in moved }
         localFunctions = local.mapNotNullTo(HashSet()) { it.name }
         movedFunctions = movedOut.mapNotNullTo(HashSet()) { it.name }
+        val statementIndices = statements.withIndex().associate { (index, statement) -> statement to index }
+        /** The start of the statement, including the comments preceding it, which the inserted lines should not split. */
+        fun leadingStart(
+            statementIndex: Int
+        ): Int {
+            var start = statements[statementIndex].startOffset
+            var element = statements[statementIndex].prevSibling
+            while (element is PsiWhiteSpace || element is PsiComment) {
+                if (element is PsiComment) start = element.startOffset
+                element = element.prevSibling
+            }
+            return start
+        }
+        /** The first statement sharing the line, so the lines inserted before it do not split another statement. */
+        fun firstOnLine(
+            statementIndex: Int
+        ): Int {
+            var first = statementIndex
+            while (first > 0 && '\n' !in script.substring(statements[first - 1].endOffset, leadingStart(first))) first--
+            return first
+        }
+        // the local functions, and the indices of the statements of the other local declarations, by their names
+        val bodyFunctions = declarations.filterTo(HashSet()) { it.kind == DeclarationKind.FUNCTION && it !in moved && it.name != null }
+        val bodyFunctionsByName = bodyFunctions.groupBy { it.name!! }
+        val otherDeclarationIndices = mutableMapOf<String, MutableList<Int>>()
+        // the indices of the statements of the script block calling these names where they might be resolved on the receivers
+        val receiverCallIndices = mutableMapOf<String, MutableList<Int>>()
+        statements.forEachIndexed { index, statement ->
+            val declaration = declarationsByPsi[statement]
+            if (declaration in moved) return@forEachIndexed
+            if (declaration?.kind != DeclarationKind.FUNCTION) {
+                statement.declaredNames().forEach { otherDeclarationIndices.getOrPut(it) { mutableListOf() } += index }
+            }
+            statementReferences[index].filter { it.isCall && !it.isBound && !it.isQualified && it.mightResolveOnReceiver }.forEach {
+                receiverCallIndices.getOrPut(it.name) { mutableListOf() } += index
+            }
+        }
+        // the functions, which would be resolved instead of other declarations of their names, or the other way around
+        val unhoistableNames = dependencyNames + movedFunctions + coroutineScopeFunctions + bodyFunctionsByName.filterValues { it.size > 1 }.keys +
+                statements.filter { declarationsByPsi[it]?.kind != DeclarationKind.FUNCTION }.flatMap { it.declaredNames() }
+        /** The local functions called by this one, and whether only where they might be resolved on the receivers instead. */
+        fun ParsedDeclaration.calls(): List<Pair<ParsedDeclaration, Boolean>> = references.filter { it.isCall && !it.isBound }.flatMap { reference ->
+            bodyFunctionsByName[reference.name].orEmpty().filter {
+                it !== this && (!reference.isQualified || it.isExtension) && (!reference.isOperator || it.isOperator)
+            }.map { it to reference.mightResolveOnReceiver }
+        }.groupBy({ it.first }) { it.second }.map { (function, onReceiver) -> function to onReceiver.all { it } }
+        fun ParsedDeclaration.index() = statementIndices.getValue(psi)
+        /** Why the function cannot be hoisted before the statements up to the [bound] index, inclusive, or its name, if the [reason] is `null`. */
+        class Failure(
+            val bound: Int,
+            val reason: Unhoisted? = null
+        )
+        val failures = HashMap<ParsedDeclaration, Failure>()
+        val hoisted = HashSet<ParsedDeclaration>()
+        val hoistedBefore = mutableMapOf<Int, MutableList<ParsedDeclaration>>()
+        val unhoisted = mutableListOf<UnhoistedCall>()
+        statements.forEachIndexed { index, statement ->
+            val caller = declarationsByPsi[statement]?.takeIf { it in bodyFunctions && it !in hoisted } ?: return@forEachIndexed
+            // searched depth-first without the recursion, as the chain of the calls might be long,
+            // declaring each function after the ones it calls, which are declared after the caller,
+            // while the calls within the lambdas, and the like, are resolved on their receivers instead, as in a regular script
+            val stack = mutableListOf(caller to caller.calls().filter { (it, onReceiver) -> !onReceiver && it.index() > index }.map { it.first }.iterator())
+            val onStack = hashSetOf(caller)
+            // the functions which can be hoisted, if the one called by the caller can be
+            val tentative = LinkedHashSet<ParsedDeclaration>()
+            /** The failure of hoisting the [function], or `null`, if it is hoisted already, or entered. */
+            fun enter(
+                function: ParsedDeclaration
+            ): Failure? {
+                if (function in hoisted || function in tentative) return null
+                failures[function]?.let { if (it.bound >= index) return it }
+                if (function in onStack) {
+                    val cycle = stack.map { it.first }.dropWhile { it !== function } + function
+                    return Failure(cycle.minOf { it.index() }, Unhoisted.Cycle(cycle.map { it.name!! }))
+                }
+                if (function.name in unhoistableNames) return Failure(Int.MAX_VALUE)
+                val functionIndex = function.index()
+                // all of them, failing for the callers preceding the last one
+                val blocking = function.references.filter { !it.isQualified && !it.isBound }.flatMap { reference ->
+                    otherDeclarationIndices[reference.name].orEmpty().filter { it < functionIndex }.map { reference.name to it }
+                }.distinct().sortedBy { it.second }
+                if (blocking.isNotEmpty() && blocking.last().second >= index) {
+                    return Failure(blocking.last().second, Unhoisted.Blocked(function.name!!, blocking.map { (name, blocker) ->
+                        name to statements[blocker].startOffsetSkippingComments
+                    }))
+                }
+                val calls = function.calls()
+                // the calls resolved on the receivers, which would refer to the function instead, or the other way around
+                if (receiverCallIndices[function.name].orEmpty().any { caller ->
+                        caller in index until functionIndex && declarationsByPsi[statements[caller]].let { it !in hoisted && it !in tentative }
+                    }
+                    || calls.any { (it, onReceiver) -> onReceiver && it.index() > functionIndex && (it in hoisted || it in tentative) }
+                ) {
+                    return Failure(index)
+                }
+                stack += function to calls.filter { (it, onReceiver) -> it.index() >= index && (!onReceiver || it.index() < functionIndex) }
+                    .map { it.first }.iterator()
+                onStack += function
+                return null
+            }
+            while (true) {
+                val (function, callees) = stack.last()
+                if (callees.hasNext()) {
+                    val callee = callees.next()
+                    var failure = enter(callee) ?: continue
+                    failures[callee] = failure
+                    // each function on the stack calls the next one, so it cannot be hoisted either, nor the ones it calls
+                    var child = callee
+                    while (stack.size > 1) {
+                        val parent = stack.removeAt(stack.lastIndex).first
+                        onStack -= parent
+                        failure = Failure(minOf(failure.bound, child.index()), failure.reason)
+                        failures[parent] = failure
+                        child = parent
+                    }
+                    tentative.clear()
+                    failure.reason?.let { unhoisted += UnhoistedCall(child.name!!, caller.toDeclaration(), it) }
+                } else if (stack.size > 1) {
+                    stack.removeAt(stack.lastIndex)
+                    onStack -= function
+                    tentative += function
+                    if (stack.size == 1) {
+                        hoisted += tentative
+                        hoistedBefore.getOrPut(index) { mutableListOf() } += tentative
+                        tentative.clear()
+                    }
+                } else {
+                    break
+                }
+            }
+        }
+        // the statements of the hoisted functions, by the ones they precede
+        hoistedAt = hoistedBefore.entries.flatMap { (index, functions) -> functions.map { it.index() to index } }.toMap()
+        hoistedFunctions = hoistedBefore.entries.associate { (index, functions) ->
+            leadingStart(index) to functions.map { it.toDeclaration() }
+        }
+        unhoistedCalls = unhoisted
+        endsWithMovedDeclaration = statements.lastOrNull()?.let { last ->
+            moved.any { it.psi == last } || hoisted.any { it.psi == last }
+        } == true
         // the first local property, and the first local function, of each name of a dependency, by the index of its statement
         val dependencyProperties = mutableMapOf<String, Pair<Int, ParsedDeclaration>>()
         val dependencyFunctions = mutableMapOf<String, Pair<Int, ParsedDeclaration>>()
@@ -1221,11 +1482,14 @@ private class ScriptStructure(
                     .forEach { shadowingProperties.putIfAbsent(it, index to property) }
             }
         }
+        // the hoisted functions see the declarations preceding the statements they are hoisted before
+        fun positionOf(index: Int) = hoistedAt[index] ?: index
         val shadowedFunctionCandidatesByStatement = statements.indices.associateWith { index ->
             if (declarationsByPsi[statements[index]] in moved) return@associateWith emptyList()
+            val position = positionOf(index)
             statementReferences[index].mapNotNull { reference ->
                 shadowingProperties[reference.name]?.takeIf { (propertyIndex) ->
-                    propertyIndex < index && reference.isCall && reference.refersToLocal(localProperties)
+                    propertyIndex < position && reference.isCall && reference.refersToLocal(localProperties)
                 }?.let { (_, property) ->
                     Triple(reference, property.line(), movedFunctionsByName.getValue(reference.name).first().line())
                 }
@@ -1239,12 +1503,13 @@ private class ScriptStructure(
         }.groupBy { it.name!! }
         val coroutineScopeCandidatesByStatement = statements.indices.associateWith { index ->
             if (declarationsByPsi[statements[index]] in moved) return@associateWith emptyList()
+            val position = positionOf(index)
             statementReferences[index].filter { reference ->
                 !reference.isQualified && !reference.isBound && reference.name in coroutineScopeDeclarations
                         // like in `coroutineScope { launch { } }`, where the nested coroutine scope is resolved also in the script
                         && !reference.isInLambda
                         // refers to the local property shadowing the function, see shadowedFunctionCandidates
-                        && shadowingProperties[reference.name]?.let { (propertyIndex) -> propertyIndex < index } != true
+                        && shadowingProperties[reference.name]?.let { (propertyIndex) -> propertyIndex < position } != true
             }.map {
                 val declaration = coroutineScopeDeclarations.getValue(it.name).first()
                 Triple(it, declaration.line(), declaration.kind == DeclarationKind.FUNCTION)
@@ -1253,42 +1518,28 @@ private class ScriptStructure(
         coroutineScopeCandidates = coroutineScopeCandidatesByStatement.values.flatten()
         val laterDeclaredCandidatesByStatement = statements.indices.associateWith { index ->
             if (declarationsByPsi[statements[index]] in moved) return@associateWith emptyList()
+            val position = positionOf(index)
             statementReferences[index].mapNotNull { reference ->
                 dependencyProperties[reference.name]?.takeIf { (declarationIndex) ->
                     // also when called, as the function of the same name might not apply
-                    declarationIndex > index && reference.refersToLocal(localProperties)
+                    declarationIndex > position && reference.refersToLocal(localProperties)
                 }?.let { (_, property) -> Triple(reference, property.line(), false) }
                     ?: dependencyFunctions[reference.name]?.takeIf { (declarationIndex) ->
-                        declarationIndex > index && reference.isCall && reference.refersToLocal(localFunctions)
+                        declarationIndex > position && reference.isCall && reference.refersToLocal(localFunctions)
                     }?.let { (_, function) -> Triple(reference, function.line(), true) }
             }
         }
         laterDeclaredDependencyCandidates = laterDeclaredCandidatesByStatement.values.flatten()
-        val statementIndices = statements.withIndex().associate { (index, statement) -> statement to index }
         blockCopies = if (!confirming) emptyMap() else buildMap<Int, MutableList<Pair<String, String>>> {
             /** The copies of the functions, by their names, each preceding the first statement of the candidates of its name. */
             fun addCopies(
                 candidatesByStatement: Map<Int, List<Triple<Reference, Int, *>>>,
                 functions: Map<String, List<ParsedDeclaration>>,
                 message: String
-            ) = candidatesByStatement.entries.sortedBy { it.key }.flatMap { (index, candidates) ->
-                candidates.map { it.first.name to index }
+            ) = candidatesByStatement.entries.sortedBy { positionOf(it.key) }.flatMap { (index, candidates) ->
+                candidates.map { it.first.name to positionOf(index) }
             }.distinctBy { it.first }.forEach { (name, index) ->
-                /** The start of the statement, including the comments preceding it, which the copies should not be inserted into. */
-                fun leadingStart(
-                    statementIndex: Int
-                ): Int {
-                    var start = statements[statementIndex].startOffset
-                    var element = statements[statementIndex].prevSibling
-                    while (element is PsiWhiteSpace || element is PsiComment) {
-                        if (element is PsiComment) start = element.startOffset
-                        element = element.prevSibling
-                    }
-                    return start
-                }
-                // preceding the first statement sharing the line, so the inserted line does not split another statement
-                var first = index
-                while (first > 0 && '\n' !in script.substring(statements[first - 1].endOffset, leadingStart(first))) first--
+                val first = firstOnLine(index)
                 val invisibleClasses = localClasses.filter { statementIndices.getValue(it.psi) >= first }.mapTo(HashSet()) { it.name!! }
                 getOrPut(leadingStart(first)) { mutableListOf() } += functions[name].orEmpty()
                     .filterNot { it.refersToTypes(invisibleClasses) }

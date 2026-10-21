@@ -433,16 +433,45 @@ internal class ScriptErrorReporter(
         val (line, kind) = (if (preferFunction) source.bodyDeclarationLine(name, DeclarationKind.FUNCTION) else null)
             ?: source.bodyDeclarationLine(name) ?: return
         val declaration = source.movedDeclarationAt(position)
+        // the line of the statement, which the hoisted function is declared before
+        val referenceLine = source.hoistedBefore(position) ?: position.line
         if (declaration != null) {
             appendNotVisibleHint(declaration, name, line)
-        } else if (line > position.line) {
-            val declarations = when (kind) {
-                CLASS -> "classes"
-                FUNCTION -> "functions"
-                else -> "properties"
+        } else if (line > referenceLine) {
+            val unhoistable = if (kind == FUNCTION) source.unhoistableFunction(name, position) else null
+            if (unhoistable != null) {
+                +"  hint: '$name' is declared at line ${line + 1}, while the functions of the script body are visible only after their declaration,"
+                +" and it cannot be declared before line ${unhoistable.callerLine + 1}, as "
+                appendUnhoistableReason(unhoistable, name)
+            } else {
+                val declarations = when (kind) {
+                    CLASS -> "classes"
+                    FUNCTION -> "functions"
+                    else -> "properties"
+                }
+                +"  hint: '$name' is declared at line ${line + 1}, while the $declarations of the script body are visible only after their declaration"
+                +" - move it before line ${referenceLine + 1}.\n"
             }
-            +"  hint: '$name' is declared at line ${line + 1}, while the $declarations of the script body are visible only after their declaration"
-            +" - move it before line ${position.line + 1}.\n"
+        }
+    }
+
+    private fun StringBuilder.appendUnhoistableReason(
+        unhoistable: UnhoistableFunction,
+        name: String
+    ) {
+        when (unhoistable) {
+            is UnhoistableFunction.MutualRecursion -> {
+                unhoistable.functions.joinTo(this, separator = " -> ") { "'$it'" }
+                +" call each other - mutually recursive functions cannot access the local declarations of the script body,"
+                +" pass them as parameters instead.\n"
+            }
+            is UnhoistableFunction.DeclaredBetween -> {
+                +(if (unhoistable.function == name) "it" else "'${unhoistable.function}', which it calls,")
+                +" refers to "
+                unhoistable.declarations.joinTo(this, separator = ", and ") { (declared, line) -> "'$declared' declared at line ${line + 1}" }
+                +" - declare ${if (unhoistable.declarations.size == 1) "'${unhoistable.declarations.single().first}'" else "them"}"
+                +" before line ${unhoistable.callerLine + 1}.\n"
+            }
         }
     }
 

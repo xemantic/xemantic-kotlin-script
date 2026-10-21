@@ -66,6 +66,71 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should hoist long chain of local functions each called by the one declared before it`() {
+        // given
+        val count = 50_000
+        val script = buildString {
+            appendLine("val x = 1")
+            (0 until count - 1).forEach { appendLine("fun f$it(): Int = f${it + 1}() + x") }
+            appendLine("fun f${count - 1}() = x")
+            append("f0()")
+        }
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val body = source.text.substringAfter(SCRIPT_BLOCK_START).lines().map { it.trim() }.filter { it.isNotEmpty() }
+        assert(body.take(3) == listOf("val x = 1", "fun f${count - 1}() = x", "fun f${count - 2}(): Int = f${count - 1}() + x"))
+        assert(source.toScriptLine(source.text.lines().indexOf("fun f${count - 1}() = x") + 1) == count)
+    }
+
+    @Test
+    fun `should not hoist long chain of local functions ending with function accessing property declared in between`() {
+        // given
+        val count = 50_000
+        val script = buildString {
+            appendLine("val x = 1")
+            (0 until count - 1).forEach { appendLine("fun f$it(): Int = f${it + 1}() + x") }
+            appendLine("val y = 2")
+            appendLine("fun f${count - 1}() = y")
+            append("f0()")
+        }
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val body = source.text.substringAfter(SCRIPT_BLOCK_START).lines().map { it.trim() }.filter { it.isNotEmpty() }
+        assert(body.take(2) == listOf("val x = 1", "fun f0(): Int = f1() + x"))
+    }
+
+    @Test
+    fun `should not hoist function called by function which cannot be hoisted`() {
+        // given
+        val script = """
+            val x = 1
+            fun a() = c()
+            val y = 3
+            fun c() = maxOf(1, 2) + minOf(1, 2)
+            fun maxOf(p: Int, q: Int) = x
+            fun minOf(p: Int, q: Int) = y
+            a()
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val body = source.text.substringAfter(SCRIPT_BLOCK_START).lines().map { it.trim() }.filter { it.isNotEmpty() }
+        // hoisted only before the function calling them, which cannot be hoisted itself, as `minOf` refers to `y`
+        assert(body.take(6) == listOf(
+            "val x = 1", "fun a() = c()", "val y = 3", "fun maxOf(p: Int, q: Int) = x", "fun minOf(p: Int, q: Int) = y",
+            "fun c() = maxOf(1, 2) + minOf(1, 2)"
+        ))
+    }
+
+    @Test
     fun `should give distinct location ids to scripts of the same hash code`() {
         // given
         val scripts = listOf("\"Aa\"", "\"BB\"")

@@ -116,6 +116,23 @@ Most of these cases are reported as errors, while the following ones still resol
 
 Giving the declarations and the dependencies distinct names avoids them.
 
+A function accessing the local properties of the script body stays local to the script block,
+where it is visible only after its declaration.
+When such a function is called by a function declared before it,
+it is declared before the calling one instead,
+together with the local functions it calls ([#4](https://github.com/xemantic/xemantic-kotlin-script/issues/4)).
+It stays in place
+when it, or a function it calls, refers to a local declaration declared after the calling function,
+like a property, a destructured value, or a class, as in `fun b(box: Box)` with `class Box` declared in between,
+when it is named like another declaration of the script, or like a dependency, or overloaded in the script body,
+when it is called within a lambda, a class, or an extension function, which might resolve the call on its receiver instead,
+like `b()` in `with(obj) { b() }`, as in a regular script,
+or when the functions call each other, like `isEven` and `isOdd` comparing `n` against a local `limit`.
+The call is then reported as an unresolved reference, with a hint at the declaration to declare earlier,
+or at the mutually recursive functions, which can be avoided by passing the local values they access as parameters,
+unless the call resolves to another function of its name, like `println` of the standard library,
+called instead of a local `println` ([#51](https://github.com/xemantic/xemantic-kotlin-script/issues/51)).
+
 ### Error reporting
 
 A script like:
