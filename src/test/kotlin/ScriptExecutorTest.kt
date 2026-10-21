@@ -4319,6 +4319,26 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should not hint at member operator of array access enclosing unresolved plain call of the same name`() = runTest {
+        // given
+        val script = """
+            val scale = listOf(10).first()
+            class M { operator fun get(i: Int) = i }
+            class Grid
+            operator fun Grid.get(i: Int) = i * scale
+            val g get() = Grid().run { M()[get(1)] }
+            g
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert(result is ScriptResult.Error && "does not refer to the function" !in result.message)
+    }
+
+    @Test
     fun `should report invisible operator functions of delegates, typed destructuring entries and binary operators`() = runTest {
         // given
         val scripts = listOf(
