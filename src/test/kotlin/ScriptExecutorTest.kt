@@ -3210,6 +3210,45 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should refer to the coroutine scope of the script body by the script block label without warnings`() = runTest {
+        // given
+        val script = """
+            this@_script is Job && this@_script === coroutineContext[Job] && this@_script.isActive
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("limit", 1)))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == true)
+            have(warnings == null)
+        }
+    }
+
+    @Test
+    fun `should return from the script body by the script block label without warnings`() = runTest {
+        // given
+        val script = """
+            if (limit > 0) return@_script "early"
+            "late"
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("limit", 1)))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "early")
+            have(warnings == null)
+        }
+    }
+
+    @Test
     fun `should call function moved out of the script body instead of callable dependency of the same name`() = runTest {
         // given
         val script = """

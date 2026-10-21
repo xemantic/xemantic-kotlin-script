@@ -185,8 +185,13 @@ internal const val DEPENDENCIES_CLASS_NAME = "_ScriptDependencies"
 
 private const val DEPENDENCIES_CLASS = "`$DEPENDENCIES_CLASS_NAME`"
 
-/** The line starting the script block in the [ScriptSource.text]. */
-internal const val SCRIPT_BLOCK_START = "_script($DEPENDENCIES_CLASS()) { {"
+/**
+ * The line starting the script block in the [ScriptSource.text].
+ *
+ * The outer lambda is labeled, as otherwise both lambdas would be labeled `_script`,
+ * reporting `this@_script`, the coroutine scope of the script body, as ambiguous.
+ */
+internal const val SCRIPT_BLOCK_START = "_script($DEPENDENCIES_CLASS()) _dependencies@{ {"
 
 /** The line ending the script block in the [ScriptSource.text]. */
 internal const val SCRIPT_BLOCK_END = "} }"
@@ -201,7 +206,7 @@ internal const val SCRIPT_BLOCK_END = "} }"
  * <the accessors of the shadowed dependencies>
  * }
  * <declarations which cannot be local>
- * _script(_ScriptDependencies()) { {
+ * _script(_ScriptDependencies()) _dependencies@{ {
  * <the rest of the script>
  * } }
  * ```
