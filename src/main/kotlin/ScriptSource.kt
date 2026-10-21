@@ -855,6 +855,8 @@ private val psiFactory: KtPsiFactory by lazy {
  *   so it refers to a member, or an extension.
  * @param isBound whether the name is declared in the element the references are collected from,
  *   like a parameter, a local variable or a member, so it does not refer to a top-level declaration.
+ * @param element the element it is at, and [scope] the element the references are collected from,
+ *   kept only until [canAccessScriptMembers] is computed.
  */
 private class Reference(
     val name: String,
@@ -873,11 +875,8 @@ private class Reference(
     val isCallableReference: Boolean,
     /** Whether it names a type, like `Foo` in `x: Foo`, which a value of the same name, like a parameter, does not shadow. */
     val isType: Boolean,
-    /**
-     * Whether it is within a declaration, which can access the members of the script, when moved out of the script body,
-     * unlike e.g. an object, an enum class, an interface, or a nested class.
-     */
-    val canAccessScriptMembers: Boolean,
+    element: PsiElement,
+    scope: PsiElement,
     /** Whether it is an operator, or a convention, like `+`, referring to the operator functions only, like `plus`. */
     val isOperator: Boolean = false,
     /** Whether it is within a lambda, which might have a receiver, so its resolution is not known without compiling. */
@@ -888,6 +887,13 @@ private class Reference(
      */
     val mightResolveOnReceiver: Boolean = false
 ) {
+
+    /**
+     * Whether it is within a declaration, which can access the members of the script, when moved out of the script body,
+     * unlike e.g. an object, an enum class, an interface, or a nested class,
+     * computed only when needed, for the references to the constants, see [refersToConstant].
+     */
+    val canAccessScriptMembers: Boolean by lazy(LazyThreadSafetyMode.NONE) { canAccessScriptMembers(element, scope) }
 
     /** Whether it might refer to one of the local declarations of the script body of these [names]. */
     fun refersToLocal(
@@ -900,7 +906,7 @@ private class Reference(
      */
     fun refersToConstant(
         constants: Set<String>
-    ): Boolean = canAccessScriptMembers && refersToLocal(constants)
+    ): Boolean = refersToLocal(constants) && canAccessScriptMembers
 
 }
 
@@ -933,7 +939,8 @@ private fun PsiElement.references(
                 || (expression is KtOperationReferenceExpression && expression.getReferencedNameElementType() == KtTokens.IDENTIFIER),
         isCallableReference = callableReference?.callableReference == expression,
         isType = expression.parent is KtUserType,
-        canAccessScriptMembers = canAccessScriptMembers(expression, scope),
+        element = expression,
+        scope = scope,
         isInLambda = isInLambda(expression, scope),
         mightResolveOnReceiver = mightResolveOnReceiver(expression, scope)
     )
@@ -974,7 +981,6 @@ private fun PsiElement.operatorReferences(
         offset: Int = element.startOffset,
         length: Int = element.textLength
     ) {
-        val canAccessScriptMembers = canAccessScriptMembers(element, scope)
         names.forEach { name ->
             add(
                 Reference(
@@ -987,7 +993,8 @@ private fun PsiElement.operatorReferences(
                     isCall = true,
                     isCallableReference = false,
                     isType = false,
-                    canAccessScriptMembers = canAccessScriptMembers,
+                    element = element,
+                    scope = scope,
                     isOperator = true
                 )
             )
@@ -2072,7 +2079,7 @@ private class ScriptStructure(
         }
         val accessingLocalProperties = declarations.filter { declaration ->
             declaration in referredToOnReceivers || declaration.references.any {
-                it.refersToLocal(variables) || (!it.canAccessScriptMembers && it.refersToLocal(constants))
+                it.refersToLocal(variables) || (it.refersToLocal(constants) && !it.canAccessScriptMembers)
             }
         }.toSet()
         /** The declarations not [moved] yet, which access the local properties, or refer to such ones not moved yet. */
