@@ -91,7 +91,13 @@ import kotlin.script.experimental.api.SourceCode
 internal data class ScriptPosition(
     val line: Int,
     val column: Int
-)
+) : Comparable<ScriptPosition> {
+
+    override fun compareTo(
+        other: ScriptPosition
+    ): Int = compareValuesBy(this, other, { it.line }, { it.column })
+
+}
 
 /** The reference to the [name] in the script, from the [start] to the [end], exclusive. */
 internal class ScriptReference(
@@ -102,8 +108,7 @@ internal class ScriptReference(
 
     operator fun contains(
         position: ScriptPosition
-    ): Boolean = (position.line > start.line || (position.line == start.line && position.column >= start.column))
-            && (position.line < end.line || (position.line == end.line && position.column < end.column))
+    ): Boolean = position >= start && position < end
 
 }
 
