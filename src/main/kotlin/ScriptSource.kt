@@ -50,6 +50,7 @@ import org.jetbrains.kotlin.psi.KtDeclarationWithBody
 import org.jetbrains.kotlin.psi.KtDestructuringDeclaration
 import org.jetbrains.kotlin.psi.KtElement
 import org.jetbrains.kotlin.psi.KtEnumEntry
+import org.jetbrains.kotlin.psi.KtEscapeStringTemplateEntry
 import org.jetbrains.kotlin.psi.KtExpression
 import org.jetbrains.kotlin.psi.KtForExpression
 import org.jetbrains.kotlin.psi.KtLabelReferenceExpression
@@ -64,6 +65,7 @@ import org.jetbrains.kotlin.psi.KtPropertyDelegate
 import org.jetbrains.kotlin.psi.KtPropertyAccessor
 import org.jetbrains.kotlin.psi.KtPsiFactory
 import org.jetbrains.kotlin.psi.KtSimpleNameExpression
+import org.jetbrains.kotlin.psi.KtStringTemplateEntryWithExpression
 import org.jetbrains.kotlin.psi.KtStringTemplateExpression
 import org.jetbrains.kotlin.psi.KtLambdaExpression
 import org.jetbrains.kotlin.psi.KtOperationReferenceExpression
@@ -313,6 +315,15 @@ internal class ScriptSource(
     /** The package of the script, like `foo.bar`, or an empty string, if it has none. */
     val packageName: String
 
+    /** The names of the classes and the objects declared in the script, including `Companion` of an unnamed companion object, and the enum entries. */
+    val classNames: Set<String>
+
+    /** The names of the [classNames] enclosing other classes, objects or enum entries, which qualify their names. */
+    val enclosingClassNames: Set<String>
+
+    /** The contents of the string literals of the script, with the escapes resolved, and a NUL character in place of each template expression. */
+    val stringLiterals: List<String>
+
     private val lineStarts: List<Int>
 
     /** For each line of the [text], the line of the script, or `null` for the lines of the block and the preamble. */
@@ -341,6 +352,9 @@ internal class ScriptSource(
         movedDeclarations = structure.movedDeclarations
         returnsUnit = structure.endsWithMovedDeclaration
         packageName = structure.packageName
+        classNames = structure.classNames
+        enclosingClassNames = structure.enclosingClassNames
+        stringLiterals = structure.stringLiterals
         fun Pair<String, IntRange>.toScriptReference() = ScriptReference(first, position(second.first), position(second.last + 1))
         conflictingDependencyDeclarations = structure.conflictingDependencyDeclarations.map { it.toScriptReference() }
         fun Reference.toScriptReference() = ScriptReference(name, position(offset), position(offset + length))
@@ -1113,6 +1127,15 @@ private class ScriptStructure(
     /** See [ScriptSource.packageName]. */
     val packageName: String
 
+    /** See [ScriptSource.classNames]. */
+    val classNames: Set<String>
+
+    /** See [ScriptSource.enclosingClassNames]. */
+    val enclosingClassNames: Set<String>
+
+    /** See [ScriptSource.stringLiterals]. */
+    val stringLiterals: List<String>
+
     /** The names and the ranges of the [ScriptSource.scriptMemberCallableReferences]. */
     val scriptMemberCallableReferences: List<Pair<String, IntRange>>
 
@@ -1140,6 +1163,21 @@ private class ScriptStructure(
     init {
         val file = psiFactory.createFile("script.kts", script)
         packageName = file.packageFqName.asString()
+        val classes = file.collectDescendantsOfType<KtClassOrObject>()
+        fun KtClassOrObject.className() = name ?: "Companion".takeIf { this is KtObjectDeclaration && isCompanion() }
+        classNames = classes.mapNotNullTo(HashSet()) { it.className() }
+        enclosingClassNames = classes.filter { declaration ->
+            declaration.collectDescendantsOfType<KtClassOrObject> { it !== declaration }.isNotEmpty()
+        }.mapNotNullTo(HashSet()) { it.className() }
+        stringLiterals = file.collectDescendantsOfType<KtStringTemplateExpression>().map { literal ->
+            literal.entries.joinToString("") { entry ->
+                when (entry) {
+                    is KtEscapeStringTemplateEntry -> entry.unescapedValue
+                    is KtStringTemplateEntryWithExpression -> "\u0000"
+                    else -> entry.text
+                }
+            }
+        }
         headerEnd = listOfNotNull(
             file.firstChild?.takeIf { it.node.elementType == KtTokens.SHEBANG_COMMENT },
             // like `@file:JvmName("x")`, while the parser takes there also a stray `@` of the script body

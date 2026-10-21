@@ -1097,6 +1097,305 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report enum constant not found without the name of the script class`() = runTest {
+        // given
+        val script = """
+            enum class Color { RED, GREEN }
+            Color.valueOf("BLUE")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.withoutJdkLineNumbers() sameAs """
+                java.lang.IllegalArgumentException: No enum constant Color.BLUE
+                  at java.lang.Enum.valueOf(Enum.java:<line>)
+                  at <script body>(script.kts:2)
+                  | Color.valueOf("BLUE")
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report enum constant not found without the name of the script class in a package`() = runTest {
+        // given
+        val script = """
+            package com.acme
+            enum class Color { RED, GREEN }
+            Color.valueOf("BLUE")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.withoutJdkLineNumbers() sameAs """
+                java.lang.IllegalArgumentException: No enum constant Color.BLUE
+                  at java.lang.Enum.valueOf(Enum.java:<line>)
+                  at <script body>(script.kts:3)
+                  | Color.valueOf("BLUE")
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report class cast of classes declared in the script without the name of the script class`() = runTest {
+        // given
+        val script = """
+            sealed interface Shape
+            class Circle : Shape
+            class Square : Shape
+            val shape: Shape = Circle()
+            shape as Square
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.withoutHashCodes() sameAs """
+                java.lang.ClassCastException: class Circle cannot be cast to class Square (Circle and Square are in unnamed module of loader org.jetbrains.kotlin.scripting.compiler.plugin.impl.CompiledScriptClassLoader @<hash>)
+                  at <script body>(script.kts:5)
+                  | shape as Square
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report class cast of local classes of the script body without their synthetic names`() = runTest {
+        // given
+        val script = """
+            open class Animal
+            class Dog : Animal()
+            val animal: Any = Animal()
+            animal as Dog
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.withoutHashCodes() sameAs """
+                java.lang.ClassCastException: class Animal cannot be cast to class Dog (Animal and Dog are in unnamed module of loader org.jetbrains.kotlin.scripting.compiler.plugin.impl.CompiledScriptClassLoader @<hash>)
+                  at <script body>(script.kts:4)
+                  | animal as Dog
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report default string representations of the classes declared in the script without the name of the script class`() = runTest {
+        // given
+        val script = $$"""
+            class Box { class Lid }
+            object Registry
+            class Holder { companion object }
+            class Note
+            throw IllegalStateException("${Box.Lid()} $Registry ${Holder.Companion} ${Note()} ${Box::class}")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.withoutHashCodes().lines().first() sameAs
+                    "java.lang.IllegalStateException: Box.Lid@<hash> Registry@<hash> Holder.Companion@<hash> Note@<hash> class Box"
+        }
+    }
+
+    @Test
+    fun `should report the message of the cause without the name of the script class`() = runTest {
+        // given
+        val script = """
+            enum class Color { RED }
+            fun parse(name: String): Color = try {
+                Color.valueOf(name)
+            } catch (e: IllegalArgumentException) {
+                throw IllegalStateException("cannot parse", e)
+            }
+            parse("BLUE")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.withoutJdkLineNumbers() sameAs """
+                java.lang.IllegalStateException: cannot parse
+                  at parse(script.kts:5)
+                  |     throw IllegalStateException("cannot parse", e)
+                  at <script body>(script.kts:7)
+                  | parse("BLUE")
+                Caused by: java.lang.IllegalArgumentException: No enum constant Color.BLUE
+                  at java.lang.Enum.valueOf(Enum.java:<line>)
+                  at parse(script.kts:3)
+                  |     Color.valueOf(name)
+                  at <script body>(script.kts:7)
+                  | parse("BLUE")
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should keep names in exception messages which the script wrote itself`() = runTest {
+        // given
+        val script = """
+            enum class Color { RED }
+            throw IllegalStateException("_.Color _.Shape my_.Color _Color __.Color x._.Color")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first() sameAs
+                    "java.lang.IllegalStateException: _.Color _.Shape my_.Color _Color __.Color x._.Color"
+        }
+    }
+
+    @Test
+    fun `should report enum constant not found without the name of the script class written in a comment or a longer name`() = runTest {
+        // given
+        val script = """
+            // see _.Color
+            object Palette_ { enum class Color { RED } }
+            enum class Color { RED }
+            val red = Palette_.Color.RED
+            Color.valueOf("BLUE")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first() sameAs "java.lang.IllegalArgumentException: No enum constant Color.BLUE"
+        }
+    }
+
+    @Test
+    fun `should report class cast of local class declared in a function named like a class of the script`() = runTest {
+        // given
+        val script = """
+            interface Shape
+            class Square : Shape
+            fun Shape(): Shape {
+                class Impl : Shape
+                return Impl()
+            }
+            Shape() as Square
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first().substringBefore(" (") sameAs
+                    "java.lang.ClassCastException: class Impl cannot be cast to class Square"
+        }
+    }
+
+    @Test
+    fun `should report class cast of arrays of classes declared in the script without the name of the script class`() = runTest {
+        // given
+        val script = """
+            sealed interface Shape
+            class Circle : Shape
+            class Square : Shape
+            val shapes: Any = arrayOf(Circle())
+            shapes as Array<Square>
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first().substringBefore(" (") sameAs
+                    "java.lang.ClassCastException: class [LCircle; cannot be cast to class [LSquare;"
+        }
+    }
+
+    @Test
+    fun `should report class cast of local classes without the synthetic names named like a class of the script`() = runTest {
+        // given
+        val script = """
+            class result
+            fun make(): Any {
+                open class Animal
+                class Dog : Animal()
+                return Animal()
+            }
+            make() as result
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first().substringBefore(" (") sameAs
+                    "java.lang.ClassCastException: class Animal cannot be cast to class result"
+        }
+    }
+
+    @Test
+    fun `should report exception with a very long message resembling the name of the script class`() = runTest {
+        // given
+        val script = """
+            error("_" + ".".repeat(100_000) + "${'$'}".repeat(100_000))
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first() sameAs
+                    "java.lang.IllegalStateException: _" + ".".repeat(100_000) + "$".repeat(100_000)
+        }
+    }
+
+    /** The line numbers of the frames of the JDK, like `Enum.java:293`, which differ between its versions. */
+    private fun String.withoutJdkLineNumbers() = replace(Regex("(\\w+\\.java):\\d+\\)"), "$1:<line>)")
+
+    /** Like `@1b6d3586` of the default string representation, which differs on every run. */
+    private fun String.withoutHashCodes() = replace(Regex("@[0-9a-f]+\\b"), "@<hash>")
+
+    @Test
     fun `should report suppressed exceptions`() = runTest {
         // given
         val script = """
