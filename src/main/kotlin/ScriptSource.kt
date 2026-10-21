@@ -436,12 +436,6 @@ internal class ScriptSource(
                 mapping += null
             }
         }
-        if (coroutineScopeCopies) {
-            lines += "abstract class $BODY_SCOPE_CLASS : kotlinx.coroutines.CoroutineScope {"
-            lines += structure.coroutineScopeMembers.map { "@${optInMarker(COROUTINE_SCOPE_FUNCTION)} $it" }
-            lines += "}"
-            repeat(structure.coroutineScopeMembers.size + 2) { mapping += null }
-        }
         // a callable one is visible to the moved declarations referring to it as a value, like `map(log)`, as in the script,
         // while their calls, which in the script call the local function, if it applies, are confirmed, see hiddenLocalFunctionCandidates
         val (shadowed, visible) = dependencies.partition {
@@ -479,6 +473,13 @@ internal class ScriptSource(
             addLines(lineOf(declaration.start)..lineOf(declaration.end - 1)) {
                 it in declaration.start until declaration.end && !movedExcluded[it]
             }
+        }
+        // following the moved type aliases, which are not visible before their declarations
+        if (coroutineScopeCopies) {
+            lines += "abstract class $BODY_SCOPE_CLASS : kotlinx.coroutines.CoroutineScope {"
+            lines += structure.coroutineScopeMembers.map { "@${optInMarker(COROUTINE_SCOPE_FUNCTION)} $it" }
+            lines += "}"
+            repeat(structure.coroutineScopeMembers.size + 2) { mapping += null }
         }
         // qualified, as the script might declare a function of its name
         lines += if (coroutineScopeCopies) "$SCRIPT_BLOCK_START kotlin.with(this as $BODY_SCOPE_CLASS) {" else SCRIPT_BLOCK_START
@@ -701,6 +702,20 @@ private fun KtNamedFunction.signature(): String? = if (
 }
 
 /**
+ * The overriding declaration of the member of `Any` of the same signature as this function, like `override fun toString(): kotlin.String`,
+ * which a declaration of this signature in a class would hide, or `null`, if it has another signature, like `fun equals(other: String)`.
+ */
+private fun KtNamedFunction.anyMemberOverride(): String? = if (receiverTypeReference != null || typeParameters.isNotEmpty()) null else {
+    val parameterTypes = valueParameters.map { it.typeReference?.singleLineText()?.trim()?.removePrefix("kotlin.") }
+    when {
+        name == "toString" && parameterTypes.isEmpty() -> "override fun toString(): kotlin.String = kotlin.TODO()"
+        name == "hashCode" && parameterTypes.isEmpty() -> "override fun hashCode(): kotlin.Int = kotlin.TODO()"
+        name == "equals" && parameterTypes == listOf("Any?") -> "override fun equals(other: kotlin.Any?): kotlin.Boolean = kotlin.TODO()"
+        else -> null
+    }
+}
+
+/**
  * The function type of the property, which can be called, like `(String) -> Any?` of `val log = { m: String -> ... }`,
  * declared, or of its lambda with the typed parameters, or `null`, if it is not known.
  */
@@ -721,7 +736,8 @@ private fun KtProperty.functionType(
     ): String? = if (any { it.typeReference == null || it.destructuringDeclaration != null }) null else {
         (receiver?.let { "$it." } ?: "") + joinToString(prefix = "(", postfix = ") -> Any?") { it.typeReference!!.singleLineText() }
     }
-    return when (val initializer = initializer) {
+    // like `val log get() = { m: String -> ... }` of a moved property
+    return when (val initializer = initializer ?: getter?.bodyExpression) {
         is KtLambdaExpression -> initializer.valueParameters.functionType()
         // like `fun(m: Any?) { ... }`
         is KtNamedFunction -> initializer.valueParameters.functionType(initializer.receiverTypeReference?.let { "(${it.singleLineText()})" })
@@ -1408,14 +1424,18 @@ private class ScriptStructure(
             moved.filter { it.name in names }.mapNotNull { declaration ->
                 val property = declaration.psi as? KtProperty
                 when {
-                    declaration.kind == DeclarationKind.FUNCTION ->
-                        if (declaration.refersToTypes(localClassNames)) null else declaration.signature()
+                    declaration.kind == DeclarationKind.FUNCTION -> (declaration.psi as KtNamedFunction).anyMemberOverride()
+                        ?: if (declaration.refersToTypes(localClassNames)) null else declaration.signature()
                     // overriding the inherited member, of the type compatible with any, as the copies are never evaluated
                     property != null && property.receiverTypeReference == null && property.name == "coroutineContext" ->
                         "override val `coroutineContext`: Nothing get() = kotlin.TODO()"
-                    // of the declared type, which might be called, like a function type
-                    property != null && property.receiverTypeReference == null ->
-                        "val `${property.name}`: ${property.typeReference?.singleLineText() ?: "Nothing"} get() = kotlin.TODO()"
+                    // of the known type, which might be called, like the function type of `val log get() = { m: String -> ... }`
+                    property != null && property.receiverTypeReference == null -> "val `${property.name}`: ${
+                        property.functionType(
+                            localFunction = { name -> movedFunctionsByName[name]?.singleOrNull()?.psi as? KtNamedFunction },
+                            typeAlias = { name -> typeAliases[name] }
+                        ) ?: "Nothing"
+                    } get() = kotlin.TODO()"
                     else -> null
                 }
             }.distinct()

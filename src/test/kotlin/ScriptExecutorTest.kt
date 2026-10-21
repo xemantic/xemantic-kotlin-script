@@ -4395,7 +4395,11 @@ class ScriptExecutorTest {
             "val r = run { launch { } }\nfun launch(block: () -> Unit): String = \"mine\"\nr",
             "val r = listOf(1).map { cancel() }\nfun cancel(): String = \"mine\"\nr",
             "val r = \"x\".let { isActive }\nval isActive get() = \"mine\"\nr",
-            "val r = with(this) { launch { } }\nfun launch(block: () -> Unit): String = \"mine\"\nr"
+            "val r = with(this) { launch { } }\nfun launch(block: () -> Unit): String = \"mine\"\nr",
+            // the type alias declared after the copies would not be visible to them
+            "val r = launch { }\ntypealias Block = () -> Unit\nfun launch(block: Block): String = \"mine\"\nr",
+            "val r = run { launch { } }\ntypealias Block = () -> Unit\nfun launch(block: Block): String = \"mine\"\nr",
+            "val r = run { launch { } }\nval launch get() = { b: () -> Unit -> \"mine\" }\nr"
         )
         val executor = ScriptExecutor()
 
