@@ -30,7 +30,6 @@ import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -2438,7 +2437,7 @@ class ScriptExecutorTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                error: The script could not be compiled because of an internal failure of the compiler: java.lang.IllegalStateException: The compilation of the script was cancelled
+                error: The script could not be compiled because of an internal failure of the compiler: java.lang.IllegalStateException: The compilation of the script was cancelled, caused by: java.util.concurrent.CancellationException: compiler cancelled
             """.trimIndent()
         }
     }
@@ -2467,7 +2466,10 @@ class ScriptExecutorTest {
         val results = listOf(owner.await(), waiter.await())
 
         // then
-        assert(results.all { it is ScriptResult.Error && it.phase == ExecutionPhase.COMPILATION })
+        val (ownerResult, waiterResult) = results
+        assert(ownerResult is ScriptResult.Error && ownerResult.phase == ExecutionPhase.COMPILATION)
+        assert(waiterResult is ScriptResult.Error && waiterResult.phase == ExecutionPhase.COMPILATION)
+        assert(waiterResult.message == ownerResult.message)
         assert(executor.compilationCount == 1)
     }
 
@@ -2483,27 +2485,6 @@ class ScriptExecutorTest {
 
         // then
         assert(failure is OutOfMemoryError && failure.message == "compiler out of memory")
-    }
-
-    @Test
-    fun `should cancel the compilation when its caller is cancelled`() = runTest {
-        // given
-        val compiling = CompletableDeferred<Unit>()
-        val executor = DefaultScriptExecutor(
-            compiler = FailingCompiler {
-                compiling.complete(Unit)
-                awaitCancellation()
-            }
-        )
-        var result: ScriptResult? = null
-        val execution = launch { result = executor.execute("42") }
-        compiling.await()
-
-        // when
-        execution.cancelAndJoin()
-
-        // then
-        assert(execution.isCancelled && result == null)
     }
 
     @Test

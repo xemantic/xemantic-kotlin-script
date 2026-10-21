@@ -96,8 +96,10 @@ public interface ScriptExecutor {
      * so the caller awaits all the coroutines it launched, and its cancellation cancels them.
      * Note that cancellation cannot interrupt a blocking call of the script, like `Thread.sleep`.
      *
-     * Even an internal failure of the compiler is reported as a [ExecutionPhase.COMPILATION] error,
-     * while only the cancellation of the caller, and a [VirtualMachineError] other than [StackOverflowError], are thrown.
+     * A failure of the compilation, even an internal one of the compiler, is reported as a [ExecutionPhase.COMPILATION] error,
+     * unless it is the cancellation of the caller, or a [VirtualMachineError] other than [StackOverflowError], which are thrown.
+     *
+     * @throws IllegalArgumentException if the [dependencies] have duplicate, or reserved, names.
      */
     public suspend fun execute(
         @Language("kotlin") script: String,
