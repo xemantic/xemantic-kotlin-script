@@ -462,14 +462,7 @@ internal class ScriptErrorReporter(
         val (start, end) = range
         appendSourceLines(start, end)
         unresolvedReference.matchEntire(diagnostic.message)?.let { match ->
-            appendHint(
-                name = match.groupValues[1],
-                position = start,
-                // unlike a property, a function of the same name is called, also with a trailing lambda
-                preferFunction = source.scriptLines[end.line].drop(end.column).trimStart().let {
-                    it.startsWith('(') || it.startsWith('{')
-                }
-            )
+            appendHint(name = match.groupValues[1], position = start)
         }
         if (capturing != null) {
             val kind = capturing[1].lowercase()
@@ -575,11 +568,9 @@ internal class ScriptErrorReporter(
      */
     private fun StringBuilder.appendHint(
         name: String,
-        position: ScriptPosition,
-        preferFunction: Boolean = false
+        position: ScriptPosition
     ) {
-        val (line, kind) = (if (preferFunction) source.bodyDeclarationLine(name, DeclarationKind.FUNCTION) else null)
-            ?: source.bodyDeclarationLine(name) ?: return
+        val (line, kind) = source.bodyDeclarationLine(name, position) ?: return
         val declaration = source.movedDeclarationAt(position)
         if (declaration != null) {
             appendNotVisibleHint(declaration, name, line)

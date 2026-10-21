@@ -3705,6 +3705,136 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report unresolved reference indexed or iterated before its declaration`() = runTest {
+        // given
+        val scripts = listOf(
+            """
+            val k = "a".length
+            val x = arr[0]
+            val arr = listOf(k)
+            x
+            """,
+            """
+            val k = "a".length
+            for (x in xs) println(x)
+            val xs = listOf(k)
+            """,
+            """
+            val limit = listOf("a".length)
+            sealed interface Check
+            class Below : Check { fun ok() = limit[0] }
+            Below().ok()
+            """,
+            """
+            val limit = listOf("a".length)
+            sealed interface Check
+            class Below : Check { fun ok() { for (x in limit) println(x) } }
+            Below().ok()
+            """
+        ).map { it.trimIndent() }
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // followed by the failures of the operators of the unresolved reference, depending on the compiler version
+        results[0] should {
+            be<ScriptResult.Error>()
+            have("""
+                script.kts:2:9: error: Unresolved reference 'arr'.
+                  | val x = <error>arr</error>[0]
+                  hint: 'arr' is declared at line 3, while the properties of the script body are visible only after their declaration - move it before line 2.
+            """.trimIndent() in message)
+        }
+        results[1] should {
+            be<ScriptResult.Error>()
+            have("""
+                script.kts:2:11: error: Unresolved reference 'xs'.
+                  | for (x in <error>xs</error>) println(x)
+                  hint: 'xs' is declared at line 3, while the properties of the script body are visible only after their declaration - move it before line 2.
+            """.trimIndent() in message)
+        }
+        results[2] should {
+            be<ScriptResult.Error>()
+            have("""
+                script.kts:3:34: error: Unresolved reference 'limit'.
+                  | class Below : Check { fun ok() = <error>limit</error>[0] }
+                  hint: 'Below' is compiled outside of the script body, where 'limit' (line 1) is not visible - pass it as a parameter, or declare it within 'Below'.
+            """.trimIndent() in message)
+        }
+        results[3] should {
+            be<ScriptResult.Error>()
+            have("""
+                script.kts:3:44: error: Unresolved reference 'limit'.
+                  | class Below : Check { fun ok() { for (x in <error>limit</error>) println(x) } }
+                  hint: 'Below' is compiled outside of the script body, where 'limit' (line 1) is not visible - pass it as a parameter, or declare it within 'Below'.
+            """.trimIndent() in message)
+        }
+    }
+
+    @Test
+    fun `should report unresolved type declared later as local class named like preceding local function`() = runTest {
+        // given
+        val scripts = listOf(
+            """
+            val k = "a".length
+            fun Base(x: Int) = k
+            val b: Base? = null
+            open class Base { val v = k }
+            b
+            """,
+            """
+            val k = "a".length
+            fun Base(x: Int) = k
+            val b = listOf<Base>()
+            open class Base { val v = k }
+            b
+            """,
+            """
+            val k = "a".length
+            fun Base(x: Int) = k
+            class Derived : Base() { val w = k }
+            open class Base { val v = k }
+            Derived().w
+            """
+        ).map { it.trimIndent() }
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        results[0] should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:8: error: Unresolved reference 'Base'.
+                  | val b: <error>Base</error>? = null
+                  hint: 'Base' is declared at line 4, while the classes of the script body are visible only after their declaration - move it before line 3.
+            """.trimIndent()
+        }
+        results[1] should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:16: error: Unresolved reference 'Base'.
+                  | val b = listOf<<error>Base</error>>()
+                  hint: 'Base' is declared at line 4, while the classes of the script body are visible only after their declaration - move it before line 3.
+            """.trimIndent()
+        }
+        results[2] should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:17: error: Unresolved reference 'Base'.
+                  | class Derived : <error>Base</error>() { val w = k }
+                  hint: 'Base' is declared at line 4, while the classes of the script body are visible only after their declaration - move it before line 3.
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should report error at declaration moved out of the script body calling dependency with invoke operator shadowed by local function`() = runTest {
         // given
         val script = """
