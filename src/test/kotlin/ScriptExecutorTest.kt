@@ -3213,12 +3213,13 @@ class ScriptExecutorTest {
     fun `should refer to the coroutine scope of the script body by the script block label without warnings`() = runTest {
         // given
         val script = """
-            this@_script is Job && this@_script === coroutineContext[Job] && this@_script.isActive
+            val nested = listOf(1).map { this@_script.isActive }.single()
+            this@_script is Job && this@_script === coroutineContext[Job] && this@_script.isActive && nested
         """.trimIndent()
         val executor = ScriptExecutor()
 
         // when
-        val result = executor.execute(script, listOf(dependency("limit", 1)))
+        val result = executor.execute(script)
 
         // then
         result should {
@@ -3229,7 +3230,7 @@ class ScriptExecutorTest {
     }
 
     @Test
-    fun `should return from the script body by the script block label without warnings`() = runTest {
+    fun `should return from the script body by the script block label`() = runTest {
         // given
         val script = """
             if (limit > 0) return@_script "early"
@@ -3245,6 +3246,28 @@ class ScriptExecutorTest {
             be<ScriptResult.Value>()
             have(value == "early")
             have(warnings == null)
+        }
+    }
+
+    @Test
+    fun `should not resolve the label of the outer lambda of the script block`() = runTest {
+        // given
+        val script = """
+            this@_dependencies
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:5: error: Unresolved label.
+                  | this<error>@_dependencies</error>
+            """.trimIndent()
         }
     }
 
