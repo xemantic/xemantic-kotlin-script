@@ -1275,6 +1275,72 @@ class ScriptExecutorTest {
         }
     }
 
+    @Test
+    fun `should report enum constant not found without the name of the script class written in a comment or a longer name`() = runTest {
+        // given
+        val script = """
+            // see _.Color
+            object Palette_ { enum class Color { RED } }
+            enum class Color { RED }
+            val red = Palette_.Color.RED
+            Color.valueOf("BLUE")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first() sameAs "java.lang.IllegalArgumentException: No enum constant Color.BLUE"
+        }
+    }
+
+    @Test
+    fun `should report class cast of local classes without the synthetic names named like a class of the script`() = runTest {
+        // given
+        val script = """
+            class result
+            fun make(): Any {
+                open class Animal
+                class Dog : Animal()
+                return Animal()
+            }
+            make() as result
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first().substringBefore(" (") sameAs
+                    "java.lang.ClassCastException: class Animal cannot be cast to class result"
+        }
+    }
+
+    @Test
+    fun `should report exception with a very long message resembling the name of the script class`() = runTest {
+        // given
+        val script = """
+            error("_" + ".".repeat(100_000) + "${'$'}".repeat(100_000))
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first() sameAs
+                    "java.lang.IllegalStateException: _" + ".".repeat(100_000) + "$".repeat(100_000)
+        }
+    }
+
     /** Like `@1b6d3586` of the default string representation, which differs on every run. */
     private fun String.withoutHashCodes() = replace(Regex("@[0-9a-f]+\\b"), "@<hash>")
 

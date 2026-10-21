@@ -70,7 +70,7 @@ class ScriptErrorReporterTest {
         // given
         val source = ScriptSource("enum class Color { RED }\nfun f() { class Dog; class Box { companion object } }")
         val throwable = RuntimeException(
-            "_\$\$\$result\$1\$1\$f\$Dog, _.Color.RED, _\$Box\$Companion@1f, _.x.Color, _.Cat, _\$_ScriptDependencies, x_.Color, _Color"
+            "_\$\$\$result\$1\$1\$f\$Dog, _.Color.RED, _\$Box\$Companion@1f, _.x.Color, _\$x.Color, _.Cat, _\$_ScriptDependencies, x_.Color, _Color"
         ).apply { stackTrace = emptyArray() }
         val reporter = ScriptErrorReporter(source, scriptClassName = "_")
 
@@ -79,7 +79,7 @@ class ScriptErrorReporterTest {
 
         // then
         message sameAs
-                "java.lang.RuntimeException: Dog, Color.RED, Box.Companion@1f, _.x.Color, _.Cat, _\$_ScriptDependencies, x_.Color, _Color"
+                "java.lang.RuntimeException: Dog, Color.RED, Box.Companion@1f, _.x.Color, _\$x.Color, _.Cat, _\$_ScriptDependencies, x_.Color, _Color"
     }
 
     @Test
