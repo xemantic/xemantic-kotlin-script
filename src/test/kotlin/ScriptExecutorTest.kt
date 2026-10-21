@@ -3723,6 +3723,86 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should call function of the coroutine scope named like dependency of nullable function type`() = runTest {
+        // given
+        val script = """
+            listOf(launch?.invoke(), launch { }.let { 1 })
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<(() -> Int)?>("launch") { 2 }))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == listOf(2, 1))
+        }
+    }
+
+    @Test
+    fun `should resolve value of dependency of nullable function type named like local function`() = runTest {
+        // given
+        val script = """
+            fun f() = 1
+            listOf(f?.invoke(), f ?: { 3 }, f())
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val results = listOf<(() -> Int)?>({ 2 }, null).map { value ->
+            executor.execute(script, listOf(dependency<(() -> Int)?>("f", value)))
+        }
+
+        // then
+        assert(results.map { result ->
+            ((result as? ScriptResult.Value)?.value as? List<*>)?.let { (invoked, elvis, called) ->
+                listOf(invoked, (elvis as () -> Int)(), called)
+            }
+        } == listOf(listOf(2, 2, 1), listOf(null, 3, 1)))
+    }
+
+    @Test
+    fun `should resolve value of dependency of nullable function type named like local function from declaration moved out of the script body`() = runTest {
+        // given
+        val script = """
+            val offset = 10
+            fun f() = offset
+            sealed interface S
+            class T : S { fun g() = listOf(f?.invoke(), (f ?: { 3 })()) }
+            T().g()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val results = listOf<(() -> Int)?>({ 2 }, null).map { value ->
+            executor.execute(script, listOf(dependency<(() -> Int)?>("f", value)))
+        }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(listOf(2, 2), listOf(null, 3)))
+    }
+
+    @Test
+    fun `should resolve value of dependency of nullable type with invoke operator named like local function`() = runTest {
+        // given
+        val script = """
+            fun logger() = 1
+            listOf(logger?.invoke("a"), logger ?: "none", logger())
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<Logger?>("logger", null)))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == listOf(null, "none", 1))
+        }
+    }
+
+    @Test
     fun `should report error at declaration moved out of the script body calling local function named like library function`() = runTest {
         // given
         val script = """
