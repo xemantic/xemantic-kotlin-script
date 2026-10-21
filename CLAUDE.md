@@ -67,8 +67,6 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 - When comparing a script with a regular `.kts` evaluated by `BasicJvmScriptingHost`, remember that its body cannot call suspending functions, unlike the script block,
   and that the compiler reports such a call there with another message ("Suspend function '…' can only be called from a coroutine…") than within a non-inline lambda of the block ("Suspension functions can only be called within coroutine body.").
 
-- `ScriptSourceTest` parses scripts of tens of thousands of declarations, so a selection in `ScriptStructure` scanning all the declarations for each declaration does not fail, but hangs the build for hours —
-  index the names (first/last offsets, callers by name) and propagate with a worklist instead.
 
 ## Anti-patterns to avoid
 

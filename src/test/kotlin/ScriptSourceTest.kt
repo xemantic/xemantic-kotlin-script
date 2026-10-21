@@ -266,6 +266,24 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should recognize lambdas passed to inline function kept local only in calls without receiver`() {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            inline fun logged(block: () -> Unit) { log += "start"; block() }
+            class Other { fun logged(block: () -> Unit) = block() }
+            logged { }
+            Other().logged { }
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        assert(source.localInlineFunctionArguments.map { it.start.line } == listOf(3))
+    }
+
+    @Test
     fun `should keep moving inline function which cannot be local or does not read local properties`() {
         // given
         val scripts = listOf(

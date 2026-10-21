@@ -4009,6 +4009,30 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report inline functions reading local property which would be resolved differently if local`() = runTest {
+        // given
+        val scripts = listOf(
+            // `this` of the script block, the coroutine
+            "val log = mutableListOf<String>()\ninline fun tag() = \"\$this\" + log.size\ntag()",
+            // the overload staying local would hide the moved one
+            "val log = mutableListOf<String>()\ninline fun f(x: Any): String { log += \"any\"; return \"any\" }\ninline fun f(x: String): String = \"string\"\nf(\"a\") + log",
+            // called before its declaration, resolved to the function of the coroutine scope instead
+            "val log = mutableListOf<String>()\nval r = run { \"std\" }\ninline fun run(block: () -> String): String { log += \"mine\"; return block() }\nr + log",
+            // called where a receiver resolves it in the script, like `run` of the class
+            "val log = mutableListOf<String>()\ninline fun run(block: () -> String): String { log += \"mine\"; return block() }\nclass A { fun go() = run { \"a\" } }\nA().go() + log",
+            // an inline function cannot be recursive
+            "val log = mutableListOf<String>()\ninline fun count(n: Int): Int = if (n == 0) log.size else count(n - 1)\ncount(2)"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+    }
+
+    @Test
     fun `should report inline function reading local property which cannot be local`() = runTest {
         // given
         val script = """
@@ -4055,7 +4079,7 @@ class ScriptExecutorTest {
             message sameAs """
                 script.kts:3:29: error: Suspension functions can only be called within coroutine body.
                   | logged { kotlinx.coroutines.<error>delay</error>(1) }
-                  hint: 'logged' is compiled without 'inline', as it reads the local values of the script body, so its lambdas cannot suspend - pass them to 'logged' as parameters to keep it inline.
+                  hint: 'logged' is compiled without 'inline', as it reads the local values of the script body, so its lambdas cannot suspend - pass the local values to 'logged' as parameters to keep it inline.
             """.trimIndent()
         }
     }
