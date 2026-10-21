@@ -425,8 +425,10 @@ internal class DefaultScriptExecutor(
             // the calls not referring to the moved functions already, which would refer to them in the script, if they apply
             val toFunctions = deprecated(SHADOWED_ORIGINAL)
             val toProperties = source.shadowedFunctionCandidates.filter { (reference) -> toFunctions.none { it in reference } }
-            // the remaining calls of the functions, which would refer to them in the script, if they apply, like the properties
-            val functionCandidates = coroutineScopeReferences.filter { it.isFunction }
+            // the remaining calls of the functions, which would refer to them in the script, if they apply, like the properties,
+            // and the references within the lambdas, unless resolved to their receivers, also in the script, see ScriptSource.coroutineScopeCopies
+            fun LaterDeclaredReference.isConfirmedByCopies() = isFunction || isInLambda
+            val confirmedCandidates = coroutineScopeReferences.filter { it.isConfirmedByCopies() }
             // independent of each other
             val (shadowed, toCoroutineScope) = coroutineScope {
                 val shadowed = async {
@@ -436,7 +438,7 @@ internal class DefaultScriptExecutor(
                     }
                 }
                 val toCoroutineScope = async {
-                    if (functionCandidates.isEmpty()) emptyList() else {
+                    if (confirmedCandidates.isEmpty()) emptyList() else {
                         val copies = source(confirming = true, coroutineScopeCopies = true)
                         compile(copies).reports.marked(copies, COROUTINE_SCOPE_FUNCTION)
                     }
@@ -454,7 +456,7 @@ internal class DefaultScriptExecutor(
                 },
                 // in the order of the script
                 coroutineScopeReferences = coroutineScopeReferences.filter { candidate ->
-                    !candidate.isFunction || toCoroutineScope.any { it in candidate.reference }
+                    !candidate.isConfirmedByCopies() || toCoroutineScope.any { it in candidate.reference }
                 },
                 shadowedFunctionReferences = toProperties.filter { (reference) ->
                     shadowed.any { it in reference }

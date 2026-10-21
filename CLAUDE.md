@@ -69,6 +69,9 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   provide an instance of a class implementing the function type, declared as `KotlinType(ThatClass::class)`.
 - In a regular `.kts`, a callable reference to a function of the script from a class of the script, like `::log`, crashes the compiler backend ("No mapping for symbol"), so there is no reference behaviour to match.
 
+- A moved function with an inferred return type, like `fun launch(block: () -> Unit) = "mine"`, is preferred to the `CoroutineScope` extensions of the script body, unlike one with a declared type,
+  so a test of a reference resolved to the coroutine scope instead needs the declared type.
+
 ## Anti-patterns to avoid
 
 - Inside a lambda walking a chain of exceptions in a `Throwable` extension, like `generateSequence(this) { read(null) { cause } }`,

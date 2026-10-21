@@ -118,4 +118,31 @@ class ScriptSourceTest {
         assert("fun f(): Int {" in body && "class C {" in body)
     }
 
+    @Test
+    fun `should override the members of Any by the copies of the moved functions of their signatures`() {
+        // given
+        val script = """
+            val r = listOf(1).map { toString() + hashCode() + equals(null) + equals("x") }
+            fun toString(): String = "mine"
+            fun hashCode() = 1
+            fun equals(other: Any?): Boolean = true
+            fun equals(other: String): Boolean = true
+            r
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script, confirming = true, coroutineScopeCopies = true)
+
+        // then
+        val copies = source.text.lines().filter { "_OptIn_coroutine_scope_function` " in it }.map { it.substringAfter("` ") }
+        assert(
+            copies == listOf(
+                "override fun toString(): kotlin.String = kotlin.TODO()",
+                "override fun hashCode(): kotlin.Int = kotlin.TODO()",
+                "override fun equals(other: kotlin.Any?): kotlin.Boolean = kotlin.TODO()",
+                "fun `equals`(`other`: String): Boolean = kotlin.TODO()"
+            )
+        )
+    }
+
 }
