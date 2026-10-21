@@ -1834,6 +1834,58 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should execute script starting with UTF-8 byte order mark`() = runTest {
+        // given
+        val script = "\uFEFF1 + 1"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should execute script starting with UTF-8 byte order mark followed by file annotation and package`() = runTest {
+        // given
+        val script = "\uFEFF@file:Suppress(\"UNUSED_VARIABLE\")\npackage foo\nval x = 1\nx + 1"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should report error column of script starting with UTF-8 byte order mark not counting it`() = runTest {
+        // given
+        val script = "\uFEFF1 + foo"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:5: error: Unresolved reference 'foo'.
+                  | 1 + <error>foo</error>
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should hint to declare function before its use when it accesses destructured local declarations`() = runTest {
         // given
         val script = """
