@@ -367,8 +367,31 @@ internal class DefaultScriptExecutor(
             ) {
                 return Compilation(source, result)
             }
+            // the types of the local properties, which are known only to the compiler, see ScriptSource.untypedPropertyCalls
+            val propertyTypes = if (source.untypedProperties.isEmpty()) emptyMap() else {
+                val typeProbes = source(propertyTypeProbes = true)
+                val unexpected = mutableListOf<String>()
+                val types = typeProbes.propertyTypes(compile(typeProbes).reports) { unexpected += it.message }
+                val (mismatches, others) = unexpected.partition { it.startsWith("Initializer type mismatch") }
+                // like after the upgrade of the compiler, changing the message naming the type
+                if (mismatches.isNotEmpty()) logger.warn { "Script[$scriptId]: Unexpected messages of the type probes: ${mismatches.joinToString(separator = "; ")}" }
+                // like `Variable must be initialized` of a property assigned later, or the errors of the script
+                if (others.isNotEmpty()) logger.debug { "Script[$scriptId]: Other errors of the type probes: ${others.joinToString(separator = "; ")}" }
+                types
+            }
             // recognizing the candidates referring to the wrong declarations indeed
-            val probe = source(confirming = true)
+            val probe = source(confirming = true, propertyTypes = propertyTypes)
+            // only the calls of the properties of unknown types, which cannot be confirmed without their copies
+            if (
+                probe.copiedProperties.isEmpty()
+                && source.laterDeclaredDependencyCandidates.isEmpty()
+                && source.laterDeclaredClassCandidates.isEmpty()
+                && source.shadowedFunctionCandidates.isEmpty()
+                && source.coroutineScopeCandidates.isEmpty()
+                && source.hiddenLocalFunctionCandidates.all { it in source.untypedPropertyCalls }
+            ) {
+                return Compilation(source, result)
+            }
             /**
              * The positions, from the start to the end, if known, of the warnings of the deprecated,
              * or opted in, declarations of this [message] in the [source], with their messages, see [ScriptSource.confirming].
@@ -392,6 +415,8 @@ internal class DefaultScriptExecutor(
                 message: String
             ) = markedRanges(source, message).map { it.first }
             val reports = compile(probe).reports
+            // unlike the other ones, the calls of which cannot be confirmed
+            val confirmedTypes = probe.confirmedPropertyTypes(reports)
             fun deprecated(
                 message: String
             ) = reports.marked(probe, message)
@@ -485,7 +510,9 @@ internal class DefaultScriptExecutor(
                 },
                 // in the order of the script
                 shadowedFunctionReferences = toLocals.mapNotNull { candidate -> shadowed.find { it.reference === candidate.reference } },
-                hiddenLocalFunctionReferences = hiddenCandidates.filter { it in hidden }
+                hiddenLocalFunctionReferences = hiddenCandidates.filter {
+                    it in hidden && (it !in source.untypedPropertyCalls || it.reference.name in confirmedTypes)
+                }
             )
         }
 
@@ -500,8 +527,19 @@ internal class DefaultScriptExecutor(
             confirming: Boolean = false,
             shadowedFunctionCopies: Boolean = false,
             overloadingFunctionCopies: Boolean = false,
-            coroutineScopeCopies: Boolean = false
-        ) = ScriptSource(script, preambleDependencies, confirming, shadowedFunctionCopies, overloadingFunctionCopies, coroutineScopeCopies)
+            coroutineScopeCopies: Boolean = false,
+            propertyTypeProbes: Boolean = false,
+            propertyTypes: Map<String, String> = emptyMap()
+        ) = ScriptSource(
+            script = script,
+            dependencies = preambleDependencies,
+            confirming = confirming,
+            shadowedFunctionCopies = shadowedFunctionCopies,
+            overloadingFunctionCopies = overloadingFunctionCopies,
+            coroutineScopeCopies = coroutineScopeCopies,
+            propertyTypeProbes = propertyTypeProbes,
+            propertyTypes = propertyTypes
+        )
 
         private suspend fun compile(
             source: ScriptSource
