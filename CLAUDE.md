@@ -67,6 +67,9 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 
 - When probing a regular `.kts` with `BasicJvmScriptingHost` to compare the behaviour, a provided property declared as `KotlinType(typeOf<(String) -> String>())` loses its type arguments, and as `KotlinType("(String) -> String")` is unresolved —
   provide an instance of a class implementing the function type, declared as `KotlinType(ThatClass::class)`.
+  Yet a provided property is resolved before a script function of the same name, unless the function has an inferred return type and precedes the call,
+  so it does not model a dependency shadowed by a declaration of the script —
+  declare the dependencies as the properties of an abstract `baseClass` of the script instead, which the script functions shadow, as the library assumes.
 - In a regular `.kts`, a callable reference to a function of the script from a class of the script, like `::log`, crashes the compiler backend ("No mapping for symbol"), so there is no reference behaviour to match.
 
 - A moved function with an inferred return type, like `fun launch(block: () -> Unit) = "mine"`, is preferred to the `CoroutineScope` extensions of the script body, unlike one with a declared type,

@@ -82,6 +82,8 @@ when (result) {
 * A reference to a dependency preceding the declaration of a local property of the same name, like `x` in `fun show() = x` followed by `val x = 2`,
   or a call preceding the declaration of a local function of the same name,
   is reported as an error, as in a regular script it refers to the declaration.
+  When the function refers to a local class declared after the first such call,
+  a call of the dependency within this class is reported even if the function does not apply to it.
 * Scripts executed repeatedly, like an agent harness defined as a script, can skip the recompilation
   with `ScriptExecutor(compilationCacheSize = ...)`, keeping that many compiled scripts, the least recently used evicted first.
   A compiled script is reused when the script text, and the names and types of the dependencies are the same,
@@ -122,7 +124,6 @@ Most of these cases are reported as errors, while the following ones still resol
   or has a receiver, like `"a".fmt(1)` of the extension functions, or when a local overload refers to a local class, while the overloads are of both inferred and declared return types ([#30](https://github.com/xemantic/xemantic-kotlin-script/issues/30)),
 * a call preceding a local class named like a callable dependency ([#31](https://github.com/xemantic/xemantic-kotlin-script/issues/31)),
 * a call from outside of the script body to a local property, whose function type is known only to the compiler, like `val print = printer()` ([#32](https://github.com/xemantic/xemantic-kotlin-script/issues/32)),
-* a call preceding a local function named like a callable dependency, which refers to a local class declared later ([#33](https://github.com/xemantic/xemantic-kotlin-script/issues/33)),
 * a call within a lambda to a property compiled outside of the script body, named like a function of its `CoroutineScope`, whose function type is known only to the compiler, like `val launch get() = launcher()` ([#44](https://github.com/xemantic/xemantic-kotlin-script/issues/44)).
 
 Giving the declarations and the dependencies distinct names avoids them.

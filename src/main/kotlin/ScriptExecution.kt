@@ -458,10 +458,13 @@ internal class DefaultScriptExecutor(
                 }
                 shadowed.await() to toCoroutineScope.await()
             }
+            val unconfirmable = probe.unconfirmableCandidates.mapTo(HashSet()) { it.start }
             return Compilation(
                 source,
                 result,
                 laterDeclaredDependencyReferences = source.laterDeclaredDependencyCandidates.filter { candidate ->
+                    // like a call within the local class, which the copies refer to, unless resolved to its member, see ScriptSource.unconfirmableCandidates
+                    (candidate.isFunction && candidate.reference.start in unconfirmable && dependencies.any { it in candidate.reference }) ||
                     (functions.takeIf { candidate.isFunction }.orEmpty()
                             // like `::x`, resolved to the property of the dependency instead of the local function
                             + dependencies.takeIf { !candidate.isFunction || candidate.isCallableReference }.orEmpty())

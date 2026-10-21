@@ -368,6 +368,13 @@ internal class ScriptSource(
     val laterDeclaredDependencyCandidates: List<LaterDeclaredReference>
 
     /**
+     * The [laterDeclaredDependencyCandidates] of the functions, which the copies of the [confirming] compilation cannot confirm,
+     * as they are within the local classes declared later, which the local functions refer to, moved to precede the copies,
+     * so they are reported, if they refer to the dependencies, as the local functions might apply to them.
+     */
+    val unconfirmableCandidates: List<ScriptReference>
+
+    /**
      * The calls of the declarations moved out of the script body named like the local functions of the script body,
      * by the 0-based lines of the first ones, which are not visible there, so they might be resolved to other functions,
      * like `check` of the standard library, while in the script they refer to the local functions.
@@ -423,6 +430,7 @@ internal class ScriptSource(
         )
         laterDeclaredDependencyCandidates = structure.laterDeclaredDependencyCandidates.map { it.toLaterDeclaredReference() }
         hiddenLocalFunctionCandidates = structure.hiddenLocalFunctionCandidates.map { it.toLaterDeclaredReference() }
+        unconfirmableCandidates = structure.unconfirmableCandidates.map { it.toScriptReference() }
         shadowedFunctionCandidates = structure.shadowedFunctionCandidates.map { candidate ->
             ShadowedFunctionReference(
                 candidate.reference.toScriptReference(),
@@ -557,13 +565,20 @@ internal class ScriptSource(
         mapping += null
         // the copies preceding the statements, where the local classes declared before them are visible
         val blockCopies = structure.blockCopies.entries.groupBy({ lineOf(it.key) }) { it.value }
+        val hoistedClasses = structure.hoistedClasses.entries.groupBy({ lineOf(it.key) }) { it.value }
+        val hoisted = BooleanArray(script.length)
+        structure.hoistedClasses.values.flatten().forEach { hoisted.fill(true, it.first, it.last + 1) }
         (lineOf(headerEnd)..lineBounds.lastIndex).forEach { line ->
+            // the columns retained, like of the moved declarations
+            hoistedClasses[line]?.flatten()?.forEach { range ->
+                addLines(lineOf(range.first)..lineOf(range.last)) { it in range && !excluded[it] }
+            }
             blockCopies[line]?.flatten()?.forEach { (messages, declaration) ->
                 lines += messages.joinToString(separator = " ", postfix = " ") { "@${optInMarker(it)}" } + declaration
                 mapping += null
             }
             addLines(line..line) { offset ->
-                offset >= headerEnd && !excluded[offset]
+                offset >= headerEnd && !excluded[offset] && !hoisted[offset]
             }
         }
         if (returnsUnit) {
@@ -1285,6 +1300,19 @@ private class ScriptStructure(
      */
     val blockCopies: Map<Int, List<Pair<List<String>, String>>>
 
+    /**
+     * The ranges of the local classes declared after the first candidates of the names of the local functions referring to them,
+     * see [ScriptSource.laterDeclaredDependencyCandidates], and of their supertypes, by the offsets of the statements they are moved to,
+     * preceding the copies of the functions in [blockCopies], as the values preceding the classes in the script body cannot be of the classes.
+     */
+    val hoistedClasses: Map<Int, List<IntRange>>
+
+    /**
+     * The [laterDeclaredDependencyCandidates] of the functions within the [hoistedClasses], which the functions refer to,
+     * preceding the copies, so they are not confirmed by them.
+     */
+    val unconfirmableCandidates: List<Reference>
+
     /** See [ScriptSource.laterDeclaredDependencyCandidates], with the offsets of the declarations, and whether they are functions. */
     val laterDeclaredDependencyCandidates: List<Triple<Reference, Int, Boolean>>
 
@@ -1367,16 +1395,25 @@ private class ScriptStructure(
         fun ParsedDeclaration.line() = nameRange?.first ?: start
         fun ParsedDeclaration.signature() = (psi as KtNamedFunction).signature()
         val localClasses = declarations.filter { it.kind == DeclarationKind.CLASS && it !in moved && it.name != null }
-        /** Whether the function refers to the types of these [names], like the local classes, which might not be visible to its copy. */
+        val signatureTypes = HashMap<ParsedDeclaration, Set<String>>()
+        /**
+         * The names of the types, which the signature of the function refers to unqualified, like the local classes, which might not be visible to its copy,
+         * unlike `kotlin.Pair`, or its own type parameters, like `P` of `fun <P : Number> f(x: P)`.
+         */
+        fun ParsedDeclaration.signatureTypes() = signatureTypes.getOrPut(this) {
+            (psi as KtNamedFunction).let { function ->
+                val typeParameters = function.typeParameters.mapNotNullTo(HashSet()) { it.name }
+                listOfNotNull(
+                    function.receiverTypeReference, function.valueParameterList, function.typeParameterList, function.typeConstraintList,
+                    function.typeReference
+                ).flatMap { part -> part.collectDescendantsOfType<KtUserType> { it.qualifier == null }.mapNotNull { it.referencedName } }
+                    .filterTo(HashSet()) { it !in typeParameters }
+            }
+        }
+        /** Whether the function refers to the types of these [names], see [signatureTypes]. */
         fun ParsedDeclaration.refersToTypes(
             names: Set<String>
-        ): Boolean = (psi as KtNamedFunction).let { function ->
-            listOfNotNull(
-                function.receiverTypeReference, function.valueParameterList, function.typeParameterList, function.typeConstraintList,
-                function.typeReference
-            )
-                .any { part -> part.collectDescendantsOfType<KtUserType>().any { it.referencedName in names } }
-        }
+        ): Boolean = signatureTypes().any { it in names }
         val localClassNames = localClasses.mapTo(HashSet()) { it.name!! }
         // the local functions, the extension ones, and the properties, which might be called, by their names
         val localExtensions = declarations.filter {
@@ -1552,8 +1589,40 @@ private class ScriptStructure(
         }
         laterDeclaredDependencyCandidates = laterDeclaredCandidatesByStatement.values.flatten()
         val statementIndices = statements.withIndex().associate { (index, statement) -> statement to index }
+        /** The start of the statement, including the comments preceding it, which the copies should not be inserted into. */
+        fun leadingStart(
+            statementIndex: Int
+        ): Int {
+            var start = statements[statementIndex].startOffset
+            var element = statements[statementIndex].prevSibling
+            while (element is PsiWhiteSpace || element is PsiComment) {
+                if (element is PsiComment) start = element.startOffset
+                element = element.prevSibling
+            }
+            return start
+        }
+        /** Whether the statement of this [index] starts a line, so the lines inserted preceding it do not split another statement. */
+        fun startsLine(
+            index: Int
+        ) = index == 0 || '\n' in script.substring(statements[index - 1].endOffset, leadingStart(index))
+        /** The first statement sharing the line with the statement of this [index], which the lines inserted preceding it would split otherwise. */
+        fun lineStart(
+            index: Int
+        ) = (index downTo 0).first { startsLine(it) }
+        /** The names of the types the subtyping of the local class depends on, of its type parameters and supertypes, if unqualified. */
+        fun ParsedDeclaration.subtypingTypes() = (psi as KtClassOrObject).let { declaration ->
+            (listOfNotNull(declaration.typeParameterList, declaration.typeConstraintList) + declaration.superTypeListEntries.mapNotNull { it.typeReference })
+                .flatMap { part -> part.collectDescendantsOfType<KtUserType> { it.qualifier == null }.mapNotNull { it.referencedName } }
+        }
+        /** The local classes moved to precede the copies, see [hoistedClasses]. */
+        val hoisted = LinkedHashMap<ParsedDeclaration, Int>()
+        /** The [hoisted] classes the functions refer to, unlike their supertypes, the values of which they would not apply to. */
+        val referredClasses = HashSet<ParsedDeclaration>()
         blockCopies = if (!confirming) emptyMap() else buildMap<Int, MutableList<Pair<String, String>>> {
-            /** The copies of the functions, by their names, each preceding the first statement of the candidates of its name. */
+            /**
+             * The copies of the functions, by their names, each preceding the first statement of the candidates of its name,
+             * preceded by the local classes they refer to, declared later, see [hoistedClasses].
+             */
             fun addCopies(
                 candidatesByStatement: Map<Int, List<Triple<Reference, Int, *>>>,
                 functions: Map<String, List<ParsedDeclaration>>,
@@ -1561,25 +1630,18 @@ private class ScriptStructure(
             ) = candidatesByStatement.entries.sortedBy { it.key }.flatMap { (index, candidates) ->
                 candidates.map { it.first.name to index }
             }.distinctBy { it.first }.forEach { (name, index) ->
-                /** The start of the statement, including the comments preceding it, which the copies should not be inserted into. */
-                fun leadingStart(
-                    statementIndex: Int
-                ): Int {
-                    var start = statements[statementIndex].startOffset
-                    var element = statements[statementIndex].prevSibling
-                    while (element is PsiWhiteSpace || element is PsiComment) {
-                        if (element is PsiComment) start = element.startOffset
-                        element = element.prevSibling
-                    }
-                    return start
+                val first = lineStart(index)
+                val copied = functions[name].orEmpty().filter { it.signature() != null }
+                val invisibleClasses = localClasses.filter { statementIndices.getValue(it.psi) >= first }
+                    .groupBy { it.name!! }.mapValues { it.value.first() }
+                // also their supertypes, which the arguments might be of, and their type parameters, in the order of their declarations
+                var referred = copied.flatMap { it.signatureTypes() }.mapNotNull { invisibleClasses[it] }
+                referredClasses += referred
+                while (referred.isNotEmpty()) {
+                    referred.forEach { hoisted.putIfAbsent(it, leadingStart(first)) }
+                    referred = referred.flatMap { it.subtypingTypes() }.mapNotNull { invisibleClasses[it] }.filter { it !in hoisted }
                 }
-                // preceding the first statement sharing the line, so the inserted line does not split another statement
-                var first = index
-                while (first > 0 && '\n' !in script.substring(statements[first - 1].endOffset, leadingStart(first))) first--
-                val invisibleClasses = localClasses.filter { statementIndices.getValue(it.psi) >= first }.mapTo(HashSet()) { it.name!! }
-                getOrPut(leadingStart(first)) { mutableListOf() } += functions[name].orEmpty()
-                    .filterNot { it.refersToTypes(invisibleClasses) }
-                    .mapNotNull { function -> function.signature()?.let { message(function) to it } }
+                getOrPut(leadingStart(first)) { mutableListOf() } += copied.map { message(it) to it.signature()!! }
             }
             addCopies(
                 laterDeclaredCandidatesByStatement.mapValues { (_, candidates) -> candidates.filter { it.third } },
@@ -1599,6 +1661,10 @@ private class ScriptStructure(
                 .groupBy { it.third }
                 .map { (declaration, uses) -> uses.first().first to (uses.map { it.second }.distinct() to declaration) }
                 .groupBy({ it.first }) { it.second }
+        }
+        hoistedClasses = hoisted.entries.sortedBy { it.key.start }.groupBy({ it.value }) { it.key.start until it.key.end }
+        unconfirmableCandidates = referredClasses.flatMap { localClass ->
+            laterDeclaredCandidatesByStatement[statementIndices.getValue(localClass.psi)].orEmpty().filter { it.third }.map { it.first }
         }
         coroutineScopeMembers = if (!coroutineScopeCopies) emptyList() else {
             // the properties, which always apply, only within the lambdas, see ScriptSource.coroutineScopeCandidates

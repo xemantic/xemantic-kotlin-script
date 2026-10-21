@@ -3836,6 +3836,118 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report error at call of dependency before local function of the same name referring to local class declared later`() = runTest {
+        // given
+        val script = """
+            val p = "!"
+            val r = f(emptyList())
+            class P
+            fun f(xs: List<P>) = "local" + p
+            r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<(List<Any?>) -> String>("f") { "dep" }))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 4.
+                  | val r = <error>f</error>(emptyList())
+                  hint: declare the function before line 2, or rename it.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at calls of dependency preceding and following local class declared before local function of the same name`() = runTest {
+        // given
+        val scripts = listOf(
+            "val p = \"!\"\nval r = f(null)\nclass P\nfun f(x: P?) = \"local\" + p\nr",
+            "val p = \"!\"\nval c = Comparator<Runnable> { _, _ -> 0 }\nval r = f(c)\nclass P(val v: Int) : Runnable { override fun run() {} }\nfun f(c: Comparator<in P>) = \"local\" + p\nr",
+            "val p = \"!\"\nval a = f(listOf(1))\nclass P\nval r = f(null)\nfun f(x: P?) = \"local\" + p\na + r",
+            "val p = \"!\"\nval a = f(listOf(1))\nclass P\nval r = f(mutableListOf(P()))\nfun f(xs: MutableList<P>) = \"local\" + p\na + r",
+            "val p = \"!\"\nval a = f(listOf(1))\nclass P { fun g() = f(listOf(this)) }\nfun f(xs: List<P>) = \"local\" + p\na + P().g()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, listOf(dependency<(Any?) -> String>("f") { "dep" })) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.first() } == listOf(
+            "script.kts:2:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 4.",
+            "script.kts:3:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 5.",
+            "script.kts:4:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 5.",
+            "script.kts:4:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 5.",
+            "script.kts:3:21: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 4."
+        ))
+    }
+
+    @Test
+    fun `should call dependency before local function referring to local class declared later which does not apply`() = runTest {
+        // given
+        val scripts = listOf(
+            "val p = \"!\"\nval r = f(listOf(1))\nclass P\nfun f(xs: List<P>) = \"local\" + p\nr",
+            "val p = \"!\"\nval a = f(listOf(1))\nclass P\nval r = f(listOf(2))\nfun f(xs: List<P>) = \"local\" + p\na + r",
+            "val p = \"!\"\nval c = Comparator<Runnable> { _, _ -> 0 }\nval r = f(c)\nclass P(val v: Int)\nfun f(c: Comparator<in P>) = \"local\" + p\nr",
+            // within the classes, which the function refers to through the other ones, or not at all, or following them on another line
+            "val p = \"!\"\nval a = f(1)\nclass Q { val q = p; fun h() = f(2) }\nclass P(val q: Q)\nfun f(xs: List<P>) = \"local\" + p\na + Q().h()",
+            "val p = \"!\"\nval a = f(1)\nabstract class S { fun g() = f(listOf(2)) }\nclass P : S() { val q = p }\nfun f(x: P?) = \"local\" + p\na + P().g()",
+            "val p = \"!\"\nval a = f(\"s\")\nclass P { val q = p; fun g() = f(\"t\") }\nfun <P : Number> f(x: P) = \"local\" + p\na + P().g()",
+            "val p = \"!\"\nval a = f(1)\nclass P { val q = p }; val b = listOf(\n  1); val c = f(3)\nfun f(xs: List<P>) = \"local\" + p\na + c",
+            // referring also to the local classes declared before the calls
+            "val p = \"!\"\nclass Q { val q = p }\nval a = f(\"s\")\nclass P { val q = p }\nfun f(q: Q?, xs: List<P>? = null) = \"local\" + p\na",
+            "val p = \"!\"\nclass Q { val q = p }\nval a = f(1)\nclass P { val q = p }\nfun f(q: Q, xs: List<P>? = null) = \"local\" + p\na",
+            "val p = \"!\"\nclass Q { val q = p }\nval a = f(listOf(\"s\"))\nclass P { val q = p }\nfun f(xs: List<Q>, ys: List<P>? = null) = \"local\" + p\na",
+            "val p = \"!\"\nclass Q { val q = p }\nval a = f(1)\nclass P { val q = p }\nfun f(q: Q) = \"localQ\" + p\nfun f(x: P) = \"localP\" + p\na",
+            // a qualified type named like a local class, and a call within the class resolved to its member
+            "val p = \"!\"\nval a = f(1)\nclass Pair { val q = p; fun g() = f(2) }\nfun f(x: kotlin.Pair<Int, Int>) = \"local\" + p\na + Pair().g()",
+            "val p = \"!\"\nval a = f(1)\nabstract class S { fun f(x: Int) = \"member\" }\nclass P : S() { val q = p; fun g() = f(2) }\nfun f(xs: List<P>) = \"local\" + p\na + P().g()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, listOf(dependency<(Any?) -> String>("f") { "dep" })) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(
+            "dep", "depdep", "dep", "depdep", "depdep", "depdep", "depdep", "dep", "dep", "dep", "dep", "depdep", "depmember"
+        ))
+    }
+
+    @Test
+    fun `should report error at calls of dependencies around local class declared later between local overloads, with multiline literal or local supertype`() = runTest {
+        // given
+        val scripts = listOf(
+            // the overloads declared before the class compete with the ones following it, as in the script
+            "val p = \"!\"\nfun h(x: Int): Int = 1 + p.length\nval a = f(\"x\")\nclass P { val q = p }\nfun h(x: Any): String = \"s\" + p\nval b = f(h(1))\nfun f(xs: List<P>) = \"localP\" + p\nfun f(n: Int) = \"localInt\" + p\na + b",
+            "val p = \"!\"\nval r = f(null)\nclass P(val s: String = \"\"\"a\nb\"\"\") { val t = p }\nval c = x\nfun f(x: P?) = \"local\" + p\nval x = \"localx\"\nr + c",
+            // applying through the supertype of the class, declared before the call
+            "val p = \"!\"\nopen class Base\nval c = Comparator<Base> { _, _ -> 0 }\nval a = f(c)\nclass P : Base() { val q = p }\nfun f(c: Comparator<in P>) = \"local\" + p\na"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map {
+            executor.execute(it, listOf(dependency<(Any?) -> String>("f") { "dep" }, dependency("x", "depx")))
+        }
+
+        // then
+        assert(results.map { result -> (result as? ScriptResult.Error)?.message?.lines()?.filter { it.startsWith("script.kts") } } == listOf(
+            listOf("script.kts:6:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 7."),
+            listOf(
+                "script.kts:2:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 6.",
+                "script.kts:5:9: error: 'x' refers to the dependency, as the property 'x' of the script body is declared later, at line 7."
+            ),
+            listOf("script.kts:4:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 6.")
+        ))
+    }
+
+    @Test
     fun `should provide dependency of nullable function type named like function of the coroutine scope`() = runTest {
         // given
         val script = """
