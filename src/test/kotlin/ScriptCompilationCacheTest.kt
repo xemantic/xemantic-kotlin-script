@@ -229,6 +229,59 @@ class ScriptCompilationCacheTest {
     }
 
     @Test
+    fun `should serve the compiled scripts rejected for referring to wrong declarations from the cache`() = runTest {
+        // given
+        val scripts = listOf(
+            // hidden local function
+            "val strict = true\nfun check(flag: Boolean) { if (strict && !flag) throw IllegalStateException(\"strict\") }\nsealed interface S\nclass T : S { fun f() = check(false) }\nT().f()",
+            // resolved to the coroutine scope
+            "cancel()\nfun cancel() { println(\"order cancelled\") }\n\"done\"",
+            "val isActive get() = false\nisActive",
+            // shadowed function
+            "val cancel = { r: String -> \"prop \" + r }\nval x = cancel(\"a\")\nfun cancel(reason: String) = \"fun \" + reason\nx"
+        )
+        val executor = DefaultScriptExecutor(compilationCacheSize = 10)
+        val results1 = scripts.map { executor.execute(it) }
+        val compilationCount = executor.compilationCount
+
+        // when
+        val results2 = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results1.all { it is ScriptResult.Error && it.phase == ExecutionPhase.COMPILATION })
+        assert(results2.map { (it as? ScriptResult.Error)?.message } == results1.map { (it as? ScriptResult.Error)?.message })
+        assert(executor.compilationCount == compilationCount)
+    }
+
+    @Test
+    fun `should not cache the script rejected for referring to later declared dependency which also failed to compile`() = runTest {
+        // given
+        val script = """
+            fun show(): String = x
+            val x = "a"
+            show()
+        """.trimIndent()
+        val dependencies = listOf(dependency("x", 1))
+        val executor = DefaultScriptExecutor(compilationCacheSize = 10)
+        val result1 = executor.execute(script, dependencies)
+        val compilationCount = executor.compilationCount
+
+        // when
+        val result2 = executor.execute(script, dependencies)
+
+        // then
+        result1 should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            have(message.startsWith("script.kts:1:22: error: 'x' refers to the dependency"))
+        }
+        assert(result2 is ScriptResult.Error && result2.message == (result1 as ScriptResult.Error).message)
+        // the compilation and the confirming one, for each execution
+        assert(compilationCount == 2)
+        assert(executor.compilationCount == 4)
+    }
+
+    @Test
     fun `should report unmatched closing brace of the script without compiling it`() = runTest {
         // given
         val script = """

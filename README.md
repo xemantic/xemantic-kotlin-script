@@ -89,7 +89,8 @@ when (result) {
   A script which failed to compile is compiled again on the next execution,
   unlike a compiled one rejected by the checks following the compilation,
   like the reference to a dependency preceding the declaration of the same name,
-  which is served from the cache, reporting the same error.
+  which is served from the cache, reporting the same error,
+  unless the compilation itself also reported an error.
 * The invocations of the compiler running at the same time are bounded by `ScriptExecutor(maxConcurrentCompilations = ...)`,
   the number of the available processors by default,
   while the other compilations of the same executor wait for their turn.
