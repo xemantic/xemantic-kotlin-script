@@ -64,6 +64,12 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   This hides bugs of the exception reporting which only show in production: test them with an exception class the recovery cannot copy, i.e. without a `(String)`, `(String, Throwable)` or `(Throwable)` constructor.
   An exception whose `getStackTrace()` contains `null` crashes the recovery itself, so such a case can only be tested by calling `ScriptErrorReporter` directly.
 
+- When comparing a script with a regular `.kts` evaluated by `BasicJvmScriptingHost`, remember that its body cannot call suspending functions, unlike the script block,
+  and that the compiler reports such a call there with another message ("Suspend function '…' can only be called from a coroutine…") than within a non-inline lambda of the block ("Suspension functions can only be called within coroutine body.").
+
+- `ScriptSourceTest` parses scripts of tens of thousands of declarations, so a selection in `ScriptStructure` scanning all the declarations for each declaration does not fail, but hangs the build for hours —
+  index the names (first/last offsets, callers by name) and propagate with a worklist instead.
+
 ## Anti-patterns to avoid
 
 - Do not add content to this file that is already discoverable by reading the source or build scripts — that inflates context without adding signal, reducing AI agent task success rates (see [arxiv 2602.11988](https://arxiv.org/abs/2602.11988)).

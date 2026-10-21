@@ -247,6 +247,59 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should keep inline function reading local property in the script body without the inline modifiers`() {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            inline fun logged(crossinline block: () -> Unit, noinline after: () -> Unit) { log += "start"; block(); after() }
+            logged({ }) { }
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        assert("logged" !in moved)
+        // the rest keeps its columns
+        assert(" ".repeat(7) + "fun logged(" + " ".repeat(12) + "block: () -> Unit, " + " ".repeat(9) + "after: () -> Unit)" in body)
+    }
+
+    @Test
+    fun `should keep moving inline function which cannot be local or does not read local properties`() {
+        // given
+        val scripts = listOf(
+            "val log = mutableListOf<String>()\ninline fun f() = 1\nf()",
+            // the non-local control flow of the lambdas of its calls
+            "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"a\"; block() }\nfun outer(): Int { logged { return 5 }; return 1 }\nouter()",
+            "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"a\"; block() }\nfun outer(): Int { logged({ return@outer 5 }); return 1 }\nouter()",
+            "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"a\"; block() }\nfor (i in 1..3) { logged { if (i == 2) break } }\nlog",
+            "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"a\"; block() }\nouter@ for (i in 1..3) { for (j in 1..3) { logged { if (j == 2) continue@outer } } }\nlog",
+            "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"a\"; block() }\nlistOf(1).forEach { logged { return@forEach } }\nlog",
+            // which cannot be local, or might resolve the names on the receivers
+            "val log = mutableListOf<String>()\ninline fun <reified T> logged() { log += T::class.simpleName!! }\nlogged<Int>()\nlog",
+            "val log = mutableListOf<String>()\ninline fun String.logged() { log += this }\n\"a\".logged()\nlog",
+            "val log = mutableListOf<String>()\n@JvmName(\"lg\") inline fun logged() { log += \"a\" }\nlogged()\nlog",
+            "class User(val name: String)\nval name = \"script\"\ninline fun greeting() = User(\"user\").run { name }\ngreeting()",
+            // not visible in the local function, if declared after it, unlike in the script
+            "val log = mutableListOf<String>()\ninline fun status() = log.size.toString() + isActive\nval isActive = false\nstatus()",
+            "val log = mutableListOf<String>()\ninline fun status() = log.size.toString() + suffix\nval suffix = \"!\"\nstatus()",
+            "val log = mutableListOf<String>()\ninline fun logged() { helper() }\nfun helper() { log += \"h\" }\nlogged()\nlog",
+            "class User(val name: String)\nval name = \"script\"\nval log = mutableListOf<String>()\ninline fun g() = log.size.toString() + User(\"u\").run { name }\ng()",
+            "val log = mutableListOf<String>()\ninline fun status() = log.size.toString() + isActive\nstatus()"
+        )
+
+        // when
+        val sources = scripts.map { ScriptSource(it) }
+
+        // then
+        sources.forEach { source ->
+            val (moved, _) = source.text.split(SCRIPT_BLOCK_START)
+            assert("inline fun" in moved)
+        }
+    }
+
+    @Test
     fun `should give distinct location ids to scripts of the same hash code`() {
         // given
         val scripts = listOf("\"Aa\"", "\"BB\"")

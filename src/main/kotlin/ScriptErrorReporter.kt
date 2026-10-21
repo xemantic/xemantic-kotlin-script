@@ -31,6 +31,11 @@ private const val MAX_REPORTED_EXCEPTIONS = 32
 
 private val unresolvedReference = Regex("Unresolved reference '(.+)'\\.")
 
+/** Reported for the suspending calls of the lambdas passed to the inline functions compiled as the local ones, see [ScriptSource.localInlineFunctionArguments]. */
+private val suspensionOutsideCoroutine = Regex(
+    "Suspension functions can only be called within coroutine body\\..*|Suspend function .+ can only be called from a coroutine or another suspend function\\..*"
+)
+
 /** Reported without a location, e.g. for an object accessing the dependencies, which are the members of the script class. */
 private val declarationCapturingScript = Regex("(Object|Enum class|Interface|Nested class) '(.+)' captures the script class instance\\..*")
 
@@ -134,7 +139,7 @@ internal class ScriptErrorReporter(
             appendPosition(reference.start)
             +"error: '${reference.name}' does not refer to the $kind of the script body declared at line ${hidden.line + 1}, which is not visible in '$declaration'.\n"
             appendSourceLines(reference.start, reference.end)
-            appendNotVisibleHint(declaration, reference.name, hidden.line)
+            appendNotVisibleHint(declaration, reference.name, hidden.line, source.isMovedInlineFunctionAt(reference.start))
         }
     }.trimEnd()
 
@@ -367,6 +372,13 @@ internal class ScriptErrorReporter(
                 }
             )
         }
+        if (suspensionOutsideCoroutine.matches(diagnostic.message)) {
+            // the innermost one, if nested
+            source.localInlineFunctionArguments.lastOrNull { start in it }?.let { argument ->
+                +"  hint: '${argument.name}' is compiled without 'inline', as it reads the local values of the script body, so its lambdas cannot suspend"
+                +" - pass them to '${argument.name}' as parameters to keep it inline.\n"
+            }
+        }
         if (capturing != null) {
             val kind = capturing[1].lowercase()
             val article = if (kind[0] in "aeiou") "an" else "a"
@@ -380,9 +392,11 @@ internal class ScriptErrorReporter(
     private fun StringBuilder.appendNotVisibleHint(
         declaration: String?,
         name: String,
-        line: Int
+        line: Int,
+        /** Whether the [declaration] is an inline function, which cannot be local, unlike the regular one. */
+        isInline: Boolean
     ) {
-        +"  hint: '$declaration' is compiled outside of the script body, where '$name' (line ${line + 1}) is not visible"
+        +"  hint: '$declaration' is ${if (isInline) "an inline function " else ""}compiled outside of the script body, where '$name' (line ${line + 1}) is not visible"
         +" - pass it as a parameter, or declare it within '$declaration'.\n"
     }
 
@@ -434,7 +448,7 @@ internal class ScriptErrorReporter(
             ?: source.bodyDeclarationLine(name) ?: return
         val declaration = source.movedDeclarationAt(position)
         if (declaration != null) {
-            appendNotVisibleHint(declaration, name, line)
+            appendNotVisibleHint(declaration, name, line, source.isMovedInlineFunctionAt(position))
         } else if (line > position.line) {
             val declarations = when (kind) {
                 CLASS -> "classes"
