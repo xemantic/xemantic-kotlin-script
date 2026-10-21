@@ -80,6 +80,8 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   nor within an `init` block, a constructor, or a default value of a constructor parameter, which behave like declared types.
   It is also preferred to a member of an implicit receiver, like `show` in `B().run { show(1) }`, even within `fun h(): String`.
   Local functions are always resolved by the specification, see `ScriptSource.overloadingFunctionCopies` for how the confirming compilations cope with it.
+- In a regular script, a constructor of a script class ranks below the receivers of the lambdas, including the script instance in `run { Foo(2) }`, and above the dependencies,
+  while a local function of the block ranks above them all, see `ScriptSource.laterDeclaredClassCandidates`.
 
 ## Anti-patterns to avoid
 
