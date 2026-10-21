@@ -48,7 +48,6 @@ import kotlin.script.experimental.api.ResultWithDiagnostics
 import kotlin.script.experimental.api.ScriptCompilationConfiguration
 import kotlin.script.experimental.api.ScriptDiagnostic
 import kotlin.script.experimental.api.ScriptEvaluationConfiguration
-import kotlin.script.experimental.api.compilerOptions
 import kotlin.script.experimental.api.defaultImports
 import kotlin.script.experimental.api.providedProperties
 import kotlin.script.experimental.jvm.baseClassLoader
@@ -137,11 +136,6 @@ internal class DefaultScriptExecutor(
         // the script body has a CoroutineScope receiver, so it can launch coroutines without imports
         defaultImports(
             "kotlinx.coroutines.*"
-        )
-        // TODO can be removed once the time API is stable?
-        compilerOptions.append(
-            "-opt-in=kotlin.time.ExperimentalTime",
-            "-Xskip-prerelease-check",
         )
     }
 

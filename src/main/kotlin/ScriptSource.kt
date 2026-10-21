@@ -227,19 +227,19 @@ internal class ScriptSource(
      * while the declarations the candidates should refer to are declared as their deprecated copies,
      * and the suppressions by the script are blanked out.
      */
-    confirming: Boolean = false,
+    private val confirming: Boolean = false,
     /**
      * Whether the confirming compilation declares the copies of the moved functions preceding the [shadowedFunctionCandidates],
      * recognizing whether they apply, instead of deprecating the moved functions themselves,
      * recognizing whether the candidates refer to them already.
      */
-    shadowedFunctionCopies: Boolean = false,
+    private val shadowedFunctionCopies: Boolean = false,
     /**
      * Whether the confirming compilation declares the copies of the moved functions preceding the [coroutineScopeCandidates],
      * recognizing whether they apply, in a compilation of its own, as they precede the local properties shadowing them,
      * unlike the copies of [shadowedFunctionCopies].
      */
-    coroutineScopeCopies: Boolean = false
+    private val coroutineScopeCopies: Boolean = false
 ) : SourceCode {
 
     val scriptLines: List<String>
@@ -385,13 +385,6 @@ internal class ScriptSource(
             } else {
                 dependency.accessor
             }
-            mapping += null
-        }
-        fun addCopies(
-            declarations: List<String>,
-            message: String
-        ) = declarations.forEach {
-            lines += "@kotlin.Deprecated(\"$message\") $it"
             mapping += null
         }
         if (confirming) {

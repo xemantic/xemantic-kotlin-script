@@ -37,7 +37,9 @@ import java.util.concurrent.Executors
 import kotlin.reflect.full.createType
 import kotlin.reflect.typeOf
 import kotlin.test.Test
+import kotlin.time.Clock
 import kotlin.time.Duration.Companion.hours
+import kotlin.time.Instant
 
 @RequiresOptIn
 annotation class ExperimentalGadget
@@ -216,6 +218,31 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should use the time API without opting in`() = runTest {
+        // given
+        val script = """
+            import kotlin.time.Instant
+            val now: Instant = clock.now()
+            now.epochSeconds
+        """.trimIndent()
+        val clock = object : Clock {
+            override fun now() = Instant.fromEpochSeconds(42)
+        }
+
+        // when
+        val result = ScriptExecutor().execute(
+            script,
+            listOf(dependency<Clock>("clock", clock))
+        )
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42L)
+        }
+    }
+
+    @Test
     fun `should use dependencies`() = runTest {
         // given
         val script = """
@@ -285,11 +312,11 @@ class ScriptExecutorTest {
     @Test
     fun `should report error at original line in the script using dependency of generic type`() = runTest {
         // given
-        val script = """
+        val script = $$"""
             import kotlin.math.max
             
             val first = items.first()
-            error("failure of ${'$'}first")
+            error("failure of $first")
         """.trimIndent()
         val executor = ScriptExecutor()
 
@@ -300,10 +327,10 @@ class ScriptExecutorTest {
         result should {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.EVALUATION)
-            message sameAs """
+            message sameAs $$"""
                 java.lang.IllegalStateException: failure of foo
                   at <script body>(script.kts:4)
-                  | error("failure of ${'$'}first")
+                  | error("failure of $first")
             """.trimIndent()
         }
     }

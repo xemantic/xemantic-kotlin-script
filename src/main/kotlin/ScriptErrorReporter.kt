@@ -198,7 +198,7 @@ internal class ScriptErrorReporter(
     private fun StringBuilder.appendDescription(
         throwable: Throwable
     ) {
-        +className(throwable.javaClass)
+        +throwable.javaClass.className()
         val message = try {
             throwable.message
         } catch (e: Throwable) {
@@ -211,19 +211,14 @@ internal class ScriptErrorReporter(
         }
     }
 
-    private fun className(
-        type: Class<*>
-    ): String {
-        val name = type.name
-        return when {
-            // the synthetic name, like `Script$result$1$fail$1`, would not tell anything
-            type.isAnonymousClass -> "<anonymous ${className(type.superclass)}>"
-            // e.g. the classes declared in the script body
-            type.isLocalClass -> type.simpleName
-            scriptClassName != null && name.startsWith("$scriptClassName$") ->
-                name.removePrefix("$scriptClassName$").replace('$', '.')
-            else -> name
-        }
+    private fun Class<*>.className(): String = when {
+        // the synthetic name, like `Script$result$1$fail$1`, would not tell anything
+        isAnonymousClass -> "<anonymous ${superclass.className()}>"
+        // e.g. the classes declared in the script body
+        isLocalClass -> simpleName
+        scriptClassName != null && name.startsWith("$scriptClassName$") ->
+            name.removePrefix("$scriptClassName$").replace('$', '.')
+        else -> name
     }
 
     private class Frame(
@@ -245,16 +240,16 @@ internal class ScriptErrorReporter(
             }
             when {
                 scriptLine != null -> Frame(
-                    location = "${functionName(element)}(script.kts:${scriptLine + 1})",
+                    location = "${element.functionName()}(script.kts:${scriptLine + 1})",
                     sourceLine = source.scriptLines[scriptLine]
                 )
                 // like a static initializer of an object declared in the script
                 index == 0 && element.fileName == source.locationId -> Frame(
-                    location = "${functionName(element)}(script.kts)",
+                    location = "${element.functionName()}(script.kts)",
                     sourceLine = null
                 )
                 index == 0 -> Frame(
-                    location = "${element.className}.${element.methodName}(${sourceOf(element)})",
+                    location = "${element.className}.${element.methodName}(${element.source})",
                     sourceLine = null
                 )
                 else -> null
@@ -277,27 +272,11 @@ internal class ScriptErrorReporter(
         }
     }
 
-    /** Like in [StackTraceElement.toString], e.g. `Native Method`, instead of the negative line number. */
-    private fun sourceOf(
-        frame: StackTraceElement
-    ): String {
-        val fileName = frame.fileName
-        return when {
-            frame.isNativeMethod -> "Native Method"
-            fileName == null -> "Unknown Source"
-            frame.lineNumber >= 0 -> "$fileName:${frame.lineNumber}"
-            else -> fileName
-        }
-    }
-
     /**
-     * The name of the function of the script [frame], in terms of the script,
+     * The name of the function of this script frame, in terms of the script,
      * e.g. `Checker.check`, `<script body>` or `<lambda>`.
      */
-    private fun functionName(
-        frame: StackTraceElement
-    ): String {
-        val className = frame.className
+    private fun StackTraceElement.functionName(): String {
         val owner = when {
             className == blockClassName || className == scriptClassName -> ""
             blockClassName != null && className.startsWith("$blockClassName$") ->
@@ -307,7 +286,7 @@ internal class ScriptErrorReporter(
             else -> className
         }
         // the local functions are named after their enclosing functions, like `invokeSuspend$outer$inner`
-        val methodParts = frame.methodName.removeSuffix("\$default").split('$')
+        val methodParts = methodName.removeSuffix("\$default").split('$')
         val type = owner.split('$').lastOrNull { it.isNotEmpty() }
         // the lambdas are named like `invokeSuspend$lambda$0`, unlike the functions named `lambda`
         val isLambda = methodParts.zipWithNext().any { (name, index) ->
@@ -467,6 +446,14 @@ internal class ScriptErrorReporter(
         }
     }
 
+}
+
+/** Like in [StackTraceElement.toString], e.g. `Native Method`, instead of the negative line number. */
+private val StackTraceElement.source: String get() = when {
+    isNativeMethod -> "Native Method"
+    fileName == null -> "Unknown Source"
+    lineNumber >= 0 -> "$fileName:$lineNumber"
+    else -> fileName
 }
 
 /**
