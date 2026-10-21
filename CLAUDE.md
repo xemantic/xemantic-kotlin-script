@@ -64,4 +64,7 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 
 ## Anti-patterns to avoid
 
+- Inside a lambda walking a chain of exceptions in a `Throwable` extension, like `generateSequence(this) { read(null) { cause } }`,
+  an unqualified `read` binds to the outer receiver, not the lambda parameter, so every step returns the first cause —
+  always qualify it, `exception.read(null) { cause }`, and test the chain at least two causes deep.
 - Do not add content to this file that is already discoverable by reading the source or build scripts — that inflates context without adding signal, reducing AI agent task success rates (see [arxiv 2602.11988](https://arxiv.org/abs/2602.11988)).
