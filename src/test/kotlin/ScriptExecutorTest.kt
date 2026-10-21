@@ -2984,6 +2984,47 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should use function moved out of the script body named like the getter of a dependency`() = runTest {
+        // given
+        val script = """
+            val r = getFoo()
+            fun getFoo() = 2
+            r + foo
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("foo", 40)))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+            have(warnings == null)
+        }
+    }
+
+    @Test
+    fun `should use function moved out of the script body named like the getter of a dependency starting with is`() = runTest {
+        // given
+        val script = """
+            val r = isReady()
+            fun isReady() = !isReady
+            r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("isReady", true)))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == false)
+        }
+    }
+
+    @Test
     fun `should recognize declarations of the script named with backticks`() = runTest {
         // given
         val scripts = listOf(
