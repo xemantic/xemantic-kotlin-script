@@ -57,10 +57,12 @@ import org.jetbrains.kotlin.psi.KtFile
 import org.jetbrains.kotlin.psi.KtForExpression
 import org.jetbrains.kotlin.psi.KtLabelReferenceExpression
 import org.jetbrains.kotlin.psi.KtLiteralStringTemplateEntry
+import org.jetbrains.kotlin.psi.KtModifierList
 import org.jetbrains.kotlin.psi.KtNamedDeclaration
 import org.jetbrains.kotlin.psi.KtNamedFunction
 import org.jetbrains.kotlin.psi.KtObjectDeclaration
 import org.jetbrains.kotlin.psi.KtParameter
+import org.jetbrains.kotlin.psi.KtPrimaryConstructor
 import org.jetbrains.kotlin.psi.KtParenthesizedExpression
 import org.jetbrains.kotlin.psi.KtPrefixExpression
 import org.jetbrains.kotlin.psi.KtProperty
@@ -99,7 +101,13 @@ import kotlin.script.experimental.api.SourceCode
 internal data class ScriptPosition(
     val line: Int,
     val column: Int
-)
+) : Comparable<ScriptPosition> {
+
+    override fun compareTo(
+        other: ScriptPosition
+    ): Int = compareValuesBy(this, other, { it.line }, { it.column })
+
+}
 
 /** The reference to the [name] in the script, from the [start] to the [end], exclusive. */
 internal class ScriptReference(
@@ -110,8 +118,7 @@ internal class ScriptReference(
 
     operator fun contains(
         position: ScriptPosition
-    ): Boolean = (position.line > start.line || (position.line == start.line && position.column >= start.column))
-            && (position.line < end.line || (position.line == end.line && position.column < end.column))
+    ): Boolean = position >= start && position < end
 
 }
 
@@ -332,6 +339,9 @@ internal class ScriptSource(
     /** See [ScriptStructure.referredKinds]. */
     private val referredKinds: Map<Pair<Int, String>, List<DeclarationKind>>
 
+    /** See [ScriptStructure.propertyReferences]. */
+    private val propertyReferences: List<Pair<ScriptReference, Int>>
+
     private val lineStarts: List<Int>
 
     /** For each line of the [text], the line of the script, or `null` for the lines of the block and the preamble. */
@@ -371,6 +381,7 @@ internal class ScriptSource(
         fun Pair<String, IntRange>.toScriptReference() = ScriptReference(first, position(second.first), position(second.last + 1))
         conflictingDependencyDeclarations = structure.conflictingDependencyDeclarations.map { it.toScriptReference() }
         fun Reference.toScriptReference() = ScriptReference(name, position(offset), position(offset + length))
+        propertyReferences = structure.propertyReferences.sortedBy { it.first.offset }.map { (reference, line) -> reference.toScriptReference() to line }
         fun Triple<Reference, Int, Boolean>.toLaterDeclaredReference() = LaterDeclaredReference(
             first.toScriptReference(), position(second).line, third, first.isCallableReference, first.isOperator
         )
@@ -600,6 +611,19 @@ internal class ScriptSource(
             position(it.start).line to it.kind
         }
     }
+
+    /**
+     * The names of the properties of the script, moved out of the script body or not, which none can be `const`,
+     * referred to between the [start] and the [end], like in an annotation argument, and the 0-based lines of their names,
+     * without the references starting at the [excluded] positions, like the ones reported as unresolved.
+     */
+    fun propertiesReferredIn(
+        start: ScriptPosition,
+        end: ScriptPosition,
+        excluded: Set<ScriptPosition> = emptySet()
+    ): List<Pair<String, Int>> = propertyReferences.filter { (reference) ->
+        reference.start >= start && reference.end <= end && reference.start !in excluded
+    }.map { (reference, line) -> reference.name to line }.distinct()
 
     /**
      * The name of the accessor of the JVM [method], like `<get-x>` of `getX`, as Kotlin names it,
@@ -1141,26 +1165,32 @@ private fun canAccessScriptMembers(
 /**
  * Whether the [name] referred to by the [expression] is declared in the enclosing elements within the [scope], exclusive,
  * recognized by the names only, without the declarations inherited from the supertypes.
+ *
+ * @param constantExpression whether the [expression] is in a constant expression, like an annotation argument, referring only to a property,
+ *   so also the properties of the companion objects are recognized, which the class bodies see,
+ *   while the parameters of the annotated declarations are not visible in their annotations, nor in the annotations of the parameters.
  */
 private fun isBound(
     expression: PsiElement,
     name: String,
     scope: PsiElement,
-    declaredNames: DeclaredNames
+    declaredNames: DeclaredNames,
+    constantExpression: Boolean = false
 ): Boolean {
+    val annotated = if (constantExpression) expression.annotatedDeclarations() else emptySet()
     var child = expression
     var parent = expression.parent
     // the plain parameters of the primary constructor are not visible in the functions of the class
     var inFunction = false
     while (parent != null && parent !== scope) {
         val declares = when (parent) {
-            is KtDeclarationWithBody -> parent.valueParameters.any { it.declares(name) }
+            is KtDeclarationWithBody -> parent !in annotated && parent.valueParameters.any { it.declares(name) }
             is KtBlockExpression -> declaredNames.isDeclaredBefore(parent, child, name)
             is KtForExpression -> child === parent.body && parent.loopParameter?.declares(name) == true
             is KtCatchClause -> child === parent.catchBody && parent.catchParameter?.name == name
             is KtWhenExpression -> child !== parent.subjectVariable && parent.subjectVariable?.name == name
-            is KtClassBody -> declaredNames.isDeclared(parent, name)
-            is KtClassOrObject -> parent.primaryConstructorParameters.any {
+            is KtClassBody -> declaredNames.isDeclared(parent, name) || (constantExpression && parent.declaresCompanionProperty(name))
+            is KtClassOrObject -> parent !in annotated && parent.primaryConstructorParameters.any {
                 it.name == name && (it.hasValOrVar() || !inFunction)
             }
             else -> false
@@ -1176,6 +1206,19 @@ private fun isBound(
 private fun PsiElement.declares(
     name: String
 ): Boolean = name in declaredNames()
+
+private fun KtClassBody.declaresCompanionProperty(
+    name: String
+): Boolean = declarations.any { declaration ->
+    declaration is KtObjectDeclaration && declaration.isCompanion() && declaration.declarations.any { it is KtProperty && it.name == name }
+}
+
+/** The declarations annotated by the annotations enclosing this element, or declaring the annotated parameters, like a function, and the class of a primary constructor. */
+private fun PsiElement.annotatedDeclarations(): Set<PsiElement> = parents.filterIsInstance<KtAnnotationEntry>().flatMap { entry ->
+    val owner = (entry.parent as? KtModifierList)?.parent
+    val declaration = (owner as? KtParameter)?.ownerFunction ?: owner
+    listOfNotNull(declaration, (declaration as? KtPrimaryConstructor)?.getContainingClassOrObject())
+}.toSet()
 
 private fun PsiElement.declaredNames(): List<String> = when (this) {
     is KtParameter -> listOfNotNull(name) + destructuringDeclaration?.declaredNames().orEmpty()
@@ -1300,6 +1343,9 @@ private class ScriptStructure(
     /** See [ScriptSource.accessorName]. */
     val propertyAccessors: List<PropertyAccessor>
 
+    /** The references of the script, which might refer to the properties of the script, and the 0-based lines of the names of the properties. */
+    val propertyReferences: List<Pair<Reference, Int>>
+
     /** The names and the ranges of the [ScriptSource.scriptMemberCallableReferences]. */
     val scriptMemberCallableReferences: List<Pair<String, IntRange>>
 
@@ -1365,8 +1411,26 @@ private class ScriptStructure(
         }
         val bodyReferences = statementReferences.flatten()
         referredKinds = bodyReferences.associate { (it.offset to it.name) to it.referredKinds() }
+        // also the ones moved out of the script body, which are the members of the script class
+        val scriptProperties = declarations.filter { it.kind == DeclarationKind.PROPERTY }
+        // by the offsets of their names, also of the entries of a destructuring declaration
+        val propertyNameOffsets = scriptProperties.flatMap { property ->
+            (property.psi as? KtDestructuringDeclaration)?.entries?.mapNotNull { entry ->
+                entry.name?.takeIf { it != "_" }?.let { it to (entry.nameIdentifier?.startOffset ?: entry.startOffset) }
+            } ?: listOfNotNull(property.name?.let { it to property.line() })
+        }.groupBy({ it.first }) { it.second }
+        propertyReferences = bodyReferences.filter { reference ->
+            val expression = file.findElementAt(reference.offset)?.parent
+            !reference.isQualified && !reference.isCall && !reference.isOperator && reference.name in propertyNameOffsets
+                    && expression is KtSimpleNameExpression && block != null
+                    && !isBound(expression, reference.name, block, declaredNames, constantExpression = true)
+        }.map { reference ->
+            val offsets = propertyNameOffsets.getValue(reference.name)
+            // the last one declared before the reference, like a redeclared local property, unlike in its own annotations
+            reference to lineOf(lineStarts, offsets.lastOrNull { it < reference.offset } ?: offsets.first())
+        }
         // only the properties which require it are moved
-        val properties = declarations.filter { it.kind == DeclarationKind.PROPERTY && !it.requiresMove }
+        val properties = scriptProperties.filter { !it.requiresMove }
         val propertyNames = properties.flatMap { listOfNotNull(it.name) + it.destructuredNames }
         val propertyNameSet = propertyNames.toSet()
         val propertyNameCounts = propertyNames.groupingBy { it }.eachCount()
@@ -1430,7 +1494,6 @@ private class ScriptStructure(
                 declarations.putIfAbsent(it, index to declaration)
             }
         }
-        fun ParsedDeclaration.line() = nameRange?.first ?: start
         fun ParsedDeclaration.signature() = (psi as KtNamedFunction).signature()
         val localClasses = declarations.filter { it.kind == DeclarationKind.CLASS && it !in moved && it.name != null }
         /** Whether the function refers to the types of these [names], like the local classes, which might not be visible to its copy. */
@@ -1662,6 +1725,8 @@ private class ScriptStructure(
     ) {
         /** Without the comments preceding the declaration, which are left in the script body. */
         val start = psi.startOffsetSkippingComments
+        /** The offset of the name, or of the declaration without a name, like a destructuring one. */
+        fun line() = nameRange?.first ?: start
         /** @param refersToScript whether the reference refers to the members of the script class. */
         fun toDeclaration(
             withNestedNames: Boolean = false,

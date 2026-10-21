@@ -31,6 +31,9 @@ private const val MAX_REPORTED_EXCEPTIONS = 32
 
 private val unresolvedReference = Regex("Unresolved reference '(.+)'\\.")
 
+/** The compile-time constant required, like an annotation argument, or the default value of an annotation parameter, reported differently for the members. */
+private val constantRequired = Regex(".* must be a compile-time constant\\.|Only 'const val' can be used in constant expressions\\.")
+
 /** Reported without a location, e.g. for an object accessing the dependencies, which are the members of the script class. */
 private val declarationCapturingScript = Regex("(Object|Enum class|Enum entry|Interface|Nested class) '(.+)' captures the script class instance\\..*")
 
@@ -112,11 +115,20 @@ internal class ScriptErrorReporter(
         }
         val counts = capturingClasses.filterNotNull().groupingBy { it }.eachCount()
         val indices = HashMap<List<String>, Int>()
+        val unresolved = if (any { constantRequired.matches(it.message) }) {
+            mapNotNullTo(HashSet()) { diagnostic ->
+                diagnostic.location?.takeIf { unresolvedReference.matches(diagnostic.message) }?.let {
+                    source.toScriptPosition(it.start.line, it.start.col)
+                }
+            }
+        } else {
+            emptySet()
+        }
         return mapIndexed { index, diagnostic ->
             val occurrence = capturingClasses[index]?.let { kindAndName ->
                 indices.merge(kindAndName, 1, Int::plus)!! - 1 to counts.getValue(kindAndName)
             }
-            buildString { appendDiagnostic(diagnostic, occurrence) }
+            buildString { appendDiagnostic(diagnostic, occurrence, unresolved) }
         }.distinct()
     }
 
@@ -414,10 +426,12 @@ internal class ScriptErrorReporter(
      *
      * @param capturingOccurrence the index of the diagnostic of the class capturing the script class instance reported without a location,
      *   among the ones of the same kind and name, and their count.
+     * @param unresolved the positions of all the unresolved references reported.
      */
     private fun StringBuilder.appendDiagnostic(
         diagnostic: ScriptDiagnostic,
-        capturingOccurrence: Pair<Int, Int>?
+        capturingOccurrence: Pair<Int, Int>?,
+        unresolved: Set<ScriptPosition>
     ) {
         val location = diagnostic.location
         location?.let { source.preambleDependencyAt(it.start.line) }?.let { dependency ->
@@ -443,9 +457,7 @@ internal class ScriptErrorReporter(
             val start = source.toScriptPosition(location.start.line, location.start.col)
             val end = location.end?.let {
                 source.toScriptPosition(it.line, it.col)
-            }?.takeIf {
-                (it.line > start.line) || (it.line == start.line && it.column >= start.column)
-            } ?: start
+            }?.takeIf { it >= start } ?: start
             start to end
         } else {
             capturingDeclaration?.let { name ->
@@ -463,6 +475,13 @@ internal class ScriptErrorReporter(
         appendSourceLines(start, end)
         unresolvedReference.matchEntire(diagnostic.message)?.let { match ->
             appendHint(name = match.groupValues[1], position = start)
+        }
+        if (constantRequired.matches(diagnostic.message)) {
+            // e.g. not visible in an object, already hinted at
+            source.propertiesReferredIn(start, end, excluded = unresolved).forEach { (name, line) ->
+                +"  hint: '$name' (line ${line + 1}) is a property of the script body, which cannot be 'const', like a top-level property of a regular script"
+                +" - inline its value, or declare it as a 'const val' in an object, if it is a primitive or a string.\n"
+            }
         }
         if (capturing != null) {
             val kind = capturing[1].lowercase()
