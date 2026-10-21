@@ -329,6 +329,9 @@ internal class ScriptSource(
     /** The contents of the string literals of the script, with the escapes resolved, and a NUL character in place of each template expression. */
     val stringLiterals: List<String>
 
+    /** See [ScriptStructure.referredKinds]. */
+    private val referredKinds: Map<Pair<Int, String>, List<DeclarationKind>>
+
     private val lineStarts: List<Int>
 
     /** For each line of the [text], the line of the script, or `null` for the lines of the block and the preamble. */
@@ -364,6 +367,7 @@ internal class ScriptSource(
         classNames = structure.classNames
         enclosingClassNames = structure.enclosingClassNames
         stringLiterals = structure.stringLiterals
+        referredKinds = structure.referredKinds
         fun Pair<String, IntRange>.toScriptReference() = ScriptReference(first, position(second.first), position(second.last + 1))
         conflictingDependencyDeclarations = structure.conflictingDependencyDeclarations.map { it.toScriptReference() }
         fun Reference.toScriptReference() = ScriptReference(name, position(offset), position(offset + length))
@@ -580,15 +584,21 @@ internal class ScriptSource(
     }
 
     /**
-     * The 0-based line of the declaration of the [name] in the script body, and its kind.
+     * The 0-based line of the declaration of the [name] in the script body, which the reference at the [position] might refer to, and its kind,
+     * the first one of the kind preferred by the reference, like a class of a type, or a function of a call, see [ScriptStructure.referredKinds].
      */
     fun bodyDeclarationLine(
         name: String,
-        kind: DeclarationKind? = null
-    ): Pair<Int, DeclarationKind>? = bodyDeclarations.find {
-        (it.name == name || name in it.destructuredNames) && (kind == null || it.kind == kind)
-    }?.let {
-        position(it.start).line to it.kind
+        position: ScriptPosition
+    ): Pair<Int, DeclarationKind>? {
+        val declarations = bodyDeclarations.filter { it.name == name || name in it.destructuredNames }
+        val kinds = referredKinds[lineStarts[position.line] + position.column to name]
+        val declaration = if (kinds == null) declarations.firstOrNull() else kinds.firstNotNullOfOrNull { kind ->
+            declarations.find { it.kind == kind }
+        }
+        return declaration?.let {
+            position(it.start).line to it.kind
+        }
     }
 
     /**
@@ -945,8 +955,24 @@ private class Reference(
     /** Whether it is an operator, or a convention, like `+`, referring to the operator functions only, like `plus`. */
     val isOperator: Boolean = false,
     /** Whether it is within a lambda, which might have a receiver, so its resolution is not known without compiling. */
-    val isInLambda: Boolean = false
+    val isInLambda: Boolean = false,
+    /** Whether it is a type, like `Base` in `val b: Base` or in `class D : Base()`, which refers to a class. */
+    val isType: Boolean = false
 ) {
+
+    /**
+     * The kinds of the declarations of the script body it might refer to, in the order of preference, like a class only of a type,
+     * or a function first of a call, which might also call a constructor, or the `invoke` operator of a property,
+     * while a qualified one, like `config.timeout`, might refer only to an extension function.
+     */
+    fun referredKinds(): List<DeclarationKind> = when {
+        isType -> classKinds
+        isOperator -> functionKinds
+        isQualified -> if (isCall) functionKinds else emptyList()
+        isCallableReference -> callableReferenceKinds
+        isCall -> callKinds
+        else -> valueKinds
+    }
 
     /** Whether it might refer to one of the local declarations of the script body of these [names]. */
     fun refersToLocal(
@@ -954,6 +980,17 @@ private class Reference(
     ): Boolean = !isQualified && !isBound && name in names
 
 }
+
+// the kinds of the declarations of the script body the references might refer to, see Reference.referredKinds
+private val classKinds = listOf(DeclarationKind.CLASS)
+
+private val functionKinds = listOf(DeclarationKind.FUNCTION)
+
+private val callableReferenceKinds = listOf(DeclarationKind.FUNCTION, DeclarationKind.PROPERTY, DeclarationKind.CLASS)
+
+private val callKinds = listOf(DeclarationKind.FUNCTION, DeclarationKind.CLASS, DeclarationKind.PROPERTY)
+
+private val valueKinds = listOf(DeclarationKind.PROPERTY, DeclarationKind.CLASS)
 
 /**
  * The references by name, in the order of the script, without the labels and the names of the arguments,
@@ -983,7 +1020,8 @@ private fun PsiElement.references(
         isCallableReference = callableReference?.callableReference == expression,
         expressionOffset = callableReference?.takeIf { it.callableReference == expression }?.startOffset ?: expression.startOffset,
         canAccessScriptMembers = canAccessScriptMembers(expression, scope),
-        isInLambda = isInLambda(expression, scope)
+        isInLambda = isInLambda(expression, scope),
+        isType = expression.parent is KtUserType
     )
 } + operatorReferences(scope)
 
@@ -1253,6 +1291,12 @@ private class ScriptStructure(
     /** See [ScriptSource.stringLiterals]. */
     val stringLiterals: List<String>
 
+    /**
+     * The kinds of the declarations of the script body, which the references of the script body might refer to, see [Reference.referredKinds],
+     * by their offsets and names, as an operator, like `get` of `a[i]`, starts where its operand does.
+     */
+    val referredKinds: Map<Pair<Int, String>, List<DeclarationKind>>
+
     /** See [ScriptSource.accessorName]. */
     val propertyAccessors: List<PropertyAccessor>
 
@@ -1320,6 +1364,7 @@ private class ScriptStructure(
             declarationsByPsi[statement]?.references ?: statement.references(scope = statement.parent, declaredNames)
         }
         val bodyReferences = statementReferences.flatten()
+        referredKinds = bodyReferences.associate { (it.offset to it.name) to it.referredKinds() }
         // only the properties which require it are moved
         val properties = declarations.filter { it.kind == DeclarationKind.PROPERTY && !it.requiresMove }
         val propertyNames = properties.flatMap { listOfNotNull(it.name) + it.destructuredNames }

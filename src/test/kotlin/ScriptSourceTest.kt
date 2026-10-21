@@ -119,6 +119,77 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should find body declaration of the kind of the reference`() {
+        // given
+        val script = """
+            fun Base(x: Int) = x
+            class Base
+            val t: Base? = null
+            val c = Base(1)
+            val r = ::Base
+            val v = Base
+            val i = 1 Base 2
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        assert(source.bodyDeclarationLine("Base", ScriptPosition(2, 7)) == (1 to DeclarationKind.CLASS))
+        assert(source.bodyDeclarationLine("Base", ScriptPosition(3, 8)) == (0 to DeclarationKind.FUNCTION))
+        assert(source.bodyDeclarationLine("Base", ScriptPosition(4, 10)) == (0 to DeclarationKind.FUNCTION))
+        assert(source.bodyDeclarationLine("Base", ScriptPosition(5, 8)) == (1 to DeclarationKind.CLASS))
+        assert(source.bodyDeclarationLine("Base", ScriptPosition(6, 10)) == (0 to DeclarationKind.FUNCTION))
+    }
+
+    @Test
+    fun `should find body declaration of reference indexed or iterated`() {
+        // given
+        val script = """
+            val arr = listOf(1)
+            val x = arr[0]
+            for (y in arr) println(y)
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        assert(source.bodyDeclarationLine("arr", ScriptPosition(1, 8)) == (0 to DeclarationKind.PROPERTY))
+        assert(source.bodyDeclarationLine("arr", ScriptPosition(2, 10)) == (0 to DeclarationKind.PROPERTY))
+    }
+
+    @Test
+    fun `should find body declaration only of the kinds the reference might refer to`() {
+        // given
+        val script = """
+            val f = { 1 }
+            fun g() = 1
+            class C
+            val plus = 0
+            val a: f? = null
+            val b: g? = null
+            val x = f()
+            val y = C()
+            val z = 1 + 2
+            val w = g
+            val u = y.f
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        assert(source.bodyDeclarationLine("f", ScriptPosition(4, 7)) == null)
+        assert(source.bodyDeclarationLine("g", ScriptPosition(5, 7)) == null)
+        assert(source.bodyDeclarationLine("f", ScriptPosition(6, 8)) == (0 to DeclarationKind.PROPERTY))
+        assert(source.bodyDeclarationLine("C", ScriptPosition(7, 8)) == (2 to DeclarationKind.CLASS))
+        assert(source.bodyDeclarationLine("plus", ScriptPosition(8, 10)) == null)
+        assert(source.bodyDeclarationLine("g", ScriptPosition(9, 8)) == null)
+        assert(source.bodyDeclarationLine("f", ScriptPosition(10, 10)) == null)
+    }
+
+    @Test
     fun `should name accessor only of property of the class of the frame`() {
         // given
         val script = "class P { val x: Int get() = 1 }; class Q { fun getX(): Int = 2 }"
