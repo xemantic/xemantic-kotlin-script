@@ -72,6 +72,15 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 - A moved function with an inferred return type, like `fun launch(block: () -> Unit) = "mine"`, is preferred to the `CoroutineScope` extensions of the script body, unlike one with a declared type,
   so a test of a reference resolved to the coroutine scope instead needs the declared type.
 
+- A regular script does not always call the most specific overload (K2, probed with `BasicJvmScriptingHost`):
+  a script function whose return type is inferred from its expression body is preferred to the overloads of declared types (or block bodies),
+  even more specific ones, by the calls within a top-level statement, or within a script declaration of an inferred type, including the lambdas and local declarations within it —
+  `show(1)`, `val r = show(1)`, `fun h() = show(1)`, `class T { fun f() = show(1) }`, `val r = run { val x: String = show(1); x }` —
+  but not within a declaration of a declared type, like `val r: String = run { show(1) }`, or `fun h(): String { val x = show(1); return x }`,
+  nor within an `init` block, a constructor, or a default value of a constructor parameter, which behave like declared types.
+  It is also preferred to a member of an implicit receiver, like `show` in `B().run { show(1) }`, even within `fun h(): String`.
+  Local functions are always resolved by the specification, see `ScriptSource.overloadingFunctionCopies` for how the confirming compilations cope with it.
+
 ## Anti-patterns to avoid
 
 - Inside a lambda walking a chain of exceptions in a `Throwable` extension, like `generateSequence(this) { read(null) { cause } }`,
