@@ -315,8 +315,11 @@ internal class ScriptSource(
     /** The package of the script, like `foo.bar`, or an empty string, if it has none. */
     val packageName: String
 
-    /** The names of the classes and the objects declared in the script, including `Companion` of an unnamed companion object. */
+    /** The names of the classes and the objects declared in the script, including `Companion` of an unnamed companion object, and the enum entries. */
     val classNames: Set<String>
+
+    /** The names of the [classNames] enclosing other classes, objects or enum entries, which qualify their names. */
+    val enclosingClassNames: Set<String>
 
     /** The contents of the string literals of the script, with the escapes resolved, and a NUL character in place of each template expression. */
     val stringLiterals: List<String>
@@ -350,6 +353,7 @@ internal class ScriptSource(
         returnsUnit = structure.endsWithMovedDeclaration
         packageName = structure.packageName
         classNames = structure.classNames
+        enclosingClassNames = structure.enclosingClassNames
         stringLiterals = structure.stringLiterals
         fun Pair<String, IntRange>.toScriptReference() = ScriptReference(first, position(second.first), position(second.last + 1))
         conflictingDependencyDeclarations = structure.conflictingDependencyDeclarations.map { it.toScriptReference() }
@@ -1126,6 +1130,9 @@ private class ScriptStructure(
     /** See [ScriptSource.classNames]. */
     val classNames: Set<String>
 
+    /** See [ScriptSource.enclosingClassNames]. */
+    val enclosingClassNames: Set<String>
+
     /** See [ScriptSource.stringLiterals]. */
     val stringLiterals: List<String>
 
@@ -1156,9 +1163,12 @@ private class ScriptStructure(
     init {
         val file = psiFactory.createFile("script.kts", script)
         packageName = file.packageFqName.asString()
-        classNames = file.collectDescendantsOfType<KtClassOrObject>().mapNotNullTo(HashSet()) { declaration ->
-            declaration.name ?: "Companion".takeIf { declaration is KtObjectDeclaration && declaration.isCompanion() }
-        }
+        val classes = file.collectDescendantsOfType<KtClassOrObject>()
+        fun KtClassOrObject.className() = name ?: "Companion".takeIf { this is KtObjectDeclaration && isCompanion() }
+        classNames = classes.mapNotNullTo(HashSet()) { it.className() }
+        enclosingClassNames = classes.filter { declaration ->
+            declaration.collectDescendantsOfType<KtClassOrObject> { it !== declaration }.isNotEmpty()
+        }.mapNotNullTo(HashSet()) { it.className() }
         stringLiterals = file.collectDescendantsOfType<KtStringTemplateExpression>().map { literal ->
             literal.entries.joinToString("") { entry ->
                 when (entry) {

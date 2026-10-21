@@ -70,7 +70,8 @@ internal class ScriptErrorReporter(
      * matching the parts with a single character class, as a repeated group would overflow the stack on a long message.
      */
     private val scriptQualifiedName = scriptClassName?.let {
-        Regex("(?<![\\p{L}\\p{N}_.$])${Regex.escape(it)}([.$][\\p{L}\\p{N}_.$]*)")
+        // also the element class of an array, like `[L_$Circle;`
+        Regex("(?:(?<=\\[L)|(?<![\\p{L}\\p{N}_.$]))${Regex.escape(it)}([.$][\\p{L}\\p{N}_.$]*)")
     }
 
     /** The names qualified by the script class written in the string literals of the script, like `_.Color`, which are kept. */
@@ -266,17 +267,19 @@ internal class ScriptErrorReporter(
     private fun MatchResult.toDeclaredClassName(): Pair<String, String>? {
         val parts = classNamePart.findAll(groupValues[1]).map { it.groupValues[1] to it.groupValues[2] }.toList()
         val classNames = source.classNames
+        val enclosingClassNames = source.enclosingClassNames
         val first = if (parts.first().first == ".") {
             0.takeIf { parts.first().second in classNames } ?: return null
         } else {
             val last = parts.indexOfLast { (_, name) -> name in classNames }.takeIf { it != -1 } ?: return null
-            (last downTo 0).takeWhile { parts[it].second in classNames }.last().takeIf { start ->
+            // unlike e.g. a function named like a class, enclosing a local class
+            generateSequence(last) { index -> (index - 1).takeIf { it >= 0 && parts[it].second in enclosingClassNames } }.last().takeIf { start ->
                 // the synthetic names are separated by dollars only
                 parts.subList(1, start + 1).none { (separator) -> separator == "." }
             } ?: return null
         }
         var last = first
-        while (parts.getOrNull(last + 1)?.second in classNames) last++
+        while (parts[last].second in enclosingClassNames && parts.getOrNull(last + 1)?.second in classNames) last++
         fun List<Pair<String, String>>.join() = joinToString("") { (separator, name) -> separator + name }
         return scriptClassName + parts.take(last + 1).join() to
                 parts.subList(first, last + 1).joinToString(".") { it.second } + parts.drop(last + 1).join()

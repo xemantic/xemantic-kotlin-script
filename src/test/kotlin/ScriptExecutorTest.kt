@@ -1111,9 +1111,9 @@ class ScriptExecutorTest {
         // then
         result should {
             be<ScriptResult.Error>()
-            message sameAs """
+            message.withoutJdkLineNumbers() sameAs """
                 java.lang.IllegalArgumentException: No enum constant Color.BLUE
-                  at java.lang.Enum.valueOf(Enum.java:293)
+                  at java.lang.Enum.valueOf(Enum.java:<line>)
                   at <script body>(script.kts:2)
                   | Color.valueOf("BLUE")
             """.trimIndent()
@@ -1136,9 +1136,9 @@ class ScriptExecutorTest {
         // then
         result should {
             be<ScriptResult.Error>()
-            message sameAs """
+            message.withoutJdkLineNumbers() sameAs """
                 java.lang.IllegalArgumentException: No enum constant Color.BLUE
-                  at java.lang.Enum.valueOf(Enum.java:293)
+                  at java.lang.Enum.valueOf(Enum.java:<line>)
                   at <script body>(script.kts:3)
                   | Color.valueOf("BLUE")
             """.trimIndent()
@@ -1239,14 +1239,14 @@ class ScriptExecutorTest {
         // then
         result should {
             be<ScriptResult.Error>()
-            message sameAs """
+            message.withoutJdkLineNumbers() sameAs """
                 java.lang.IllegalStateException: cannot parse
                   at parse(script.kts:5)
                   |     throw IllegalStateException("cannot parse", e)
                   at <script body>(script.kts:7)
                   | parse("BLUE")
                 Caused by: java.lang.IllegalArgumentException: No enum constant Color.BLUE
-                  at java.lang.Enum.valueOf(Enum.java:293)
+                  at java.lang.Enum.valueOf(Enum.java:<line>)
                   at parse(script.kts:3)
                   |     Color.valueOf(name)
                   at <script body>(script.kts:7)
@@ -1298,6 +1298,54 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report class cast of local class declared in a function named like a class of the script`() = runTest {
+        // given
+        val script = """
+            interface Shape
+            class Square : Shape
+            fun Shape(): Shape {
+                class Impl : Shape
+                return Impl()
+            }
+            Shape() as Square
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first().substringBefore(" (") sameAs
+                    "java.lang.ClassCastException: class Impl cannot be cast to class Square"
+        }
+    }
+
+    @Test
+    fun `should report class cast of arrays of classes declared in the script without the name of the script class`() = runTest {
+        // given
+        val script = """
+            sealed interface Shape
+            class Circle : Shape
+            class Square : Shape
+            val shapes: Any = arrayOf(Circle())
+            shapes as Array<Square>
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first().substringBefore(" (") sameAs
+                    "java.lang.ClassCastException: class [LCircle; cannot be cast to class [LSquare;"
+        }
+    }
+
+    @Test
     fun `should report class cast of local classes without the synthetic names named like a class of the script`() = runTest {
         // given
         val script = """
@@ -1340,6 +1388,9 @@ class ScriptExecutorTest {
                     "java.lang.IllegalStateException: _" + ".".repeat(100_000) + "$".repeat(100_000)
         }
     }
+
+    /** The line numbers of the frames of the JDK, like `Enum.java:293`, which differ between its versions. */
+    private fun String.withoutJdkLineNumbers() = replace(Regex("(\\w+\\.java):\\d+\\)"), "$1:<line>)")
 
     /** Like `@1b6d3586` of the default string representation, which differs on every run. */
     private fun String.withoutHashCodes() = replace(Regex("@[0-9a-f]+\\b"), "@<hash>")
