@@ -49,6 +49,7 @@ import org.jetbrains.kotlin.psi.KtDeclaration
 import org.jetbrains.kotlin.psi.KtDeclarationWithBody
 import org.jetbrains.kotlin.psi.KtDestructuringDeclaration
 import org.jetbrains.kotlin.psi.KtElement
+import org.jetbrains.kotlin.psi.KtEnumEntry
 import org.jetbrains.kotlin.psi.KtExpression
 import org.jetbrains.kotlin.psi.KtForExpression
 import org.jetbrains.kotlin.psi.KtLabelReferenceExpression
@@ -520,16 +521,25 @@ internal class ScriptSource(
     }
 
     /**
-     * The start and the end of the name of the declaration moved out of the script body,
-     * or of the class nested in it, as the compiler names it without the enclosing classes.
+     * The name in the script, the start and the end of the name of the class moved out of the script body, or nested in one,
+     * reported by the [index]th of the [count] diagnostics without a location naming the class like the compiler,
+     * without the enclosing classes, and a companion object as `Companion`, also when named.
+     * The classes of the [name] are told by their order, counting only the ones referring to the members of the script class,
+     * like the dependencies, as only these capture the script class instance, if there are enough of them,
+     * otherwise all of them, as the compiler reports also e.g. a companion object calling its own function named like a function of the script.
      */
-    fun movedDeclarationName(
-        name: String
-    ): Pair<ScriptPosition, ScriptPosition>? = (
-            movedDeclarations.find { it.name == name }?.nameRange
-                ?: movedDeclarations.firstNotNullOfOrNull { it.nestedNameRanges[name] }
-    )?.let {
-        position(it.first) to position(it.last + 1)
+    fun movedClassName(
+        name: String,
+        index: Int,
+        count: Int
+    ): Triple<String, ScriptPosition, ScriptPosition>? {
+        val classes = movedDeclarations.flatMap { it.classNames }.filter {
+            if (name == "Companion") it.isCompanion || it.name == name else it.name == name && !it.isCompanion
+        }
+        val candidates = classes.filter { it.refersToScript }.takeIf { it.size >= count } ?: classes
+        return (candidates.getOrNull(index) ?: candidates.lastOrNull())?.let {
+            Triple(it.name ?: name, position(it.range.first), position(it.range.last + 1))
+        }
     }
 
     /**
@@ -608,13 +618,25 @@ private class Declaration(
     val nameRange: IntRange?,
     /** The names of a destructuring declaration, like `val (a, b) = pair`. */
     val destructuredNames: List<String> = emptyList(),
-    /** The ranges of the names of the classes nested in the declaration, by these names, the first one of each name. */
-    val nestedNameRanges: Map<String, IntRange> = emptyMap(),
+    /** The classes of the declaration, including itself, if it is one, in the order of the script. */
+    val classNames: List<ClassName> = emptyList(),
     /**
      * The ranges of the names of the classes and the functions nested in the declaration, by their paths within it, like `I.f`,
      * as the compiler names them in the failures of its backend, the first one of each path.
      */
     val nestedPathRanges: Map<String, IntRange> = emptyMap()
+)
+
+/** A class or an object, with the [range] of its name, or of the `companion` keyword of an unnamed companion object. */
+private class ClassName(
+    val name: String?,
+    val isCompanion: Boolean,
+    val range: IntRange,
+    /**
+     * Whether it refers to the members of the script class by their names, outside of its nested classes, so it might capture the script class instance,
+     * unless e.g. the name refers to an inherited member instead.
+     */
+    val refersToScript: Boolean
 )
 
 internal enum class DeclarationKind {
@@ -1161,13 +1183,17 @@ private class ScriptStructure(
             }
         }
         localProperties = propertyNameSet - movedConstants.mapTo(HashSet()) { it.name!! }
-        movedDeclarations = moved.map { it.toDeclaration(withNestedNames = true) }
         endsWithMovedDeclaration = moved.any { it.psi == statements.lastOrNull() }
         val (movedExtensions, movedMembers) = moved
             .filter { it.kind == DeclarationKind.FUNCTION || it.kind == DeclarationKind.PROPERTY }
             .partition { it.isExtension || (it.psi as? KtProperty)?.receiverTypeReference != null }
         val scriptMemberNames = movedMembers.flatMapTo(HashSet(dependencyNames)) { listOfNotNull(it.name) + it.destructuredNames }
         val scriptExtensionNames = movedExtensions.mapNotNullTo(HashSet()) { it.name }
+        movedDeclarations = moved.map { declaration ->
+            declaration.toDeclaration(withNestedNames = true) {
+                it.refersToLocal(scriptMemberNames) || it.name in scriptExtensionNames
+            }
+        }
         scriptMemberCallableReferences = moved.filter { it.kind == DeclarationKind.CLASS }.flatMap { declaration ->
             declaration.references.filter {
                 it.isCallableReference && it.canAccessScriptMembers && if (it.isQualified) {
@@ -1428,8 +1454,10 @@ private class ScriptStructure(
     ) {
         /** Without the comments preceding the declaration, which are left in the script body. */
         val start = psi.startOffsetSkippingComments
+        /** @param refersToScript whether the reference refers to the members of the script class. */
         fun toDeclaration(
-            withNestedNames: Boolean = false
+            withNestedNames: Boolean = false,
+            refersToScript: (Reference) -> Boolean = { false }
         ) = Declaration(
             name = name,
             kind = kind,
@@ -1437,20 +1465,28 @@ private class ScriptStructure(
             end = end,
             nameRange = nameRange,
             destructuredNames = destructuredNames,
-            nestedNameRanges = if (withNestedNames && psi is KtClassOrObject) {
-                buildMap {
-                    psi.collectDescendantsOfType<KtClassOrObject> { it !== psi }.forEach { nested ->
-                        nested.nameIdentifier?.let { putIfAbsent(nested.name!!, it.startOffset until it.endOffset) }
-                        // as the compiler names it in its diagnostics, also when named
-                        if (nested is KtObjectDeclaration && nested.isCompanion()) {
-                            (nested.nameIdentifier ?: nested.modifierList?.getModifier(KtTokens.COMPANION_KEYWORD))?.let {
-                                putIfAbsent("Companion", it.startOffset until it.endOffset)
-                            }
+            classNames = if (withNestedNames && psi is KtClassOrObject) {
+                (listOf(psi) + psi.collectDescendantsOfType<KtClassOrObject> { it !== psi }).mapNotNull { declaration ->
+                    val isCompanion = declaration is KtObjectDeclaration && declaration.isCompanion()
+                    val nameElement = declaration.nameIdentifier
+                        ?: declaration.modifierList?.getModifier(KtTokens.COMPANION_KEYWORD)?.takeIf { isCompanion }
+                        ?: return@mapNotNull null
+                    val range = declaration.startOffset until declaration.endOffset
+                    // capturing the script class instance on their own, unlike the object literals, and the enum entries, capturing it also for their enum class
+                    val nestedRanges = declaration.collectDescendantsOfType<KtClassOrObject> {
+                        it !== declaration && !(it is KtObjectDeclaration && it.isObjectLiteral()) && it !is KtEnumEntry
+                    }.map { it.startOffset until it.endOffset }
+                    ClassName(
+                        name = declaration.name,
+                        isCompanion = isCompanion,
+                        range = nameElement.startOffset until nameElement.endOffset,
+                        refersToScript = references.any { reference ->
+                            reference.offset in range && nestedRanges.none { reference.offset in it } && refersToScript(reference)
                         }
-                    }
+                    )
                 }
             } else {
-                emptyMap()
+                emptyList()
             },
             nestedPathRanges = if (withNestedNames) {
                 buildMap {
