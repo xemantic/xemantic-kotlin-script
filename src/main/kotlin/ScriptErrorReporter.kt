@@ -123,6 +123,23 @@ internal class ScriptErrorReporter(
         }
     }.trimEnd()
 
+    /** The [references] of the script body to the local properties instead of the members of the receivers, see [ScriptSource.receiverMemberCandidates]. */
+    fun toReceiverMemberMessage(
+        references: List<LaterDeclaredReference>
+    ): String = references.joinToString(separator = "\n") { property ->
+        val reference = property.reference
+        // as written, like `the name` in backticks
+        val name = source.scriptLines[reference.start.line].substring(reference.start.column, reference.end.column)
+        buildString {
+            appendPosition(reference.start)
+            +"error: '${reference.name}' refers to the property of the script body declared at line ${property.line + 1}, "
+            +"instead of the member of an implicit receiver, which a regular script refers to.\n"
+            appendSourceLines(reference.start, reference.end)
+            // the nearest receiver, which might not be the one declaring the member, so it is an example
+            +"  hint: rename the property, or qualify the member with the label of its receiver, like 'this@${property.receiverLabel ?: "label"}.$name'.\n"
+        }
+    }.trimEnd()
+
     /** The [references] of the declarations moved out of the script body to other functions, see [ScriptSource.hiddenLocalFunctionCandidates]. */
     fun toHiddenLocalFunctionMessage(
         references: List<LaterDeclaredReference>

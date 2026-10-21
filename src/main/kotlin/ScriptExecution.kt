@@ -95,7 +95,8 @@ internal class DefaultScriptExecutor(
 
     /**
      * The number of the actual compilations, not served by the cache,
-     * including the ones confirming the [ScriptSource.laterDeclaredDependencyCandidates].
+     * including the ones confirming the [ScriptSource.laterDeclaredDependencyCandidates],
+     * and the [ScriptSource.receiverMemberCandidates], run in parallel with the compilation of the script.
      */
     @OptIn(ExperimentalAtomicApi::class)
     internal val compilationCount: Int get() = compilations.load()
@@ -187,7 +188,9 @@ internal class DefaultScriptExecutor(
         /** The [ScriptSource.coroutineScopeCandidates] resolved to the coroutine scope indeed. */
         val coroutineScopeReferences: List<LaterDeclaredReference> = emptyList(),
         /** The [ScriptSource.shadowedFunctionCandidates] which would call the functions in the script. */
-        val shadowedFunctionReferences: List<Triple<ScriptReference, Int, Int>> = emptyList()
+        val shadowedFunctionReferences: List<Triple<ScriptReference, Int, Int>> = emptyList(),
+        /** The [ScriptSource.receiverMemberCandidates] which would refer to the members of the receivers in the script. */
+        val receiverMemberReferences: List<LaterDeclaredReference> = emptyList()
     )
 
     private inner class ScriptHandler(
@@ -226,6 +229,7 @@ internal class DefaultScriptExecutor(
                 || compilation.hiddenLocalFunctionReferences.isNotEmpty()
                 || compilation.shadowedFunctionReferences.isNotEmpty()
                 || compilation.coroutineScopeReferences.isNotEmpty()
+                || compilation.receiverMemberReferences.isNotEmpty()
             ) {
                 val failureMessage = listOfNotNull(
                     compilation.coroutineScopeReferences.takeIf { it.isNotEmpty() }?.let {
@@ -233,6 +237,9 @@ internal class DefaultScriptExecutor(
                     },
                     compilation.shadowedFunctionReferences.takeIf { it.isNotEmpty() }?.let {
                         ScriptErrorReporter(source).toShadowedFunctionMessage(it)
+                    },
+                    compilation.receiverMemberReferences.takeIf { it.isNotEmpty() }?.let {
+                        ScriptErrorReporter(source).toReceiverMemberMessage(it)
                     },
                     compilation.hiddenLocalFunctionReferences.takeIf { it.isNotEmpty() }?.let {
                         ScriptErrorReporter(source).toHiddenLocalFunctionMessage(it)
@@ -303,24 +310,33 @@ internal class DefaultScriptExecutor(
             if (source.unmatchedClosingBrace != null || source.conflictingDependencyDeclarations.isNotEmpty()) {
                 return Compilation(source, result = null)
             }
-            val result = compile(source)
-            // unless already reported as unresolved
-            val errors = result.reports.filter { it.severity == ScriptDiagnostic.Severity.ERROR }.mapNotNull { diagnostic ->
+            // independent of the compilation of the script, so confirmed in parallel, as the candidates are common, e.g. in lambdas
+            val (result, receiverMemberReports) = coroutineScope {
+                val receiverMemberReports = async {
+                    if (source.receiverMemberCandidates.isEmpty()) null else try {
+                        val probe = source(receiverMemberProbe = true)
+                        probe to compile(probe).reports
+                    } catch (e: Throwable) {
+                        // not confirmed, like when the compilation fails, as it might be nested too deeply as well
+                        if (e is CancellationException || (e is VirtualMachineError && e !is StackOverflowError)) throw e
+                        logger.debug { "Script[$scriptId]: Receiver members not confirmed, as the compilation failed with: $e" }
+                        null
+                    }
+                }
+                compile(source) to receiverMemberReports.await()
+            }
+            /** The start positions of the errors of the compilation of the [source]. */
+            fun List<ScriptDiagnostic>.errorPositions(
+                source: ScriptSource
+            ) = filter { it.severity == ScriptDiagnostic.Severity.ERROR }.mapNotNull { diagnostic ->
                 diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }
             }
-            if (
-                source.laterDeclaredDependencyCandidates.isEmpty()
-                && source.hiddenLocalFunctionCandidates.isEmpty()
-                && source.shadowedFunctionCandidates.isEmpty()
-                && source.coroutineScopeCandidates.isEmpty()
-            ) {
-                return Compilation(source, result)
-            }
-            // recognizing the candidates referring to the wrong declarations indeed
-            val probe = source(confirming = true)
+            // unless already reported as unresolved
+            val errors = result.reports.errorPositions(source)
             /**
              * The positions, from the start to the end, if known, of the warnings of the deprecated,
-             * or opted in, declarations of this [message] in the [source], with their messages, see [ScriptSource.confirming].
+             * or opted in, declarations of this [message] in the [source], with their messages, see [ScriptSource.confirming]
+             * and [ScriptSource.receiverMemberCandidates].
              */
             fun List<ScriptDiagnostic>.markedRanges(
                 source: ScriptSource,
@@ -340,6 +356,37 @@ internal class DefaultScriptExecutor(
                 source: ScriptSource,
                 message: String
             ) = markedRanges(source, message).map { it.first }
+            // the references resolved neither to the members declaring the local properties, nor to nothing, unlike in the script,
+            // only if both compilations succeed otherwise, as the resolution of a failed one is not known
+            val receiverMemberReferences = receiverMemberReports?.takeIf { result is Success }?.let { (probe, reports) ->
+                val unresolved = reports.errorPositions(probe)
+                val candidates = source.receiverMemberCandidates
+                if (
+                    // like in the lines of the receivers, or without a location
+                    reports.any { error ->
+                        error.severity == ScriptDiagnostic.Severity.ERROR && error.location?.let { probe.toScriptLine(it.start.line) } == null
+                    } || unresolved.any { position -> candidates.none { position in it.reference } }
+                ) {
+                    logger.debug { "Script[$scriptId]: Receiver members not confirmed, as the compilation failed" }
+                    return@let null
+                }
+                val members = reports.markedRanges(probe, RECEIVER_MEMBER)
+                candidates.filter { candidate ->
+                    unresolved.none { it in candidate.reference } && members.none { (start, _, message) ->
+                        start in candidate.reference && receiverMemberMessage(candidate.reference.name) in message
+                    }
+                }
+            }.orEmpty()
+            if (
+                source.laterDeclaredDependencyCandidates.isEmpty()
+                && source.hiddenLocalFunctionCandidates.isEmpty()
+                && source.shadowedFunctionCandidates.isEmpty()
+                && source.coroutineScopeCandidates.isEmpty()
+            ) {
+                return Compilation(source, result, receiverMemberReferences = receiverMemberReferences)
+            }
+            // recognizing the candidates referring to the wrong declarations indeed
+            val probe = source(confirming = true)
             val reports = compile(probe).reports
             fun deprecated(
                 message: String
@@ -403,7 +450,8 @@ internal class DefaultScriptExecutor(
                 shadowedFunctionReferences = toProperties.filter { (reference) ->
                     shadowed.any { it in reference }
                 },
-                hiddenLocalFunctionReferences = hiddenCandidates.filter { it in hidden }
+                hiddenLocalFunctionReferences = hiddenCandidates.filter { it in hidden },
+                receiverMemberReferences = receiverMemberReferences
             )
         }
 
@@ -417,8 +465,9 @@ internal class DefaultScriptExecutor(
         private fun source(
             confirming: Boolean = false,
             shadowedFunctionCopies: Boolean = false,
-            coroutineScopeCopies: Boolean = false
-        ) = ScriptSource(script, preambleDependencies, confirming, shadowedFunctionCopies, coroutineScopeCopies)
+            coroutineScopeCopies: Boolean = false,
+            receiverMemberProbe: Boolean = false
+        ) = ScriptSource(script, preambleDependencies, confirming, shadowedFunctionCopies, coroutineScopeCopies, receiverMemberProbe)
 
         private suspend fun compile(
             source: ScriptSource
