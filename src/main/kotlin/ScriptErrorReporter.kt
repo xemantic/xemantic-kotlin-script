@@ -40,6 +40,9 @@ private val declarationCapturingScript = Regex("(Object|Enum class|Enum entry|In
  */
 private val backendCrash = Regex("Exception while generating code for (?:.* fun (\\S+) .*|.*) declared in (.+):")
 
+/** A part of a binary or canonical class name, like `$Lid` of `_$Box$Lid`, possibly empty, like in `_$$$result$1$1$Dog`. */
+private val classNamePart = Regex("([.$])([\\p{L}\\p{N}_]*)")
+
 internal fun Iterable<ScriptDiagnostic>.filterNonIgnorable() = filterNot { diagnostic ->
     diagnostic.severity == ScriptDiagnostic.Severity.DEBUG && listOf(
         "Using JDK home inferred from java.home",
@@ -60,6 +63,14 @@ internal class ScriptErrorReporter(
     private val scriptClassName: String? = null,
     private val blockClassName: String? = null
 ) {
+
+    /**
+     * The name of a class qualified by the script class, like `_.Color` of `Enum.valueOf`, or `_$Box$Lid` of `ClassCastException`,
+     * and of the default string representation, as long as the binary name continues, not preceded by a part of another name.
+     */
+    private val scriptQualifiedName = scriptClassName?.let {
+        Regex("(?<![\\p{L}\\p{N}_.$])${Regex.escape(it)}((?:[.$][\\p{L}\\p{N}_]*)+)")
+    }
 
     fun toFailureMessage(
         diagnostics: List<ScriptDiagnostic>
@@ -224,9 +235,28 @@ internal class ScriptErrorReporter(
         }
         message?.let {
             +": "
-            +it
+            +it.withoutScriptClassName()
         }
     }
+
+    /**
+     * The names of the classes declared in the script qualified by the script class, like `_.Color.BLUE`, as named in the script, like `Color.BLUE`,
+     * also without the synthetic names of the classes enclosing a local class, like `_$$$result$1$1$Dog`,
+     * but not the names the script might have written itself.
+     */
+    private fun String.withoutScriptClassName(): String = scriptQualifiedName?.replace(this) { match ->
+        val parts = classNamePart.findAll(match.groupValues[1]).map { it.groupValues[1] to it.groupValues[2] }.toList()
+        val first = parts.indexOfFirst { (_, name) -> name in source.classNames }
+        // a canonical name, separated by dots, does not contain the synthetic names
+        if (first == -1 || (first > 0 && parts.take(first + 1).any { (separator) -> separator == "." })) {
+            return@replace match.value
+        }
+        var last = first
+        while (parts.getOrNull(last + 1)?.second in source.classNames) last++
+        val qualified = scriptClassName + parts.take(last + 1).joinToString("") { (separator, name) -> separator + name }
+        if (source.scriptLines.any { qualified in it }) return@replace match.value
+        parts.subList(first, last + 1).joinToString(".") { it.second } + parts.drop(last + 1).joinToString("") { (separator, name) -> separator + name }
+    } ?: this
 
     private fun Class<*>.className(): String = when {
         // the synthetic name, like `Script$result$1$fail$1`, would not tell anything

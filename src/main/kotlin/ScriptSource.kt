@@ -313,6 +313,9 @@ internal class ScriptSource(
     /** The package of the script, like `foo.bar`, or an empty string, if it has none. */
     val packageName: String
 
+    /** The names of the classes and the objects declared in the script, including `Companion` of an unnamed companion object. */
+    val classNames: Set<String>
+
     private val lineStarts: List<Int>
 
     /** For each line of the [text], the line of the script, or `null` for the lines of the block and the preamble. */
@@ -341,6 +344,7 @@ internal class ScriptSource(
         movedDeclarations = structure.movedDeclarations
         returnsUnit = structure.endsWithMovedDeclaration
         packageName = structure.packageName
+        classNames = structure.classNames
         fun Pair<String, IntRange>.toScriptReference() = ScriptReference(first, position(second.first), position(second.last + 1))
         conflictingDependencyDeclarations = structure.conflictingDependencyDeclarations.map { it.toScriptReference() }
         fun Reference.toScriptReference() = ScriptReference(name, position(offset), position(offset + length))
@@ -1113,6 +1117,9 @@ private class ScriptStructure(
     /** See [ScriptSource.packageName]. */
     val packageName: String
 
+    /** See [ScriptSource.classNames]. */
+    val classNames: Set<String>
+
     /** The names and the ranges of the [ScriptSource.scriptMemberCallableReferences]. */
     val scriptMemberCallableReferences: List<Pair<String, IntRange>>
 
@@ -1140,6 +1147,9 @@ private class ScriptStructure(
     init {
         val file = psiFactory.createFile("script.kts", script)
         packageName = file.packageFqName.asString()
+        classNames = file.collectDescendantsOfType<KtClassOrObject>().mapNotNullTo(HashSet()) { declaration ->
+            declaration.name ?: "Companion".takeIf { declaration is KtObjectDeclaration && declaration.isCompanion() }
+        }
         headerEnd = listOfNotNull(
             file.firstChild?.takeIf { it.node.elementType == KtTokens.SHEBANG_COMMENT },
             // like `@file:JvmName("x")`, while the parser takes there also a stray `@` of the script body
