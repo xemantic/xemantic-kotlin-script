@@ -28,6 +28,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import org.jetbrains.kotlin.config.JvmTarget
 import kotlin.concurrent.atomics.AtomicInt
@@ -84,6 +86,7 @@ public class ScriptBody internal constructor(
 internal class DefaultScriptExecutor(
     private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
     compilationCacheSize: Int = 0,
+    maxConcurrentCompilations: Int = Runtime.getRuntime().availableProcessors(),
     /** Replaced only by the tests of the internal failures of the compiler. */
     compiler: JvmScriptCompiler = JvmScriptCompiler()
 ) : ScriptExecutor {
@@ -107,6 +110,9 @@ internal class DefaultScriptExecutor(
         require(compilationCacheSize >= 0) {
             "compilationCacheSize must not be negative, but was: $compilationCacheSize"
         }
+        require(maxConcurrentCompilations > 0) {
+            "maxConcurrentCompilations must be positive, but was: $maxConcurrentCompilations"
+        }
     }
 
     private val compilationCache = if (compilationCacheSize > 0) {
@@ -116,6 +122,12 @@ internal class DefaultScriptExecutor(
     } else {
         null
     }
+
+    /**
+     * Bounds the invocations of the compiler, each loading the whole classpath,
+     * acquired only around them, so not by the callers waiting for the cached compilation.
+     */
+    private val compilationPermits = Semaphore(maxConcurrentCompilations)
 
     private val scriptingHost = BasicJvmScriptingHost(compiler = compiler)
 
@@ -438,17 +450,22 @@ internal class DefaultScriptExecutor(
         ): ResultWithDiagnostics<CompiledScript> {
             @OptIn(ExperimentalAtomicApi::class)
             compilations.incrementAndFetch()
-            return try {
-                scriptingHost.compiler(
-                    script = source,
-                    scriptCompilationConfiguration = compilationConfig()
-                )
+            val result = try {
+                compilationPermits.withPermit {
+                    scriptingHost.compiler(
+                        script = source,
+                        scriptCompilationConfiguration = compilationConfig()
+                    )
+                }
             } catch (e: CancellationException) {
                 // the cancellation of the caller is not a failure of the compilation,
                 // otherwise it would silently cancel the active caller, and the ones waiting in the cache, instead of failing them
                 currentCoroutineContext().ensureActive()
                 throw IllegalStateException("The compilation of the script was cancelled", e)
             }
+            // the compiler reports what it throws as a diagnostic, like `error: Java heap space`, not an error of the script
+            result.reports.firstNotNullOfOrNull { it.exception?.fatalCause() }?.let { throw it }
+            return result
         }
 
 
@@ -603,6 +620,19 @@ private suspend fun Throwable.rethrowIfCancelledOrFatal() {
     if (this is CancellationException) currentCoroutineContext().ensureActive()
     if (this is VirtualMachineError && this !is StackOverflowError) throw this
 }
+
+/**
+ * This exception, or its first cause, which is a [VirtualMachineError] other than [StackOverflowError],
+ * see [rethrowIfCancelledOrFatal], if any.
+ */
+private fun Throwable.fatalCause(): Throwable? = generateSequence(this) { exception ->
+    read(null) { cause }?.takeUnless { it === exception }
+}.take(MAX_FATAL_CAUSE_DEPTH).firstOrNull {
+    it is VirtualMachineError && it !is StackOverflowError
+}
+
+/** Bounds the chain of causes, which might be cyclic. */
+private const val MAX_FATAL_CAUSE_DEPTH = 100
 
 /**
  * The original exception, if this one is its copy made by the coroutine stack trace recovery,
