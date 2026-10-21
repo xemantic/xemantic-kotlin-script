@@ -39,6 +39,10 @@ import org.jetbrains.kotlin.psi.KtArrayAccessExpression
 import org.jetbrains.kotlin.psi.KtBinaryExpression
 import org.jetbrains.kotlin.psi.KtBlockExpression
 import org.jetbrains.kotlin.psi.KtCallExpression
+import org.jetbrains.kotlin.psi.KtValueArgument
+import org.jetbrains.kotlin.psi.KtLambdaArgument
+import org.jetbrains.kotlin.psi.KtLabeledExpression
+import org.jetbrains.kotlin.psi.KtCallableDeclaration
 import org.jetbrains.kotlin.psi.KtCallableReferenceExpression
 import org.jetbrains.kotlin.psi.KtCatchClause
 import org.jetbrains.kotlin.psi.KtClass
@@ -48,6 +52,7 @@ import org.jetbrains.kotlin.psi.KtConstantExpression
 import org.jetbrains.kotlin.psi.KtDeclaration
 import org.jetbrains.kotlin.psi.KtDeclarationWithBody
 import org.jetbrains.kotlin.psi.KtDestructuringDeclaration
+import org.jetbrains.kotlin.psi.KtDoubleColonExpression
 import org.jetbrains.kotlin.psi.KtElement
 import org.jetbrains.kotlin.psi.KtExpression
 import org.jetbrains.kotlin.psi.KtForExpression
@@ -67,6 +72,7 @@ import org.jetbrains.kotlin.psi.KtStringTemplateExpression
 import org.jetbrains.kotlin.psi.KtLambdaExpression
 import org.jetbrains.kotlin.psi.KtOperationReferenceExpression
 import org.jetbrains.kotlin.psi.KtTypeAlias
+import org.jetbrains.kotlin.psi.KtTypeReference
 import org.jetbrains.kotlin.psi.KtUnaryExpression
 import org.jetbrains.kotlin.psi.KtUserType
 import org.jetbrains.kotlin.psi.KtValueArgumentName
@@ -118,7 +124,9 @@ internal class LaterDeclaredReference(
     /** Whether it refers to the declaration as a function, like `::foo`, which might be resolved to a property instead. */
     val isCallableReference: Boolean = false,
     /** Whether it is an operator, or a convention, like `[]` of `get`, sharing its position with other ones, like `set`. */
-    val isOperator: Boolean = false
+    val isOperator: Boolean = false,
+    /** The label of the receiver, which might declare the member referred to in the script, see [ScriptSource.receiverMemberCandidates]. */
+    val receiverLabel: String? = null
 ) {
     val kind: String get() = if (isFunction) "function" else "property"
 }
@@ -164,6 +172,27 @@ internal const val COROUTINE_SCOPE_FUNCTION = "xemantic-kotlin-script: coroutine
 
 /** The opt-in message of the moved functions, see [ScriptSource.shadowedFunctionCandidates]. */
 internal const val SHADOWED_ORIGINAL = "xemantic-kotlin-script: shadowed original"
+
+/** The deprecation message of the members of the receivers declaring the local properties, see [ScriptSource.receiverMemberCandidates]. */
+internal const val RECEIVER_MEMBER = "xemantic-kotlin-script: receiver member"
+
+/** The deprecation message of the member of the receiver declaring the local property of this [name], see [ScriptSource.receiverMemberCandidates]. */
+internal fun receiverMemberMessage(
+    name: String
+): String = "$RECEIVER_MEMBER: $name;"
+
+/**
+ * Replacing the first character of the name of the local property, and of the references to it, preceding the receiver
+ * declaring it instead, keeping the columns, see [ScriptSource.receiverMemberCandidates],
+ * one of these letters for each property, which the script does not contain, so it is not a name of the script.
+ */
+private val renamingChars = '\u0250'..'\u02af'
+
+/** The maximum number of the receivers declaring the local properties, nested in each other, see [ScriptSource.receiverMemberCandidates]. */
+private const val MAX_RECEIVERS = 32
+
+/** The content of the string literal of this text. */
+private fun String.escaped(): String = replace("\\", "\\\\").replace("\"", "\\\"").replace("$", "\\$")
 
 /** The opt-in annotation marking the local copies of the declarations, reporting this [message] where they are used. */
 private fun optInMarker(
@@ -239,7 +268,12 @@ internal class ScriptSource(
      * recognizing whether they apply, in a compilation of its own, as they precede the local properties shadowing them,
      * unlike the copies of [shadowedFunctionCopies].
      */
-    private val coroutineScopeCopies: Boolean = false
+    private val coroutineScopeCopies: Boolean = false,
+    /**
+     * Whether it is the source of the compilation confirming the [receiverMemberCandidates],
+     * with the suppressions blanked out, like the [confirming] one.
+     */
+    private val receiverMemberProbe: Boolean = false
 ) : SourceCode {
 
     val scriptLines: List<String>
@@ -301,6 +335,24 @@ internal class ScriptSource(
      */
     val hiddenLocalFunctionCandidates: List<LaterDeclaredReference>
 
+    /**
+     * The references of the script body to the local properties within the lambdas, the classes, and the functions with receivers,
+     * which might have the members, or the extensions, of the same names, like the local classes declaring them,
+     * by the 0-based lines of the properties, while in the script they refer to these members,
+     * as the properties are the members of the script, resolved after them.
+     * They are confirmed by compiling the script with each local property renamed, together with the references preceding
+     * the receiver declaring it instead as its deprecated member, an object preceding the first statement of its candidates,
+     * and the receiver of the statements from there, see [receiverMemberProbe],
+     * resolved like the member of the script, after the receivers within these statements,
+     * while before the coroutine scope of the script body, the dependencies, and the imports,
+     * reporting the ones resolved to anything else, only if the compilation succeeds otherwise.
+     * The calls are not candidates, as the script body calls the members of the receivers as well, unless the property applies,
+     * and neither are the references of a statement, which no line starts between it and the property,
+     * as the receiver cannot precede it, nor the ones of the properties, whose first candidates follow
+     * the ones of the first [MAX_RECEIVERS] receivers, or which are more than the [renamingChars].
+     */
+    val receiverMemberCandidates: List<LaterDeclaredReference>
+
     private val lineStarts: List<Int>
 
     /** For each line of the [text], the line of the script, or `null` for the lines of the block and the preamble. */
@@ -323,7 +375,8 @@ internal class ScriptSource(
             dependencies.mapTo(HashSet()) { it.name },
             confirming,
             shadowedFunctionCopies,
-            coroutineScopeCopies
+            coroutineScopeCopies,
+            receiverMemberProbe
         )
         unmatchedClosingBrace = structure.unmatchedClosingBrace?.let { position(it) }
         movedDeclarations = structure.movedDeclarations
@@ -341,6 +394,9 @@ internal class ScriptSource(
             Triple(reference.toScriptReference(), position(property).line, position(function).line)
         }
         coroutineScopeCandidates = structure.coroutineScopeCandidates.map { it.toLaterDeclaredReference() }
+        receiverMemberCandidates = structure.receiverMemberCandidates.map { (reference, property) ->
+            LaterDeclaredReference(reference.toScriptReference(), position(property).line, isFunction = false, receiverLabel = reference.receiverLabel)
+        }
         bodyDeclarations = structure.bodyDeclarations
         val deprecatedDependencies = if (confirming) {
             laterDeclaredDependencyCandidates.mapTo(HashSet()) { it.reference.name }
@@ -352,7 +408,7 @@ internal class ScriptSource(
         val mapping = mutableListOf<Int?>()
         // the confirming compilation reports the deprecations, even if suppressed by the script
         val unsuppressed = BooleanArray(script.length)
-        if (confirming) structure.suppressions.forEach { unsuppressed.fill(true, it.first, it.last + 1) }
+        structure.suppressions.forEach { unsuppressed.fill(true, it.first, it.last + 1) }
         fun addLines(
             range: IntRange,
             keep: (offset: Int) -> Boolean
@@ -360,7 +416,10 @@ internal class ScriptSource(
             val bounds = lineBounds[line]
             lines += buildString {
                 bounds.forEach { offset ->
-                    +(if (keep(offset) && !unsuppressed[offset]) script[offset] else ' ')
+                    +when {
+                        !keep(offset) || unsuppressed[offset] -> ' '
+                        else -> structure.receiverMemberRenames[offset] ?: script[offset]
+                    }
                 }
             }
             mapping += line
@@ -438,7 +497,15 @@ internal class ScriptSource(
         mapping += null
         // the copies preceding the statements, where the local classes declared before them are visible
         val blockCopies = structure.blockCopies.entries.groupBy({ lineOf(it.key) }) { it.value }
+        // each receiver declaring the members instead of the local properties, of the statements following them
+        val receiverMembers = structure.receiverMembers.entries.groupBy({ lineOf(it.key) }) { it.value }
+        var receivers = 0
         (lineOf(headerEnd)..lineBounds.lastIndex).forEach { line ->
+            receiverMembers[line]?.forEach { members ->
+                lines += "kotlin.with(object { ${members.joinToString(separator = "; ")} }) {"
+                mapping += null
+                receivers++
+            }
             blockCopies[line]?.flatten()?.forEach { (messages, declaration) ->
                 lines += messages.joinToString(separator = " ", postfix = " ") { "@${optInMarker(it)}" } + declaration
                 mapping += null
@@ -450,6 +517,10 @@ internal class ScriptSource(
         if (returnsUnit) {
             // the block would return the value of the statement before the declaration, unlike the script
             lines += "null"
+            mapping += null
+        }
+        repeat(receivers) {
+            lines += "}"
             mapping += null
         }
         lines += SCRIPT_BLOCK_END
@@ -750,7 +821,18 @@ private class Reference(
     /** Whether it is an operator, or a convention, like `+`, referring to the operator functions only, like `plus`. */
     val isOperator: Boolean = false,
     /** Whether it is within a lambda, which might have a receiver, so its resolution is not known without compiling. */
-    val isInLambda: Boolean = false
+    val isInLambda: Boolean = false,
+    /** Whether it is within a lambda, a class, or a function with a receiver, which might have a member of its name. */
+    val isInReceiverScope: Boolean = false,
+    /** The label of the nearest of these receivers, like `run` of `run { }`, if known. */
+    val receiverLabel: String? = null,
+    /** Whether the name is declared in the element the references are collected from, other than by a member of a class, see [isBound]. */
+    val isBoundLocally: Boolean = isBound,
+    /**
+     * Whether it might refer to a value, unlike a type, like `Item` in `x as Item`, a receiver of `::`, like in `Item::class`,
+     * or an implicit declaration, like `it` of a lambda without parameters, or `field` of an accessor.
+     */
+    val refersToValue: Boolean = true
 ) {
 
     /** Whether it might refer to one of the local declarations of the script body of these [names]. */
@@ -787,7 +869,11 @@ private fun PsiElement.references(
                 || (expression is KtOperationReferenceExpression && expression.getReferencedNameElementType() == KtTokens.IDENTIFIER),
         isCallableReference = callableReference?.callableReference == expression,
         canAccessScriptMembers = canAccessScriptMembers(expression, scope),
-        isInLambda = isInLambda(expression, scope)
+        isInLambda = isInLambda(expression, scope),
+        isInReceiverScope = isInReceiverScope(expression, scope),
+        receiverLabel = receiverLabel(expression, scope),
+        isBoundLocally = isBound(expression, name, scope, declaredNames, byMembers = false),
+        refersToValue = refersToValue(expression, name, scope)
     )
 } + operatorReferences(scope)
 
@@ -884,6 +970,45 @@ private fun isInLambda(
     scope: PsiElement
 ): Boolean = expression.parents.takeWhile { it !== scope }.any { it is KtLambdaExpression }
 
+/** See [Reference.isInReceiverScope]. */
+private fun isInReceiverScope(
+    expression: PsiElement,
+    scope: PsiElement
+): Boolean = expression.parents.takeWhile { it !== scope }.any {
+    it is KtLambdaExpression || it is KtClassOrObject || (it is KtNamedFunction && it.receiverTypeReference != null)
+}
+
+/** See [Reference.receiverLabel]. */
+private fun receiverLabel(
+    expression: PsiElement,
+    scope: PsiElement
+): String? = when (val receiver = expression.parents.takeWhile { it !== scope }.firstOrNull {
+    it is KtLambdaExpression || it is KtClassOrObject || (it is KtNamedFunction && it.receiverTypeReference != null)
+}) {
+    is KtLambdaExpression -> (receiver.parent as? KtLabeledExpression)?.getLabelName() ?: run {
+        val argument = receiver.parent as? KtValueArgument
+        // like `run { }`, or `run({ })`
+        val call = if (argument is KtLambdaArgument) argument.parent else argument?.parent?.parent
+        ((call as? KtCallExpression)?.calleeExpression as? KtSimpleNameExpression)?.getReferencedName()
+    }
+    is KtClassOrObject -> receiver.name
+    is KtNamedFunction -> receiver.name
+    else -> null
+}
+
+/** See [Reference.refersToValue]. */
+private fun refersToValue(
+    expression: KtSimpleNameExpression,
+    name: String,
+    scope: PsiElement
+): Boolean {
+    val parents = expression.parents.takeWhile { it !== scope }
+    return (expression.parent as? KtDoubleColonExpression)?.receiverExpression !== expression
+            && parents.none { it is KtTypeReference || it is KtUserType }
+            && !(name == "it" && parents.any { it is KtLambdaExpression && it.functionLiteral.valueParameterList == null })
+            && !(name == "field" && parents.any { it is KtPropertyAccessor })
+}
+
 /** See [Reference.canAccessScriptMembers]. */
 private fun canAccessScriptMembers(
     expression: PsiElement,
@@ -911,7 +1036,9 @@ private fun isBound(
     expression: PsiElement,
     name: String,
     scope: PsiElement,
-    declaredNames: DeclaredNames
+    declaredNames: DeclaredNames,
+    /** Whether also by the members of the classes, unlike the parameters and the local variables only. */
+    byMembers: Boolean = true
 ): Boolean {
     var child = expression
     var parent = expression.parent
@@ -920,13 +1047,18 @@ private fun isBound(
     while (parent != null && parent !== scope) {
         val declares = when (parent) {
             is KtDeclarationWithBody -> parent.valueParameters.any { it.declares(name) }
+                    || (parent as? KtCallableDeclaration)?.contextParameters.orEmpty().any { it.declares(name) }
+            // the context parameters of a property with accessors
+            is KtProperty -> parent.contextParameters.any { it.declares(name) }
             is KtBlockExpression -> declaredNames.isDeclaredBefore(parent, child, name)
-            is KtForExpression -> child === parent.body && parent.loopParameter?.declares(name) == true
+            // the body is wrapped in a container
+            is KtForExpression -> (child === parent.body || child === parent.body?.parent) && parent.loopParameter?.declares(name) == true
             is KtCatchClause -> child === parent.catchBody && parent.catchParameter?.name == name
             is KtWhenExpression -> child !== parent.subjectVariable && parent.subjectVariable?.name == name
-            is KtClassBody -> declaredNames.isDeclared(parent, name)
+            is KtClassBody -> byMembers && declaredNames.isDeclared(parent, name)
             is KtClassOrObject -> parent.primaryConstructorParameters.any {
-                it.name == name && (it.hasValOrVar() || !inFunction)
+                // the initializers refer to the property, not to the parameter, of the same name
+                it.name == name && (if (it.hasValOrVar()) byMembers else !inFunction)
             }
             else -> false
         }
@@ -1004,7 +1136,9 @@ private class ScriptStructure(
     /** See [ScriptSource.shadowedFunctionCopies]. */
     shadowedFunctionCopies: Boolean,
     /** See [ScriptSource.coroutineScopeCopies]. */
-    coroutineScopeCopies: Boolean
+    coroutineScopeCopies: Boolean,
+    /** Whether to compute the renames and the members of the local properties, see [ScriptSource.receiverMemberProbe]. */
+    receiverMemberProbe: Boolean
 ) {
 
     val headerEnd: Int
@@ -1041,6 +1175,21 @@ private class ScriptStructure(
 
     /** See [ScriptSource.coroutineScopeCandidates], with the offsets of the declarations, and whether they are functions. */
     val coroutineScopeCandidates: List<Triple<Reference, Int, Boolean>>
+
+    /** See [ScriptSource.receiverMemberCandidates], with the offsets of the local properties. */
+    val receiverMemberCandidates: List<Triple<Reference, Int, Boolean>>
+
+    /**
+     * The characters replacing the first characters of the names of the local properties, and of the references to them,
+     * by their offsets, see [ScriptSource.receiverMemberProbe].
+     */
+    val receiverMemberRenames: Map<Int, Char>
+
+    /**
+     * The deprecated members declaring the renamed local properties, see [ScriptSource.receiverMemberProbe],
+     * by the offsets of the lines, which their receiver precedes.
+     */
+    val receiverMembers: Map<Int, List<String>>
 
 
     /**
@@ -1204,7 +1353,7 @@ private class ScriptStructure(
                 }.mapNotNull { it.name } +
                 file.importDirectives.filter { it.importedFqName?.asString() == "kotlin.Suppress" }.mapNotNull { it.aliasName }
         fun KtAnnotationEntry.isSuppress() = shortName?.asString() in suppressNames
-        suppressions = if (!confirming) emptyList() else {
+        suppressions = if (!confirming && !receiverMemberProbe) emptyList() else {
             file.collectDescendantsOfType<KtAnnotationEntry> { it.isSuppress() }.map { entry ->
                 // like `@[Suppress("X")]`, which would be invalid without the entries
                 val annotation = entry.parent as? KtAnnotation
@@ -1265,6 +1414,94 @@ private class ScriptStructure(
         }
         laterDeclaredDependencyCandidates = laterDeclaredCandidatesByStatement.values.flatten()
         val statementIndices = statements.withIndex().associate { (index, statement) -> statement to index }
+        /**
+         * The start of the first line following the end of the statement preceding the one of this index, up to its start,
+         * which begins with the statement, or a comment, so an inserted line splits neither of them, or `null`, if there is none.
+         */
+        fun lineStart(
+            statementIndex: Int
+        ): Int? {
+            var element = statements[statementIndex - 1].nextSibling
+            var lineBreak = false
+            while (element != null && element !== statements[statementIndex]) {
+                if (element !is PsiWhiteSpace) {
+                    if (lineBreak) return element.startOffset
+                } else if ('\n' in element.text) {
+                    lineBreak = true
+                }
+                element = element.nextSibling
+            }
+            return if (lineBreak) statements[statementIndex].startOffset else null
+        }
+        /** The first local property of this name, if any, and the index of its statement. */
+        fun localProperty(
+            name: String
+        ) = localPropertiesByName[name]?.first()?.let { it to statementIndices.getValue(it.psi) }
+        // like the references to the local properties, also the ones bound by the members of the local classes, which they precede
+        val propertyCandidates = statements.indices.flatMap { index ->
+            if (declarationsByPsi[statements[index]] in moved) return@flatMap emptyList()
+            statementReferences[index].filter { reference ->
+                reference.isInReceiverScope && reference.refersToValue && !reference.isCall && !reference.isQualified
+                        && !reference.isBoundLocally && localProperty(reference.name)?.let { (_, propertyIndex) -> propertyIndex < index } == true
+            }.map { it to index }
+        }.groupBy { it.first.name }
+        // the statements starting the lines, which the receivers declaring the local properties precede, each one preceding
+        // the first candidates of the properties it declares, chosen in the order of these candidates, each one as late as possible,
+        // so they are as few as possible, and nested as little as possible
+        val receiverStarts = buildMap {
+            var start: Int? = null
+            var receivers = 0
+            for ((name, candidates) in propertyCandidates.entries.sortedBy { (_, candidates) -> candidates.first().second }) {
+                val propertyIndex = localProperty(name)!!.second
+                if (start == null || start <= propertyIndex) {
+                    if (receivers == MAX_RECEIVERS) continue
+                    start = (candidates.first().second downTo propertyIndex + 1).firstOrNull { lineStart(it) != null } ?: continue
+                    receivers++
+                }
+                put(name, start)
+            }
+        }
+        // each local property with a candidate renamed with its own letter, which the script does not contain, so it is not a name of the script
+        val renamed = script.toHashSet().let { scriptChars ->
+            receiverStarts.keys.zip(renamingChars.filterNot { it in scriptChars }).toMap()
+        }
+        receiverMemberCandidates = propertyCandidates.filterKeys { it in renamed }.values.flatten().sortedBy { it.first.offset }.map { (reference) ->
+            Triple(reference, localProperty(reference.name)!!.first.line(), false)
+        }
+        receiverMemberRenames = if (!receiverMemberProbe) emptyMap() else buildMap {
+            /** Renames the name, unless quoted, or the first character of the quoted name. */
+            fun rename(offset: Int, name: String) = put(if (script[offset] == '`') offset + 1 else offset, renamed.getValue(name))
+            renamed.keys.forEach { name ->
+                val (property, propertyIndex) = localProperty(name)!!
+                when (val psi = property.psi) {
+                    is KtProperty -> psi.nameIdentifier
+                    is KtDestructuringDeclaration -> psi.entries.find { it.name == name }?.nameIdentifier
+                    else -> null
+                }?.let { rename(it.startOffset, name) }
+                // the references preceding the receiver, as the receiver resolves the following ones,
+                // also called, unless they might be resolved to the receivers also in the script body
+                (propertyIndex + 1 until receiverStarts.getValue(name)).forEach { index ->
+                    if (declarationsByPsi[statements[index]] !in moved) {
+                        statementReferences[index].filter { reference ->
+                            reference.name == name && reference.refersToValue && !reference.isQualified && !reference.isBound
+                                    && !(reference.isCall && reference.isInReceiverScope)
+                        }.forEach { rename(it.offset, name) }
+                    }
+                }
+            }
+        }
+        receiverMembers = if (!receiverMemberProbe) emptyMap() else renamed.keys.groupBy { lineStart(receiverStarts.getValue(it))!! }.mapValues { (_, names) ->
+            names.map { name ->
+                val local = "`${renamed.getValue(name)}${name.drop(1)}`"
+                val isVar = when (val psi = localProperty(name)!!.first.psi) {
+                    is KtProperty -> psi.isVar
+                    is KtDestructuringDeclaration -> psi.isVar
+                    else -> false
+                }
+                // initialized, unlike with a getter, so it can be smart cast, like the local property
+                "@kotlin.Deprecated(\"${receiverMemberMessage(name).escaped()}\") ${if (isVar) "var" else "val"} `$name` = $local"
+            }
+        }
         blockCopies = if (!confirming) emptyMap() else buildMap<Int, MutableList<Pair<String, String>>> {
             /** The copies of the functions, by their names, each preceding the first statement of the candidates of its name. */
             fun addCopies(

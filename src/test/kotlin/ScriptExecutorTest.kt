@@ -3829,4 +3829,228 @@ class ScriptExecutorTest {
         }
     }
 
+    @Test
+    fun `should report property of script body referred to instead of member of implicit receiver`() = runTest {
+        // given
+        val script = """
+            val name = "script"
+            data class User(val name: String)
+            User("alice").run { name }
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:21: error: 'name' refers to the property of the script body declared at line 1, instead of the member of an implicit receiver, which a regular script refers to.
+                  | User("alice").run { <error>name</error> }
+                  hint: rename the property, or qualify the member with the label of its receiver, like 'this@run.name'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report properties of script body referred to instead of members of extension receivers, superclasses and extensions`() = runTest {
+        // given
+        val scripts = listOf(
+            "val name = \"script\"\ndata class User(val name: String)\nfun User.describe() = \"user \" + name\nUser(\"alice\").describe()",
+            "open class Base { val name = \"base\" }\nval name = \"script\"\nclass Derived : Base() { fun f() = name }\nDerived().f()",
+            "open class Base { val name = \"base\" }\nval name = \"script\"\nobject : Base() { fun f() = name }.f()",
+            "val length = 7\nbuildString { append(length) }",
+            "val javaClass = 5\n\"abc\".run { javaClass }",
+            "var name = \"a\"\nclass Box { var name = \"b\" }\nval box = Box().apply { name = \"c\" }\nname + box.name",
+            "val (size, other) = 3 to 4\nlistOf(1, 2).run { size + other }",
+            "var (b, length) = 2 to 7\nlength = 8\n\"x\".run { length + b }",
+            // the receiver declaring the property in the probe follows the comment of its line
+            "val name = \"script\" // the name\nclass User(val name: String)\nUser(\"alice\").run { name }",
+            "val `the name` = \"script\"\nclass User(val `the name`: String)\nUser(\"alice\").run { `the name` }",
+            // also referred to preceding the receiver declaring the property in the probe
+            "val name = \"x\"; println(name)\nclass User(val name: String)\nUser(\"alice\").run { name }",
+            // a nearer receiver
+            "val name = \"script\"\nclass User(val name: String)\nUser(\"a\").run { \"x\".run { name } }"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        val errorLines = results.map { result ->
+            (result as? ScriptResult.Error)?.message?.lines()?.filter { it.startsWith("script.kts:") }?.map { it.substringBefore(": error") }
+        }
+        assert(errorLines == listOf(
+            listOf("script.kts:3:33"),
+            listOf("script.kts:3:36"),
+            listOf("script.kts:3:29"),
+            listOf("script.kts:2:22"),
+            listOf("script.kts:2:13"),
+            listOf("script.kts:3:25"),
+            listOf("script.kts:2:20"),
+            listOf("script.kts:3:11"),
+            listOf("script.kts:3:21"),
+            listOf("script.kts:3:21"),
+            listOf("script.kts:3:21"),
+            listOf("script.kts:3:27")
+        ))
+    }
+
+    @Test
+    fun `should keep properties of script body referred to within receivers without members of their names`() = runTest {
+        // given
+        val scripts = listOf(
+            "val name = \"script\"\nlistOf(1).map { name + it }.first()",
+            "val name = \"script\"\n\"abc\".run { name + length }",
+            "val prefix = \">\"\nbuildString { append(prefix); append(length) }",
+            // resolved to the coroutine scope of the script body otherwise
+            "val isActive = 3\nrun { isActive }",
+            "val name = \"script\"\nclass Greeter { fun greet() = \"hi \" + name }\nGreeter().greet()",
+            "val name = \"script\"\nfun String.describe() = this + \" \" + name\n\"abc\".describe()",
+            "@file:Suppress(\"DEPRECATION\")\nval name = \"script\"\n\"abc\".run { name }",
+            // resolved to the receiver also in the script body, as the property cannot be called
+            "val first = 10\nval list = listOf(1, 2)\nwith(list) { first() + first }"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(
+            "script1", "script3", ">1", 3, "hi script", "abc script", "script", 11
+        ))
+    }
+
+    @Test
+    fun `should report properties of script body referred to instead of own members of local classes and objects`() = runTest {
+        // given
+        val scripts = listOf(
+            "val n = 10\nval other = 1\nclass A { val n = 2; fun f() = n + other }\nA().f()",
+            "val name = \"script\"\ndata class User(val name: String) { fun greet() = \"hi \" + name }\nUser(\"alice\").greet()",
+            "val name = \"script\"\nval o = object { val name = \"obj\"; fun f() = name }\no.f()",
+            // resolved to the property, not to the parameter, by the initializer
+            "val name = \"s\"\nclass U(val name: String) { val upper = name.uppercase() }\nU(\"a\").upper + name"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        val errorLines = results.map { result ->
+            (result as? ScriptResult.Error)?.message?.lines()?.filter { it.startsWith("script.kts:") }?.map { it.substringBefore(": error") }
+        }
+        assert(errorLines == listOf(
+            listOf("script.kts:3:32"),
+            listOf("script.kts:2:59"),
+            listOf("script.kts:2:46"),
+            listOf("script.kts:2:41")
+        ))
+    }
+
+    @Test
+    fun `should hint at labels of receivers of properties of script body referred to instead of their members`() = runTest {
+        // given
+        val scripts = listOf(
+            "val length = 7\nbuildString { append(length) }",
+            "val name = \"script\"\ndata class User(val name: String)\nfun User.describe() = \"user \" + name\nUser(\"alice\").describe()",
+            "open class Base { val name = \"base\" }\nval name = \"script\"\nclass Derived : Base() { fun f() = name }\nDerived().f()",
+            "val length = 7\nval f: String.() -> Int = { length }\n\"abc\".f()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        val hints = results.map { result -> (result as? ScriptResult.Error)?.message?.lines()?.filter { "hint:" in it }?.map { it.trim() } }
+        assert(hints == listOf(
+            listOf("hint: rename the property, or qualify the member with the label of its receiver, like 'this@buildString.length'."),
+            listOf("hint: rename the property, or qualify the member with the label of its receiver, like 'this@describe.name'."),
+            listOf("hint: rename the property, or qualify the member with the label of its receiver, like 'this@Derived.name'."),
+            listOf("hint: rename the property, or qualify the member with the label of its receiver, like 'this@label.length'.")
+        ))
+    }
+
+    @Test
+    fun `should keep loop variables, implicit declarations and types named like properties of script body`() = runTest {
+        // given
+        val scripts = listOf(
+            "val i = 10\nlistOf(1).map { var s = 0; for (i in 1..3) { s += i }; s }",
+            "val k = 1\nval m = mapOf(2 to 3)\nm.map { var s = 0; for ((k, v) in m) s += k + v; s }",
+            "val it = 5\nlistOf(1, 2).map { it }",
+            "val field = 1\nclass A { var x = 0; set(v) { field = v } }\nA().apply { x = 3 }.x",
+            "val T = 1\nclass Box<T>(val x: T)\nBox(T).x",
+            "val String = 1\nlistOf<Any>(\"a\").map { (it as String).length + String }",
+            "val name = \"script\"\nval other = 1\nclass A { context(name: String) fun f() = name + other }\nwith(\"ctx\") { A().f() }"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(
+            listOf(6), listOf(5), listOf(1, 2), 3, 1, listOf(2), "ctx1"
+        ))
+    }
+
+    @Test
+    fun `should keep property of script body named with special characters referred to within receiver`() = runTest {
+        // given
+        val script = """
+            val `a${'$'}b"c` = "s"
+            listOf(1).map { `a${'$'}b"c` }
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == listOf("s"))
+        }
+    }
+
+    @Test
+    fun `should keep many properties of script body referred to within receivers`() = runTest {
+        // given
+        val script = (1..150).joinToString(separator = "\n") { "val p$it = $it\nval r$it = run { p$it }" } + "\nr150"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 150)
+        }
+    }
+
+    @Test
+    fun `should keep property of script body shadowing dependency referred to within receiver`() = runTest {
+        // given
+        val script = """
+            val name = "script"
+            "abc".run { name }
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("name", "dependency")))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "script")
+        }
+    }
+
 }
