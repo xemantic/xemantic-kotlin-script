@@ -33,6 +33,7 @@ import org.jetbrains.kotlin.compiler.plugin.ExperimentalCompilerApi
 import org.jetbrains.kotlin.config.CompilerConfiguration
 import org.jetbrains.kotlin.lexer.KotlinLexer
 import org.jetbrains.kotlin.lexer.KtTokens
+import org.jetbrains.kotlin.load.java.JvmAbi
 import org.jetbrains.kotlin.psi.KtAnnotation
 import org.jetbrains.kotlin.psi.KtAnnotationEntry
 import org.jetbrains.kotlin.psi.KtArrayAccessExpression
@@ -52,8 +53,10 @@ import org.jetbrains.kotlin.psi.KtElement
 import org.jetbrains.kotlin.psi.KtEnumEntry
 import org.jetbrains.kotlin.psi.KtEscapeStringTemplateEntry
 import org.jetbrains.kotlin.psi.KtExpression
+import org.jetbrains.kotlin.psi.KtFile
 import org.jetbrains.kotlin.psi.KtForExpression
 import org.jetbrains.kotlin.psi.KtLabelReferenceExpression
+import org.jetbrains.kotlin.psi.KtLiteralStringTemplateEntry
 import org.jetbrains.kotlin.psi.KtNamedDeclaration
 import org.jetbrains.kotlin.psi.KtNamedFunction
 import org.jetbrains.kotlin.psi.KtObjectDeclaration
@@ -64,6 +67,7 @@ import org.jetbrains.kotlin.psi.KtProperty
 import org.jetbrains.kotlin.psi.KtPropertyDelegate
 import org.jetbrains.kotlin.psi.KtPropertyAccessor
 import org.jetbrains.kotlin.psi.KtPsiFactory
+import org.jetbrains.kotlin.psi.KtScript
 import org.jetbrains.kotlin.psi.KtSimpleNameExpression
 import org.jetbrains.kotlin.psi.KtStringTemplateEntryWithExpression
 import org.jetbrains.kotlin.psi.KtStringTemplateExpression
@@ -76,6 +80,7 @@ import org.jetbrains.kotlin.psi.KtValueArgumentName
 import org.jetbrains.kotlin.psi.KtWhenExpression
 import org.jetbrains.kotlin.psi.psiUtil.allChildren
 import org.jetbrains.kotlin.psi.psiUtil.collectDescendantsOfType
+import org.jetbrains.kotlin.psi.psiUtil.containingClassOrObject
 import org.jetbrains.kotlin.psi.psiUtil.endOffset
 import org.jetbrains.kotlin.psi.psiUtil.getReceiverExpression
 import org.jetbrains.kotlin.psi.psiUtil.forEachDescendantOfType
@@ -336,6 +341,9 @@ internal class ScriptSource(
 
     private val bodyDeclarations: List<Declaration>
 
+    /** The accessors of the properties, which might be in a stack trace, by their JVM names. */
+    private val propertyAccessors: Map<String, List<PropertyAccessor>>
+
     init {
         val lineBounds = lineBounds(script)
         lineStarts = lineBounds.map { it.first }
@@ -343,6 +351,7 @@ internal class ScriptSource(
         // the parser recognizes only `\n` as a line terminator, replacing each character keeps the offsets
         val structure = ScriptStructure(
             script.replace('\r', '\n'),
+            lineStarts,
             dependencies.mapTo(HashSet()) { it.name },
             confirming,
             shadowedFunctionCopies,
@@ -372,6 +381,7 @@ internal class ScriptSource(
             reference.toScriptReference() to script.substring(reference.second).split(lineBreak).joinToString("")
         }
         bodyDeclarations = structure.bodyDeclarations
+        propertyAccessors = structure.propertyAccessors.groupBy { it.jvmName }
         val deprecatedDependencies = if (confirming) {
             laterDeclaredDependencyCandidates.mapTo(HashSet()) { it.reference.name }
         } else {
@@ -581,6 +591,26 @@ internal class ScriptSource(
         position(it.start).line to it.kind
     }
 
+    /**
+     * The name of the accessor of the JVM [method], like `<get-x>` of `getX`, as Kotlin names it,
+     * if it is the method name of an accessor of a property of the [owner] declared at the 0-based [line],
+     * unlike a function of this name, or `null`.
+     *
+     * @param owner the binary name of the class declaring the method within the script class or the script block,
+     *   like `A$N`, or `f$L` of a local class of the function `f`, or empty for the script class.
+     */
+    fun accessorName(
+        method: String,
+        owner: String,
+        line: Int
+    ): String? {
+        // like `1` of a class declared in a lambda
+        val path = owner.split('$').filter { part -> part.isNotEmpty() && !part.all { it.isDigit() } }
+        return propertyAccessors[method]?.find { accessor ->
+            line in accessor.lines && (accessor.ownerPath?.equals(path) ?: (accessor.ownerClass == path.lastOrNull()))
+        }?.name
+    }
+
     private fun position(
         offset: Int
     ): ScriptPosition {
@@ -689,6 +719,91 @@ private fun KtNamedDeclaration.pathName(): String? =
 
 private fun KtDeclaration.memberOnlyAnnotationEntries(): List<KtAnnotationEntry> = annotationEntries.filter {
     it.useSiteTarget != null || it.shortName?.asString() in memberOnlyAnnotations
+}
+
+/** An accessor of a property, which might be in a stack trace, see [ScriptSource.accessorName]. */
+private class PropertyAccessor(
+    /** Like `<get-x>`. */
+    val name: String,
+    /**
+     * The names of the declarations containing the property, like `A`, `N` of `A.N`, or `f`, `L` of a local class of the function `f`,
+     * as they qualify the binary name of its class, empty for the script class,
+     * or `null`, if they qualify it otherwise, like an object literal, or a class in the initializer of a property.
+     */
+    val ownerPath: List<String>?,
+    /** The class declaring the property, if its [ownerPath] is unknown, as long as no other class of the script is named like it. */
+    val ownerClass: String?,
+    val jvmName: String,
+    /** The 0-based lines of the accessor, or of the whole property for a default accessor. */
+    val lines: IntRange
+)
+
+/**
+ * The accessors of the property, which might be in a stack trace, having a body, or delegating, or checking the initialization of a `lateinit` property,
+ * named like `getX` and `setX` of `x`, or `isOn` and `setOn` of `isOn`, or with `@JvmName`, also as `@get:JvmName`.
+ * The bridges, like of a generic getter, the synthetic accessors, like `access$getX`, and the names of the internal accessors,
+ * suffixed with the module name, are not recognized.
+ */
+private fun KtProperty.accessors(
+    lineOf: (offset: Int) -> Int,
+    uniqueClassNames: Set<String>
+): List<PropertyAccessor> {
+    val name = name ?: return emptyList()
+    val container = containingClassOrObject
+    // the members of an object literal are reported like the lambdas
+    if (container is KtObjectDeclaration && container.isObjectLiteral()) return emptyList()
+    val ownerPath = ownerPath()
+    val ownerClass = if (ownerPath == null) container?.pathName()?.takeIf { it in uniqueClassNames } ?: return emptyList() else null
+    fun accessor(
+        getter: Boolean,
+        range: IntRange?
+    ): PropertyAccessor? {
+        if (range == null) return null
+        val target = if (getter) "get" else "set"
+        val annotations = (if (getter) this.getter else setter)?.annotationEntries.orEmpty() +
+                annotationEntries.filter { it.useSiteTarget?.text == target }
+        val jvmName = annotations.filter { it.shortName?.asString() == "JvmName" }.firstNotNullOfOrNull { annotation ->
+            (annotation.valueArguments.firstOrNull()?.getArgumentExpression() as? KtStringTemplateExpression)?.entries?.takeIf { entries ->
+                entries.all { it is KtLiteralStringTemplateEntry || it is KtEscapeStringTemplateEntry }
+            }?.joinToString("") { (it as? KtEscapeStringTemplateEntry)?.unescapedValue ?: it.text }
+        } ?: if (getter) JvmAbi.getterName(name) else JvmAbi.setterName(name)
+        return PropertyAccessor("<$target-$name>", ownerPath, ownerClass, jvmName, lineOf(range.first)..lineOf(range.last))
+    }
+    val whole = startOffset until endOffset
+    return listOfNotNull(
+        accessor(
+            getter = true,
+            range = getter?.takeIf { it.hasBody() }?.let { it.startOffset until it.endOffset }
+                ?: whole.takeIf { hasDelegate() || hasModifier(KtTokens.LATEINIT_KEYWORD) }
+        ),
+        accessor(
+            getter = false,
+            range = setter?.takeIf { it.hasBody() }?.let { it.startOffset until it.endOffset }
+                ?: whole.takeIf { hasDelegate() && isVar }
+        )
+    )
+}
+
+/** See [PropertyAccessor.ownerPath], skipping the lambdas, which add the numbers to the binary name. */
+private fun KtProperty.ownerPath(): List<String>? {
+    val path = mutableListOf<String>()
+    var accessed: KtProperty? = null
+    for (element in parents) {
+        when {
+            element is KtScript || element is KtFile -> break
+            element === accessed -> {}
+            element is KtObjectDeclaration && element.isObjectLiteral() -> return null
+            element is KtClassOrObject -> path += element.pathName() ?: return null
+            element is KtNamedFunction -> path += element.name ?: return null
+            // like `g` of `_$g$L` of a local class of the getter of `g`
+            element is KtPropertyAccessor -> {
+                accessed = element.property
+                path += element.property.name ?: return null
+            }
+            element is KtProperty -> return null
+        }
+    }
+    return path.asReversed()
 }
 
 /**
@@ -1080,6 +1195,8 @@ private class DeclaredNames {
  */
 private class ScriptStructure(
     private val script: String,
+    /** The offsets of the lines of the script, see [ScriptSource.accessorName]. */
+    lineStarts: List<Int>,
     dependencyNames: Set<String>,
     /** Whether to compute the copies of the declarations, see [ScriptSource.confirming]. */
     confirming: Boolean,
@@ -1136,6 +1253,9 @@ private class ScriptStructure(
     /** See [ScriptSource.stringLiterals]. */
     val stringLiterals: List<String>
 
+    /** See [ScriptSource.accessorName]. */
+    val propertyAccessors: List<PropertyAccessor>
+
     /** The names and the ranges of the [ScriptSource.scriptMemberCallableReferences]. */
     val scriptMemberCallableReferences: List<Pair<String, IntRange>>
 
@@ -1177,6 +1297,11 @@ private class ScriptStructure(
                     else -> entry.text
                 }
             }
+        }
+        val uniqueClassNames = file.collectDescendantsOfType<KtClassOrObject>().mapNotNull { it.pathName() }
+            .groupingBy { it }.eachCount().filterValues { it == 1 }.keys
+        propertyAccessors = file.collectDescendantsOfType<KtProperty>().flatMap { property ->
+            property.accessors({ lineOf(lineStarts, it) }, uniqueClassNames)
         }
         headerEnd = listOfNotNull(
             file.firstChild?.takeIf { it.node.elementType == KtTokens.SHEBANG_COMMENT },

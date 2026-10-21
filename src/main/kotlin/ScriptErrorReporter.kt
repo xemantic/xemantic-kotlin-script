@@ -314,7 +314,7 @@ internal class ScriptErrorReporter(
             }
             when {
                 scriptLine != null -> Frame(
-                    location = "${element.functionName()}(script.kts:${scriptLine + 1})",
+                    location = "${element.functionName(scriptLine)}(script.kts:${scriptLine + 1})",
                     sourceLine = source.scriptLines[scriptLine]
                 )
                 // like a static initializer of an object declared in the script
@@ -348,9 +348,12 @@ internal class ScriptErrorReporter(
 
     /**
      * The name of the function of this script frame, in terms of the script,
-     * e.g. `Checker.check`, `<script body>` or `<lambda>`.
+     * e.g. `Checker.check`, `<script body>`, `<lambda>` or `<get-x>` of a property accessor,
+     * the accessors told by the 0-based [scriptLine] of the frame, if any.
      */
-    private fun StackTraceElement.functionName(): String {
+    private fun StackTraceElement.functionName(
+        scriptLine: Int? = null
+    ): String {
         val owner = when {
             className == blockClassName || className == scriptClassName -> ""
             blockClassName != null && className.startsWith("$blockClassName$") ->
@@ -369,8 +372,13 @@ internal class ScriptErrorReporter(
         return when {
             isLambda || (type != null && type.all { it.isDigit() }) -> "<lambda>"
             type == null && className == blockClassName && methodParts == listOf("invokeSuspend") -> "<script body>"
-            type == null -> methodParts.last()
-            else -> "$type.${methodParts.last()}"
+            else -> {
+                // the local functions of an accessor are named after it, like `getX$inner`
+                val function = scriptLine?.takeIf { methodParts.size == 1 }?.let { line ->
+                    this@ScriptErrorReporter.source.accessorName(methodParts.single(), owner, line)
+                } ?: methodParts.last()
+                if (type == null) function else "$type.$function"
+            }
         }
     }
 
