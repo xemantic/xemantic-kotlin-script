@@ -80,13 +80,16 @@ public class ScriptBody internal constructor(
     internal val block: suspend CoroutineScope.() -> Any?
 )
 
+/** The default of the `maxConcurrentCompilations` of the `ScriptExecutor(...)` factory function. */
+internal fun defaultMaxConcurrentCompilations(): Int = Runtime.getRuntime().availableProcessors()
+
 /**
  * The default [ScriptExecutor], see the `ScriptExecutor(...)` factory function for the parameters.
  */
 internal class DefaultScriptExecutor(
     private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
     compilationCacheSize: Int = 0,
-    maxConcurrentCompilations: Int = Runtime.getRuntime().availableProcessors(),
+    maxConcurrentCompilations: Int = defaultMaxConcurrentCompilations(),
     /** Replaced only by the tests of the internal failures of the compiler. */
     compiler: JvmScriptCompiler = JvmScriptCompiler()
 ) : ScriptExecutor {
@@ -448,10 +451,11 @@ internal class DefaultScriptExecutor(
         private suspend fun compile(
             source: ScriptSource
         ): ResultWithDiagnostics<CompiledScript> {
-            @OptIn(ExperimentalAtomicApi::class)
-            compilations.incrementAndFetch()
             val result = try {
                 compilationPermits.withPermit {
+                    // not counting the callers cancelled while waiting for the permit
+                    @OptIn(ExperimentalAtomicApi::class)
+                    compilations.incrementAndFetch()
                     scriptingHost.compiler(
                         script = source,
                         scriptCompilationConfiguration = compilationConfig()
@@ -626,7 +630,7 @@ private suspend fun Throwable.rethrowIfCancelledOrFatal() {
  * see [rethrowIfCancelledOrFatal], if any.
  */
 private fun Throwable.fatalCause(): Throwable? = generateSequence(this) { exception ->
-    read(null) { cause }?.takeUnless { it === exception }
+    exception.read(null) { cause }?.takeUnless { it === exception }
 }.take(MAX_FATAL_CAUSE_DEPTH).firstOrNull {
     it is VirtualMachineError && it !is StackOverflowError
 }

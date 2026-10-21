@@ -2546,6 +2546,30 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should not report VirtualMachineError causing the cause of the exception reported by the compiler as compilation error`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            compiler = FakeCompiler {
+                ResultWithDiagnostics.Failure(
+                    ScriptDiagnostic(
+                        code = ScriptDiagnostic.unspecifiedError,
+                        message = "Could not read file",
+                        exception = RuntimeException(
+                            IllegalStateException("Could not read file", OutOfMemoryError("Java heap space"))
+                        )
+                    )
+                )
+            }
+        )
+
+        // when
+        val failure = runCatching { executor.execute("42") }.exceptionOrNull()
+
+        // then
+        assert(failure is OutOfMemoryError && failure.message == "Java heap space")
+    }
+
+    @Test
     @OptIn(ExperimentalCoroutinesApi::class)
     fun `should bound the number of concurrent compilations`() = runTest {
         // given
@@ -2611,11 +2635,78 @@ class ScriptExecutorTest {
         // when
         val other = async { executor.execute("2") }
         runCurrent()
-
-        // then
-        assert(active == 2)
+        val activeWithWaiter = active
         compiled.complete(Unit)
         listOf(owner, waiter, other).awaitAll()
+
+        // then
+        assert(activeWithWaiter == 2)
+        assert(executor.compilationCount == 2)
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun `should not compile for the caller cancelled while waiting for a compilation permit`() = runTest {
+        // given
+        val compiled = CompletableDeferred<Unit>()
+        val executor = DefaultScriptExecutor(
+            dispatcher = StandardTestDispatcher(testScheduler),
+            maxConcurrentCompilations = 1,
+            compiler = FakeCompiler {
+                compiled.await()
+                ResultWithDiagnostics.Failure(ScriptDiagnostic(ScriptDiagnostic.unspecifiedError, "not compiled"))
+            }
+        )
+        val compiling = async { executor.execute("1") }
+        runCurrent()
+        val queued = launch { executor.execute("2") }
+        runCurrent()
+
+        // when
+        queued.cancelAndJoin()
+        compiled.complete(Unit)
+        val compilingResult = compiling.await()
+        val laterResult = executor.execute("3")
+
+        // then
+        assert(queued.isCancelled)
+        assert(compilingResult is ScriptResult.Error && compilingResult.phase == ExecutionPhase.COMPILATION)
+        assert(laterResult is ScriptResult.Error && laterResult.phase == ExecutionPhase.COMPILATION)
+        // the cancelled caller never invoked the compiler
+        assert(executor.compilationCount == 2)
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun `should compile again for the waiting caller when the caching owner is cancelled while waiting for a permit`() = runTest {
+        // given
+        val compiled = CompletableDeferred<Unit>()
+        val executor = DefaultScriptExecutor(
+            dispatcher = StandardTestDispatcher(testScheduler),
+            compilationCacheSize = 10,
+            maxConcurrentCompilations = 1,
+            compiler = FakeCompiler {
+                compiled.await()
+                ResultWithDiagnostics.Failure(ScriptDiagnostic(ScriptDiagnostic.unspecifiedError, "not compiled"))
+            }
+        )
+        val compiling = async { executor.execute("1") }
+        runCurrent()
+        val owner = launch { executor.execute("2") }
+        runCurrent()
+        val waiter = async { executor.execute("2") }
+        runCurrent()
+
+        // when
+        owner.cancelAndJoin()
+        compiled.complete(Unit)
+        val compilingResult = compiling.await()
+        val waiterResult = waiter.await()
+
+        // then
+        assert(owner.isCancelled)
+        assert(compilingResult is ScriptResult.Error && compilingResult.phase == ExecutionPhase.COMPILATION)
+        assert(waiterResult is ScriptResult.Error && waiterResult.phase == ExecutionPhase.COMPILATION)
         assert(executor.compilationCount == 2)
     }
 

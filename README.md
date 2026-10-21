@@ -86,6 +86,11 @@ when (result) {
   with `ScriptExecutor(compilationCacheSize = ...)`, keeping that many compiled scripts, the least recently used evicted first.
   A compiled script is reused when the script text, and the names and types of the dependencies are the same,
   while the dependency values might differ.
+* The invocations of the compiler running at the same time are bounded by `ScriptExecutor(maxConcurrentCompilations = ...)`,
+  the number of the available processors by default,
+  while the other compilations of the same executor wait for their turn.
+  Each invocation loads the whole classpath, so lower it when the heap is small,
+  otherwise the concurrent compilations might fail with `OutOfMemoryError`, which is thrown, not reported as an error of the script.
 * The value of the last expression of the script becomes `ScriptResult.Value.value`, or `Unit` if there is none.
 * The script is compiled against the whole classpath of the current context,
   so any class available to the host application can be imported by the script.

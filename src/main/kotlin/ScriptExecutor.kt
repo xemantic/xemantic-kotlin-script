@@ -121,20 +121,35 @@ public interface ScriptExecutor {
  *   A script which failed to compile is not cached,
  *   unlike a compiled one, which might still be reported as a [ExecutionPhase.COMPILATION] error every time,
  *   e.g. for referring to a dependency before the declaration of the same name.
- * @param maxConcurrentCompilations the maximal number of scripts compiled at the same time,
- *   the number of the available processors by default, must be positive.
- *   As each compilation loads the whole classpath, lower it when the heap is small,
- *   otherwise the concurrent compilations might exhaust it, failing with [OutOfMemoryError].
+ * @param maxConcurrentCompilations the maximal number of the invocations of the compiler running at the same time
+ *   in this executor, the number of the available processors by default, must be positive.
+ *   A script might invoke the compiler more than once, e.g. to confirm the references to the dependencies,
+ *   which take turns with the invocations for other scripts.
+ *   As each invocation loads the whole classpath, lower it when the heap is small,
+ *   otherwise the concurrent invocations might exhaust it, failing with [OutOfMemoryError].
  *   The callers waiting for the same script compiled by another one, see [compilationCacheSize], are not counted.
  */
 public fun ScriptExecutor(
     dispatcher: CoroutineDispatcher = Dispatchers.IO,
     compilationCacheSize: Int = 0,
-    maxConcurrentCompilations: Int = Runtime.getRuntime().availableProcessors()
+    maxConcurrentCompilations: Int = defaultMaxConcurrentCompilations()
 ): ScriptExecutor = DefaultScriptExecutor(
     dispatcher,
     compilationCacheSize,
     maxConcurrentCompilations
+)
+
+/** Kept for the binary compatibility with the clients compiled against 0.1.0. */
+@Deprecated(
+    "Kept for the binary compatibility",
+    level = DeprecationLevel.HIDDEN
+)
+public fun ScriptExecutor(
+    dispatcher: CoroutineDispatcher = Dispatchers.IO,
+    compilationCacheSize: Int = 0
+): ScriptExecutor = ScriptExecutor(
+    dispatcher = dispatcher,
+    compilationCacheSize = compilationCacheSize
 )
 
 /**
