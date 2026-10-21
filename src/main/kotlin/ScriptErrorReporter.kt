@@ -34,11 +34,22 @@ private val unresolvedReference = Regex("Unresolved reference '(.+)'\\.")
 /** Reported without a location, e.g. for an object accessing the dependencies, which are the members of the script class. */
 private val declarationCapturingScript = Regex("(Object|Enum class|Interface|Nested class) '(.+)' captures the script class instance\\..*")
 
-internal fun Iterable<ScriptDiagnostic>.filterNonIgnorable() = filterNot { diagnostic ->
-    diagnostic.severity == ScriptDiagnostic.Severity.DEBUG && listOf(
-        "Using JDK home inferred from java.home",
-        "Loading modules:"
-    ).any { diagnostic.message.startsWith(it) }
+/**
+ * The diagnostics without the ignorable ones, and without the warnings located in the code generated in the [source],
+ * like the redundant projection, or the deprecation, of the type of a dependency accessor, which the script cannot change,
+ * while the errors located there are still reported, e.g. of the type of a dependency requiring an opt-in.
+ */
+internal fun Iterable<ScriptDiagnostic>.filterNonIgnorable(
+    source: ScriptSource
+) = filterNot { diagnostic ->
+    when (diagnostic.severity) {
+        ScriptDiagnostic.Severity.DEBUG -> listOf(
+            "Using JDK home inferred from java.home",
+            "Loading modules:"
+        ).any { diagnostic.message.startsWith(it) }
+        ScriptDiagnostic.Severity.WARNING -> diagnostic.location?.let { source.isGeneratedLine(it.start.line) } == true
+        else -> false
+    }
 }
 
 /**

@@ -503,6 +503,14 @@ internal class ScriptSource(
     ): String? = preambleDependencies[line - 1]
 
     /**
+     * Whether the 1-based [line] of the [text] is generated, like the accessor of a dependency or the lines of the script block,
+     * so the script cannot change it, unlike the lines of the header and of the declarations moved out of the script body.
+     */
+    fun isGeneratedLine(
+        line: Int
+    ): Boolean = line - 1 in lineMapping.indices && lineMapping[line - 1] == null
+
+    /**
      * The name of the declaration moved out of the script body, which contains the [position].
      */
     fun movedDeclarationAt(
