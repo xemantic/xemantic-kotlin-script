@@ -2577,6 +2577,359 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report frame of property getter by the property name`() = runTest {
+        // given
+        val script = """
+            val g: Int get() = error("boom")
+            g
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: boom
+                  at <get-g>(script.kts:1)
+                  | val g: Int get() = error("boom")
+                  at <script body>(script.kts:2)
+                  | g
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frame of property setter by the property name`() = runTest {
+        // given
+        val script = """
+            var s: Int
+                get() = 0
+                set(value) { error("cannot set ${'$'}value") }
+            s = 42
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: cannot set 42
+                  at <set-s>(script.kts:3)
+                  |     set(value) { error("cannot set ${'$'}value") }
+                  at <script body>(script.kts:4)
+                  | s = 42
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frames of accessors of boolean property named with is prefix by the property name`() = runTest {
+        // given
+        val script = """
+            var isOn: Boolean
+                get() = error("cannot get")
+                set(value) { isOn }
+            isOn = true
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: cannot get
+                  at <get-isOn>(script.kts:2)
+                  |     get() = error("cannot get")
+                  at <set-isOn>(script.kts:3)
+                  |     set(value) { isOn }
+                  at <script body>(script.kts:4)
+                  | isOn = true
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frame of extension property getter by the property name`() = runTest {
+        // given
+        val script = """
+            val String.shout: String get() = error("cannot shout ${'$'}this")
+            "hello".shout
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: cannot shout hello
+                  at <get-shout>(script.kts:1)
+                  | val String.shout: String get() = error("cannot shout ${'$'}this")
+                  at <script body>(script.kts:2)
+                  | "hello".shout
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frame of class member property getter by the class and the property name`() = runTest {
+        // given
+        val script = """
+            class Foo {
+                val x: Int get() = error("no x")
+            }
+            Foo().x
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: no x
+                  at Foo.<get-x>(script.kts:2)
+                  |     val x: Int get() = error("no x")
+                  at <script body>(script.kts:4)
+                  | Foo().x
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frame of delegated property getter by the property name and of the delegate by its function`() = runTest {
+        // given
+        val script = """
+            class Boom {
+                operator fun getValue(thisRef: Any?, property: Any?): Int = error("boom")
+            }
+            class Foo {
+                val x by Boom()
+            }
+            Foo().x
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: boom
+                  at Boom.getValue(script.kts:2)
+                  |     operator fun getValue(thisRef: Any?, property: Any?): Int = error("boom")
+                  at Foo.<get-x>(script.kts:5)
+                  |     val x by Boom()
+                  at <script body>(script.kts:7)
+                  | Foo().x
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frame of property getter with JVM name by the property name`() = runTest {
+        // given
+        val script = """
+            class Foo {
+                val x: Int
+                    @JvmName("fetchX") get() = error("no x")
+            }
+            Foo().x
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: no x
+                  at Foo.<get-x>(script.kts:3)
+                  |         @JvmName("fetchX") get() = error("no x")
+                  at <script body>(script.kts:5)
+                  | Foo().x
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frame of function named like property getter by the function name`() = runTest {
+        // given
+        val script = """
+            val g: Int get() = 1
+            fun getG(times: Int): Int = error("boom ${'$'}times")
+            getG(g)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: boom 1
+                  at getG(script.kts:2)
+                  | fun getG(times: Int): Int = error("boom ${'$'}times")
+                  at <script body>(script.kts:3)
+                  | getG(g)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frame of member function named like getter of property of another class in the same line by the function name`() = runTest {
+        // given
+        val script = """
+            class P { val x: Int get() = 1 }; class Q { val y: Int get() = 2; fun getX(): Int = error("boom") }
+            Q().getX()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: boom
+                  at Q.getX(script.kts:1)
+                  | class P { val x: Int get() = 1 }; class Q { val y: Int get() = 2; fun getX(): Int = error("boom") }
+                  at <script body>(script.kts:2)
+                  | Q().getX()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frame of function of nested class named like getter of property of nested class of the same name by the function name`() = runTest {
+        // given
+        val script = """
+            class A { class N { val x: Int get() = 1 } }; class B { class N { fun getX(): Int = error("boom") } }
+            B.N().getX()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: boom
+                  at N.getX(script.kts:1)
+                  | class A { class N { val x: Int get() = 1 } }; class B { class N { fun getX(): Int = error("boom") } }
+                  at <script body>(script.kts:2)
+                  | B.N().getX()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frame of function of local class named like getter of property of local class of the same name by the function name`() = runTest {
+        // given
+        val script = """
+            fun a() { class L { val x: Int get() = 1 } }; fun b(): Int { class L { fun getX(): Int = error("boom") }; return L().getX() }
+            b()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: boom
+                  at L.getX(script.kts:1)
+                  | fun a() { class L { val x: Int get() = 1 } }; fun b(): Int { class L { fun getX(): Int = error("boom") }; return L().getX() }
+                  at b(script.kts:1)
+                  | fun a() { class L { val x: Int get() = 1 } }; fun b(): Int { class L { fun getX(): Int = error("boom") }; return L().getX() }
+                  at <script body>(script.kts:2)
+                  | b()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frames of functions named like property getter called by the getter by the function names`() = runTest {
+        // given
+        val script = """
+            val g: Int get() { class L { fun getG(): Int = error("boom") }; return L().getG() }
+            val x: Int get() = C().getX(); class C { fun getX(): Int = g }
+            x
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: boom
+                  at L.getG(script.kts:1)
+                  | val g: Int get() { class L { fun getG(): Int = error("boom") }; return L().getG() }
+                  at <get-g>(script.kts:1)
+                  | val g: Int get() { class L { fun getG(): Int = error("boom") }; return L().getG() }
+                  at C.getX(script.kts:2)
+                  | val x: Int get() = C().getX(); class C { fun getX(): Int = g }
+                  at <get-x>(script.kts:2)
+                  | val x: Int get() = C().getX(); class C { fun getX(): Int = g }
+                  at <script body>(script.kts:3)
+                  | x
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frame of uninitialized lateinit property getter by the property name`() = runTest {
+        // given
+        val script = """
+            class Foo { lateinit var x: String }
+            Foo().x
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            // the first frame is the one of the standard library throwing the exception
+            assert(message.endsWith("""
+                  at Foo.<get-x>(script.kts:1)
+                  | class Foo { lateinit var x: String }
+                  at <script body>(script.kts:2)
+                  | Foo().x
+            """.trimIndent().prependIndent("  ")))
+        }
+    }
+
+    @Test
     fun `should use class declared later in the script`() = runTest {
         // given
         val script = """
