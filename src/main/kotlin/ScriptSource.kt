@@ -373,6 +373,11 @@ internal class ScriptSource(
         movedDeclarations.forEach { excluded.fill(true, it.start, it.end) }
         structure.blankedRanges.forEach { excluded.fill(true, it.first, it.last + 1) }
         val movedExcluded = BooleanArray(script.length)
+        // the comment runs to the end of the script, like in a regular script
+        structure.unterminatedComment?.let {
+            excluded.fill(true, it, script.length)
+            movedExcluded.fill(true, it, script.length)
+        }
         structure.movedBlankedRanges.forEach { movedExcluded.fill(true, it.first, it.last + 1) }
 
         val headerEnd = structure.headerEnd
@@ -1014,6 +1019,9 @@ private class ScriptStructure(
 
     val unmatchedClosingBrace: Int? = unmatchedClosingBrace(script)
 
+    /** The start of the block comment ending the script unterminated, which would swallow the closing of the script block. */
+    val unterminatedComment: Int? = unterminatedComment(script)
+
     val movedDeclarations: List<Declaration>
 
     val bodyDeclarations: List<Declaration>
@@ -1645,4 +1653,23 @@ private fun unmatchedClosingBrace(
         }
         lexer.advance()
     }
+}
+
+/**
+ * The offset of the block comment, or the KDoc, ending the [script] unterminated, also when it closes only a nested comment,
+ * recognized as the comment token extending also over a line appended to the script.
+ */
+private fun unterminatedComment(
+    script: String
+): Int? {
+    val lexer = KotlinLexer()
+    lexer.start(script)
+    var last: Int? = null
+    while (lexer.tokenType != null) {
+        last = lexer.tokenStart.takeIf { lexer.tokenType == KtTokens.BLOCK_COMMENT || lexer.tokenType == KtTokens.DOC_COMMENT }
+        lexer.advance()
+    }
+    if (last == null) return null
+    lexer.start(script.substring(last) + "\n")
+    return last.takeIf { lexer.tokenEnd == lexer.bufferEnd }
 }

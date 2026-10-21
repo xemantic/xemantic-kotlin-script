@@ -2212,6 +2212,24 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should end script with unterminated block comment like regular script`() = runTest {
+        // given
+        val scripts = listOf(
+            "val a = 2\n/* abc\na",
+            "val a = 2\na /** doc",
+            "val a = 2\na\n/* a /* b */ c",
+            "fun f() = 2\nf()\n/* abc"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(Unit, 2, 2, 2))
+    }
+
+    @Test
     fun `should call function declared later when its own names shadow local declarations of the script body`() = runTest {
         // given
         val script = """

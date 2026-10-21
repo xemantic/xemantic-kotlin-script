@@ -24,6 +24,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
+import org.jetbrains.kotlin.lexer.KotlinLexer
+import org.jetbrains.kotlin.lexer.KtTokens
 import kotlin.test.Test
 
 class ScriptSourceTest {
@@ -119,6 +121,35 @@ class ScriptSourceTest {
         assert(sources.none { '\uFEFF' in it.text || '\uFEFF' in it.scriptLines.first() })
         assert(sources.zip(scripts).all { (source, script) ->
             source.scriptLines.first() == script.lines().first().removePrefix("\uFEFF")
+        })
+    }
+
+    @Test
+    fun `should not let unterminated block comment ending script swallow closing of script block`() {
+        // given
+        val scripts = listOf(
+            "val a = 1\n/* abc\na",
+            "1 + 1\n/** doc",
+            "1 + 1\n/* a /* b */ c",
+            "fun f() = 3\nf() /* abc",
+            "fun f() = 3 /* abc",
+            "import kotlin.math.PI\n/* abc",
+            "/* abc"
+        )
+
+        // when
+        val sources = scripts.map { ScriptSource(it) }
+
+        // then
+        assert(sources.all { source ->
+            val lexer = KotlinLexer()
+            lexer.start(source.text)
+            var last = lexer.tokenType
+            while (lexer.tokenType != null) {
+                last = lexer.tokenType
+                lexer.advance()
+            }
+            last == KtTokens.RBRACE
         })
     }
 
