@@ -234,6 +234,9 @@ internal class DefaultScriptExecutor(
         /** Parsed only when not compiled already, as the cached compilation keeps it. */
         private lateinit var source: ScriptSource
 
+        /** Reporting the failures of the [source], once it is known. */
+        private val reporter by lazy { ScriptErrorReporter(source) }
+
         suspend fun handle(): ScriptResult {
             val compilation = try {
                 compile()
@@ -255,9 +258,8 @@ internal class DefaultScriptExecutor(
                 )
             }
             source = compilation.source
-            val compilationResult = compilation.result ?: return ScriptResult.Error(
-                ScriptErrorReporter(source).toSourceFailureMessage(),
-                ExecutionPhase.COMPILATION
+            val compilationResult = compilation.result ?: return compilationFailure(
+                reporter.toSourceFailureMessage()
             )
             if (
                 compilation.laterDeclaredDependencyReferences.isNotEmpty()
@@ -267,24 +269,21 @@ internal class DefaultScriptExecutor(
             ) {
                 val failureMessage = listOfNotNull(
                     compilation.coroutineScopeReferences.takeIf { it.isNotEmpty() }?.let {
-                        ScriptErrorReporter(source).toCoroutineScopeMessage(it)
+                        reporter.toCoroutineScopeMessage(it)
                     },
                     compilation.shadowedFunctionReferences.takeIf { it.isNotEmpty() }?.let {
-                        ScriptErrorReporter(source).toShadowedFunctionMessage(it)
+                        reporter.toShadowedFunctionMessage(it)
                     },
                     compilation.hiddenLocalFunctionReferences.takeIf { it.isNotEmpty() }?.let {
-                        ScriptErrorReporter(source).toHiddenLocalFunctionMessage(it)
+                        reporter.toHiddenLocalFunctionMessage(it)
                     },
                     compilation.laterDeclaredDependencyReferences.takeIf { it.isNotEmpty() }?.let {
-                        ScriptErrorReporter(source).toLaterDeclaredDependencyMessage(it)
+                        reporter.toLaterDeclaredDependencyMessage(it)
                     },
                     // explained by the reference to the dependency
-                    (compilationResult as? Failure)?.let { ScriptErrorReporter(source).toFailureMessage(it.reports.filterNonIgnorable()) }
+                    (compilationResult as? Failure)?.let { reporter.toFailureMessage(it.reports.filterNonIgnorable()) }
                 ).joinToString(separator = "\n\n")
-                logger.debug {
-                    "Script[$scriptId]: Compilation (1/2) failure message: $failureMessage"
-                }
-                return ScriptResult.Error(failureMessage, ExecutionPhase.COMPILATION)
+                return compilationFailure(failureMessage)
             }
             val result = when (compilationResult) {
                 is Success -> {
@@ -295,18 +294,21 @@ internal class DefaultScriptExecutor(
                         }
                     )
                 }
-                is Failure -> {
-                    val failureMessage = ScriptErrorReporter(source).toFailureMessage(
-                        compilationResult.reports.filterNonIgnorable()
-                    )
-                    logger.debug {
-                        "Script[$scriptId]: Compilation (1/2) failure message: $failureMessage"
-                    }
-                    ScriptResult.Error(failureMessage, ExecutionPhase.COMPILATION)
-                }
+                is Failure -> compilationFailure(
+                    reporter.toFailureMessage(compilationResult.reports.filterNonIgnorable())
+                )
             }
 
             return result
+        }
+
+        private fun compilationFailure(
+            failureMessage: String
+        ): ScriptResult.Error {
+            logger.debug {
+                "Script[$scriptId]: Compilation (1/2) failure message: $failureMessage"
+            }
+            return ScriptResult.Error(failureMessage, ExecutionPhase.COMPILATION)
         }
 
         private suspend fun compile(): Compilation {
@@ -508,7 +510,7 @@ internal class DefaultScriptExecutor(
                 }
                 is Failure -> {
                     // in practice, this never happens
-                    val failureMessage = ScriptErrorReporter(source).toFailureMessage(
+                    val failureMessage = reporter.toFailureMessage(
                         evaluationResult.reports.filterNonIgnorable()
                     )
                     ScriptResult.Error(failureMessage, ExecutionPhase.EVALUATION)
@@ -564,7 +566,7 @@ internal class DefaultScriptExecutor(
         private fun warningsMessage(
             warnings: List<ScriptDiagnostic>
         ): String? = if (warnings.isEmpty()) null else {
-            ScriptErrorReporter(source).toFailureMessage(warnings)
+            reporter.toFailureMessage(warnings)
         }
 
         private fun ResultValue.failure(
