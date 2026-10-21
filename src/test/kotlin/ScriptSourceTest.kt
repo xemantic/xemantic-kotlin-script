@@ -300,4 +300,69 @@ class ScriptSourceTest {
         assert(source.accessorName("fetchZ", owner = "", line = 4) == "<get-z>")
     }
 
+    @Test
+    fun `should find properties of the script referred to in range`() {
+        // given
+        val script = """
+            const val A = "a"
+            val (b, c) = "b" to "c"
+            val A = "redeclared"
+            @Suppress(A + b + A + c.length + B.c) fun f() = 1
+            class B { val b = 1; @Deprecated(b) fun g() = b }
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        assert(source.propertiesReferredIn(ScriptPosition(3, 10), ScriptPosition(3, 36)) == listOf("A" to 2, "b" to 1, "c" to 1))
+        assert(source.propertiesReferredIn(ScriptPosition(4, 33), ScriptPosition(4, 34)).isEmpty())
+    }
+
+    @Test
+    fun `should find properties of the script referred to in range at the lines of their names`() {
+        // given
+        val script = """
+            @Suppress("X")
+            val A = "a"
+            @Suppress(A)
+            val A = "redeclared"
+            @JvmName(A) fun f(A: String) = A
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        assert(source.propertiesReferredIn(ScriptPosition(2, 10), ScriptPosition(2, 11)) == listOf("A" to 1))
+        assert(source.propertiesReferredIn(ScriptPosition(4, 9), ScriptPosition(4, 10)) == listOf("A" to 3))
+        assert(source.propertiesReferredIn(ScriptPosition(4, 9), ScriptPosition(4, 10), excluded = setOf(ScriptPosition(4, 9))).isEmpty())
+    }
+
+    @Test
+    fun `should find properties of the script referred to in annotations not seeing parameters nor properties of companion objects`() {
+        // given
+        val script = """
+            const val MSG = "m"
+            annotation class Ann(val value: String)
+            fun f(@Suppress(MSG) MSG: String) = MSG
+            class C @Ann(MSG) constructor(val MSG: String)
+            class D { companion object { fun MSG() = 1 }; @Ann(MSG) fun g() = 1 }
+            class E { companion object { const val MSG = "e" }; @Ann(MSG) fun g() = 1 }
+            @Suppress("X")
+            val (p, q) = "p" to "q"
+            @Ann(q) fun h() = 1
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        assert(source.propertiesReferredIn(ScriptPosition(2, 16), ScriptPosition(2, 19)) == listOf("MSG" to 0))
+        assert(source.propertiesReferredIn(ScriptPosition(3, 13), ScriptPosition(3, 16)) == listOf("MSG" to 0))
+        assert(source.propertiesReferredIn(ScriptPosition(4, 51), ScriptPosition(4, 54)) == listOf("MSG" to 0))
+        assert(source.propertiesReferredIn(ScriptPosition(5, 57), ScriptPosition(5, 60)).isEmpty())
+        assert(source.propertiesReferredIn(ScriptPosition(8, 5), ScriptPosition(8, 6)) == listOf("q" to 7))
+    }
+
 }

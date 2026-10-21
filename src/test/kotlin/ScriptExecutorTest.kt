@@ -1993,6 +1993,220 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should hint that const val of the script body cannot be used as annotation argument`() = runTest {
+        // given
+        val script = """
+            const val MSG = "old"
+            @Deprecated(MSG) fun old() = 1
+            old()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:13: error: Annotation argument must be a compile-time constant.
+                  | @Deprecated(<error>MSG</error>) fun old() = 1
+                  hint: 'MSG' (line 1) is a property of the script body, which cannot be 'const', like a top-level property of a regular script - inline its value, or declare it as a 'const val' in an object, if it is a primitive or a string.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint that properties of the script body cannot be used in constant expressions of annotations`() = runTest {
+        // given
+        val script = """
+            val prefix = "do"
+            const val NAME = "run"
+            val UNUSED = "UNUSED_VARIABLE"
+            @JvmName(NAME) fun start() = prefix
+            @Suppress("A" + UNUSED) val x = 1
+            annotation class Tag(val value: String = NAME)
+            start()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:10: error: Only 'const val' can be used in constant expressions.
+                  | @JvmName(<error>NAME</error>) fun start() = prefix
+                  hint: 'NAME' (line 2) is a property of the script body, which cannot be 'const', like a top-level property of a regular script - inline its value, or declare it as a 'const val' in an object, if it is a primitive or a string.
+
+                script.kts:6:42: error: Default value of annotation parameter must be a compile-time constant.
+                  | annotation class Tag(val value: String = <error>NAME</error>)
+                  hint: 'NAME' (line 2) is a property of the script body, which cannot be 'const', like a top-level property of a regular script - inline its value, or declare it as a 'const val' in an object, if it is a primitive or a string.
+
+                script.kts:5:11: error: Annotation argument must be a compile-time constant.
+                  | @Suppress(<error>"A" + UNUSED</error>) val x = 1
+                  hint: 'UNUSED' (line 3) is a property of the script body, which cannot be 'const', like a top-level property of a regular script - inline its value, or declare it as a 'const val' in an object, if it is a primitive or a string.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not hint at property of the script body when annotation argument refers to member property of the same name`() = runTest {
+        // given
+        val script = """
+            const val MSG = "old"
+            class Legacy {
+                val MSG = "older"
+                @Deprecated(MSG) fun old() = 1
+            }
+            Legacy().old()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:17: error: Annotation argument must be a compile-time constant.
+                  |     @Deprecated(<error>MSG</error>) fun old() = 1
+
+                script.kts:6:10: warning: 'fun old(): Int' is deprecated.
+                  | Legacy().<error>old</error>()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not hint at property of the script body when annotation argument refers to const val of companion object`() = runTest {
+        // given
+        val script = """
+            val MSG = "s"
+            val suffix = "!"
+            class Legacy {
+                companion object { const val MSG = "old" }
+                @Deprecated(MSG + suffix) fun old() = 1
+            }
+            Legacy().old()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:5:17: error: Only 'const val' can be used in constant expressions.
+                  |     @Deprecated(<error>MSG + suffix</error>) fun old() = 1
+                  hint: 'suffix' (line 2) is a property of the script body, which cannot be 'const', like a top-level property of a regular script - inline its value, or declare it as a 'const val' in an object, if it is a primitive or a string.
+
+                script.kts:7:10: warning: 'fun old(): Int' is deprecated.
+                  | Legacy().<error>old</error>()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint at property of the script body named like parameter of function in annotation argument`() = runTest {
+        // given
+        val script = """
+            @Suppress("RedundantSuppression")
+            const val NAME = "run"
+            @JvmName(NAME) fun start(NAME: String) = NAME
+            start("x")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:10: error: Annotation argument must be a compile-time constant.
+                  | @JvmName(<error>NAME</error>) fun start(NAME: String) = NAME
+                  hint: 'NAME' (line 2) is a property of the script body, which cannot be 'const', like a top-level property of a regular script - inline its value, or declare it as a 'const val' in an object, if it is a primitive or a string.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not hint at property of the script body when annotation argument of object cannot refer to it`() = runTest {
+        // given
+        val script = """
+            val MSG = "s"
+            val suffix = "!"
+            object Legacy {
+                @Deprecated(MSG + suffix) fun old() = 1
+            }
+            Legacy.old()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:17: error: Unresolved reference 'MSG'.
+                  |     @Deprecated(<error>MSG</error> + suffix) fun old() = 1
+                  hint: 'Legacy' is compiled outside of the script body, where 'MSG' (line 1) is not visible - pass it as a parameter, or declare it within 'Legacy'.
+
+                script.kts:4:17: error: Annotation argument must be a compile-time constant.
+                  |     @Deprecated(<error>MSG + suffix</error>) fun old() = 1
+
+                script.kts:4:17: error: Argument type mismatch: actual type is 'CoroutineScope', but 'String' was expected.
+                  |     @Deprecated(<error>MSG + suffix</error>) fun old() = 1
+
+                script.kts:4:23: error: Unresolved reference 'suffix'.
+                  |     @Deprecated(MSG + <error>suffix</error>) fun old() = 1
+                  hint: 'Legacy' is compiled outside of the script body, where 'suffix' (line 2) is not visible - pass it as a parameter, or declare it within 'Legacy'.
+
+                script.kts:6:8: warning: 'fun old(): Int' is deprecated.
+                  | Legacy.<error>old</error>()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should execute script using const val of object as annotation argument`() = runTest {
+        // given
+        val script = """
+            object Messages {
+                const val OLD = "use new()"
+            }
+            @Deprecated(Messages.OLD) fun old() = 1
+            @Suppress("DEPRECATION")
+            old()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 1)
+        }
+    }
+
+    @Test
     fun `should not move function accessing local declarations when member of moved declaration has the same name`() = runTest {
         // given
         val script = """
@@ -4275,6 +4489,63 @@ class ScriptExecutorTest {
                 script.kts:4:25: error: 'check' does not refer to the function of the script body declared at line 2, which is not visible in 'T'.
                   | class T : S { fun f() = <error>check</error>(false) }
                   hint: 'T' is compiled outside of the script body, where 'check' (line 2) is not visible - pass it as a parameter, or declare it within 'T'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should refer to local property from declaration moved out of the script body when function of companion object has its name`() = runTest {
+        // given
+        val script = """
+            val k = "s"
+            sealed interface S
+            class T : S {
+                companion object { fun k(x: Int) = x }
+                fun f(): String = k
+            }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "s")
+        }
+    }
+
+    @Test
+    fun `should report error at declaration moved out of the script body calling local function named like function of companion object`() = runTest {
+        // given
+        val script = """
+            val k = 1
+            fun log(msg: String) = msg + k
+            sealed interface S
+            class T : S {
+                companion object { fun log(x: Int) = x }
+                fun f() = log("a")
+            }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:6:15: error: 'log' does not refer to the function of the script body declared at line 2, which is not visible in 'T'.
+                  |     fun f() = <error>log</error>("a")
+                  hint: 'T' is compiled outside of the script body, where 'log' (line 2) is not visible - pass it as a parameter, or declare it within 'T'.
+
+                script.kts:6:19: error: Argument type mismatch: actual type is 'String', but 'Int' was expected.
+                  |     fun f() = log(<error>"a"</error>)
             """.trimIndent()
         }
     }
