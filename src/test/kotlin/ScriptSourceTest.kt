@@ -125,6 +125,46 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should derive the sources of all the compilations from the script parsed once`() {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            fun printer(): (Any?) -> Unit = { log += it.toString() }
+            val print = printer()
+            @Suppress("DEPRECATION") fun show() = x
+            val x = 2
+            val f = { s: String -> "prop" }
+            val a = { f(1) }
+            val b = f("a")
+            val r = run { launch { } + Foo(1) }
+            fun launch(block: () -> Unit): String = "mine"
+            class Foo(val v: Int)
+            sealed class Shape { fun show() = print("shape") }
+            class Circle : Shape()
+            fun f(x: Int) = "fun-int"
+            fun f(s: String) = "fun-str"
+        """.trimIndent()
+        val dependencies = listOf("x", "Foo").map { PreambleDependency(it, "val `$it`: Int = TODO()") }
+        val sources = listOf<ScriptSource.Parsed.() -> ScriptSource>(
+            { source() },
+            { source(propertyTypeProbes = true) },
+            { source(confirming = true, propertyTypes = mapOf("print" to "(Any?) -> Unit")) },
+            { source(confirming = true, shadowedFunctionCopies = true) },
+            { source(confirming = true, overloadingFunctionCopies = true) },
+            { source(confirming = true, coroutineScopeCopies = true) }
+        )
+        val parsed = ScriptSource.Parsed(script, dependencies)
+
+        // when
+        val derived = sources.map { parsed.it() }
+
+        // then
+        val separate = sources.map { ScriptSource.Parsed(script, dependencies).it() }
+        assert(derived.map { it.text } == separate.map { it.text })
+        assert(derived.map { it.text }.distinct().size == sources.size)
+    }
+
+    @Test
     fun `should give distinct location ids to scripts of the same hash code`() {
         // given
         val scripts = listOf("\"Aa\"", "\"BB\"")
