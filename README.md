@@ -126,7 +126,12 @@ Most of these cases are reported as errors, while the following ones still resol
 * a call of a function, of which only some overloads are compiled outside of the script body, when it precedes a local overload,
   or has a receiver, like `"a".fmt(1)` of the extension functions, or when a local overload refers to a local class, while the overloads are of both inferred and declared return types ([#30](https://github.com/xemantic/xemantic-kotlin-script/issues/30)),
 * a call preceding a local class named like a callable dependency, when only a constructor with a parameter of a local class declared after the call applies, like `Foo(null)` followed by `class Bar` and `class Foo(val b: Bar?)` ([#31](https://github.com/xemantic/xemantic-kotlin-script/issues/31)),
-* a call from outside of the script body to a local property, whose function type is known only to the compiler, like `val print = printer()` ([#32](https://github.com/xemantic/xemantic-kotlin-script/issues/32)),
+* a call from outside of the script body to a local property, whose function type is known only to the compiler, like `val print = printer()`,
+  when the compiler names its type differently than it is visible there, like a local class, or a class which is not imported,
+  or does not name it as a valid type, like an anonymous object of a function type, `val print = object : (Any?) -> Unit { ... }`, or a platform type, like `String!`,
+  or when it is made callable by an `invoke` operator extension declared by the script, like `operator fun Int.invoke(x: Any?)` of `val print = 1 + 2`,
+  or when the property is assigned after its declaration, like `val print: Printer` followed by `print = Printer()`,
+  or when another statement follows the property on the same line ([#32](https://github.com/xemantic/xemantic-kotlin-script/issues/32)),
 * a call preceding a local function named like a callable dependency, which refers to a local class declared later ([#33](https://github.com/xemantic/xemantic-kotlin-script/issues/33)),
 * a call within a lambda to a property compiled outside of the script body, named like a function of its `CoroutineScope`, whose function type is known only to the compiler, like `val launch get() = launcher()` ([#44](https://github.com/xemantic/xemantic-kotlin-script/issues/44)).
 

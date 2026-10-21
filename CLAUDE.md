@@ -57,6 +57,8 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 - The Gradle configuration cache is enabled (`gradle.properties`), so a task action (`doLast { … }`) must not call a function declared in the build script — the script object is not serializable.
   Inline the logic or move the helper into `buildSrc` / an included build, and register tasks with `tasks.register(...)` rather than the `by tasks.registering` delegate.
 - Expected compilation error messages in `ScriptExecutorTest` are compiler-version specific: Kotlin 2.4 dropped the redundant "must either have an explicit type" diagnostic for `val x =` which 2.3 reported, so re-check them after every Kotlin upgrade.
+- The types of the local properties, which only the compiler knows, are read from the message of its `Initializer type mismatch` error, which is compiler-version specific as well —
+  a changed message only silently disables the confirmation, which `should report calls of declarations moved out of the script body to local properties of function types inferred by the compiler` catches.
 - Tests run with kotlinx.coroutines debug mode (Gradle enables `-ea`), so an exception thrown by the script block arrives as a stack-trace-recovery copy wrapping the original, which `ScriptExecutor` unwraps.
   This hides bugs of the exception reporting which only show in production: test them with an exception class the recovery cannot copy, i.e. without a `(String)`, `(String, Throwable)` or `(Throwable)` constructor.
   An exception whose `getStackTrace()` contains `null` crashes the recovery itself, so such a case can only be tested by calling `ScriptErrorReporter` directly.
