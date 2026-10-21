@@ -1790,17 +1790,22 @@ private class ScriptStructure(
         // the properties, which might be the constants moved together with the declarations reading them, are not variables
         val variableProperties = properties.filterNot { it.isConstant(dependencyNames, propertyNameCounts) }
         val variables = variableProperties.flatMapTo(HashSet()) { it.names }
+        // the local variables declared before, which take precedence over the receivers, unlike the ones declared later
+        val firstVariableStarts = mutableMapOf<String, Int>()
+        variableProperties.forEach { property -> property.names.forEach { firstVariableStarts.merge(it, property.start, ::minOf) } }
+        // the properties declared after, which are not visible to the local ones, unlike in the script
+        val lastPropertyStarts = mutableMapOf<String, Int>()
+        declarations.filter { it.kind == DeclarationKind.PROPERTY }.forEach { property ->
+            property.names.forEach { lastPropertyStarts.merge(it, property.start, ::maxOf) }
+        }
         val candidates = declarations.filter { declaration ->
-            // the local variables declared before, which take precedence over the receivers, unlike the ones declared later
-            val earlierVariables = variableProperties.filter { it.start < declaration.start }.flatMapTo(HashSet()) { it.names }
-            val laterProperties = declarations.filter { it.kind == DeclarationKind.PROPERTY && it.start > declaration.start }
-                .flatMapTo(HashSet()) { it.names }
             declaration.isDelegable && declaration.name !in callableReferences && declaration.references.filter { reference ->
                 declaration.accessors.any { reference.offset in it.startOffset until it.endOffset }
             }.all {
                 it.isQualified || it.isBound || (
-                        it.name != declaration.name && it.name !in excludedNames && it.name !in laterProperties
-                                && (it.name !in receiverNames || it.name in earlierVariables)
+                        it.name != declaration.name && it.name !in excludedNames
+                                && (lastPropertyStarts[it.name] ?: -1) <= declaration.start
+                                && (it.name !in receiverNames || (firstVariableStarts[it.name] ?: Int.MAX_VALUE) < declaration.start)
                                 && (it.name in allowedNames || it.name.first().isUpperCase())
                         )
             }
