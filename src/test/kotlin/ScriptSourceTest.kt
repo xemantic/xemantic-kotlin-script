@@ -24,8 +24,6 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
-import org.jetbrains.kotlin.lexer.KotlinLexer
-import org.jetbrains.kotlin.lexer.KtTokens
 import kotlin.test.Test
 
 class ScriptSourceTest {
@@ -125,32 +123,32 @@ class ScriptSourceTest {
     }
 
     @Test
-    fun `should not let unterminated block comment ending script swallow closing of script block`() {
+    fun `should blank out unterminated block comment ending script only at top level of script body`() {
         // given
-        val scripts = listOf(
+        val topLevel = listOf(
             "val a = 1\n/* abc\na",
-            "1 + 1\n/** doc",
-            "1 + 1\n/* a /* b */ c",
+            "1 + 1\n/** abc",
+            "1 + 1\n/* a /* b */ abc",
             "fun f() = 3\nf() /* abc",
             "fun f() = 3 /* abc",
             "import kotlin.math.PI\n/* abc",
+            "import kotlin.math.PI /* abc",
             "/* abc"
+        )
+        val nested = listOf(
+            "class A {\n  /* abc\n  val x = 1\n}\nA().x",
+            "fun f(): Int {\n  /* abc\n  return 1\n}\nf()",
+            "listOf(1,\n/* abc",
+            "val a = 5\n\"\${a /* abc }\""
         )
 
         // when
-        val sources = scripts.map { ScriptSource(it) }
+        val topLevelSources = topLevel.map { ScriptSource(it) }
+        val nestedSources = nested.map { ScriptSource(it) }
 
         // then
-        assert(sources.all { source ->
-            val lexer = KotlinLexer()
-            lexer.start(source.text)
-            var last = lexer.tokenType
-            while (lexer.tokenType != null) {
-                last = lexer.tokenType
-                lexer.advance()
-            }
-            last == KtTokens.RBRACE
-        })
+        assert(topLevelSources.none { "abc" in it.text })
+        assert(nestedSources.all { "abc" in it.text })
     }
 
     @Test

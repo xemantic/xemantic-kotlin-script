@@ -382,7 +382,7 @@ internal class ScriptSource(
 
         val headerEnd = structure.headerEnd
         if (headerEnd > 0) {
-            addLines(0..lineOf(headerEnd - 1)) { it < headerEnd }
+            addLines(0..lineOf(headerEnd - 1)) { it < headerEnd && !excluded[it] }
         }
         fun addAccessor(
             dependency: PreambleDependency
@@ -1017,10 +1017,13 @@ private class ScriptStructure(
 
     val headerEnd: Int
 
-    val unmatchedClosingBrace: Int? = unmatchedClosingBrace(script)
+    private val lexed = lexScript(script)
+
+    /** The offset of the first `}` closing the script block, which would otherwise end the script early. */
+    val unmatchedClosingBrace: Int? = lexed.unmatchedClosingBrace
 
     /** The start of the block comment ending the script unterminated, which would swallow the closing of the script block. */
-    val unterminatedComment: Int? = unterminatedComment(script)
+    val unterminatedComment: Int? = lexed.unterminatedComment
 
     val movedDeclarations: List<Declaration>
 
@@ -1624,18 +1627,26 @@ private val enclosingOf = mapOf<IElementType, Set<IElementType>>(
     KtTokens.CLOSING_QUOTE to emptySet()
 )
 
+/** The offsets of the [ScriptStructure.unmatchedClosingBrace] and of the [ScriptStructure.unterminatedComment]. */
+private class LexedScript(
+    val unmatchedClosingBrace: Int?,
+    val unterminatedComment: Int?
+)
+
 /**
- * The offset of the first `}` closing the script block, which the script is wrapped in,
- * recognized with the lexer, as the parser of the script alone recovers from it differently.
+ * Finds the first `}` closing the script block, which the script is wrapped in,
+ * recognized with the lexer, as the parser of the script alone recovers from it differently,
+ * and the block comment, or the KDoc, ending the script unterminated at the top level,
+ * also when it closes only a nested comment, while within a block or a string it is a missing closing token.
  */
-private fun unmatchedClosingBrace(
+private fun lexScript(
     script: String
-): Int? {
+): LexedScript {
     val lexer = KotlinLexer()
     lexer.start(script)
     val opened = mutableListOf<IElementType>()
     while (true) {
-        val type = lexer.tokenType ?: return null
+        val type = lexer.tokenType ?: return LexedScript(null, null)
         if (type in openingTokens) opened += type
         // ends the unterminated single-line string instead of the closing quote
         if (type == KtTokens.DANGLING_NEWLINE) {
@@ -1648,28 +1659,31 @@ private fun unmatchedClosingBrace(
             if (opening > enclosing) {
                 opened.subList(opening, opened.size).clear()
             } else if (type == KtTokens.RBRACE && enclosing == -1) {
-                return lexer.tokenStart
+                return LexedScript(lexer.tokenStart, null)
             }
+        }
+        if ((type == KtTokens.BLOCK_COMMENT || type == KtTokens.DOC_COMMENT) && lexer.tokenEnd == lexer.bufferEnd
+            && opened.isEmpty() && isUnterminatedComment(script, lexer.tokenStart)
+        ) {
+            return LexedScript(null, lexer.tokenStart)
         }
         lexer.advance()
     }
 }
 
-/**
- * The offset of the block comment, or the KDoc, ending the [script] unterminated, also when it closes only a nested comment,
- * recognized as the comment token extending also over a line appended to the script.
- */
-private fun unterminatedComment(
-    script: String
-): Int? {
-    val lexer = KotlinLexer()
-    lexer.start(script)
-    var last: Int? = null
-    while (lexer.tokenType != null) {
-        last = lexer.tokenStart.takeIf { lexer.tokenType == KtTokens.BLOCK_COMMENT || lexer.tokenType == KtTokens.DOC_COMMENT }
-        lexer.advance()
+/** Whether the block comment starting at [start] is not closed, counting the nested comments like the lexer. */
+private fun isUnterminatedComment(
+    script: String,
+    start: Int
+): Boolean {
+    var depth = 0
+    var offset = start
+    while (offset < script.length - 1) {
+        when {
+            script[offset] == '/' && script[offset + 1] == '*' -> { depth++; offset += 2 }
+            script[offset] == '*' && script[offset + 1] == '/' -> { depth--; offset += 2 }
+            else -> offset++
+        }
     }
-    if (last == null) return null
-    lexer.start(script.substring(last) + "\n")
-    return last.takeIf { lexer.tokenEnd == lexer.bufferEnd }
+    return depth > 0
 }

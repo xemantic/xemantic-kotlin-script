@@ -2218,7 +2218,8 @@ class ScriptExecutorTest {
             "val a = 2\n/* abc\na",
             "val a = 2\na /** doc",
             "val a = 2\na\n/* a /* b */ c",
-            "fun f() = 2\nf()\n/* abc"
+            "fun f() = 2\nf()\n/* abc",
+            "import kotlin.math.PI /* abc"
         )
         val executor = ScriptExecutor()
 
@@ -2226,7 +2227,30 @@ class ScriptExecutorTest {
         val results = scripts.map { executor.execute(it) }
 
         // then
-        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(Unit, 2, 2, 2))
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(Unit, 2, 2, 2, Unit))
+    }
+
+    @Test
+    fun `should report unterminated block comment within braces of script where it swallows closing brace`() = runTest {
+        // given
+        val scripts = listOf(
+            "class A {\n  /* abc\n  val x = 1\n}\nA().x",
+            "class A {\n  val x = 1\n  /* abc\n}\nA().x",
+            "fun f(): Int {\n  /* abc\n  return 1\n}\nf()",
+            "val a = 5\n\"\${a /* x }\""
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.first() } == listOf(
+            "script.kts:1:10: error: Syntax error: Missing '}.",
+            "script.kts:2:12: error: Syntax error: Missing '}.",
+            "script.kts:1:15: error: Syntax error: Expecting '}'.",
+            "script.kts:2:5: error: Syntax error: Expecting '}'."
+        ))
     }
 
     @Test
