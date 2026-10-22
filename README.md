@@ -120,6 +120,11 @@ when (result) {
   unless their type names a local class staying in the script body, like `val x: Foo? = null`,
   so a function reading only such values, like `fun tax(x: Double) = x * taxRate`, is moved together with them as well,
   when they call it, or when it is called before its declaration,
+  unless called before the declaration of such a value, like `f` in `val r = f()` followed by `val k = 5` and `fun f() = k`,
+  which a regular script reads before it is initialized, as `0` or `null`,
+  or called before its declaration only where a receiver might resolve the call instead, like `append` in `buildString { append("x") }`,
+  and also after it, where a receiver might resolve the call, like in a following `buildString { append("y") }`,
+  as no placement outside of the script body resolves all these calls like a regular script (see the last of the known limitations below),
   and referring to a local value or function of the same name as a dependency is reported as unresolved, instead of using the dependency,
   while an object, an enum class, an interface or a nested class cannot refer even to the dependencies,
   as they are the members of the script instance.
@@ -135,15 +140,15 @@ Most of these cases are reported as errors, while the following ones still resol
 * a property of the script body is resolved before a member of the same name of an implicit receiver,
   like `name` in `user.run { name }` with `val name = "script"`, as it is a local variable of the block ([#36](https://github.com/xemantic/xemantic-kotlin-script/issues/36)),
 * overloads of a function, of which only some are compiled outside of the script body ([#30](https://github.com/xemantic/xemantic-kotlin-script/issues/30)),
-* a call preceding the declaration of a value initialized with a literal, to a function reading it, which is compiled outside of the script body together with the value,
-  like `val r = f()`, `val k = 5`, `fun f() = k`, `sealed class S { fun h() = f() }`, reads the initialized value, while a regular script reads `0` or `null`,
 * a call preceding a local class named like a callable dependency ([#31](https://github.com/xemantic/xemantic-kotlin-script/issues/31)),
 * a call from outside of the script body to a local property, whose function type is known only to the compiler, like `val print = printer()` ([#32](https://github.com/xemantic/xemantic-kotlin-script/issues/32)),
 * a call preceding a local function named like a callable dependency, which refers to a local class declared later ([#33](https://github.com/xemantic/xemantic-kotlin-script/issues/33)),
 * a call within a lambda to a function compiled outside of the script body, named like a function of its `CoroutineScope`, like `cancel` ([#44](https://github.com/xemantic/xemantic-kotlin-script/issues/44)),
 * a call where a receiver might resolve it, like within a lambda, following the declaration of a function, which is called before its declaration only where the receivers resolve the calls instead,
   like the second `append` in `buildString { append("x") }`, `fun append(t: String) = t + "!"`, `fun g() = buildString { append("y") }`,
-  as the function is resolved after the receivers, like when called before its declaration, while a regular script resolves it before them.
+  as the function is resolved after the receivers, like when called before its declaration, while a regular script resolves it before them
+  ([#73](https://github.com/xemantic/xemantic-kotlin-script/issues/73)), unless the function reads the values initialized with a literal,
+  or is called before its declaration as a member of a class of the same name, like `g` in `class A { fun f() = g(); fun g() = 1 }`, which keeps it in the script body.
 
 Giving the declarations and the dependencies distinct names avoids them.
 

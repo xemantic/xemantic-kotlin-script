@@ -1091,7 +1091,10 @@ private fun canAccessScriptMembers(
 /** How a name is declared in the enclosing elements, see [binding]. */
 private enum class Binding {
     NONE,
-    /** By the member functions or the member extension properties of the enclosing classes only, see [Reference.isBoundByMember]. */
+    /**
+     * By the member functions or the member extension properties of the enclosing classes only, see [Reference.isBoundByMember],
+     * overridden by the local ones, which shadow the declarations of the script, as the bindings are ordered by their strength.
+     */
     MEMBER,
     /** By the functions or the extension properties only, see [Reference.isBoundByNonFunction]. */
     FUNCTION,
@@ -1403,12 +1406,22 @@ private class ScriptStructure(
         val classes = declarations.filter { it.kind == DeclarationKind.CLASS && it.name != null }
         var constantNames: Set<String>
         var selected: Set<ParsedDeclaration>
-        val selectMovedDeclarations = movedDeclarationsSelection(declarations, bodyReferences)
+        val selectMovedDeclarations = movedDeclarationsSelection(
+            declarations,
+            bodyReferences,
+            localReferences = statements.zip(statementReferences).flatMap { (statement, references) ->
+                if (declarationsByPsi[statement]?.mustMove == true) emptyList() else references
+            },
+            // run where they are declared, unlike the functions and the classes
+            executedReferences = statements.zip(statementReferences).filter { (statement) ->
+                declarationsByPsi[statement].let { it == null || it.kind == DeclarationKind.PROPERTY }
+            }.map { (statement, references) -> statement.startOffset to references }
+        )
         // unless their type names a local class, like `val x: Foo? = null`, which would not be visible to them,
         // while the fewer constants, the fewer declarations are moved, possibly not the classes of the remaining ones
         while (true) {
             constantNames = constants.mapTo(HashSet()) { it.name!! }
-            selected = selectMovedDeclarations(propertyNameSet, constantNames)
+            selected = selectMovedDeclarations(propertyNameSet, constants.associate { it.name!! to it.start })
             val localClassNames = classes.filter { it !in selected }.mapTo(HashSet()) { it.name!! }
             val remaining = constants.filter { constant -> typeNames.getValue(constant).none { it in localClassNames } }
             if (remaining.size == constants.size) break
@@ -2080,13 +2093,17 @@ private class ScriptStructure(
      * except the [constants], which are moved together with the declarations referring to them,
      * unless referred to from where the members of the script are not accessible, like an object.
      *
-     * Returns the selection by the local properties and the [constants] among them,
+     * Returns the selection by the local properties and the constants among them, with their starts,
      * sharing what does not depend on them, as the constants are selected repeatedly.
      */
     private fun movedDeclarationsSelection(
         declarations: List<ParsedDeclaration>,
-        bodyReferences: List<Reference>
-    ): (localProperties: Set<String>, constants: Set<String>) -> Set<ParsedDeclaration> {
+        bodyReferences: List<Reference>,
+        /** The [bodyReferences] outside of the declarations which cannot be local. */
+        localReferences: List<Reference>,
+        /** The [bodyReferences] of the statements run where they are declared, by their starts, unlike the functions and the classes. */
+        executedReferences: List<Pair<Int, List<Reference>>>
+    ): (localProperties: Set<String>, constantStarts: Map<String, Int>) -> Set<ParsedDeclaration> {
         val named = declarations.filter { it.name != null && it.kind != DeclarationKind.PROPERTY }
         val namedByName = named.groupBy { it.name!! }
         val subtypesByName = mutableMapOf<String, MutableList<ParsedDeclaration>>()
@@ -2131,10 +2148,63 @@ private class ScriptStructure(
             (declaration.kind == DeclarationKind.FUNCTION || declaration.kind == DeclarationKind.CLASS)
                     && (firstReferences[declaration] ?: Int.MAX_VALUE) < declaration.start
         }
-        return { localProperties, constants ->
+        // The functions called before their declarations only where the compiler might resolve the calls otherwise,
+        // on a receiver, like `append` in `buildString { append("x") }`, or to a member of the class, like `g` in `class A { fun f() = g(); fun g() = 1 }`,
+        // and also after their declarations, where a receiver might resolve them, like `append` in a following `buildString { append("y") }`.
+        // A regular script ranks such a function before the receivers after its declaration, unless it resolved a call before it to the function,
+        // so no placement of a moved function matches it for all the calls, unlike the local function, invisible before its declaration.
+        val (calledOnReceivers, calledAsMembers) = run {
+            val localReferencesByName = localReferences.groupBy { it.name }
+            val bodyReferencesByName = bodyReferences.groupBy { it.name }
+            val functions = declarations.filter { it.kind == DeclarationKind.FUNCTION && it.name != null }
+            fun Reference.mightReferTo(function: ParsedDeclaration) = (!isQualified || function.isExtension) && (!isOperator || function.isOperator)
+            val ambiguouslyCalled = functions.filter { function ->
+                localReferencesByName[function.name].orEmpty().none {
+                    // resolved to the function, if applicable, ranking it after the receivers everywhere, like when moved after the script block
+                    it.offset < function.start && !it.isBound && !it.mightResolveOnReceiver && !it.isCallableReference && it.mightReferTo(function)
+                } && bodyReferencesByName[function.name].orEmpty().any {
+                    it.offset >= function.end && it.mightResolveOnReceiver && it.mightReferTo(function)
+                            && (!it.isBound || it.isBoundByMember || (it.isBoundByNonFunction && it.isCall))
+                }
+            }
+            fun calledBefore(
+                filter: (Reference) -> Boolean
+            ) = ambiguouslyCalled.filterTo(HashSet()) { function ->
+                localReferencesByName[function.name].orEmpty().any { it.offset < function.start && filter(it) && it.mightReferTo(function) }
+            }
+            calledBefore { !it.isBound && it.mightResolveOnReceiver } to calledBefore { it.isBoundByMember }
+        }
+        // the start of the first statement run where it is declared, which refers to each declaration, also indirectly
+        val firstRunBy = HashMap<ParsedDeclaration, Int>()
+        executedReferences.forEach { (start, statementReferences) ->
+            val queue = ArrayDeque<ParsedDeclaration>()
+            statementReferences.forEach { reference ->
+                reference.referenced().forEach { if (firstRunBy.putIfAbsent(it, start) == null) queue += it }
+            }
+            while (queue.isNotEmpty()) {
+                references.getValue(queue.removeFirst()).forEach { if (firstRunBy.putIfAbsent(it, start) == null) queue += it }
+            }
+        }
+        return { localProperties, constantStarts ->
+            val constants = constantStarts.keys
             val variables = localProperties - constants
+            // the declarations reading the constants, or referring to such ones, which would be local, if the constants were
+            val readingConstants = declarations.filterTo(mutableSetOf()) { declaration ->
+                declaration.references.any { it.refersToConstant(constants) }
+            }
+            ArrayDeque(readingConstants).let { queue ->
+                while (queue.isNotEmpty()) {
+                    referrers[queue.removeFirst()].orEmpty().forEach { if (readingConstants.add(it)) queue += it }
+                }
+            }
+            // reading a constant, when called before its declaration, like `f` in `val r = f()` followed by `val k = 5` and `fun f() = k`,
+            // which a regular script reads before it is initialized, as `0` or `null`, so they stay local, as if the constant was local
+            val readBeforeInitialized = firstRunBy.filterTo(HashMap()) { (declaration, start) ->
+                declaration.references.any { it.refersToConstant(constants) && constantStarts.getValue(it.name) > start }
+            }.keys
             val accessingLocalProperties = declarations.filter { declaration ->
-                declaration.references.any {
+                declaration in calledAsMembers || (declaration in calledOnReceivers && declaration in readingConstants)
+                        || declaration in readBeforeInitialized || declaration.references.any {
                     it.refersToLocal(variables) || (it.refersToLocal(constants) && !it.canAccessScriptMembers)
                 }
             }.toSet()
