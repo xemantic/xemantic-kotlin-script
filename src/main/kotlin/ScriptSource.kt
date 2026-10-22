@@ -679,20 +679,28 @@ internal class ScriptSource private constructor(
             mapping += null
         }
         val blockCopies = if (confirming) structure.blockCopies(shadowedFunctionCopies, coroutineScopeCopies) else emptyMap()
+        // the members of the script copying the local declarations, adding their lines, by the offsets of the names of the local functions,
+        // each following the moved declarations preceding its original, like the type aliases, which are not visible before their declarations,
+        // as in the script, and the other ones, like the copies of the properties, following all of them
+        val memberCopies = mutableListOf<Pair<Int?, () -> Unit>>()
         if (confirming) {
             // named in the message, as the operators of the same position refer to different functions, like `get` and `set`,
             // unlike the copies of the local functions overloading the moved ones, see overloadingFunctionCopies
             if (!overloadingFunctionCopies) structure.hiddenLocalFunctionCopies(copiedPropertyTypes).forEach { copy ->
-                // the type of the copy of the property might be an invalid one, see confirmedPropertyTypes
-                if (copy.name in copiedProperties) propertyTypeLines[lines.size] = copy.name
-                val message = hiddenLocalFunctionMessage(copy.name, copy.isOperator, copy.offset?.let { position(it).line })
-                lines += "@kotlin.Deprecated(${stringLiteral(message)}) ${copy.declaration}"
-                mapping += null
+                memberCopies += copy.offset to {
+                    // the type of the copy of the property might be an invalid one, see confirmedPropertyTypes
+                    if (copy.name in copiedProperties) propertyTypeLines[lines.size] = copy.name
+                    val message = hiddenLocalFunctionMessage(copy.name, copy.isOperator, copy.offset?.let { position(it).line })
+                    lines += "@kotlin.Deprecated(${stringLiteral(message)}) ${copy.declaration}"
+                    mapping += null
+                }
             }
             // resolved together with the moved functions they overload, as in the script, see shadowedFunctionCopies
-            if (overloadingFunctionCopies) structure.overloadingCopies.forEach {
-                lines += it
-                mapping += null
+            if (overloadingFunctionCopies) structure.overloadingCopies.forEach { (offset, copy) ->
+                memberCopies += offset to {
+                    lines += copy
+                    mapping += null
+                }
             }
             // the deprecation of the local functions, like the copies in the script block, is not reported, unlike their opt-in
             val blockCopyMessages = blockCopies.values.flatten().flatMap { it.first }
@@ -708,9 +716,22 @@ internal class ScriptSource private constructor(
         // the types probed, or checked, whether the ones of the copies are the same, see propertyTypeProbes
         val checkedPropertyTypes = if (confirming && !overloadingFunctionCopies && !propertyTypeProbes) copiedPropertyTypes else emptyMap()
         structure.propertyTypeCheckFunctions(checkedPropertyTypes).forEach { (name, declaration) ->
-            propertyTypeLines[lines.size] = name
-            lines += declaration
-            mapping += null
+            memberCopies += null to {
+                propertyTypeLines[lines.size] = name
+                lines += declaration
+                mapping += null
+            }
+        }
+        val pendingMemberCopies = ArrayDeque(memberCopies.sortedBy { it.first ?: Int.MAX_VALUE })
+        /** Adds the [memberCopies] of the originals preceding this [offset], or all the remaining ones, if `null`. */
+        fun addMemberCopies(
+            offset: Int?
+        ) {
+            while (pendingMemberCopies.isNotEmpty()) {
+                val copyOffset = pendingMemberCopies.first().first
+                if (offset != null && (copyOffset == null || copyOffset >= offset)) break
+                pendingMemberCopies.removeFirst().second()
+            }
         }
         // a callable one is visible to the moved declarations referring to it as a value, like `map(log)`, as in the script,
         // while their calls, which in the script call the local function, if it applies, are confirmed, see hiddenLocalFunctionCandidates
@@ -737,6 +758,7 @@ internal class ScriptSource private constructor(
             emptySet()
         }
         movedDeclarations.forEach { declaration ->
+            addMemberCopies(declaration.start)
             // opt-in markers, which can mark the same declaration, unlike the deprecations
             if (declaration.kind == DeclarationKind.FUNCTION && declaration.name in deprecatedFunctions) {
                 lines += "@${optInMarker(SHADOWED_ORIGINAL)}"
@@ -758,6 +780,7 @@ internal class ScriptSource private constructor(
                 it in declaration.start until declaration.end && !movedExcluded[it]
             }
         }
+        addMemberCopies(null)
         // following the moved type aliases, which are not visible before their declarations
         if (coroutineScopeCopies) {
             lines += "abstract class $BODY_SCOPE_CLASS : kotlinx.coroutines.CoroutineScope {"
@@ -1663,7 +1686,7 @@ private class ScriptStructure(
 
     /**
      * The names of the [localFunctions], which the references of the moved declarations cannot be confirmed to refer to,
-     * see [ScriptSource.hiddenLocalFunctionCandidates], as they cannot be copied, like the ones referring to the local classes or the type aliases,
+     * see [ScriptSource.hiddenLocalFunctionCandidates], as they cannot be copied, like the ones referring to the local classes, or to the type aliases declared after them,
      * or as they are referred to as functions, like `::log`, which would be resolved to the dependency of the same name instead,
      * or as their names are bound within the moved declarations, which are not candidates.
      * Only the ones named like the dependencies are checked for the copies.
@@ -1694,8 +1717,8 @@ private class ScriptStructure(
     /** The names of the moved functions overloaded by the local ones, which the [shadowedFunctionCandidates] call, see [ScriptSource.overloadingFunctionCopies]. */
     val overloadedFunctions: Set<String>
 
-    /** The copies of the local functions overloading the [overloadedFunctions], see [ScriptSource.overloadingFunctionCopies]. */
-    val overloadingCopies: List<String>
+    /** The copies of the local functions overloading the [overloadedFunctions], by the offsets of their names, see [ScriptSource.overloadingFunctionCopies]. */
+    val overloadingCopies: List<Pair<Int, String>>
 
     /** The names of the local functions overloading the [overloadedFunctions], renamed with these letters, see [ScriptSource.overloadingFunctionCopies]. */
     val renamedRanges: List<Pair<IntRange, Char>>
@@ -1897,10 +1920,16 @@ private class ScriptStructure(
                 }?.let { (local, isFunction) -> Triple(reference, local.line(), isFunction) }
             }
         }
-        // the copies precede the type aliases, which are not visible before their declarations
-        val uncopiedTypes = localClassNames + declarations.mapNotNull { (it.psi as? KtTypeAlias)?.name }
+        val typeAliasDeclarations = declarations.filter { it.psi is KtTypeAlias && it.name != null }
+        /**
+         * Whether the copy of the function would not be compiled, as it refers to the local classes, or to the type aliases declared after it,
+         * which are not visible to it in the script, nor to its copy, following the moved declarations preceding it, see [ScriptSource.confirming].
+         */
+        fun ParsedDeclaration.isUncopied() = signature() == null || refersToTypes(
+            localClassNames + typeAliasDeclarations.filter { it.start > start }.map { it.name!! }
+        )
         unconfirmedLocalFunctions = localFunctionsByName.filter { (name, functions) ->
-            name in dependencyNames && functions.any { it.refersToTypes(uncopiedTypes) || it.signature() == null }
+            name in dependencyNames && functions.any { it.isUncopied() }
         }.keys + hiddenLocalFunctionCandidates.filter { (reference) ->
             reference.isCallableReference && reference.refersToLocal(localFunctions)
         }.map { it.first.name } + moved.flatMap { declaration ->
@@ -1957,9 +1986,9 @@ private class ScriptStructure(
         val mixedOverloads = overloadingFunctions.filter { (name, functions) ->
             (functions.map { it.second } + movedFunctionsByName.getValue(name)).map { (it.psi as KtNamedFunction).isOfInferredType() }.distinct().size > 1
         }.keys
-        // unless they cannot be copied preceding the moved declarations, see ScriptSource.overloadingFunctionCopies
+        // unless they cannot be copied, see ScriptSource.overloadingFunctionCopies
         val uncopiedOverloads = overloadingFunctions.filter { (_, functions) ->
-            functions.any { (_, function) -> function.refersToTypes(uncopiedTypes) || function.signature() == null }
+            functions.any { (_, function) -> function.isUncopied() }
         }.keys
         /** The candidates among the references of each statement of the script body, unless moved, by its index. */
         fun <T : Any> bodyCandidates(
@@ -1991,7 +2020,7 @@ private class ScriptStructure(
         val overloadedNames = shadowedFunctionCandidates.filter { it.isInInferredType }.mapTo(HashSet()) { it.reference.name }
         overloadedFunctions = overloadedNames
         val overloading = overloadingFunctions.filterKeys { it in overloadedNames }
-        overloadingCopies = overloading.values.flatten().mapNotNull { it.second.signature() }
+        overloadingCopies = overloading.values.flatten().mapNotNull { (_, function) -> function.signature()?.let { function.line() to it } }
         // a distinct letter for each name, so the renamed functions of different names do not overload each other
         renamedRanges = overloading.values.flatMapIndexed { index, functions ->
             functions.mapNotNull { (_, function) ->
