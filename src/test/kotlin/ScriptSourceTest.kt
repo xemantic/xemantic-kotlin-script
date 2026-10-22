@@ -182,7 +182,7 @@ class ScriptSourceTest {
     }
 
     @Test
-    fun `should not move function reading constant called before its declaration only where receiver might resolve it`() {
+    fun `should move function reading constant called before its declaration where receiver might resolve it after the script block`() {
         // given
         val scripts = listOf(
             "val k = \"!\"\nval s = buildString { append(\"x\") }\nfun append(t: String) = t + k\nappend(s)",
@@ -195,9 +195,11 @@ class ScriptSourceTest {
         val sources = scripts.map { ScriptSource(it) }
 
         // then
-        sources.forEach { source ->
+        // like in the script, resolved after the receivers
+        sources.zip(listOf("fun append", "fun sum", "fun describe", "fun scale")).forEach { (source, function) ->
             val (moved, body) = source.movedAndBody()
-            assert("val k" !in moved && "val k" in body)
+            assert("val k" in moved && "val k" !in body)
+            assert(function in source.text.substringAfter("\n$SCRIPT_BLOCK_END\n"))
         }
     }
 
