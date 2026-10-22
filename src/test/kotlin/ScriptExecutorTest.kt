@@ -4054,7 +4054,11 @@ class ScriptExecutorTest {
             // the property cannot be called, so the member is called also in the script body
             "val name = \"script\"\nclass U { fun name() = \"member\" }\nU().run { name() }",
             "val name = { a: Int -> \"script${'$'}a\" }\nclass U { fun name(a: String) = \"member${'$'}a\" }\nU().run { name(\"x\") }",
-            "val name = { \"script\" }\nlistOf(1).map { name() }.first()"
+            "val name = { \"script\" }\nlistOf(1).map { name() }.first()",
+            // the properties requiring a context, or a receiver, do not apply without them
+            "class Ctx\nval name: context(Ctx) () -> String = { \"s\" }\nclass U { fun name() = \"m\" }\nU().run { name() }",
+            "class Ctx\nval name = context(c: Ctx) fun(): String = \"s\"\nclass U { fun name() = \"m\" }\nU().run { name() }",
+            "val name: String.() -> String = { \"s\" }\nclass U { fun name() = \"m\" }\nU().run { name() }"
         )
         val executor = ScriptExecutor()
 
@@ -4062,7 +4066,7 @@ class ScriptExecutorTest {
         val results = scripts.map { executor.execute(it) }
 
         // then
-        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("script", "member", "memberx", "script"))
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("script", "member", "memberx", "script", "m", "m", "m"))
     }
 
     @Test
@@ -4109,6 +4113,48 @@ class ScriptExecutorTest {
                 "script.kts:202:20"
             ))
         }
+    }
+
+    @Test
+    fun `should confirm receiver members of many properties by one compilation at a time besides the one of the script`() = runTest {
+        // given
+        val script = (1..100).joinToString(separator = "\n") {
+            "val p$it = $it\nval r$it = run { p$it }"
+        } + "\nclass U(val p1: Int, val p100: Int)\nU(7, 8).run { p1 + p100 }"
+        val executor = DefaultScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(message.lines().filter { it.startsWith("script.kts:") }.map { it.substringBefore(": error") } == listOf(
+                "script.kts:202:15",
+                "script.kts:202:20"
+            ))
+        }
+        assert(executor.maxConcurrentCompilations <= 2)
+    }
+
+    @Test
+    fun `should not confirm further receiver members when compilation of script fails`() = runTest {
+        // given
+        val script = (1..100).joinToString(separator = "\n") {
+            "val p$it = $it\nval r$it = run { p$it }"
+        } + "\nclass U(val p1: Int, val p100: Int)\nU(7, 8).run { p1 + p100 + undefined }"
+        val executor = DefaultScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have("Unresolved reference 'undefined'" in message)
+        }
+        // the script, and the first of the compilations confirming the receiver members, run in parallel with it
+        assert(executor.compilationCount == 2)
     }
 
     @Test

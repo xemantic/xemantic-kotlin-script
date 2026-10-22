@@ -89,7 +89,8 @@ when (result) {
   while in a regular script it is a member of the script, resolved after them.
   So is a call of such a property, like `name()` in `user.run { name() }` with `val name = { "script" }`,
   if both the property and the member apply to the arguments.
-  It is recognized by other compilations of the script, run in parallel, where such a property is a member of a receiver,
+  It is recognized by other compilations of the script, the first one run in parallel, where such a property is a member of a receiver,
+  each one confirming up to 32 nested receivers, so a large script with many such properties takes longer to compile,
   so it is not reported, if such a compilation fails, like when a mutable property is smart cast.
 * Scripts executed repeatedly, like an agent harness defined as a script, can skip the recompilation
   with `ScriptExecutor(compilationCacheSize = ...)`, keeping that many compiled scripts, the least recently used evicted first.

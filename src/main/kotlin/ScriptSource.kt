@@ -46,6 +46,8 @@ import org.jetbrains.kotlin.psi.KtClass
 import org.jetbrains.kotlin.psi.KtClassBody
 import org.jetbrains.kotlin.psi.KtClassOrObject
 import org.jetbrains.kotlin.psi.KtConstantExpression
+import org.jetbrains.kotlin.psi.KtContextParameterList
+import org.jetbrains.kotlin.psi.KtContextReceiverList
 import org.jetbrains.kotlin.psi.KtDeclaration
 import org.jetbrains.kotlin.psi.KtDeclarationWithBody
 import org.jetbrains.kotlin.psi.KtDestructuringDeclaration
@@ -391,8 +393,7 @@ internal class ScriptSource(
      * The 1-based line of the [text] failing the compilation on purpose, if it only confirms the [receiverMemberCandidates],
      * so it is not generating the code, see [receiverMemberProbe].
      */
-    var analysisOnlyLine: Int? = null
-        private set
+    val analysisOnlyLine: Int?
 
     /** The names of the dependencies, by the 0-based lines of the [text] declaring their accessors. */
     private val preambleDependencies = mutableMapOf<Int, String>()
@@ -509,14 +510,14 @@ internal class ScriptSource(
             it.name in structure.localProperties || (it.isCallable && it.name in structure.localFunctions)
         }
         visible.forEach { addAccessor(it) }
-        if (structure.receiverMembers.isNotEmpty()) {
+        analysisOnlyLine = if (structure.receiverMembers.isEmpty()) null else {
             lines += "@OptIn(kotlin.contracts.ExperimentalContracts::class) suspend fun <T> $RECEIVER_SCOPE_FUNCTION(receiver: T, block: suspend T.() -> Unit) { " +
                     "kotlin.contracts.contract { callsInPlace(block, kotlin.contracts.InvocationKind.EXACTLY_ONCE) }; receiver.block() }"
             mapping += null
             // failing on purpose, so the compilation ends with the analysis, without generating the code, which is never run
-            analysisOnlyLine = lines.size + 1
             lines += "private val $ANALYSIS_ONLY: Unit = 0"
             mapping += null
+            lines.size
         }
         lines += "class $DEPENDENCIES_CLASS {"
         mapping += null
@@ -1152,15 +1153,21 @@ private fun binding(
 
 /** Whether this property can be called without arguments, as its function type is known without compiling, like `{ "x" }`. */
 private fun KtProperty.isInvocableWithoutArguments(): Boolean {
+    /** Whether this element declares the context receivers, or parameters, which a call without them does not apply to. */
+    fun PsiElement?.declaresContext() = this != null && (
+            collectDescendantsOfType<KtContextReceiverList>().isNotEmpty() || collectDescendantsOfType<KtContextParameterList>().isNotEmpty()
+    )
     val type = typeReference
     if (type != null) {
         val function = type.typeElement as? KtFunctionType ?: return false
-        return function.receiverTypeReference == null && function.parameters.isEmpty()
+        // like `context(Ctx) () -> String`, also of the nested types, so possibly not applying
+        return function.receiverTypeReference == null && function.parameters.isEmpty() && !type.declaresContext()
     }
     return when (val initializer = initializer) {
         is KtLambdaExpression -> initializer.valueParameters.isEmpty()
-        // an anonymous function
+        // an anonymous function, unless like `context(c: Ctx) fun() = ...`
         is KtNamedFunction -> initializer.name == null && initializer.receiverTypeReference == null && initializer.valueParameters.isEmpty()
+                && !initializer.modifierList.declaresContext()
         else -> false
     }
 }
@@ -1556,30 +1563,14 @@ private class ScriptStructure(
             reference: Reference,
             name: String
         ) = reference.name == name && reference.refersToValue && !reference.isQualified && !reference.isBound
-        /**
-         * Whether this reference to the local property of this [name], preceding the receiver declaring it instead, is a call within a receiver,
-         * which the script body calls the member of, if the property does not apply, unlike the property renamed,
-         * so it is not renamed, and the receiver precedes it, resolving it like the script body, if the property applies.
-         */
-        fun isReceiverCall(
-            reference: Reference,
-            name: String
-        ) = mightReferToProperty(reference, name) && reference.isCall && reference.isInReceiverScope
-        // the statements, which the receivers declaring the local properties precede at the latest,
-        // the ones of the first candidates, or of the preceding calls within the receivers
-        val receiverLimits = propertyCandidates.mapValues { (name, candidates) ->
-            val firstCandidate = candidates.first().second
-            (localProperty(name)!!.second + 1 until firstCandidate).firstOrNull { index ->
-                declarationsByPsi[statements[index]] !in moved && statementReferences[index].any { isReceiverCall(it, name) }
-            } ?: firstCandidate
-        }
-        // the statements, which the receivers declaring the local properties precede, each one preceding the limits
-        // of the properties it declares, chosen in the order of these limits, each one as late as possible,
-        // so they are as few as possible, and nested as little as possible, with their indices
+        // the statements, which the receivers declaring the local properties precede, each one preceding the first candidates
+        // of the properties it declares, chosen in the order of these candidates, each one as late as possible,
+        // so they are as few as possible, and nested as little as possible, with their indices,
+        // preceded by no call within a receiver, as such calls are candidates themselves
         val receiverStarts = buildMap {
             var start: Int? = null
             var receivers = 0
-            for ((name, limit) in receiverLimits.entries.sortedBy { it.value }) {
+            for ((name, limit) in propertyCandidates.mapValues { it.value.first().second }.entries.sortedBy { it.value }) {
                 if (start == null || start <= localProperty(name)!!.second) {
                     start = limit
                     receivers++
@@ -1600,7 +1591,7 @@ private class ScriptStructure(
                 reference,
                 localProperty(reference.name)!!.first.line(),
                 probeOf(reference.name),
-                isUncertainCall = reference.isCall && !(reference.isCallWithoutArguments && isInvocableWithoutArguments(reference.name))
+                isUncertainCall = reference.callEnd != null && !(reference.isCallWithoutArguments && isInvocableWithoutArguments(reference.name))
             )
         }
         val probed = if (receiverMemberProbe == null) emptyList() else renamed.keys.filter { probeOf(it) == receiverMemberProbe }
@@ -1618,9 +1609,7 @@ private class ScriptStructure(
                 // also called, and the receivers of `::`, like `name::class`
                 (propertyIndex + 1 until receiverStarts.getValue(name).first).forEach { index ->
                     if (declarationsByPsi[statements[index]] !in moved) {
-                        statementReferences[index].filter { reference ->
-                            mightReferToProperty(reference, name) && !isReceiverCall(reference, name)
-                        }.forEach { rename(it.offset, name) }
+                        statementReferences[index].filter { mightReferToProperty(it, name) }.forEach { rename(it.offset, name) }
                     }
                 }
                 // the calls following the receiver, see [ScriptSource.receiverMemberCalls]

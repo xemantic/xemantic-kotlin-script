@@ -29,8 +29,11 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import org.jetbrains.kotlin.config.JvmTarget
+import kotlin.concurrent.atomics.AtomicBoolean
 import kotlin.concurrent.atomics.AtomicInt
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.concurrent.atomics.fetchAndIncrement
@@ -101,6 +104,16 @@ internal class DefaultScriptExecutor(
      */
     @OptIn(ExperimentalAtomicApi::class)
     internal val compilationCount: Int get() = compilations.load()
+
+    @OptIn(ExperimentalAtomicApi::class)
+    private val activeCompilations = AtomicInt(0)
+
+    @OptIn(ExperimentalAtomicApi::class)
+    private val maxActiveCompilations = AtomicInt(0)
+
+    /** The maximum number of the compilations run at the same time, by all the scripts. */
+    @OptIn(ExperimentalAtomicApi::class)
+    internal val maxConcurrentCompilations: Int get() = maxActiveCompilations.load()
 
     init {
         require(compilationCacheSize >= 0) {
@@ -306,6 +319,7 @@ internal class DefaultScriptExecutor(
             return compilation
         }
 
+        @OptIn(ExperimentalAtomicApi::class)
         private suspend fun doCompile(): Compilation {
             val source = source()
             if (source.unmatchedClosingBrace != null || source.conflictingDependencyDeclarations.isNotEmpty()) {
@@ -357,25 +371,27 @@ internal class DefaultScriptExecutor(
              * as the resolution of a failed one is not known, and calls only if the properties apply to them.
              */
             suspend fun receiverMembers(
-                index: Int
+                index: Int,
+                scriptFailed: AtomicBoolean
             ): List<LaterDeclaredReference> {
                 val candidates = source.receiverMemberProbes[index]
                 val probe = source(receiverMemberProbe = index)
                 val reports = compile(probe).reports.analyzed(probe)
-                if (reports.failOutside(probe, candidates.map { it.reference })) {
+                // like the errors of the arguments of a call, which another call might apply to
+                if (reports.failOutside(probe, candidates.map { it.uncertainCall ?: it.reference })) {
                     logger.debug { "Script[$scriptId]: Receiver members not confirmed, as the compilation failed" }
                     return emptyList()
                 }
                 val unresolved = reports.errorPositions(probe)
                 val members = reports.markedRanges(probe, RECEIVER_MEMBER)
                 val references = candidates.filter { candidate ->
-                    unresolved.none { it in candidate.reference } && members.none { (start, _, message) ->
+                    unresolved.none { it in (candidate.uncertainCall ?: candidate.reference) } && members.none { (start, _, message) ->
                         start in candidate.reference && receiverMemberMessage(candidate.reference.name) in message
                     }
                 }
                 // the calls, which the properties renamed apply to, if they apply to all of them, while the renamed calls cannot be told apart otherwise
                 val calls = references.mapNotNull { it.uncertainCall }
-                if (calls.isEmpty()) return references
+                if (calls.isEmpty() || scriptFailed.load()) return references
                 val callProbe = source(receiverMemberProbe = index, receiverMemberCalls = calls.mapTo(HashSet()) { it.start })
                 val callReports = compile(callProbe).reports.analyzed(callProbe)
                 if (callReports.failOutside(callProbe, calls)) {
@@ -387,26 +403,37 @@ internal class DefaultScriptExecutor(
                     reference.uncertainCall?.let { call -> failedCalls.none { it in call } } ?: true
                 }
             }
-            // independent of the compilation of the script, so confirmed in parallel, as the candidates are common, e.g. in lambdas,
+            /** See [receiverMembers], or none, if it fails, like when nested too deeply as well. */
+            suspend fun confirmedReceiverMembers(
+                index: Int,
+                scriptFailed: AtomicBoolean
+            ) = try {
+                receiverMembers(index, scriptFailed)
+            } catch (e: Throwable) {
+                if (e is CancellationException || (e is VirtualMachineError && e !is StackOverflowError)) throw e
+                logger.debug { "Script[$scriptId]: Receiver members not confirmed, as the compilation failed with: $e" }
+                emptyList()
+            }
+            // the first ones independent of the compilation of the script, so confirmed in parallel, as the candidates are common, e.g. in lambdas,
             // also when that one fails, as the compiler does not stop when cancelled, while confirming them after its success would delay every such script,
-            // each one nesting a limited number of receivers, independent of each other as well
+            // and the following ones, of the scripts nesting more receivers, only after its success, at most two at a time, bounding the memory
             val (result, receiverMemberReferences) = coroutineScope {
-                val receiverMemberReferences = source.receiverMemberProbes.indices.map { index ->
-                    async {
-                        try {
-                            receiverMembers(index)
-                        } catch (e: Throwable) {
-                            // not confirmed, like when the compilation fails, as it might be nested too deeply as well
-                            if (e is CancellationException || (e is VirtualMachineError && e !is StackOverflowError)) throw e
-                            logger.debug { "Script[$scriptId]: Receiver members not confirmed, as the compilation failed with: $e" }
-                            emptyList()
-                        }
+                val scriptFailed = AtomicBoolean(false)
+                val permits = Semaphore(RECEIVER_MEMBER_COMPILATIONS)
+                val first = async {
+                    if (source.receiverMemberProbes.isEmpty()) emptyList() else permits.withPermit {
+                        confirmedReceiverMembers(0, scriptFailed)
                     }
                 }
                 val result = compile(source)
-                // in the order of the script
-                result to receiverMemberReferences.awaitAll().flatten().takeIf { result is Success }.orEmpty()
-                    .sortedWith(compareBy({ it.reference.start.line }, { it.reference.start.column }))
+                if (result !is Success) scriptFailed.store(true)
+                val following = if (result !is Success) emptyList() else (1 until source.receiverMemberProbes.size).map { index ->
+                    async { permits.withPermit { confirmedReceiverMembers(index, scriptFailed) } }
+                }
+                val references = first.await() + following.awaitAll().flatten()
+                result to if (result !is Success) emptyList() else references.sortedWith(
+                    compareBy({ it.reference.start.line }, { it.reference.start.column })
+                )
             }
             // unless already reported as unresolved
             val errors = result.reports.errorPositions(source)
@@ -510,6 +537,13 @@ internal class DefaultScriptExecutor(
         ): ResultWithDiagnostics<CompiledScript> {
             @OptIn(ExperimentalAtomicApi::class)
             compilations.incrementAndFetch()
+            @OptIn(ExperimentalAtomicApi::class)
+            val active = activeCompilations.incrementAndFetch()
+            @OptIn(ExperimentalAtomicApi::class)
+            while (true) {
+                val max = maxActiveCompilations.load()
+                if (active <= max || maxActiveCompilations.compareAndSet(max, active)) break
+            }
             return try {
                 scriptingHost.compiler(
                     script = source,
@@ -520,6 +554,9 @@ internal class DefaultScriptExecutor(
                 // otherwise it would silently cancel the active caller, and the ones waiting in the cache, instead of failing them
                 currentCoroutineContext().ensureActive()
                 throw IllegalStateException("The compilation of the script was cancelled", e)
+            } finally {
+                @OptIn(ExperimentalAtomicApi::class)
+                activeCompilations.addAndFetch(-1)
             }
         }
 
@@ -695,6 +732,12 @@ internal fun scriptJvmTarget(
 ): String = (JvmTarget.fromString(javaSpecificationVersion) ?: JvmTarget.supportedValues().last()).description
 
 private const val SCRIPT_BLOCK_NAME = "_script"
+
+/**
+ * The maximum number of the compilations confirming the [ScriptSource.receiverMemberCandidates] of a script at a time,
+ * as each one takes as much memory as the compilation of the script.
+ */
+private const val RECEIVER_MEMBER_COMPILATIONS = 2
 
 private const val HIDDEN_DEPENDENCY_PREFIX = "_dependency_"
 
