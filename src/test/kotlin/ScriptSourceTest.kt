@@ -407,6 +407,28 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should keep inline function called within declaration of inferred type as extension of outer receiver`() {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            inline fun logged(crossinline block: () -> Unit, noinline after: () -> Unit) { log += "start"; block(); after() }
+            fun h() = buildString { logged({ }) { } }
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.movedAndBody()
+        assert("logged" !in moved)
+        // split at the name, while the rest keeps its columns
+        assert(
+            " ".repeat(7) + "fun \n`_ScriptDependencies`.\n" + " ".repeat(11) + "logged(" +
+                    " ".repeat(12) + "block: () -> Unit, " + " ".repeat(9) + "after: () -> Unit)" in body
+        )
+    }
+
+    @Test
     fun `should recognize lambdas passed to inline function kept local only in calls without receiver`() {
         // given
         val script = """
@@ -421,7 +443,7 @@ class ScriptSourceTest {
         val source = ScriptSource(script)
 
         // then
-        assert(source.localInlineFunctionArguments.map { it.start.line } == listOf(3))
+        assert(source.localInlineFunctionArguments.map { it.lambda.start.line } == listOf(3))
     }
 
     @Test
@@ -509,6 +531,50 @@ class ScriptSourceTest {
         // then
         val body = source.text.substringAfter(SCRIPT_BLOCK_START)
         assert("fun f(): Int {" in body && "class C {" in body)
+    }
+
+    @Test
+    fun `should not move function named like property read before its declaration`() {
+        // given
+        val script = "val work = 1\nval y = work + 1\nfun work() = 2\ny + work()"
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.movedAndBody()
+        assert("fun work()" !in moved && "fun work()" in body)
+    }
+
+    @Test
+    fun `should not move class named like parameter of moved declaration`() {
+        // given
+        val script = "val n = 1\nenum class E { A; fun f(Box: Int) = Box + 1 }\nclass Box { fun size() = n }\nE.A.f(Box().size())"
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.movedAndBody()
+        assert("class Box" !in moved && "class Box" in body)
+    }
+
+    @Test
+    fun `should not recognize loop variables named like local properties as reading them`() {
+        // given
+        val scripts = listOf(
+            "val items = listOf(1, 2)\nval total: Int get() { var s = 0; for (items in listOf(5)) s += items; return s }\ntotal",
+            "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { for (log in listOf(\"a\")) println(log); block() }\nlogged { }"
+        )
+
+        // when
+        val sources = scripts.map { ScriptSource(it) }
+
+        // then
+        val (getterMoved, getterBody) = sources[0].movedAndBody()
+        assert("get()" in getterMoved && " by object " !in getterBody)
+        val (inlineMoved) = sources[1].movedAndBody()
+        assert("inline fun logged" in inlineMoved)
     }
 
 }
