@@ -407,6 +407,28 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should keep inline function called within declaration of inferred type as extension of outer receiver`() {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            inline fun logged(crossinline block: () -> Unit, noinline after: () -> Unit) { log += "start"; block(); after() }
+            fun h() = buildString { logged({ }) { } }
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.movedAndBody()
+        assert("logged" !in moved)
+        // split at the name, while the rest keeps its columns
+        assert(
+            " ".repeat(7) + "fun \n`_ScriptDependencies`.\n" + " ".repeat(11) + "logged(" +
+                    " ".repeat(12) + "block: () -> Unit, " + " ".repeat(9) + "after: () -> Unit)" in body
+        )
+    }
+
+    @Test
     fun `should recognize lambdas passed to inline function kept local only in calls without receiver`() {
         // given
         val script = """

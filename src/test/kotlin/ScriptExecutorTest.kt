@@ -4444,6 +4444,67 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report call of generic inline function kept local on other receiver as unresolved reference`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            inline fun <T> logged(block: () -> T): T { log += "start"; return block() }
+            fun h() = buildString { logged { } }
+            "a".logged { 1 }
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:5: error: Unresolved reference 'logged'.
+                  | "a".<error>logged</error> { 1 }
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should resolve calls of inline functions reading local properties in the last expression like a regular script`() = runTest {
+        // given
+        val prefix = "val log = mutableListOf<String>()\nvar x = \"\"\n" +
+                "inline fun logged(block: () -> Unit): String { log += \"start\"; block(); throw IllegalStateException(\"start\") }\n" +
+                "class R { fun logged(block: () -> Unit): String = throw IllegalStateException(\"member\") }\n"
+        val call = "with(R()) { logged { } }"
+        // the last expressions of the types known without resolving them, where a regular script resolves its functions before the receivers
+        val beforeReceivers = listOf(
+            "\"${'$'}{$call}\"", "\"a${'$'}{$call}\"", "\"a\" + \"${'$'}{$call}\"", "\"${'$'}{$call}\" + \"\"\"a\"\"\"",
+            "$call == \"\"", "$call != \"\"", "$call === \"\"", "$call !== \"\"", "$call < \"\"", "$call >= \"\"",
+            "($call == \"\")", "@Suppress(\"X\") ($call == \"\")", "$call.compareTo(\"\") == 0",
+            "x = $call", "x += $call", "while (log.isEmpty()) $call", "do { $call } while (false)",
+            "throw Exception($call)"
+        )
+        // and the other ones, where it resolves them after the receivers
+        val afterReceivers = listOf(
+            call, "($call)", "$call + \"\"", "\"a\" + $call", "\"${'$'}{$call}\" + x", "(\"${'$'}{$call}\") + \"\"", "\"${'$'}{$call}\".length",
+            "$call == \"\" || true", "!($call == \"\")", "$call is String", "if (true) $call else \"\"",
+            "for (i in 1..1) $call", "for (i in 1..1) { $call }", "for (c in $call) { }"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val calls = (beforeReceivers + afterReceivers).map { last ->
+            // the function called, as the value of the last expression might not reveal it
+            (executor.execute("$prefix$last") as? ScriptResult.Error)?.message?.lines()?.first()
+        }
+
+        // then
+        assert(
+            calls == beforeReceivers.map { "java.lang.IllegalStateException: start" } +
+                    afterReceivers.map { "java.lang.IllegalStateException: member" }
+        )
+    }
+
+    @Test
     fun `should report inline function reading local property called by class member of the same name`() = runTest {
         // given
         val script = """

@@ -118,6 +118,7 @@ when (result) {
   Where a receiver might resolve a call of a function of the script, like within a lambda, a class, or an extension function,
   a regular script resolves the function before the members and the extensions of the receivers, like a local function, like `logged` in `with(r) { logged { } }`,
   except within a declaration of an inferred type, like `val x = …` or `fun f() = …`, also a member of a class, or within the last expression of the script,
+  unless it is of a type known without resolving it, like a string template, an equality, a comparison, an assignment, a `while` loop or `throw`, unlike a `for` loop,
   where it resolves the function after them, like `logged` in `val x = with(r) { logged { } }`.
   Such an inline function is resolved like that as well, while it is compiled outside of the script body, when it has both of these calls,
   or when it is named like a function of the coroutine scope of the script body, like `run`, or like a dependency, or referred to by a callable reference, like `::logged`,

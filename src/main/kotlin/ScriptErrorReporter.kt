@@ -44,6 +44,9 @@ private val outerReceiverMismatch = Regex(
     "Candidate 'fun (?:<[^']*> )?`?$DEPENDENCIES_CLASS_NAME`?\\.`?([^`(]+)`?\\(.*' is inapplicable because of a receiver type mismatch\\."
 )
 
+/** Reported together with the [outerReceiverMismatch] of a generic function. */
+private val typeParameterNotInferred = Regex("Cannot infer type for type parameter '.+'\\..*")
+
 /** The [message][ScriptDiagnostic.message] without the internal names of the outer receiver of the script block, see [outerReceiverMismatch]. */
 private val ScriptDiagnostic.scriptMessage: String get() = outerReceiverMismatch.matchEntire(message)?.let {
     "Unresolved reference '${it.groupValues[1]}'."
@@ -96,10 +99,16 @@ internal class ScriptErrorReporter(
         }
     }.trimEnd()
 
-    /** The descriptions of the diagnostics, without the repeated ones, e.g. of the same type used twice in an accessor. */
-    private fun List<ScriptDiagnostic>.describe(): List<String> = map { diagnostic ->
-        buildString { appendDiagnostic(diagnostic) }
-    }.distinct()
+    /**
+     * The descriptions of the diagnostics, without the repeated ones, e.g. of the same type used twice in an accessor,
+     * nor the type arguments not inferred for the calls reported as unresolved, see [outerReceiverMismatch].
+     */
+    private fun List<ScriptDiagnostic>.describe(): List<String> {
+        val unresolved = filter { outerReceiverMismatch.matches(it.message) }.mapTo(HashSet()) { it.location?.start }
+        return filterNot { it.location?.start in unresolved && typeParameterNotInferred.matches(it.message) }.map { diagnostic ->
+            buildString { appendDiagnostic(diagnostic) }
+        }.distinct()
+    }
 
     /** The failure recognized in the [source] before compiling it. */
     fun toSourceFailureMessage(): String = source.unmatchedClosingBrace?.let {

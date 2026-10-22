@@ -83,6 +83,9 @@ import org.jetbrains.kotlin.psi.KtLambdaExpression
 import org.jetbrains.kotlin.psi.KtOperationReferenceExpression
 import org.jetbrains.kotlin.psi.KtAnnotatedExpression
 import org.jetbrains.kotlin.psi.KtTypeAlias
+import org.jetbrains.kotlin.psi.KtDoWhileExpression
+import org.jetbrains.kotlin.psi.KtWhileExpression
+import org.jetbrains.kotlin.psi.KtThrowExpression
 import org.jetbrains.kotlin.psi.KtUnaryExpression
 import org.jetbrains.kotlin.psi.KtUserType
 import org.jetbrains.kotlin.psi.KtValueArgument
@@ -1213,10 +1216,33 @@ private fun isInInferredType(
     return if (statement is KtDeclaration) isInInferred(0) else {
         // the value of the script, unlike the statements, which have no value
         val statements = (scope as? KtBlockExpression)?.statements
-        first === statements?.lastOrNull() && statement !is KtLoopExpression
-                && !(statement is KtBinaryExpression && statement.operationToken.let { it == KtTokens.EQ || it in KtTokens.AUGMENTED_ASSIGNMENTS })
+        first === statements?.lastOrNull() && statement is KtExpression && !statement.isOfKnownType()
     }
 }
+
+/** The operators of the expressions of the types known without resolving them, see [isOfKnownType]. */
+private val knownTypeOperations = setOf(
+    KtTokens.EQEQ, KtTokens.EXCLEQ, KtTokens.EQEQEQ, KtTokens.EXCLEQEQEQ, KtTokens.LT, KtTokens.GT, KtTokens.LTEQ, KtTokens.GTEQ, KtTokens.EQ
+) + KtTokens.AUGMENTED_ASSIGNMENTS.types
+
+/**
+ * Whether the type of this expression, the last one of the script, is known without resolving it, see [Reference.isInInferredType],
+ * like a string template, also concatenated with other ones, like `"a" + "${x}"`, an equality, a comparison, an assignment,
+ * a `while` or a `do-while` loop, or `throw`, unlike e.g. a `for` loop,
+ * as recognized by comparing with a regular script, which resolves its functions within them before the receivers.
+ */
+private fun KtExpression.isOfKnownType(): Boolean = when (this) {
+    is KtParenthesizedExpression -> expression?.isOfKnownType() == true
+    is KtAnnotatedExpression -> baseExpression?.isOfKnownType() == true
+    is KtLabeledExpression -> baseExpression?.isOfKnownType() == true
+    is KtStringTemplateExpression, is KtThrowExpression, is KtWhileExpression, is KtDoWhileExpression -> true
+    is KtBinaryExpression -> operationToken in knownTypeOperations || isStringConcatenation()
+    else -> false
+}
+
+/** Whether it is a string template, or the string templates concatenated, like `"a" + "${x}"`, without the parentheses. */
+private fun KtExpression.isStringConcatenation(): Boolean = this is KtStringTemplateExpression
+        || (this is KtBinaryExpression && operationToken == KtTokens.PLUS && right is KtStringTemplateExpression && left?.isStringConcatenation() == true)
 
 /** See [Reference.canAccessScriptMembers]. */
 private fun canAccessScriptMembers(
