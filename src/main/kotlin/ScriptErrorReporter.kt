@@ -389,8 +389,12 @@ internal class ScriptErrorReporter(
         }
         range?.let { appendPosition(it.first) }
         appendSeverityAndMessage(
-            // more specific than the "Unexpected symbol" of the compiler
-            if (range != null && range.first == source.unmatchedClosingBrace && diagnostic.message.startsWith("Syntax error:")) {
+            // more specific than the "Unexpected symbol" of the compiler, covering the brace,
+            // unlike e.g. the empty range of `Expecting ')'` of `foo(1}` at the same position
+            if (
+                range != null && range.first == source.unmatchedClosingBrace && range.second != range.first
+                && diagnostic.message.startsWith("Syntax error:")
+            ) {
                 diagnostic.copy(message = UNMATCHED_CLOSING_BRACE)
             } else {
                 diagnostic

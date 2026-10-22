@@ -2286,7 +2286,8 @@ class ScriptExecutorTest {
         // given
         val scripts = listOf(
             "val a = (1\n}",
-            "foo(1 }"
+            "foo(1 }",
+            "foo(1}"
         )
         val executor = ScriptExecutor()
 
@@ -2298,7 +2299,9 @@ class ScriptExecutorTest {
             "script.kts:1:11: error: Syntax error: Expecting ')'.\n  | val a = (1<error></error>\n\n" +
                     "script.kts:2:1: error: Syntax error: Unexpected '}' without matching '{'.\n  | <error>}</error>",
             "script.kts:1:6: error: Syntax error: Expecting ')'.\n  | foo(1<error></error> }\n\n" +
-                    "script.kts:1:7: error: Syntax error: Unexpected '}' without matching '{'.\n  | foo(1 <error>}</error>"
+                    "script.kts:1:7: error: Syntax error: Unexpected '}' without matching '{'.\n  | foo(1 <error>}</error>",
+            "script.kts:1:6: error: Syntax error: Expecting ')'.\n  | foo(1<error></error>}\n\n" +
+                    "script.kts:1:6: error: Syntax error: Unexpected '}' without matching '{'.\n  | foo(1<error>}</error>"
         ))
     }
 
