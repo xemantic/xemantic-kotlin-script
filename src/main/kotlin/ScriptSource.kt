@@ -1204,7 +1204,7 @@ private fun KtNamedFunction.signature(
     keepsInferredType: Boolean = true,
     /** The replacements of the names of the types, see [singleLineText]. */
     renamed: Map<PsiElement, String> = emptyMap(),
-    /** The receiver of the copy of the function without one, like `kotlinx.coroutines.CoroutineScope`. */
+    /** The receiver of the copy, like `kotlinx.coroutines.CoroutineScope`, unless the function has one already. */
     receiver: String? = null
 ): String? = if (
     typeParameters.any { it.nameIdentifier == null } || valueParameters.any { it.typeReference == null || it.name == null }
@@ -1338,6 +1338,19 @@ private fun KtClassOrObject.placeholder(
 
 /** The prefix of the name of the class replacing a local class in the copies preceding its declaration, see [placeholder]. */
 private const val PLACEHOLDER_CLASS_PREFIX = "_InvisibleClass_"
+
+/** These elements, and the ones they refer to, transitively. */
+private inline fun <T> List<T>.closure(
+    references: (T) -> List<T>
+): Set<T> {
+    val closure = LinkedHashSet<T>()
+    var elements = distinct()
+    while (elements.isNotEmpty()) {
+        closure += elements
+        elements = elements.flatMap { references(it) }.distinct().filter { it !in closure }
+    }
+    return closure
+}
 
 /**
  * The overriding declaration of the member of `Any` of the same signature as this function, like `override fun toString(): kotlin.String`,
@@ -2451,6 +2464,7 @@ private class ScriptStructure(
         val uniqueLocalClasses = localClasses.groupBy { it.name!! }.filterValues { it.size == 1 }.mapValues { it.value.single() }
         /**
          * The references of these parts of a declaration to the local classes of these [invisibleClasses] names, unqualified, unless shadowed by its type parameters,
+         * which are the only declarations taking precedence over the local classes of the script body there, as the classes declared later than them are not visible,
          * or `null`, if it refers to them qualified, like `P.Inner`, which their placeholders do not declare, or to a class of a name declared more than once.
          */
         fun List<PsiElement>.invisibleClassReferences(
@@ -2486,29 +2500,21 @@ private class ScriptStructure(
         val placeholderCopies = { name: String, invisibleClasses: Set<String> ->
             localFunctionsByName[name].orEmpty().flatMap { function ->
                 val declaration = function.psi as KtNamedFunction
-                val references = listOfNotNull(
-                    declaration.receiverTypeReference, declaration.valueParameterList, declaration.typeParameterList, declaration.typeConstraintList,
-                    declaration.typeReference
+                // the types of the signature, unlike the default values replaced in the copy, of a function without a receiver, like the dependency
+                val references = (
+                    declaration.valueParameters.mapNotNull { it.typeReference }
+                        + listOfNotNull(declaration.typeParameterList, declaration.typeConstraintList, declaration.typeReference)
                 ).invisibleClassReferences(invisibleClasses, declaration.typeParameters) ?: return@flatMap emptyList()
                 if (references.isEmpty()) return@flatMap listOfNotNull(declaration.signature()?.let { LATER_DECLARED_FUNCTION to it })
                 // also the ones their declarations refer to, like their supertypes, by the classes
-                val classReferences = mutableMapOf<ParsedDeclaration, List<Pair<PsiElement, ParsedDeclaration>>>()
-                var referred = references.map { it.second }.distinct()
-                while (referred.isNotEmpty()) {
-                    referred.forEach { localClass ->
-                        classReferences[localClass] = localClass.placeholderReferences(invisibleClasses) ?: return@flatMap emptyList()
-                    }
-                    referred = referred.flatMap { localClass -> classReferences.getValue(localClass).map { it.second } }.distinct().filter { it !in classReferences }
+                val classReferences = HashMap<ParsedDeclaration, List<Pair<PsiElement, ParsedDeclaration>>>()
+                references.map { it.second }.closure { localClass ->
+                    classReferences.getOrPut(localClass) { localClass.placeholderReferences(invisibleClasses) ?: return@flatMap emptyList() }.map { it.second }
                 }
                 // named after the first declared of the classes it replaces, itself or the ones it refers to, which tells which of them are replaced,
                 // so the copies at the places, where the same ones are not visible, like preceding and following an unrelated class, declare the same placeholders
                 val placeholderNames = classReferences.keys.associateWith { localClass ->
-                    val replaced = HashSet<ParsedDeclaration>()
-                    var classes = listOf(localClass)
-                    while (classes.isNotEmpty()) {
-                        replaced += classes
-                        classes = classes.flatMap { classReferences.getValue(it).map { (_, referred) -> referred } }.filter { it !in replaced }
-                    }
+                    val replaced = listOf(localClass).closure { classReferences.getValue(it).map { (_, referred) -> referred } }
                     "`$PLACEHOLDER_CLASS_PREFIX${replaced.minOf { statementIndices.getValue(it.psi) }}_${localClass.name}`"
                 }
                 fun List<Pair<PsiElement, ParsedDeclaration>>.renamed() = associate { (name, localClass) -> name to placeholderNames.getValue(localClass) }

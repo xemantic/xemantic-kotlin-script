@@ -139,7 +139,7 @@ Most of these cases are reported as errors, while the following ones still resol
   or when the property is assigned after its declaration, like `val print: Printer` followed by `print = Printer()`,
   or when another statement follows the property on the same line ([#32](https://github.com/xemantic/xemantic-kotlin-script/issues/32)),
 * a call preceding a local function named like a callable dependency, which refers to a local class, when the call is within the declaration of this class, or follows it on the same line,
-  or when the call follows it, which another call of its name precedes, while the function refers also to a local class declared after the call, and the call applies to the function regardless of the former,
+  passing a value of this class, like `f(P())`, or when the call follows it, which another call of its name precedes, while the function refers also to a local class declared after the call, and the call applies to the function regardless of the former,
   like `f(null, null)` following `f(1, 1)` and `class P`, followed by `class R` and `fun f(p: P?, r: R?)` ([#33](https://github.com/xemantic/xemantic-kotlin-script/issues/33)),
 * a call preceding a local function, which compiles, when another local function of its name is visible already,
   or when it is within a lambda, a class, or an extension function, while the local function refers to a local class, or is named like a function of its `CoroutineScope`, like `run { V(1) + V(2) }` calling another `plus` before `operator fun V.plus(o: V)` ([#51](https://github.com/xemantic/xemantic-kotlin-script/issues/51)),

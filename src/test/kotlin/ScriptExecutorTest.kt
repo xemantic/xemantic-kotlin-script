@@ -4789,7 +4789,10 @@ class ScriptExecutorTest {
             // the overloads declared before the class compete with the ones following it, as in the script
             "val p = \"!\"\nfun h(x: Int): Int = 1 + p.length\nval a = f(\"x\")\nclass P { val q = p }\nfun h(x: Any): String = \"s\" + p\nval b = f(h(1))\nfun f(xs: List<P>) = \"localP\" + p\nfun f(n: Int) = \"localInt\" + p\na + b",
             // with a multiline literal
-            "val p = \"!\"\nval r = f(null)\nclass P(val s: String = \"\"\"a\nb\"\"\") { val t = p }\nval c = x\nfun f(x: P?) = \"local\" + p\nval x = \"localx\"\nr + c"
+            "val p = \"!\"\nval r = f(null)\nclass P(val s: String = \"\"\"a\nb\"\"\") { val t = p }\nval c = x\nfun f(x: P?) = \"local\" + p\nval x = \"localx\"\nr + c",
+            // within the class, or following it on the same line, without a value of the class
+            "val p = \"!\"\nval a = f(1)\nclass P { val q = p; fun g() = f(null) }\nfun f(x: P?) = \"local\" + p\na + P().g()",
+            "val p = \"!\"\nval a = f(1)\nclass P { val q = p }; val b = f(null)\nfun f(x: P?) = \"local\" + p\na + b"
         )
         val dependencies = listOf(
             dependency<(Any?) -> String>("f") { "dep" }, dependency<(Any?) -> String>("g") { "depg" }, dependency("x", "depx")
@@ -4834,8 +4837,27 @@ class ScriptExecutorTest {
             listOf(
                 "script.kts:2:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 6.",
                 "script.kts:5:9: error: 'x' refers to the dependency, as the property 'x' of the script body is declared later, at line 7."
-            )
+            ),
+            listOf("script.kts:3:32: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 4."),
+            listOf("script.kts:3:32: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 4.")
         ))
+    }
+
+    @Test
+    fun `should call dependency within local class which local function of the same name declared later refers to when passing value of the class`() = runTest {
+        // given
+        val scripts = listOf(
+            "val p = \"!\"\nval a = f(1)\nclass P { val q = p; fun g() = f(P()) }\nfun f(x: P) = \"local\" + p\na + P().g()",
+            "val p = \"!\"\nval a = f(1)\nclass P { val q = p }; val b = f(P())\nfun f(x: P) = \"local\" + p\na + b"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, listOf(dependency<(Any?) -> String>("f") { "dep" })) }
+
+        // then
+        // unlike in a regular script, calling the local function, see README
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("depdep", "depdep"))
     }
 
     @Test
@@ -4860,7 +4882,10 @@ class ScriptExecutorTest {
             "val p = \"!\"\nclass Q { val q = p }\nval a = f(1)\nclass P { val q = p }\nfun f(q: Q) = \"localQ\" + p\nfun f(x: P) = \"localP\" + p\na",
             // a qualified type named like a local class, and a call within the class resolved to its member
             "val p = \"!\"\nval a = f(1)\nclass Pair { val q = p; fun g() = f(2) }\nfun f(x: kotlin.Pair<Int, Int>) = \"local\" + p\na + Pair().g()",
-            "val p = \"!\"\nval a = f(1)\nabstract class S { fun f(x: Int) = \"member\" }\nclass P : S() { val q = p; fun g() = f(2) }\nfun f(xs: List<P>) = \"local\" + p\na + P().g()"
+            "val p = \"!\"\nval a = f(1)\nabstract class S { fun f(x: Int) = \"member\" }\nclass P : S() { val q = p; fun g() = f(2) }\nfun f(xs: List<P>) = \"local\" + p\na + P().g()",
+            // within the lambdas of the scope functions of the script instance, declaring the dependency
+            "val p = \"!\"\nval a = run { f(null) }\nclass P\nfun f(x: P?) = \"local\" + p\na",
+            "val p = \"!\"\nval b = run { f(null) }\nclass P\nval c = run { f(null) }\nfun f(x: P?) = \"local\" + p\nb + c"
         )
         val dependencies = listOf(
             dependency<(Any?) -> String>("f") { "dep" }, dependency<(Any?) -> String>("g") { "depg" }, dependency("x", "depx")
@@ -4872,7 +4897,8 @@ class ScriptExecutorTest {
 
         // then
         assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(
-            "deprecv", "depdepg", "dep", "depdep", "dep", "depdep", "depdep", "depdep", "depdep", "dep", "dep", "dep", "dep", "depdep", "depmember"
+            "deprecv", "depdepg", "dep", "depdep", "dep", "depdep", "depdep", "depdep", "depdep", "dep", "dep", "dep", "dep", "depdep", "depmember",
+            "dep", "depdep"
         ))
     }
 
