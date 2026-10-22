@@ -319,9 +319,31 @@ internal class ScriptSource(
      * The callable references of the classes moved out of the script body to the moved functions and properties, or to the dependencies,
      * like `::log`, or to the moved extensions, like `String::up`, which are the members of the script class, crashing the compiler backend,
      * from the whole callable reference to the end of the name, recognized by the names only, without the ones bound in the classes,
-     * with their texts in a single line.
+     * nor the ones qualified by a class declared in the script having a member of the name, like `Order::total`,
+     * with their texts in a single line, mapped only after a crash.
      */
-    val scriptMemberCallableReferences: List<Pair<ScriptReference, String>>
+    val scriptMemberCallableReferences: List<Pair<ScriptReference, String>> by lazy {
+        structureCallableReferences.map { reference ->
+            // like `String::up` split across lines
+            ScriptReference(reference.first, position(reference.second.first), position(reference.second.last + 1)) to
+                    script.substring(reference.second).split(lineBreak).joinToString("")
+        }
+    }
+
+    /** See [ScriptStructure.scriptMemberCallableReferences]. */
+    private val structureCallableReferences: List<Pair<String, IntRange>>
+
+    /**
+     * The ranges of the names of the classes and the functions nested in the declarations moved out of the script body, by their paths within them, like `I.f`,
+     * as the compiler names them in the failures of its backend, the first one of each path, by the starts of the declarations,
+     * parsed only after a crash.
+     */
+    private val nestedPathRanges: Map<Int, Map<String, IntRange>> by lazy {
+        val starts = movedDeclarations.mapTo(HashSet()) { it.start }
+        psiFactory.createFile("script.kts", script.replace('\r', '\n')).script?.blockExpression?.statements.orEmpty()
+            .filter { it.startOffsetSkippingComments in starts }
+            .associate { it.startOffsetSkippingComments to it.nestedPathRanges() }
+    }
 
     /** The package of the script, like `foo.bar`, or an empty string, if it has none. */
     val packageName: String
@@ -399,10 +421,7 @@ internal class ScriptSource(
             Triple(reference.toScriptReference(), position(property).line, position(function).line)
         }
         coroutineScopeCandidates = structure.coroutineScopeCandidates.map { it.toLaterDeclaredReference() }
-        scriptMemberCallableReferences = structure.scriptMemberCallableReferences.map { reference ->
-            // like `String::up` split across lines
-            reference.toScriptReference() to script.substring(reference.second).split(lineBreak).joinToString("")
-        }
+        structureCallableReferences = structure.scriptMemberCallableReferences
         bodyDeclarations = structure.bodyDeclarations
         val deprecatedDependencies = if (confirming) {
             laterDeclaredDependencyCandidates.mapTo(HashSet()) { it.reference.name }
@@ -598,7 +617,8 @@ internal class ScriptSource(
     fun movedDeclarationPath(
         path: List<String>
     ): Pair<ScriptPosition, ScriptPosition>? = movedDeclarations.find { it.name == path.firstOrNull() }?.let { declaration ->
-        (path.lastIndex downTo 1).firstNotNullOfOrNull { declaration.nestedPathRanges[path.subList(1, it + 1).joinToString(".")] }
+        val ranges = nestedPathRanges[declaration.start].orEmpty()
+        (path.lastIndex downTo 1).firstNotNullOfOrNull { ranges[path.subList(1, it + 1).joinToString(".")] }
             ?: declaration.nameRange
     }?.let {
         position(it.first) to position(it.last + 1)
@@ -696,12 +716,7 @@ private class Declaration(
     /** Whether it is a function with a receiver, like `fun Int.double()`. */
     val isExtension: Boolean = false,
     /** The classes of the declaration, including itself, if it is one, in the order of the script. */
-    val classNames: List<ClassName> = emptyList(),
-    /**
-     * The ranges of the names of the classes and the functions nested in the declaration, by their paths within it, like `I.f`,
-     * as the compiler names them in the failures of its backend, the first one of each path.
-     */
-    val nestedPathRanges: Map<String, IntRange> = emptyMap()
+    val classNames: List<ClassName> = emptyList()
 )
 
 /** A class or an object, with the [range] of its name, or of the `companion` keyword of an unnamed companion object. */
@@ -756,6 +771,23 @@ private val memberOnlyAnnotations = setOf("Volatile", "Transient", "JvmField", "
 /** Whether it is named in the path of the code, which the compiler reports in the failures of its backend, unlike e.g. an object literal. */
 private fun KtNamedDeclaration.isPathElement(): Boolean =
     (this is KtClassOrObject && !(this is KtObjectDeclaration && isObjectLiteral())) || this is KtNamedFunction
+
+/**
+ * The ranges of the names of the classes and the functions nested in this declaration, not including itself, by their paths within it, like `I.f`,
+ * the first one of each path in the order of the script.
+ */
+private fun PsiElement.nestedPathRanges(): Map<String, IntRange> = buildMap {
+    val root = this@nestedPathRanges
+    collectDescendantsOfType<KtNamedDeclaration> { it !== root && it.isPathElement() }.sortedBy { it.startOffset }.forEach { nested ->
+        val path = (nested.parents.takeWhile { it !== root }.filterIsInstance<KtNamedDeclaration>()
+            .filter { it.isPathElement() }.toList().asReversed() + nested)
+            .map { it.pathName() ?: return@forEach }
+        val name = nested.nameIdentifier
+            ?: nested.modifierList?.getModifier(KtTokens.COMPANION_KEYWORD)
+            ?: return@forEach
+        putIfAbsent(path.joinToString("."), name.startOffset until name.endOffset)
+    }
+}
 
 private fun KtNamedDeclaration.pathName(): String? =
     name ?: if (this is KtObjectDeclaration && isCompanion()) "Companion" else null
@@ -922,7 +954,9 @@ private class Reference(
     /** Whether it is within a lambda, which might have a receiver, so its resolution is not known without compiling. */
     val isInLambda: Boolean = false,
     /** Whether it is a type, like `Base` in `val b: Base` or in `class D : Base()`, which refers to a class. */
-    val isType: Boolean = false
+    val isType: Boolean = false,
+    /** The name of the receiver of a callable reference, like `Order` of `Order::total`, if it is a simple name. */
+    val receiverName: String? = null
 ) {
 
     /**
@@ -991,7 +1025,10 @@ private fun PsiElement.references(
         expressionOffset = callableReference?.takeIf { it.callableReference == expression }?.startOffset ?: expression.startOffset,
         canAccessScriptMembers = canAccessScriptMembers(expression, scope),
         isInLambda = isInLambda(expression, scope),
-        isType = expression.parent is KtUserType
+        isType = expression.parent is KtUserType,
+        receiverName = callableReference?.takeIf { it.callableReference == expression }?.let {
+            (it.receiverExpression as? KtSimpleNameExpression)?.getReferencedName()
+        }
     )
 } + operatorReferences(scope)
 
@@ -1394,11 +1431,17 @@ private class ScriptStructure(
                 it.refersToLocal(scriptMemberNames) || ((it.isQualified || !it.isBound) && it.name in scriptExtensionNames)
             }
         }
+        // like `Order` of `Order::total`, a class of the script declaring or inheriting a member of the name, which the reference refers to
+        fun Reference.isQualifiedByMemberClass() = receiverName?.let { receiver ->
+            classesByName[receiver]?.any { type ->
+                name in type.inheritedMemberNames() || (type.declarations + type.primaryConstructorParameters.filter { it.hasValOrVar() }).any { it.name == name }
+            }
+        } == true
         scriptMemberCallableReferences = moved.filter { it.kind == DeclarationKind.CLASS }.flatMap { declaration ->
             declaration.references.filter {
                 it.isCallableReference && it.canAccessScriptMembers && if (it.isQualified) {
                     // like `String::up`, where the members of the class do not apply
-                    it.name in scriptExtensionNames
+                    it.name in scriptExtensionNames && !it.isQualifiedByMemberClass()
                 } else {
                     !it.isBound && it.name in scriptMemberNames
                 }
@@ -1705,21 +1748,6 @@ private class ScriptStructure(
                 }
             } else {
                 emptyList()
-            },
-            nestedPathRanges = if (withNestedNames) {
-                buildMap {
-                    psi.collectDescendantsOfType<KtNamedDeclaration> { it.isPathElement() }.forEach { nested ->
-                        val path = (nested.parents.takeWhile { it !== psi }.filterIsInstance<KtNamedDeclaration>()
-                            .filter { it.isPathElement() }.toList().asReversed() + nested)
-                            .map { it.pathName() ?: return@forEach }
-                        val name = nested.nameIdentifier
-                            ?: nested.modifierList?.getModifier(KtTokens.COMPANION_KEYWORD)
-                            ?: return@forEach
-                        putIfAbsent(path.joinToString("."), name.startOffset until name.endOffset)
-                    }
-                }
-            } else {
-                emptyMap()
             }
         )
     }

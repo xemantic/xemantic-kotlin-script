@@ -3762,6 +3762,64 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report error at bound callable reference of moved class to extension function of script crashing compiler`() = runTest {
+        // given
+        val script = """
+            fun String.up() = uppercase()
+            sealed interface S
+            class T : S { fun f() = listOf("a").map { "a"::up } }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:43: error: The compiler crashed generating the callable reference '"a"::up'.
+                  | class T : S { fun f() = listOf("a").map { <error>"a"::up</error> } }
+                  hint: 'T' is compiled outside of the script body, where a callable reference to 'up' of the script crashes the compiler - replace it with a lambda using 'up'.
+            """.trimIndent()
+        }
+    }
+
+    /**
+     * Pins the wording of the crash of the compiler backend, recognized by the reporter, which might change with the compiler version,
+     * as otherwise the crash is reported without a location.
+     */
+    @Test
+    fun `should report compiler crash not explained by callable reference at nested class without intermediate representation`() = runTest {
+        // given
+        val script = """
+            fun log(m: String) = m
+            sealed interface S
+            class T : S {
+                class T { fun f() = listOf("a").map(::log) }
+            }
+            T.T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:11: error: Exception while generating code for public final fun f (): kotlin.collections.List<kotlin.String> declared in <root>._.T.T
+                  Caused by: java.lang.AssertionError: Non-mapped local declaration: VALUE_PARAMETER INSTANCE_RECEIVER kind:DispatchReceiver name:<this> type:<root>._
+                  |     class <error>T</error> { fun f() = listOf("a").map(::log) }
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should report error at callable reference split across lines crashing compiler`() = runTest {
         // given
         val script = """

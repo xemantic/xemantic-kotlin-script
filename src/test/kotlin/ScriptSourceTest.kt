@@ -312,4 +312,24 @@ class ScriptSourceTest {
         assert(source.propertiesReferredIn(ScriptPosition(8, 5), ScriptPosition(8, 6)) == listOf("q" to 7))
     }
 
+    @Test
+    fun `should find callable references to script members only of extension functions not shadowed by members of class declared in the script`() {
+        // given
+        val script = """
+            fun List<Int>.total() = sum()
+            class Order { fun total() = 3 }
+            open class Base { fun total() = 4 }
+            class Special : Base()
+            sealed interface S
+            class T : S { fun f() = Order::total; fun g() = Special::total; fun h() = List<Int>::total }
+            T().f()
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        assert(source.scriptMemberCallableReferences.map { it.second } == listOf("List<Int>::total"))
+    }
+
 }

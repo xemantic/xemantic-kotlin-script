@@ -196,9 +196,103 @@ class ScriptErrorReporterTest {
         """.trimIndent()
     }
 
+    @Test
+    fun `should report compiler backend crash at moved property of accessor`() {
+        // given
+        val reporter = ScriptErrorReporter(ScriptSource("inline fun g() = 1\nval x: Int get() = g()\nx"))
+
+        // when
+        val message = reporter.toFailureMessage(listOf(backendCrash("public final fun <get-x> (): kotlin.Int declared in <root>._")))
+
+        // then
+        message sameAs """
+            script.kts:2:5: error: Exception while generating code for public final fun <get-x> (): kotlin.Int declared in <root>._
+              Caused by: java.lang.AssertionError: Non-mapped local declaration
+              | val <error>x</error>: Int get() = g()
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report compiler backend crash of library function without location and with whole root cause message`() {
+        // given
+        val reporter = ScriptErrorReporter(ScriptSource("inline fun map() = 1\nmap()"))
+        val crash = backendCrash(
+            code = "public final fun map (): kotlin.Int declared in kotlin.collections.CollectionsKt",
+            rootCause = "Non-mapped local declaration\nof the lambda\n\n in FUN name:f"
+        )
+
+        // when
+        val message = reporter.toFailureMessage(listOf(crash))
+
+        // then
+        message sameAs """
+            error: Exception while generating code for public final fun map (): kotlin.Int declared in kotlin.collections.CollectionsKt
+              Caused by: java.lang.AssertionError: Non-mapped local declaration
+              of the lambda
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report compiler backend crash of unknown wording without intermediate representation`() {
+        // given
+        val reporter = ScriptErrorReporter(ScriptSource("fun log(m: String) = m\nsealed interface S\nclass T : S { fun f() = listOf(\"a\").map(::log) }\nT().f()"))
+        val crash = ScriptDiagnostic(
+            code = ScriptDiagnostic.unspecifiedError,
+            message = "Code generation failed for f in T:\nFUN name:f visibility:public modality:FINAL returnType:kotlin.Int\n  BLOCK_BODY",
+            exception = RuntimeException(
+                "Code generation failed for f in T:\nFUN name:f",
+                AssertionError("Non-mapped local declaration: VALUE_PARAMETER INSTANCE_RECEIVER kind:DispatchReceiver name:<this> type:<root>._").apply {
+                    stackTrace = arrayOf(StackTraceElement("org.jetbrains.kotlin.backend.jvm.codegen.ExpressionCodegen", "visitGetValue", "ExpressionCodegen.kt", 1))
+                }
+            )
+        )
+
+        // when
+        val message = reporter.toFailureMessage(listOf(crash))
+
+        // then
+        message sameAs """
+            error: Code generation failed for f in T
+              Caused by: java.lang.AssertionError: Non-mapped local declaration: VALUE_PARAMETER INSTANCE_RECEIVER kind:DispatchReceiver name:<this> type:<root>._
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report compiler backend crash of moved class not capturing the script class instance at the class rather than at its callable references`() {
+        // given
+        val reporter = ScriptErrorReporter(ScriptSource("fun log(m: String) = m\nsealed interface S\nclass T : S { fun f() = listOf(\"a\").map(::log) }\nT().f()"))
+
+        // when
+        val message = reporter.toFailureMessage(listOf(backendCrash("public final fun f (): kotlin.Int declared in <root>._.T")))
+
+        // then
+        message sameAs """
+            script.kts:3:7: error: Exception while generating code for public final fun f (): kotlin.Int declared in <root>._.T
+              Caused by: java.lang.AssertionError: Non-mapped local declaration
+              | class <error>T</error> : S { fun f() = listOf("a").map(::log) }
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report compiler backend crash at nested class named like the moved class enclosing it`() {
+        // given
+        val reporter = ScriptErrorReporter(ScriptSource("sealed interface S\nclass T : S {\n    class T { fun f() = 1 }\n}\nT.T().f()"))
+
+        // when
+        val message = reporter.toFailureMessage(listOf(backendCrash("public final fun f (): kotlin.Int declared in <root>._.T.T")))
+
+        // then
+        message sameAs """
+            script.kts:3:11: error: Exception while generating code for public final fun f (): kotlin.Int declared in <root>._.T.T
+              Caused by: java.lang.AssertionError: Non-mapped local declaration
+              |     class <error>T</error> { fun f() = 1 }
+        """.trimIndent()
+    }
+
     /** Like the one reported by the compiler, followed by the intermediate representation of the [code]. */
     private fun backendCrash(
-        code: String
+        code: String,
+        rootCause: String = "Non-mapped local declaration\n\n in FUN name:f"
     ) = ScriptDiagnostic(
         code = ScriptDiagnostic.unspecifiedError,
         message = """
@@ -208,7 +302,7 @@ class ScriptErrorReporterTest {
         """.trimIndent(),
         exception = RuntimeException(
             "Exception while generating code for $code:\nFUN name:f",
-            AssertionError("Non-mapped local declaration\n\n in FUN name:f")
+            AssertionError(rootCause)
         )
     )
 

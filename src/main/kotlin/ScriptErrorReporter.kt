@@ -48,9 +48,17 @@ private val declarationCapturingScript = Regex(
 
 /**
  * The first line of the failure of the compiler backend, reported without a location, followed by the intermediate representation of the code,
- * with the name of the generated function, if it is one, and the path of the declaration containing it within the script class, if any, like `T.I`.
+ * with the name of the generated function, if it is one, and the path of the declaration containing it within the script class, if any, like `T.I`,
+ * in the wording of the compiler, which might change with its version, so the other failures of the backend are recognized by their exceptions,
+ * and reported without a location, see [isBackendCrash].
  */
 private val backendCrash = Regex("Exception while generating code for (?:.* fun (\\S+) .*|.*) declared in (.+):")
+
+/** The package of the compiler backend, throwing the exceptions of its failures, or failing in its frames. */
+private const val BACKEND_PACKAGE = "org.jetbrains.kotlin.backend."
+
+/** The accessor of a property, like `<get-x>`, named so by the compiler in the failures of its backend. */
+private val accessorFunction = Regex("<[gs]et-(.+)>")
 
 /** The longest name of a class of the script looked up in a text resembling one, as the text might continue, like `_.Color is unknown`. */
 private const val MAX_CLASS_NAME_LENGTH = 256
@@ -565,13 +573,23 @@ internal class ScriptErrorReporter(
         }
         if (location == null) {
             val firstLine = diagnostic.message.lineSequence().first()
-            backendCrash.matchEntire(firstLine)?.let { match ->
-                // qualified by the package of the script, or by `<root>`, followed by the script class
-                val qualifiedPath = match.groupValues[2]
-                val path = listOf("<root>.", "${source.packageName}.").firstOrNull { qualifiedPath.startsWith(it) }?.let {
-                    qualifiedPath.removePrefix(it).split('.').drop(1)
-                }.orEmpty()
-                appendBackendCrash(diagnostic, firstLine.removeSuffix(":"), match.groupValues[1], path)
+            val match = backendCrash.matchEntire(firstLine)
+            if (match != null || diagnostic.isBackendCrash()) {
+                // qualified by the package of the script, or by `<root>`, followed by the script class, unless it is a declaration of a library
+                val qualifiedPath = match?.groupValues?.get(2)
+                val scriptPath = qualifiedPath?.let { path ->
+                    listOf("<root>.", "${source.packageName}.").firstOrNull { path.startsWith(it) }?.let { prefix ->
+                        val names = path.removePrefix(prefix).split('.')
+                        prefix + names.first() to names.drop(1)
+                    }
+                }
+                appendBackendCrash(
+                    diagnostic = diagnostic,
+                    message = firstLine.removeSuffix(":"),
+                    function = match?.groupValues?.get(1).orEmpty(),
+                    scriptClass = scriptPath?.first,
+                    path = scriptPath?.second
+                )
                 return
             }
         }
@@ -617,20 +635,51 @@ internal class ScriptErrorReporter(
     }
 
     /**
-     * The crash of the compiler backend while generating the [function] within the declaration of this [path], if any,
-     * explained by the callable references of all the classes moved out of the script body to the members of the script class,
-     * if the declaration moved out of the script body containing the code has any,
-     * as the compiler stops at the first crash, otherwise by the first line of the [message] and of its root cause,
-     * without the intermediate representation of the code, at the innermost declaration of the [path] found in the script.
+     * Whether it is a failure of the compiler backend, reported without a location, in the wording not recognized by [backendCrash],
+     * like `Backend Internal error: Exception during IR lowering`, told by its exceptions thrown by the backend.
+     */
+    private fun ScriptDiagnostic.isBackendCrash(): Boolean = location == null && exceptionChain().any { exception ->
+        exception.javaClass.name.startsWith(BACKEND_PACKAGE)
+                || exception.read(emptyList()) { stackTrace.filterNotNull() }.any { it.className.startsWith(BACKEND_PACKAGE) }
+    }
+
+    /** The exception of the diagnostic, followed by its causes. */
+    private fun ScriptDiagnostic.exceptionChain(): List<Throwable> = generateSequence(exception) { cause ->
+        cause.read(null) { this.cause }?.takeIf { it !== cause }
+    }.take(MAX_REPORTED_EXCEPTIONS).toList()
+
+    /**
+     * The crash of the compiler backend while generating the [function], within the declaration of this [path] within the [scriptClass],
+     * qualified like `<root>._`, if known, explained by the callable references of all the classes moved out of the script body to the members of the script class,
+     * as the compiler stops at the first crash, if its root cause is the instance of the script class not available in the declaration moved out of the script body,
+     * which has such references, or, if the declaration is not known, if it failed generating a callable reference.
+     * Otherwise it is reported by the first line of the [message] and the first paragraph of the message of its root cause,
+     * without the intermediate representation of the code, at the innermost declaration of the [path] found in the script, if any.
      */
     private fun StringBuilder.appendBackendCrash(
         diagnostic: ScriptDiagnostic,
         message: String,
         function: String,
-        path: List<String>
+        scriptClass: String?,
+        path: List<String>?
     ) {
+        val chain = diagnostic.exceptionChain()
+        val rootCause = chain.lastOrNull()
+        val rootCauseMessage = rootCause?.read(null) { this.message }?.substringBefore("\n\n")?.trimEnd()
         val references = source.scriptMemberCallableReferences
-        if (references.any { (reference) -> source.movedDeclarationAt(reference.start) == path.firstOrNull() }) {
+        val explained = references.isNotEmpty() && if (path != null && scriptClass != null) {
+            // like `Non-mapped local declaration: VALUE_PARAMETER INSTANCE_RECEIVER ... type:<root>._`
+            references.any { (reference) -> source.movedDeclarationAt(reference.start) == path.firstOrNull() }
+                    && rootCauseMessage?.let { Regex("${Regex.escape(scriptClass)}(?![\\w.$])").containsMatchIn(it) } == true
+        } else {
+            // like the lowering of a bound callable reference, like `"a"::up`, naming no declaration
+            chain.any { exception ->
+                exception.read(emptyList()) { stackTrace.filterNotNull() }.any {
+                    it.className.startsWith(BACKEND_PACKAGE) && "Reference" in it.className.substringAfterLast('.')
+                }
+            }
+        }
+        if (explained) {
             references.forEachIndexed { index, (reference, text) ->
                 val start = reference.start
                 val end = reference.end
@@ -646,12 +695,14 @@ internal class ScriptErrorReporter(
             }
             return
         }
-        val range = source.movedDeclarationPath(path.ifEmpty { listOf(function) })
-        val rootCause = generateSequence(diagnostic.exception) { cause ->
-            cause.read(null) { this.cause }?.takeIf { it !== cause }
-        }.take(MAX_REPORTED_EXCEPTIONS).lastOrNull()
+        val range = when {
+            path == null -> null
+            // like the accessor `<get-x>` of the property `x`
+            path.isEmpty() -> source.movedDeclarationPath(listOf(accessorFunction.matchEntire(function)?.groupValues?.get(1) ?: function))
+            else -> source.movedDeclarationPath(path)
+        }
         val causeLine = rootCause?.let { cause ->
-            listOfNotNull(cause.javaClass.name, cause.read(null) { this.message }?.lineSequence()?.first()).joinToString(": ")
+            listOfNotNull(cause.javaClass.name, rootCauseMessage).joinToString(": ")
         }
         range?.let { appendPosition(it.first) }
         appendSeverityAndMessage(
