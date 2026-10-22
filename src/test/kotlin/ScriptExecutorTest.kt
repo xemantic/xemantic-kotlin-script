@@ -4960,6 +4960,205 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report calls of declarations moved out of the script body to local properties made callable by local invoke operators`() = runTest {
+        // given
+        val invoke = "operator fun Int.invoke(x: Any?): String = \"int:${'$'}x\"\n"
+        val scripts = listOf(
+            // failing as resolved to `kotlin.io.print` instead
+            "${invoke}val print = 1 + 2\nsealed class S { fun show(): String = print(\"\") }\nclass T : S()\nT().show()",
+            "${invoke}val print = three()\nfun three() = 3\nsealed class S { fun show(): String = print(\"\") }\nclass T : S()\nT().show()",
+            "${invoke}val print: Int = listOf(3).first()\nsealed class S { fun show(): String = print(\"\") }\nclass T : S()\nT().show()",
+            // returning `Unit` of `kotlin.io.print` instead
+            "${invoke}val print = 1 + 2\nsealed class S { fun show(): Any = print(\"\") }\nclass T : S()\nT().show()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+        assert(results.all { "'print' does not refer to the property of the script body declared at line 2" in (it as ScriptResult.Error).message })
+    }
+
+    @Test
+    fun `should move local invoke operator called on value by declaration moved out of the script body`() = runTest {
+        // given
+        val script = """
+            operator fun Int.invoke(x: Any?): String = "int:${'$'}x"
+            val print: Int = 3
+            sealed class S { fun show(): String = print("") }
+            class T : S()
+            T().show()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "int:")
+        }
+    }
+
+    @Test
+    fun `should report unresolved value called by declaration moved out of the script body once`() = runTest {
+        // given
+        val script = """
+            val p = listOf("!").first()
+            operator fun Int.invoke(x: Any?): String = "int:${'$'}x${'$'}p"
+            val q = listOf(1).first()
+            sealed class S { fun g() = q(2) }
+            class T : S()
+            T().g()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert(result is ScriptResult.Error && result.message == """
+            script.kts:4:28: error: Unresolved reference 'q'.
+              | sealed class S { fun g() = <error>q</error>(2) }
+              hint: 'S' is compiled outside of the script body, where 'q' (line 3) is not visible - pass it as a parameter, or declare it within 'S'.
+        """.trimIndent())
+    }
+
+    @Test
+    fun `should move extension overloads not referred to by the script body despite overloads accessing local properties`() = runTest {
+        // given
+        val scripts = listOf(
+            "val p = listOf(\"!\").first()\nfun String.f(): String = \"s\" + p\nfun Int.f(): String = \"int\"\nsealed class S { fun g() = 1.f() }\nclass T : S()\nT().g()",
+            "class V(val n: Int)\nval p = listOf(1).first()\noperator fun String.plus(v: V): String = this + v.n + p\noperator fun V.plus(v: V): V = V(n + v.n)\n" +
+                    "sealed class S { fun g() = (V(1) + V(2)).n }\nclass T : S()\nT().g()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("int", 3))
+    }
+
+    @Test
+    fun `should move local invoke operator called on implicit lambda parameter by declaration moved out of the script body`() = runTest {
+        // given
+        val script = """
+            operator fun Int.invoke(x: Any?): String = "int:${'$'}x"
+            sealed class S { fun g() = listOf(3).map { it("x") } }
+            class T : S()
+            T().g()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == listOf("int:x"))
+        }
+    }
+
+    @Test
+    fun `should not move local invoke operator overloading one accessing local properties`() = runTest {
+        // given
+        val script = """
+            val p = listOf("!").first()
+            operator fun Any.invoke(x: Any?): String = "any:${'$'}x${'$'}p"
+            operator fun Int.invoke(x: Any?): String = "int:${'$'}x"
+            sealed class S { fun g() = listOf(1).size }
+            class T : S()
+            T().g().toString() + 3("x")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "1int:x")
+        }
+    }
+
+    @Test
+    fun `should report calls of moved declarations to local overloads not moved with the overloads accessing local properties`() = runTest {
+        // given
+        val overloads = "val p = listOf(\"!\").first()\n"
+        val scripts = listOf(
+            "${overloads}fun Any.f(x: Any?): String = \"any:${'$'}x${'$'}p\"\nfun Int.f(x: Any?): String = \"int:${'$'}x\"\n" +
+                    "sealed class S { fun g() = 1.f(2) }\nclass T : S()\nT().g() + 3.f(\"x\")" to "where 'f' (line ",
+            "${overloads}operator fun Any.invoke(x: Any?): String = \"any:${'$'}x${'$'}p\"\noperator fun Int.invoke(x: Any?): String = \"int:${'$'}x\"\n" +
+                    "sealed class S { fun g(n: Int) = n(2) }\nclass T : S()\nT().g(1) + 3(\"x\")" to
+                    // the overload called in the script
+                    "'invoke' does not refer to the function of the script body declared at line 3"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { (script) -> executor.execute(script) }
+
+        // then
+        assert(results.zip(scripts).all { (result, script) ->
+            result is ScriptResult.Error && script.second in result.message
+        })
+    }
+
+    @Test
+    fun `should report calls of declarations moved out of the script body on values made callable by hidden local invoke operator`() = runTest {
+        // given
+        val invoke = "val p = \"!\"\noperator fun Int.invoke(x: Any?): String = \"int:${'$'}x${'$'}p\"\n"
+        val scripts = listOf(
+            // failing as resolved to `kotlin.io.print` instead, of the constant moved with the class
+            "${invoke}val print: Int = 3\nsealed class S { fun show(): String = print(\"\") }\nclass T : S()\nT().show()",
+            // returning `Unit` of `kotlin.io.print` instead
+            "${invoke}val print: Int = 3\nsealed class S { fun show(): Any = print(\"\") }\nclass T : S()\nT().show()",
+            "${invoke}sealed class S { fun show(n: Int): Any = n(\"\") }\nclass T : S()\nT().show(4)"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+        assert(results.all { "'invoke' does not refer to the function of the script body declared at line 2" in (it as ScriptResult.Error).message })
+    }
+
+    @Test
+    fun `should report call of declaration moved out of the script body failing as resolved to another function than the local one`() = runTest {
+        // given
+        val script = """
+            val p = "!"
+            fun print(x: Int): String = "n${'$'}x${'$'}p"
+            sealed class S { fun f(): String = print(1) }
+            class T : S()
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert(result is ScriptResult.Error && result.message == """
+            script.kts:3:36: error: 'print' does not refer to the function of the script body declared at line 2, which is not visible in 'S'.
+              | sealed class S { fun f(): String = <error>print</error>(1) }
+              hint: 'S' is compiled outside of the script body, where 'print' (line 2) is not visible - pass it as a parameter, or declare it within 'S'.
+
+            script.kts:3:36: error: Return type mismatch: expected 'String', actual 'Unit'.
+              | sealed class S { fun f(): String = <error>print(1)</error> }
+        """.trimIndent())
+    }
+
+    @Test
     fun `should report calls of declarations moved out of the script body to local properties of inferred types on receivers named like packages`() = runTest {
         // given
         val scripts = listOf(
@@ -5447,16 +5646,20 @@ class ScriptExecutorTest {
             "Cfg()!!", "cfg as Cfg", "null ?: cfg", "when { cfg is Cfg -> cfg else -> Cfg() }", "@Deprecated(\"x\") cfg", "l@ cfg", "mkf(cfg)()",
             "cfg + cfg", "-cfg", "!cfg", "cfg with cfg", "cfg..cfg", "(cfg)()", "(mkf(cfg))()", "@Suppress(\"x\") Cfg()",
             // the call of the same name, bound by name to the member of the enum class
-            "mapOf(1 to cfg).getValue(1)", "l@ (mapOf(1 to cfg)).getValue(1)"
+            "mapOf(1 to cfg).getValue(1)", "l@ (mapOf(1 to cfg)).getValue(1)",
+            // starting with the local of the same name, where the compiler reports the delegate convention as well
+            "getValue[0]"
         )
+        // the local named like the convention, only where the delegate expression starts with it
+        fun locals(delegate: String) = if (delegate.startsWith("getValue")) "val getValue = listOf(cfg); " else ""
         val scripts = operators.flatMap { (name, operator) ->
             delegates.map { delegate ->
-                "$declarations${operator}enum class E { A; fun getValue() = 0; fun f(): Int { val cfg = Cfg(); val v: Int by $delegate; return v } }\nE.A.f()" to name
+                "$declarations${operator}enum class E { A; fun getValue() = 0; fun f(): Int { val cfg = Cfg(); ${locals(delegate)}val v: Int by $delegate; return v } }\nE.A.f()" to name
             }
         } + delegates.map { delegate ->
             val variable = "class Cfg { $members; operator fun getValue(t: Any?, p: KProperty<*>) = 1 }\n" +
                     "operator fun Cfg.setValue(t: Any?, p: KProperty<*>, v: Int) { println(scale) }\n"
-            "${declarations.replace("class Cfg { $members }\n", variable)}enum class E { A; fun getValue() = 0; fun f(): Int { val cfg = Cfg(); var v: Int by $delegate; v = 2; return v } }\nE.A.f()" to "setValue"
+            "${declarations.replace("class Cfg { $members }\n", variable)}enum class E { A; fun getValue() = 0; fun f(): Int { val cfg = Cfg(); ${locals(delegate)}var v: Int by $delegate; v = 2; return v } }\nE.A.f()" to "setValue"
         }
         val executor = ScriptExecutor()
 
@@ -5497,6 +5700,31 @@ class ScriptExecutorTest {
 
         // then
         assert(results.all { it is ScriptResult.Error && "does not refer to the function" !in it.message })
+    }
+
+    @Test
+    fun `should report invisible delegate convention reported at callee of the same name`() = runTest {
+        // given
+        val script = """
+            import kotlin.reflect.KProperty
+            val scale = listOf(10).first()
+            class Cfg
+            operator fun Cfg.getValue(t: Any?, p: KProperty<*>): Int = scale
+            fun getValue(c: Cfg): Cfg = c
+            sealed class E { fun f(): Int { val cfg = Cfg(); val v: Int by getValue(cfg); return v } }
+            class F : E()
+            F().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert(result is ScriptResult.Error && result.message.startsWith(
+            "script.kts:6:61: error: 'getValue' does not refer to the function of the script body declared at line 4, which is not visible in 'E'.\n" +
+                    "  | sealed class E { fun f(): Int { val cfg = Cfg(); val v: Int <error>by getValue(cfg)</error>; return v } }\n"
+        ))
     }
 
     @Test
