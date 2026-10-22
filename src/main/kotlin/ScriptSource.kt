@@ -94,6 +94,7 @@ import org.jetbrains.kotlin.psi.psiUtil.forEachDescendantOfType
 import org.jetbrains.kotlin.psi.psiUtil.parents
 import org.jetbrains.kotlin.psi.psiUtil.startOffset
 import org.jetbrains.kotlin.psi.psiUtil.startOffsetSkippingComments
+import java.util.Collections
 import java.util.IdentityHashMap
 import kotlin.concurrent.atomics.AtomicLong
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
@@ -1609,9 +1610,8 @@ private class ScriptStructure(
         fun referredToBefore(
             references: List<Reference>
         ): List<ParsedDeclaration> = references.filter {
-            // unlike the ones bound by the local functions, while a value bound by the same name might not be called, like `format()` of an `Int`,
-            // and a member of the class, like `g` in `class A { fun f() = g(); fun g() = 1 }`, is resolved on its receiver instead, like in the script
-            (!it.isBound || it.isBoundByMember || (it.isBoundByNonFunction && it.isCall))
+            // unlike the ones bound by the local functions, while a value bound by the same name might not be called, like `format()` of an `Int`
+            (!it.isBound || (it.isBoundByNonFunction && it.isCall))
                     // which would be resolved on the coroutine scope instead, see coroutineScopeCandidates
                     && it.name !in coroutineScopeFunctions
                     // resolved to the property of the dependency of the same name instead, if declared before
@@ -2159,42 +2159,76 @@ private class ScriptStructure(
             (declaration.kind == DeclarationKind.FUNCTION || declaration.kind == DeclarationKind.CLASS)
                     && (firstReferences[declaration] ?: Int.MAX_VALUE) < declaration.start
         }
-        // The functions called before their declarations only where the compiler might resolve the calls otherwise,
-        // on a receiver, like `append` in `buildString { append("x") }`, or to a member of the class, like `g` in `class A { fun f() = g(); fun g() = 1 }`,
+        // The functions called before their declarations only where a receiver might resolve the calls instead, like `append` in `buildString { append("x") }`,
         // and also after their declarations, where a receiver might resolve them, like `append` in a following `buildString { append("y") }`.
         // A regular script ranks such a function before the receivers after its declaration, unless it resolved a call before it to the function,
         // so no placement of a moved function matches it for all the calls, unlike the local function, invisible before its declaration.
         // A function with a declared return type is ranked after the receivers by a regular script also after its declaration, like when moved after the script block.
+        // Also the functions called before their declarations as the members of the classes, like `g` in `class A { fun f() = g(); fun g() = 1 }`,
+        // which the script resolves to the members, and which are resolved to the moved functions declared before the script block instead.
         val (calledOnReceivers, calledAsMembers) = run {
             val localReferencesByName = localReferences.groupBy { it.name }
             val bodyReferencesByName = bodyReferences.groupBy { it.name }
             val classesByName = declarations.filter { it.kind == DeclarationKind.CLASS }.mapNotNull { it.psi as? KtClassOrObject }
                 .filter { it.name != null }.groupBy { it.name!! }
+            val classes = classesByName.values.flatten().sortedBy { it.startOffset }
+            /** The classes of the script it extends, or `null` if some supertypes are not declared by the script. */
+            val supertypeClasses = IdentityHashMap<KtClassOrObject, List<KtClassOrObject>?>()
+            fun KtClassOrObject.supertypeClasses() = supertypeClasses.getOrPut(this) {
+                superTypeListEntries.flatMap { entry ->
+                    val type = entry.typeReference?.typeElement as? KtUserType
+                    (if (type?.qualifier == null) type?.referencedName?.let { classesByName[it] } else null) ?: return@getOrPut null
+                }
+            }
+            /** The names of the members declared by the class, also by its companion object. */
+            val declaredMemberNames = IdentityHashMap<KtClassOrObject, Set<String>>()
+            fun KtClassOrObject.declaredMemberNames(): Set<String> = declaredMemberNames.getOrPut(this) {
+                buildSet {
+                    this@declaredMemberNames.declarations.forEach { declaration ->
+                        addAll(declaration.declaredNames())
+                        if (declaration is KtObjectDeclaration && declaration.isCompanion()) {
+                            declaration.declarations.forEach { addAll(it.declaredNames()) }
+                        }
+                    }
+                    primaryConstructorParameters.filter { it.hasValOrVar() }.mapNotNullTo(this) { it.name }
+                }
+            }
             /**
-             * Whether the class might have a member of this [name], declared, inherited from the classes of the script,
-             * or from the other supertypes, whose members are not known, also implicitly, like the ones of `Any` or of a data class.
+             * The classes of the script, which satisfy the [condition], or extend such ones, computed once for all of them,
+             * in the order of the script, until no more are found, rather than recursively, as there might be many classes extending each other.
              */
+            fun inherited(
+                condition: (KtClassOrObject) -> Boolean
+            ): Set<KtClassOrObject> {
+                val result = Collections.newSetFromMap(IdentityHashMap<KtClassOrObject, Boolean>())
+                do {
+                    val found = classes.count {
+                        it !in result && (condition(it) || it.supertypeClasses()?.any { supertype -> supertype in result } == true) && result.add(it)
+                    }
+                } while (found > 0)
+                return result
+            }
+            /** Whether the members of the class are not all known, as inherited from the supertypes not declared by the script, or declared implicitly. */
+            val unknownMembers = IdentityHashMap<KtClassOrObject, Boolean>()
+            fun KtClassOrObject.hasUnknownMembers() = unknownMembers.getOrPut(this) {
+                (this is KtClass && (isEnum() || isData() || isAnnotation())) || supertypeClasses() == null
+                        || this.declarations.any { it is KtObjectDeclaration && it.isCompanion() && it.superTypeListEntries.isNotEmpty() }
+            }
+            val withUnknownMembers = inherited { it.hasUnknownMembers() }
+            val withMembersByName = HashMap<String, Set<KtClassOrObject>>()
+            /** Whether the class might have a member of this [name], also implicitly, like the ones of `Any`. */
             fun KtClassOrObject.mightHaveMember(
-                name: String,
-                visited: MutableSet<KtClassOrObject> = HashSet()
-            ): Boolean = visited.add(this) && (
-                    name in implicitMemberNames || (this is KtClass && (isEnum() || isData() || isAnnotation()))
-                            || this.declarations.any {
-                                name in it.declaredNames() || (it is KtObjectDeclaration && it.isCompanion() && it.mightHaveMember(name, visited))
-                            }
-                            || primaryConstructorParameters.any { it.hasValOrVar() && it.name == name }
-                            || superTypeListEntries.any { entry ->
-                                val type = entry.typeReference?.typeElement as? KtUserType
-                                val supertypes = if (type?.qualifier == null) type?.referencedName?.let { classesByName[it] } else null
-                                supertypes == null || supertypes.any { it.mightHaveMember(name, visited) }
-                            }
-                    )
+                name: String
+            ): Boolean = name in implicitMemberNames || this in withUnknownMembers || hasUnknownMembers() || name in declaredMemberNames()
+                    || supertypeClasses()!!.any { supertype ->
+                        supertype in withUnknownMembers || supertype in withMembersByName.getOrPut(name) { inherited { name in it.declaredMemberNames() } }
+                    }
             // the classes of the script without a member of the same name do not resolve it
             fun Reference.mightResolveOnReceiver() = isInLambdaOrExtension || enclosingClasses.any { it.mightHaveMember(name) }
             fun Reference.mightReferTo(function: ParsedDeclaration) = (!isQualified || function.isExtension) && (!isOperator || function.isOperator)
-            val ambiguouslyCalled = declarations.filter { declaration ->
-                declaration.kind == DeclarationKind.FUNCTION && declaration.name != null
-                        && (declaration.psi as KtNamedFunction).let { !it.hasBlockBody() && it.typeReference == null }
+            val functions = declarations.filter { it.kind == DeclarationKind.FUNCTION && it.name != null }
+            val ambiguouslyCalled = functions.filter { function ->
+                (function.psi as KtNamedFunction).let { !it.hasBlockBody() && it.typeReference == null }
             }.filter { function ->
                 localReferencesByName[function.name].orEmpty().none {
                     // resolved to the function, if applicable, ranking it after the receivers everywhere, like when moved after the script block
@@ -2209,7 +2243,9 @@ private class ScriptStructure(
             ) = ambiguouslyCalled.filterTo(HashSet()) { function ->
                 localReferencesByName[function.name].orEmpty().any { it.offset < function.start && it.mightReferTo(function) && filter(it) }
             }
-            calledBefore { !it.isBound && it.mightResolveOnReceiver() } to calledBefore { it.isBoundByMember }
+            calledBefore { !it.isBound && it.mightResolveOnReceiver() } to functions.filterTo(HashSet()) { function ->
+                localReferencesByName[function.name].orEmpty().any { it.offset < function.start && it.isBoundByMember && it.mightReferTo(function) }
+            }
         }
         // the start of the first statement run where it is declared, which refers to each declaration, also indirectly
         val firstRunBy = HashMap<ParsedDeclaration, Int>()
@@ -2240,7 +2276,7 @@ private class ScriptStructure(
                 declaration.references.any { it.refersToConstant(constants) && constantStarts.getValue(it.name) > start }
             }.keys
             val accessingLocalProperties = declarations.filter { declaration ->
-                declaration in calledAsMembers || (declaration in calledOnReceivers && declaration in readingConstants)
+                ((declaration in calledOnReceivers || declaration in calledAsMembers) && declaration in readingConstants)
                         || declaration in readBeforeInitialized || declaration.references.any {
                     it.refersToLocal(variables) || (it.refersToLocal(constants) && !it.canAccessScriptMembers)
                 }
