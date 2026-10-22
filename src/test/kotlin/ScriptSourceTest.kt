@@ -79,6 +79,24 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should move with property any accessor following its accessor on the line after it without indentation`() {
+        // given
+        val scripts = listOf(
+            "var v = 0\nget() = field + 1\nset(3)\nv",
+            "var v = 0\nget() = field + 1\nset\nv",
+            "var v = 0\nget(3)\nset(value) { field = value }\nv"
+        )
+
+        // when
+        val sources = scripts.map { ScriptSource(it) }
+
+        // then
+        assert(sources.all { source ->
+            source.text.substringAfter(SCRIPT_BLOCK_START).let { body -> "get" !in body && "set" !in body }
+        })
+    }
+
+    @Test
     fun `should keep in the script body calls of get and set on the line after property without indentation`() {
         // given
         val scripts = listOf(

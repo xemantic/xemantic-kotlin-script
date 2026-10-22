@@ -387,4 +387,28 @@ class ScriptCompilationCacheTest {
         assert(executor.compilationCount == compilationCount)
     }
 
+
+    @Test
+    fun `should not confirm this in local function referring to the receiver of a known lambda with receiver`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf("a")
+            fun size() = with(log) { this.size }
+            fun text() = buildString { this.append(size()) }
+            fun list() = log.apply { this.add("b") }
+            text() + list()
+        """.trimIndent()
+        val executor = DefaultScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "1[a, b]")
+        }
+        assert(executor.compilationCount == 1)
+    }
+
 }
