@@ -87,8 +87,11 @@ when (result) {
   if an implicit receiver has a member, or an extension, of the same name, like the class itself, or its superclass,
   as the property is a local variable of the script body, resolved before them,
   while in a regular script it is a member of the script, resolved after them.
-  It is recognized by another compilation of the script, run in parallel, where such a property is a member of a receiver,
-  so it is not reported, if that compilation fails, like when a mutable property is smart cast.
+  So is a call of such a property, like `name()` in `user.run { name() }` with `val name = { "script" }`,
+  if both the property and the member apply to the arguments.
+  It is recognized by other compilations of the script, the first one run in parallel, where such a property is a member of a receiver,
+  each one confirming up to 32 nested receivers, so a large script with many such properties takes longer to compile,
+  so it is not reported, if such a compilation fails, like when a mutable property is smart cast.
 * Scripts executed repeatedly, like an agent harness defined as a script, can skip the recompilation
   with `ScriptExecutor(compilationCacheSize = ...)`, keeping that many compiled scripts, the least recently used evicted first.
   A compiled script is reused when the script text, and the names and types of the dependencies are the same,
@@ -114,11 +117,9 @@ when the declarations of the script have the same names as each other, or as the
 Most of these cases are reported as errors, while the following ones still resolve differently, without an error:
 
 * a property of the script body is resolved before a member of the same name of an implicit receiver,
-  when called, like `name()` in `user.run { name() }` with `val name = { "script" }`,
-  or referred to by a statement starting in the line ending its declaration, like `val name = "script"; val n = user.run { name }`,
-  or when the compilation recognizing it fails,
-  or, as the receivers of that compilation are nested at most 32 times, for a property first referred to after 32 other ones,
-  each declared after the first reference to the previous one ([#36](https://github.com/xemantic/xemantic-kotlin-script/issues/36)),
+  when the compilation recognizing it fails,
+  or when it is the receiver of `::`, like `name::class` in `user.run { name::class }`, which might be a type as well
+  ([#36](https://github.com/xemantic/xemantic-kotlin-script/issues/36)),
 * overloads of a function, of which only some are compiled outside of the script body ([#30](https://github.com/xemantic/xemantic-kotlin-script/issues/30)),
 * a call preceding a local class named like a callable dependency ([#31](https://github.com/xemantic/xemantic-kotlin-script/issues/31)),
 * a call from outside of the script body to a local property, whose function type is known only to the compiler, like `val print = printer()` ([#32](https://github.com/xemantic/xemantic-kotlin-script/issues/32)),

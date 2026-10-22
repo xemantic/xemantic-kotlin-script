@@ -3849,7 +3849,7 @@ class ScriptExecutorTest {
             message sameAs """
                 script.kts:3:21: error: 'name' refers to the property of the script body declared at line 1, instead of the member of an implicit receiver, which a regular script refers to.
                   | User("alice").run { <error>name</error> }
-                  hint: rename the property, or qualify the member with the label of its receiver, like 'this@run.name'.
+                  hint: rename the property, or qualify the member with its receiver, like 'this.name', or with the label of an outer receiver, like 'this@label.name'.
             """.trimIndent()
         }
     }
@@ -3953,13 +3953,15 @@ class ScriptExecutorTest {
     }
 
     @Test
-    fun `should hint at labels of receivers of properties of script body referred to instead of their members`() = runTest {
+    fun `should hint at qualifying members of receivers of properties of script body referred to instead of them`() = runTest {
         // given
         val scripts = listOf(
             "val length = 7\nbuildString { append(length) }",
             "val name = \"script\"\ndata class User(val name: String)\nfun User.describe() = \"user \" + name\nUser(\"alice\").describe()",
             "open class Base { val name = \"base\" }\nval name = \"script\"\nclass Derived : Base() { fun f() = name }\nDerived().f()",
-            "val length = 7\nval f: String.() -> Int = { length }\n\"abc\".f()"
+            "val length = 7\nval f: String.() -> Int = { length }\n\"abc\".f()",
+            // the lambda of `map` has no receiver, so `this@map` would not compile
+            "val name = \"script\"\nclass User(val name: String)\nUser(\"a\").run { listOf(1).map { name } }"
         )
         val executor = ScriptExecutor()
 
@@ -3969,11 +3971,190 @@ class ScriptExecutorTest {
         // then
         val hints = results.map { result -> (result as? ScriptResult.Error)?.message?.lines()?.filter { "hint:" in it }?.map { it.trim() } }
         assert(hints == listOf(
-            listOf("hint: rename the property, or qualify the member with the label of its receiver, like 'this@buildString.length'."),
-            listOf("hint: rename the property, or qualify the member with the label of its receiver, like 'this@describe.name'."),
-            listOf("hint: rename the property, or qualify the member with the label of its receiver, like 'this@Derived.name'."),
-            listOf("hint: rename the property, or qualify the member with the label of its receiver, like 'this@label.length'.")
+            listOf("hint: rename the property, or qualify the member with its receiver, like 'this.length', or with the label of an outer receiver, like 'this@label.length'."),
+            listOf("hint: rename the property, or qualify the member with its receiver, like 'this.name', or with the label of an outer receiver, like 'this@label.name'."),
+            listOf("hint: rename the property, or qualify the member with its receiver, like 'this.name', or with the label of an outer receiver, like 'this@label.name'."),
+            listOf("hint: rename the property, or qualify the member with its receiver, like 'this.length', or with the label of an outer receiver, like 'this@label.length'."),
+            listOf("hint: rename the property, or qualify the member with its receiver, like 'this.name', or with the label of an outer receiver, like 'this@label.name'.")
         ))
+    }
+
+    @Test
+    fun `should report properties of script body referred to instead of members of implicit receivers after bound callable references and calls`() = runTest {
+        // given
+        val scripts = listOf(
+            "val name = \"x\"\nprintln(name::class.simpleName)\nclass User(val name: String)\nUser(\"a\").run { name }",
+            "val name = \"x\"\nval n = name::length.get()\nclass User(val name: String)\nUser(\"a\").run { name }",
+            "val name = { \"script\" }\nval a = run { name() }\nclass User(val name: String)\nUser(\"a\").run { name }",
+            // resolved to the receiver also in the script body, as the property cannot be called
+            "val first = 10\nval list = listOf(1, 2)\nval a = list.run { first() }\nclass Box(val first: Int)\nBox(3).run { first + a }",
+            // in the line ending the declaration of the property
+            "val name = \"x\"; println(name::class.simpleName)\nclass User(val name: String)\nUser(\"a\").run { name }",
+            // a value initialized, and a variable smart cast, within the statements following the receiver in the probe
+            "val x: Int\nval name = \"script\"\nclass User(val name: String)\nval u = User(\"a\").run { name }; x = 1\nu + x",
+            "var s: String? = null\nval name = \"script\"\nclass User(val name: String)\nval u = User(\"a\").run { name }; s = \"q\"\nu + s.length"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        val errorLines = results.map { result ->
+            (result as? ScriptResult.Error)?.message?.lines()?.filter { it.startsWith("script.kts:") }?.map { it.substringBefore(": error") }
+        }
+        assert(errorLines == listOf(
+            listOf("script.kts:4:17"),
+            listOf("script.kts:4:17"),
+            listOf("script.kts:4:17"),
+            listOf("script.kts:5:14"),
+            listOf("script.kts:3:17"),
+            listOf("script.kts:4:25"),
+            listOf("script.kts:4:25")
+        ))
+    }
+
+    @Test
+    fun `should report properties of script body called instead of members of implicit receivers`() = runTest {
+        // given
+        val scripts = listOf(
+            "val name = { \"script\" }\nclass U { fun name() = \"member\" }\nU().run { name() }",
+            "val name: () -> String = { \"script\" }\nclass U { val name = { \"member\" } }\nU().run { name() }",
+            "val name = fun() = \"script\"\nclass U { fun name() = \"member\" }\nU().run { name() }",
+            "val name = { -> \"script\" }\nclass U\nfun U.name() = \"ext\"\nU().run { name() }",
+            // the property applying to the arguments is recognized by compiling
+            "val name = { a: Int -> \"script${'$'}a\" }\nclass U { fun name(a: Int) = \"member${'$'}a\" }\nU().run { name(1) }",
+            "val name = \"script\"\nfun String.name() = this\nclass U(val name: String)\nU(\"a\").run { name.name() + name }"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        val errorLines = results.map { result ->
+            (result as? ScriptResult.Error)?.message?.lines()?.filter { it.startsWith("script.kts:") }?.map { it.substringBefore(": error") }
+        }
+        assert(errorLines == listOf(
+            listOf("script.kts:3:11"),
+            listOf("script.kts:3:11"),
+            listOf("script.kts:3:11"),
+            listOf("script.kts:4:11"),
+            listOf("script.kts:3:11"),
+            listOf("script.kts:4:14", "script.kts:4:28")
+        ))
+    }
+
+    @Test
+    fun `should keep properties of script body called within receivers without applicable members of their names`() = runTest {
+        // given
+        val scripts = listOf(
+            // the member cannot be called, so the property is called also in a regular script
+            "val name = { \"script\" }\nclass U(val name: String)\nU(\"a\").run { name() }",
+            // the property cannot be called, so the member is called also in the script body
+            "val name = \"script\"\nclass U { fun name() = \"member\" }\nU().run { name() }",
+            "val name = { a: Int -> \"script${'$'}a\" }\nclass U { fun name(a: String) = \"member${'$'}a\" }\nU().run { name(\"x\") }",
+            "val name = { \"script\" }\nlistOf(1).map { name() }.first()",
+            // the properties requiring a context, or a receiver, do not apply without them
+            "class Ctx\nval name: context(Ctx) () -> String = { \"s\" }\nclass U { fun name() = \"m\" }\nU().run { name() }",
+            "class Ctx\nval name = context(c: Ctx) fun(): String = \"s\"\nclass U { fun name() = \"m\" }\nU().run { name() }",
+            "val name: String.() -> String = { \"s\" }\nclass U { fun name() = \"m\" }\nU().run { name() }"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("script", "member", "memberx", "script", "m", "m", "m"))
+    }
+
+    @Test
+    fun `should report properties of script body referred to in the line ending their declarations`() = runTest {
+        // given
+        val scripts = listOf(
+            "val name = \"script\"; class U(val name: String); U(\"a\").run { name }",
+            "class U(val name: String)\nval name = \"script\"; val n = U(\"a\").run { name }\nn",
+            // the statement preceding the receiver is split
+            "class U(val name: String)\nval name = \"script\"; val a = 1; val n = U(\"a\").run { name } + a\nn"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        val errorLines = results.map { result ->
+            (result as? ScriptResult.Error)?.message?.lines()?.filter { it.startsWith("script.kts:") }?.map { it.substringBefore(": error") }
+        }
+        assert(errorLines == listOf(
+            listOf("script.kts:1:62"),
+            listOf("script.kts:2:43"),
+            listOf("script.kts:2:54")
+        ))
+    }
+
+    @Test
+    fun `should report property of script body referred to instead of member after more receivers than nested in one compilation`() = runTest {
+        // given
+        val script = (1..100).joinToString(separator = "\n") {
+            "val p$it = $it\nval r$it = run { p$it }"
+        } + "\nclass U(val p1: Int, val p100: Int)\nU(7, 8).run { p1 + p100 }"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(message.lines().filter { it.startsWith("script.kts:") }.map { it.substringBefore(": error") } == listOf(
+                "script.kts:202:15",
+                "script.kts:202:20"
+            ))
+        }
+    }
+
+    @Test
+    fun `should confirm receiver members of many properties by one compilation at a time besides the one of the script`() = runTest {
+        // given
+        val script = (1..100).joinToString(separator = "\n") {
+            "val p$it = $it\nval r$it = run { p$it }"
+        } + "\nclass U(val p1: Int, val p100: Int)\nU(7, 8).run { p1 + p100 }"
+        val executor = DefaultScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(message.lines().filter { it.startsWith("script.kts:") }.map { it.substringBefore(": error") } == listOf(
+                "script.kts:202:15",
+                "script.kts:202:20"
+            ))
+        }
+        assert(executor.maxConcurrentCompilations <= 2)
+    }
+
+    @Test
+    fun `should not confirm further receiver members when compilation of script fails`() = runTest {
+        // given
+        val script = (1..100).joinToString(separator = "\n") {
+            "val p$it = $it\nval r$it = run { p$it }"
+        } + "\nclass U(val p1: Int, val p100: Int)\nU(7, 8).run { p1 + p100 + undefined }"
+        val executor = DefaultScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have("Unresolved reference 'undefined'" in message)
+        }
+        // the script, and the first of the compilations confirming the receiver members, run in parallel with it
+        assert(executor.compilationCount == 2)
     }
 
     @Test

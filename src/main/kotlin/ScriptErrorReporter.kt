@@ -135,8 +135,9 @@ internal class ScriptErrorReporter(
             +"error: '${reference.name}' refers to the property of the script body declared at line ${property.line + 1}, "
             +"instead of the member of an implicit receiver, which a regular script refers to.\n"
             appendSourceLines(reference.start, reference.end)
-            // the nearest receiver, which might not be the one declaring the member, so it is an example
-            +"  hint: rename the property, or qualify the member with the label of its receiver, like 'this@${property.receiverLabel ?: "label"}.$name'.\n"
+            // `this` is the nearest implicit receiver, while a lambda might have none, like the one of `map`, so it has no label
+            +"  hint: rename the property, or qualify the member with its receiver, like 'this.$name', "
+            +"or with the label of an outer receiver, like 'this@label.$name'.\n"
         }
     }.trimEnd()
 
