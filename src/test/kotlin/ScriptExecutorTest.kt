@@ -4438,6 +4438,93 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report error at call preceding local function referring to local class declared after preceding call of its name`() = runTest {
+        // given
+        val script = """
+            val p = "0".toInt()
+            val a = maxOf(1, 2)
+            class W(val x: Int)
+            val r = maxOf(W(1), W(2))
+            fun maxOf(a: W, b: W) = W(a.x + b.x + p)
+            r.x + a
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        // without the errors of the library function the call is resolved to instead, like the argument type mismatches
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:9: error: 'maxOf' does not refer to the function of the script body declared at line 5, which is not visible before its declaration.
+                  | val r = <error>maxOf</error>(W(1), W(2))
+                  hint: 'maxOf' is declared at line 5, while the functions of the script body are visible only after their declaration - move it before line 4.
+
+                script.kts:6:3: error: Unresolved reference 'x'.
+                  | r.<error>x</error> + a
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at call preceding local function with arguments of wrong types only once`() = runTest {
+        // given
+        val script = """
+            val p = "0".toInt()
+            fun show(x: Int) = "int" + p
+            val r = show(listOf("a").first())
+            fun show(x: String) = "string" + p
+            r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:9: error: 'show' does not refer to the function of the script body declared at line 4, which is not visible before its declaration.
+                  | val r = <error>show</error>(listOf("a").first())
+                  hint: 'show' is declared at line 4, while the functions of the script body are visible only after their declaration - move it before line 3.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at nested array access preceding local operator function only at the innermost one`() = runTest {
+        // given
+        val script = """
+            val p = "0".toInt()
+            data class V(val x: Int)
+            val l = listOf(10, 20)
+            val r = l[V(1)[0]]
+            operator fun V.get(i: Int) = x + i + p
+            r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:11: error: 'get' does not refer to the function of the script body declared at line 5, which is not visible before its declaration.
+                  | val r = l[<error>V(1)[0]</error>]
+                  hint: 'get' is declared at line 5, while the functions of the script body are visible only after their declaration - move it before line 4.
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should report error at calls preceding local functions named like library functions`() = runTest {
         // given
         val scripts = listOf(
@@ -4454,7 +4541,9 @@ class ScriptExecutorTest {
             // within a local function
             "val p = \"9\".toInt()\nfun f() = listOf(1)\nval r = f()\nfun listOf(x: Int) = kotlin.collections.listOf(x, p)\nr",
             // an operator of a local class, failing within a lambda
-            "val p = \"0\".toInt()\ndata class V(val x: Int)\nval r = run { V(1) + V(2) }\noperator fun V.plus(o: V) = V(x + o.x + p)\nr.x"
+            "val p = \"0\".toInt()\ndata class V(val x: Int)\nval r = run { V(1) + V(2) }\noperator fun V.plus(o: V) = V(x + o.x + p)\nr.x",
+            // an operator of a local class, preceded by another operator of its name, where the class is not visible yet
+            "val p = \"0\".toInt()\nval s = 1 + 2\ndata class V(val x: Int)\nval r = V(1) + V(2)\noperator fun V.plus(o: V) = V(x + o.x + p)\nr.x"
         )
         val executor = ScriptExecutor()
 
@@ -4469,7 +4558,8 @@ class ScriptExecutorTest {
             "script.kts:2:15: error: 'listOf' does not refer to the function of the script body declared at line 3, which is not visible before its declaration.",
             "script.kts:2:25: error: 'maxOf' does not refer to the function of the script body declared at line 4, which is not visible before its declaration.",
             "script.kts:2:11: error: 'listOf' does not refer to the function of the script body declared at line 4, which is not visible before its declaration.",
-            "script.kts:3:20: error: 'plus' does not refer to the function of the script body declared at line 4, which is not visible before its declaration."
+            "script.kts:3:20: error: 'plus' does not refer to the function of the script body declared at line 4, which is not visible before its declaration.",
+            "script.kts:4:14: error: 'plus' does not refer to the function of the script body declared at line 5, which is not visible before its declaration."
         ))
     }
 
@@ -4482,7 +4572,11 @@ class ScriptExecutorTest {
             // the local function does not apply
             "val p = \"1\".toInt()\nval r = listOf(\"a\")\nfun listOf(x: Int) = kotlin.collections.listOf(x, p)\nr",
             // the member of a local class takes precedence over the extension operator
-            "val p = \"0\".toInt()\ndata class V(val x: Int) { operator fun plus(o: V) = V(x * o.x) }\nval r = V(2) + V(3)\noperator fun V.plus(o: V) = V(x + o.x + p)\nr.x"
+            "val p = \"0\".toInt()\ndata class V(val x: Int) { operator fun plus(o: V) = V(x * o.x) }\nval r = V(2) + V(3)\noperator fun V.plus(o: V) = V(x + o.x + p)\nr.x",
+            // the members of the receivers take precedence over the local functions of inferred types as well
+            "val p = \"1\".toInt()\nclass S { fun pick(x: Int) = x * 2 }\nval r = with(S()) { pick(1) }\nfun pick(x: Int) = \"s\" + p\nr",
+            "val p = \"1\".toInt()\nval r = buildList { add(1) }\nfun add(x: Int) = p\nr",
+            "val p = \"1\".toInt()\nclass S { fun pick(x: Int) = x * 2 }\nfun S.go() = pick(1)\nval r = S().go()\nfun pick(x: Int) = \"s\" + p\nr"
         )
         val executor = ScriptExecutor()
 
@@ -4490,7 +4584,7 @@ class ScriptExecutorTest {
         val results = scripts.map { executor.execute(it) }
 
         // then
-        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("x", listOf("a"), 6))
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("x", listOf("a"), 6, 2, listOf(1), 2))
     }
 
     @Test

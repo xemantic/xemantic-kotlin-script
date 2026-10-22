@@ -388,9 +388,18 @@ internal class DefaultScriptExecutor(
                 return Compilation(source, result = null)
             }
             if (source.candidates.isEmpty()) return Compilation(source, compile(source))
-            // the confirming compilations do not depend on this one
+            // the calls by name preceding the local functions only, which are mostly unresolved, like `format("x")` followed by `fun format(s: String)`,
+            // hinted at already, so the compilation precedes the confirming ones, which are not needed then, see ScriptSource.laterDeclaredFunctionCandidates
+            val compilesFirst = source.candidates.all { it is LaterDeclaredFunctionReference && !it.isOperator }
             return coroutineScope {
-                val compiled = async { compile(source) }
+                // otherwise the confirming compilations do not depend on this one
+                val compiled = if (compilesFirst) CompletableDeferred(compile(source)) else async { compile(source) }
+                if (compilesFirst) {
+                    val unresolved = compiled.await().reports.unresolvedReferences(source)
+                    if (source.candidates.all { (it.reference.start to it.reference.name) in unresolved }) {
+                        return@coroutineScope Compilation(source, compiled.await())
+                    }
+                }
                 try {
                     confirm(parsed, source, compiled)
                 } catch (failure: ConfirmingCompilationFailure) {
@@ -476,11 +485,7 @@ internal class DefaultScriptExecutor(
                 diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }
             }
             // with their names, hinted at as not visible by the reporter of the errors already
-            val unresolved = errorReports.mapNotNullTo(HashSet()) { diagnostic ->
-                unresolvedReference.matchEntire(diagnostic.message)?.let { match ->
-                    diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) to match.groupValues[1] }
-                }
-            }
+            val unresolved = result.reports.unresolvedReferences(source)
             // unlike the other ones, the calls of which cannot be confirmed
             val confirmedTypes = probe.confirmedPropertyTypes(reports)
             fun deprecated(
@@ -517,21 +522,29 @@ internal class DefaultScriptExecutor(
                     // or to the dependency of the same name, see ScriptSource.calledInsteadDependencies,
                     // unlike the invoke operators of the unresolved values, like `q(2)`, hinted at as not visible already
                     (candidate.isOperator && candidate.invokedValue == null) || (start to (candidate.invokedValue ?: candidate.reference.name)) !in unresolved
-                }?.let { candidate -> hidden.putIfAbsent(candidate, hiddenLocalFunctionLine(message)) }
+                }?.let { candidate -> hidden.putIfAbsent(candidate, localFunctionLine(message)) }
             }
             // the calls of the local functions declared later, which apply, recognized also by the copies of the hidden local functions,
             // unless already reported as unresolved, see ScriptSource.laterDeclaredFunctionCandidates
-            val laterFunctionWarnings = reports.markedRanges(probe, LATER_DECLARED_LOCAL_FUNCTION) + hiddenWarnings
-            val laterDeclaredFunctionReferences = source.laterDeclaredFunctionCandidates.mapNotNull { candidate ->
-                val name = candidate.reference.name
-                laterFunctionWarnings.firstOrNull { (start, _, message) ->
+            // each assigned to the candidate of its name containing it, the one of the same end, if nested, like `l[V(1)[0]]`, otherwise the innermost one
+            val laterFunctionMessages = mutableMapOf<LaterDeclaredFunctionReference, String>()
+            (reports.markedRanges(probe, LATER_DECLARED_LOCAL_FUNCTION) + hiddenWarnings).forEach { (start, end, message) ->
+                source.laterDeclaredFunctionCandidates.filter { candidate ->
+                    val name = candidate.reference.name
                     start in candidate.reference && (laterDeclaredFunctionMessage(name) in message || hiddenLocalFunctionMessage(name) in message)
-                }?.takeIf {
-                    (candidate.reference.start to name) !in unresolved
+                }.let { matching ->
+                    matching.firstOrNull { it.reference.end == end } ?: matching.maxWithOrNull(
+                        compareBy<LaterDeclaredFunctionReference> { it.reference.start }.thenByDescending { it.reference.end }
+                    )
+                }?.let { laterFunctionMessages.putIfAbsent(it, message) }
+            }
+            val laterDeclaredFunctionReferences = source.laterDeclaredFunctionCandidates.mapNotNull { candidate ->
+                laterFunctionMessages[candidate]?.takeIf {
+                    (candidate.reference.start to candidate.reference.name) !in unresolved
                             && (!candidate.isConfirmedOnlyWhenFailing || errors.any { it in candidate.reference })
-                }?.let { (_, _, message) ->
+                }?.let { message ->
                     // naming the overload called in the script
-                    candidate.copy(line = probe.laterDeclaredFunctionLine(message) ?: hiddenLocalFunctionLine(message) ?: candidate.line)
+                    candidate.copy(line = localFunctionLine(message) ?: candidate.line)
                 }
             }
             // the references not resolved to the moved declarations, unless already reported as errors
@@ -628,8 +641,26 @@ internal class DefaultScriptExecutor(
                 // see ScriptSource.calledInsteadDependencies
                 explainedErrors = hiddenLocalFunctionReferences.filter {
                     it.reference.name in source.calledInsteadDependencies
-                }.mapTo(HashSet()) { it.reference.start } + laterDeclaredFunctionReferences.map { it.reference.start }
+                }.mapTo(HashSet()) { it.reference.start } + laterDeclaredFunctionReferences.flatMap { reference ->
+                    // like `None of the following candidates is applicable` of `maxOf(W(1), W(2))`, or `Argument type mismatch` at its arguments,
+                    // unlike the errors of the arguments themselves, like an unresolved reference
+                    val positions = reference.arguments + reference.reference.start
+                    errorReports.mapNotNull { diagnostic ->
+                        diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }?.takeIf {
+                            it in positions && unresolvedReference.matchEntire(diagnostic.message) == null
+                        }
+                    }
+                }
             )
+        }
+
+        /** The positions of the unresolved references among these reports of the compilation of the [source], with their names. */
+        private fun List<ScriptDiagnostic>.unresolvedReferences(
+            source: ScriptSource
+        ): Set<Pair<ScriptPosition, String>> = filter { it.severity == ScriptDiagnostic.Severity.ERROR }.mapNotNullTo(HashSet()) { diagnostic ->
+            unresolvedReference.matchEntire(diagnostic.message)?.let { match ->
+                diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) to match.groupValues[1] }
+            }
         }
 
         /** Inspected once, as recognizing a callable dependency might inspect its members by reflection. */
