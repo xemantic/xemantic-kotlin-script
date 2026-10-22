@@ -3875,6 +3875,80 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report call within lambda resolved on its receiver in the script to function moved out of the script body declared later`() = runTest {
+        // given
+        val script = """
+            val s = buildString { append("x") }
+            fun append(t: String) = t + "!"
+            append(s)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        // not silently returning "!", as a regular script returns "x!"
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:23: error: 'append' refers to the function declared at line 2, which is compiled outside of the script body, while a regular script calls the one of the receiver, as the function is declared later.
+                  | val s = buildString { <error>append</error>("x") }
+                  hint: rename the function.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report calls resolved on receivers in the script to functions moved out of the script body declared later`() = runTest {
+        // given
+        val scripts = listOf(
+            // an extension of the receiver
+            "val r = with(listOf(1, 2)) { sum() }\nfun sum() = 10\nr",
+            // within a local function declared before
+            "fun g() = buildString { append(\"x\") }\nfun append(t: String) = t + \"!\"\ng()",
+            // nested in a lambda without a receiver
+            "val s = buildString { listOf(1).forEach { append(\"x\") } }\nfun append(t: String) = t + \"!\"\nappend(s)",
+            // an inherited member of a local class
+            "open class Base { fun tag(t: String) = \"base\" + t }\nclass A : Base() { fun f() = tag(\"x\") }\nfun tag(t: String) = t + \"!\"\nA().f()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // while a regular script returns 3, "x", "x!" and "basex"
+        assert(results.all { (it as? ScriptResult.Error)?.message?.contains("while a regular script calls the one of the receiver") == true })
+    }
+
+    @Test
+    fun `should execute calls within lambdas preceding functions moved out of the script body where no receiver resolves them`() = runTest {
+        // given
+        val scripts = listOf(
+            "val s = buildString { append(foo()) }\nfun foo() = \"f\"\ns",
+            "val l = mutableListOf<String>()\nlistOf(1, 2).forEach { l += show(it) }\nfun show(i: Int) = \"n\$i\"\nl",
+            // not applicable, so resolved on the receiver also when moved
+            "val s = buildString { append(1) }\nfun append(t: String) = t + \"!\"\ns",
+            "val r = run { twice(3) }\nfun twice(i: Int) = i * 2\nr",
+            // a property of the receiver, which cannot be called
+            "val r = with(listOf(1, 2)) { size() }\nfun size() = 10\nr",
+            // declared before, also in a regular script resolved before the receiver
+            "fun append(t: String) = t + \"!\"\nval s = buildString { append(\"x\") }\nappend(s)",
+            "class A { fun f() = describe(1) }\nfun describe(i: Int) = \"n\$i\"\nA().f()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // like in a regular script
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("f", listOf("n1", "n2"), "1", 6, 10, "!", "n1"))
+    }
+
+    @Test
     fun `should keep function reading constant local when called before its declaration where receiver might resolve it, also when called by declarations moved out of the script body`() = runTest {
         // given
         val script = """

@@ -203,6 +203,12 @@ internal const val COROUTINE_SCOPE_FUNCTION = "xemantic-kotlin-script: coroutine
 /** The opt-in message of the moved functions, see [ScriptSource.shadowedFunctionCandidates]. */
 internal const val SHADOWED_ORIGINAL = "xemantic-kotlin-script: shadowed original"
 
+/** The opt-in message of the moved functions, see [ScriptSource.receiverCallCandidates]. */
+internal const val RECEIVER_CALL_ORIGINAL = "xemantic-kotlin-script: receiver call original"
+
+/** The opt-in message of the copies of the moved functions, see [ScriptSource.receiverCallCandidates]. */
+internal const val RECEIVER_CALL_FUNCTION = "xemantic-kotlin-script: receiver call function"
+
 /** The opt-in annotation marking the local copies of the declarations, reporting this [message] where they are used. */
 private fun optInMarker(
     message: String
@@ -277,7 +283,13 @@ internal class ScriptSource(
      * recognizing whether they apply, in a compilation of its own, as they precede the local properties shadowing them,
      * unlike the copies of [shadowedFunctionCopies].
      */
-    private val coroutineScopeCopies: Boolean = false
+    private val coroutineScopeCopies: Boolean = false,
+    /**
+     * Whether the confirming compilation declares the copies of the moved functions called by the [receiverCallCandidates]
+     * as the members of the outer receiver of the script body, instead of the moved functions,
+     * so they are resolved after the members and the extensions of the receivers, like in the script, in a compilation of its own.
+     */
+    private val receiverCallCopies: Boolean = false
 ) : SourceCode {
 
     val scriptLines: List<String>
@@ -318,6 +330,16 @@ internal class ScriptSource(
      * see [coroutineScopeCopies], while the ones within the lambdas are not reported, as they might have the receivers.
      */
     val coroutineScopeCandidates: List<LaterDeclaredReference>
+
+    /**
+     * The calls of the script body, where a receiver might resolve them, like `append` in `buildString { append("x") }`,
+     * preceding the declarations of the functions moved out of the script body, by the 0-based lines of the first ones,
+     * which they refer to, if they apply, like the local functions declared before them,
+     * while in the script the members and the extensions of the receivers are resolved before the functions declared later.
+     * They are confirmed by compiling the script with the functions marked with an opt-in, see [confirming],
+     * reporting the calls referring to them, which are wrong, unless they refer to their copies as well, see [receiverCallCopies].
+     */
+    val receiverCallCandidates: List<LaterDeclaredReference>
 
     /**
      * The references of the script body which might refer to the dependencies, preceding the declarations
@@ -368,7 +390,8 @@ internal class ScriptSource(
             dependencies.mapTo(HashSet()) { it.name },
             confirming,
             shadowedFunctionCopies,
-            coroutineScopeCopies
+            coroutineScopeCopies,
+            receiverCallCopies
         )
         unmatchedClosingBrace = structure.unmatchedClosingBrace?.let { position(it) }
         movedDeclarations = structure.movedDeclarations
@@ -386,6 +409,9 @@ internal class ScriptSource(
             Triple(reference.toScriptReference(), position(property).line, position(function).line)
         }
         coroutineScopeCandidates = structure.coroutineScopeCandidates.map { it.toLaterDeclaredReference() }
+        receiverCallCandidates = structure.receiverCallCandidates.map { (reference, function) ->
+            LaterDeclaredReference(reference.toScriptReference(), position(function).line, isFunction = true, reference.isCallableReference)
+        }
         bodyDeclarations = structure.bodyDeclarations
         localInlineFunctionArguments = structure.localInlineFunctionArguments.map { (name, range) ->
             ScriptReference(name, position(range.first), position(range.last + 1))
@@ -444,7 +470,10 @@ internal class ScriptSource(
                 mapping += null
             }
             // the deprecation of the local functions, like the copies in the script block, is not reported, unlike their opt-in
-            listOf(LATER_DECLARED_FUNCTION, SHADOWED_FUNCTION, SHADOWED_ORIGINAL, COROUTINE_SCOPE_ORIGINAL, COROUTINE_SCOPE_FUNCTION).forEach { message ->
+            listOf(
+                LATER_DECLARED_FUNCTION, SHADOWED_FUNCTION, SHADOWED_ORIGINAL, COROUTINE_SCOPE_ORIGINAL, COROUTINE_SCOPE_FUNCTION,
+                RECEIVER_CALL_ORIGINAL, RECEIVER_CALL_FUNCTION
+            ).forEach { message ->
                 lines += "@kotlin.RequiresOptIn(\"$message\", level = RequiresOptIn.Level.WARNING) annotation class ${optInMarker(message)}"
                 mapping += null
             }
@@ -457,9 +486,13 @@ internal class ScriptSource(
         mapping += null
         // the members of the outer receiver of the script body would be called instead of the moved functions
         shadowed.filterNot { it.isCallable && it.name in structure.movedFunctions }.forEach { addAccessor(it) }
+        structure.receiverCallCopies.forEach {
+            lines += "@${optInMarker(RECEIVER_CALL_FUNCTION)} $it"
+            mapping += null
+        }
         lines += "}"
         mapping += null
-        val markedOriginals = confirming && !shadowedFunctionCopies && !coroutineScopeCopies
+        val markedOriginals = confirming && !shadowedFunctionCopies && !coroutineScopeCopies && !receiverCallCopies
         val deprecatedFunctions = if (markedOriginals) {
             shadowedFunctionCandidates.mapTo(HashSet()) { it.first.name }
         } else {
@@ -470,6 +503,7 @@ internal class ScriptSource(
         } else {
             emptySet()
         }
+        val receiverCallFunctions = if (markedOriginals) structure.receiverCallFunctions else emptySet()
         movedDeclarations.forEach { declaration ->
             // opt-in markers, which can mark the same declaration, unlike the deprecations
             if (declaration.kind == DeclarationKind.FUNCTION && declaration.name in deprecatedFunctions) {
@@ -478,6 +512,10 @@ internal class ScriptSource(
             }
             if (declaration.name in coroutineScopeDeclarations) {
                 lines += "@${optInMarker(COROUTINE_SCOPE_ORIGINAL)}"
+                mapping += null
+            }
+            if (declaration.start in receiverCallFunctions) {
+                lines += "@${optInMarker(RECEIVER_CALL_ORIGINAL)}"
                 mapping += null
             }
             addLines(lineOf(declaration.start)..lineOf(declaration.end - 1)) {
@@ -1203,7 +1241,9 @@ private class ScriptStructure(
     /** See [ScriptSource.shadowedFunctionCopies]. */
     shadowedFunctionCopies: Boolean,
     /** See [ScriptSource.coroutineScopeCopies]. */
-    coroutineScopeCopies: Boolean
+    coroutineScopeCopies: Boolean,
+    /** See [ScriptSource.receiverCallCopies]. */
+    receiverCallCopies: Boolean
 ) {
 
     val headerEnd: Int
@@ -1240,6 +1280,15 @@ private class ScriptStructure(
 
     /** See [ScriptSource.coroutineScopeCandidates], with the offsets of the declarations, and whether they are functions. */
     val coroutineScopeCandidates: List<Triple<Reference, Int, Boolean>>
+
+    /** See [ScriptSource.receiverCallCandidates], with the offsets of the first functions declared after them. */
+    val receiverCallCandidates: List<Pair<Reference, Int>>
+
+    /** The starts of the moved functions called by the [receiverCallCandidates], not the extension ones, which are not called like them. */
+    val receiverCallFunctions: Set<Int>
+
+    /** The copies of the [receiverCallFunctions] declared by the outer receiver of the script body, see [ScriptSource.receiverCallCopies]. */
+    val receiverCallCopies: List<String>
 
 
     /**
@@ -1548,6 +1597,25 @@ private class ScriptStructure(
             }
         }
         coroutineScopeCandidates = coroutineScopeCandidatesByStatement.values.flatten()
+        // the calls preceding the moved functions where a receiver might resolve them, unlike the functions declared before,
+        // which a regular script resolves before the receivers too, like the local functions of the script body
+        receiverCallCandidates = statements.indices.flatMap { index ->
+            if (declarationsByPsi[statements[index]] in moved) return@flatMap emptyList()
+            statementReferences[index].filter { reference ->
+                reference.isCall && reference.mightResolveOnReceiver && reference.refersToLocal(movedFunctionsByName.keys)
+                        // resolved on the coroutine scope instead, see coroutineScopeCandidates
+                        && reference.name !in coroutineScopeFunctions
+            }.mapNotNull { reference ->
+                movedFunctionsByName.getValue(reference.name).firstOrNull { it.start > reference.offset }?.let { reference to it.line() }
+            }
+        }
+        // all of their overloads, which would be resolved instead of the copies otherwise
+        val calledOnReceivers = receiverCallCandidates.map { it.first.name }.distinct().flatMap { movedFunctionsByName.getValue(it) }
+        receiverCallFunctions = calledOnReceivers.mapTo(HashSet()) { it.start }
+        this.receiverCallCopies = if (!receiverCallCopies) emptyList() else {
+            calledOnReceivers.forEach { movedBlankedRanges += it.start until it.end }
+            calledOnReceivers.mapNotNull { it.signature() }
+        }
         val laterDeclaredCandidatesByStatement = statements.indices.associateWith { index ->
             if (declarationsByPsi[statements[index]] in moved) return@associateWith emptyList()
             statementReferences[index].mapNotNull { reference ->

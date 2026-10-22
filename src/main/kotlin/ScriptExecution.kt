@@ -187,7 +187,9 @@ internal class DefaultScriptExecutor(
         /** The [ScriptSource.coroutineScopeCandidates] resolved to the coroutine scope indeed. */
         val coroutineScopeReferences: List<LaterDeclaredReference> = emptyList(),
         /** The [ScriptSource.shadowedFunctionCandidates] which would call the functions in the script. */
-        val shadowedFunctionReferences: List<Triple<ScriptReference, Int, Int>> = emptyList()
+        val shadowedFunctionReferences: List<Triple<ScriptReference, Int, Int>> = emptyList(),
+        /** The [ScriptSource.receiverCallCandidates] calling the moved functions, which would be resolved on the receivers in the script. */
+        val receiverCallReferences: List<LaterDeclaredReference> = emptyList()
     )
 
     private inner class ScriptHandler(
@@ -226,8 +228,12 @@ internal class DefaultScriptExecutor(
                 || compilation.hiddenLocalFunctionReferences.isNotEmpty()
                 || compilation.shadowedFunctionReferences.isNotEmpty()
                 || compilation.coroutineScopeReferences.isNotEmpty()
+                || compilation.receiverCallReferences.isNotEmpty()
             ) {
                 val failureMessage = listOfNotNull(
+                    compilation.receiverCallReferences.takeIf { it.isNotEmpty() }?.let {
+                        ScriptErrorReporter(source).toReceiverCallMessage(it)
+                    },
                     compilation.coroutineScopeReferences.takeIf { it.isNotEmpty() }?.let {
                         ScriptErrorReporter(source).toCoroutineScopeMessage(it)
                     },
@@ -313,6 +319,7 @@ internal class DefaultScriptExecutor(
                 && source.hiddenLocalFunctionCandidates.isEmpty()
                 && source.shadowedFunctionCandidates.isEmpty()
                 && source.coroutineScopeCandidates.isEmpty()
+                && source.receiverCallCandidates.isEmpty()
             ) {
                 return Compilation(source, result)
             }
@@ -371,8 +378,13 @@ internal class DefaultScriptExecutor(
             val toProperties = source.shadowedFunctionCandidates.filter { (reference) -> toFunctions.none { it in reference } }
             // the remaining calls of the functions, which would refer to them in the script, if they apply, like the properties
             val functionCandidates = coroutineScopeReferences.filter { it.isFunction }
+            // the calls referring to the moved functions, unless they would refer to them in the script as well
+            val toOriginals = deprecated(RECEIVER_CALL_ORIGINAL)
+            val receiverCallCandidates = source.receiverCallCandidates.filter { candidate ->
+                toOriginals.any { it in candidate.reference } && errors.none { it in candidate.reference }
+            }
             // independent of each other
-            val (shadowed, toCoroutineScope) = coroutineScope {
+            val (shadowed, toCoroutineScope, toCopies) = coroutineScope {
                 val shadowed = async {
                     if (toProperties.isEmpty()) emptyList() else {
                         val copies = source(confirming = true, shadowedFunctionCopies = true)
@@ -385,7 +397,13 @@ internal class DefaultScriptExecutor(
                         compile(copies).reports.marked(copies, COROUTINE_SCOPE_FUNCTION)
                     }
                 }
-                shadowed.await() to toCoroutineScope.await()
+                val toCopies = async {
+                    if (receiverCallCandidates.isEmpty()) emptyList() else {
+                        val copies = source(confirming = true, receiverCallCopies = true)
+                        compile(copies).reports.marked(copies, RECEIVER_CALL_FUNCTION)
+                    }
+                }
+                Triple(shadowed.await(), toCoroutineScope.await(), toCopies.await())
             }
             return Compilation(
                 source,
@@ -403,7 +421,10 @@ internal class DefaultScriptExecutor(
                 shadowedFunctionReferences = toProperties.filter { (reference) ->
                     shadowed.any { it in reference }
                 },
-                hiddenLocalFunctionReferences = hiddenCandidates.filter { it in hidden }
+                hiddenLocalFunctionReferences = hiddenCandidates.filter { it in hidden },
+                receiverCallReferences = receiverCallCandidates.filter { candidate ->
+                    toCopies.none { it in candidate.reference }
+                }
             )
         }
 
@@ -417,8 +438,9 @@ internal class DefaultScriptExecutor(
         private fun source(
             confirming: Boolean = false,
             shadowedFunctionCopies: Boolean = false,
-            coroutineScopeCopies: Boolean = false
-        ) = ScriptSource(script, preambleDependencies, confirming, shadowedFunctionCopies, coroutineScopeCopies)
+            coroutineScopeCopies: Boolean = false,
+            receiverCallCopies: Boolean = false
+        ) = ScriptSource(script, preambleDependencies, confirming, shadowedFunctionCopies, coroutineScopeCopies, receiverCallCopies)
 
         private suspend fun compile(
             source: ScriptSource

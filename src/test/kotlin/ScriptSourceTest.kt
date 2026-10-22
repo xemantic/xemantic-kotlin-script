@@ -202,6 +202,28 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should recognize calls preceding moved functions only where receivers might resolve them`() {
+        // given
+        val script = """
+            val a = buildString { append("x"); this.append("y"); append("z") }
+            val b = append("w")
+            val c = listOf(1).map { launch { }; it }
+            fun append(t: String) = t + "!"
+            fun launch(block: () -> Unit) = block()
+            val d = buildString { append("v") }
+            a + b + c + d
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        // not the qualified ones, the ones outside of the lambdas, nor the ones following the functions,
+        // nor the ones named like the functions of the coroutine scope
+        assert(source.receiverCallCandidates.map { "${it.reference.name}:${it.reference.start.column}:${it.line}" } == listOf("append:22:3", "append:53:3"))
+    }
+
+    @Test
     fun `should not move function referred to before its declaration only by locally bound names`() {
         // given
         val scripts = listOf(

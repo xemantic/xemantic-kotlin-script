@@ -82,6 +82,10 @@ when (result) {
 * A reference to a dependency preceding the declaration of a local property of the same name, like `x` in `fun show() = x` followed by `val x = 2`,
   or a call preceding the declaration of a local function of the same name,
   is reported as an error, as in a regular script it refers to the declaration.
+* A call within a lambda, a class or an extension function, preceding the declaration of a function compiled outside of the script body,
+  like `append` in `buildString { append("x") }` followed by `fun append(t: String) = t + "!"`,
+  is reported as an error, when it refers to the function, while a regular script resolves it on the receiver,
+  as the members and the extensions of the receivers are resolved before the functions declared later.
 * Scripts executed repeatedly, like an agent harness defined as a script, can skip the recompilation
   with `ScriptExecutor(compilationCacheSize = ...)`, keeping that many compiled scripts, the least recently used evicted first.
   A compiled script is reused when the script text, and the names and types of the dependencies are the same,
