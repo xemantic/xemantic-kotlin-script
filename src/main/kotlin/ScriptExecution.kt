@@ -310,7 +310,8 @@ internal class DefaultScriptExecutor(
             if (source.unmatchedClosingBrace != null || source.conflictingDependencyDeclarations.isNotEmpty()) {
                 return Compilation(source, result = null)
             }
-            // independent of the compilation of the script, so confirmed in parallel, as the candidates are common, e.g. in lambdas
+            // independent of the compilation of the script, so confirmed in parallel, as the candidates are common, e.g. in lambdas,
+            // also when that one fails, as the compiler does not stop when cancelled, while confirming them after its success would delay every such script
             val (result, receiverMemberReports) = coroutineScope {
                 val receiverMemberReports = async {
                     if (source.receiverMemberCandidates.isEmpty()) null else try {
