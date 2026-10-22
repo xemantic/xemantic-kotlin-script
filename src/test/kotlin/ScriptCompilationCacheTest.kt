@@ -443,6 +443,33 @@ class ScriptCompilationCacheTest {
 
     @Test
     @OptIn(ExperimentalCoroutinesApi::class)
+    fun `should compile again when the compiling caller is interrupted`() = runTest {
+        // given
+        val cache = ScriptCompilationCache<String>(maxSize = 10) { it != "failure" }
+        val key = ScriptCompilationCache.Key(script = "foo", dependencies = emptyList())
+        var compilations = 0
+        val compile: suspend () -> String = {
+            compilations++
+            delay(1.milliseconds)
+            if (compilations == 1) throw InterruptedException("owner interrupted")
+            "failure"
+        }
+        val owner = async { runCatching { cache.getOrCompile(key, compile) } }
+        val waiter = async { cache.getOrCompile(key, compile) }
+        runCurrent()
+
+        // when
+        val ownerFailure = owner.await().exceptionOrNull()
+        val result = waiter.await()
+
+        // then
+        assert(ownerFailure is InterruptedException)
+        assert(result == "failure")
+        assert(compilations == 2)
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
     fun `should not evict the script still being compiled`() = runTest {
         // given
         val cache = ScriptCompilationCache<String>(maxSize = 1) { true }
