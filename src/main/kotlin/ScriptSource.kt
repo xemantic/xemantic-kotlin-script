@@ -1573,20 +1573,31 @@ private class ScriptStructure(
         }
         // also the extension ones
         val movedFunctionsByAnyName = moved.filter { it.kind == DeclarationKind.FUNCTION && it.name != null }.groupBy { it.name!! }
-        forwardReferencedFunctions = statements.indices.flatMap { index ->
-            if (declarationsByPsi[statements[index]] in moved) emptyList() else statementReferences[index]
-        }.filter {
+        /** The moved functions referred to by the [references] preceding them. */
+        fun referredToBefore(
+            references: List<Reference>
+        ): List<ParsedDeclaration> = references.filter {
             // unlike the ones bound by the local functions, while a value bound by the same name might not be called, like `format()` of an `Int`
             (!it.isBound || (it.isBoundByNonFunction && it.isCall))
                     // which would be resolved on the coroutine scope instead, see coroutineScopeCandidates
                     && it.name !in coroutineScopeFunctions
                     // resolved to the property of the dependency of the same name instead, if declared before
                     && !it.isCallableReference
-        }.flatMapTo(HashSet()) { reference ->
+        }.flatMap { reference ->
             movedFunctionsByAnyName[reference.name].orEmpty().filter {
                 reference.offset < it.start && (!reference.isQualified || it.isExtension) && (!reference.isOperator || it.isOperator)
-            }.map { it.start }
+            }
         }
+        val forwardReferenced = referredToBefore(
+            statements.indices.flatMap { index -> if (declarationsByPsi[statements[index]] in moved) emptyList() else statementReferences[index] }
+        ).toMutableSet()
+        // also the ones referred to before their declarations by these, which would follow them otherwise
+        ArrayDeque(forwardReferenced).let { queue ->
+            while (queue.isNotEmpty()) {
+                referredToBefore(queue.removeFirst().references).forEach { if (forwardReferenced.add(it)) queue += it }
+            }
+        }
+        forwardReferencedFunctions = forwardReferenced.mapTo(HashSet()) { it.start }
         coroutineScopeCandidates = coroutineScopeCandidatesByStatement.values.flatten()
         val laterDeclaredCandidatesByStatement = statements.indices.associateWith { index ->
             if (declarationsByPsi[statements[index]] in moved) return@associateWith emptyList()

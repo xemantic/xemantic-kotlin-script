@@ -3910,6 +3910,24 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should resolve calls on receivers before functions moved out of the script body referred to before their declarations by other moved functions like in the script`() = runTest {
+        // given
+        val scripts = listOf(
+            "val z = f()\nfun f() = append(\"a\")\nfun append(t: String) = t + \"!\"\nval s = buildString { append(\"x\") }\nz + \"|\" + s",
+            // transitively
+            "val z = f()\nfun f() = g()\nfun g() = append(\"a\")\nfun append(t: String) = t + \"!\"\nval s = buildString { append(\"x\") }\nz + \"|\" + s"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // like in a regular script
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("a!|x", "a!|x"))
+    }
+
+    @Test
     fun `should execute nested calls of overloads of functions moved out of the script body within lambdas`() = runTest {
         // given
         val scripts = listOf(

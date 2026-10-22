@@ -145,6 +145,10 @@ Most of these cases are reported as errors, while the following ones still resol
 
 Giving the declarations and the dependencies distinct names avoids them.
 
+A function called by the script body before its declaration is compiled after it,
+so the raw JVM line numbers of its frames, seen only by a script inspecting its own stack trace, differ from the ones of the script,
+while the messages of the errors refer to the lines of the script.
+
 ### Error reporting
 
 A script like:
