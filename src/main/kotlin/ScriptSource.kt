@@ -1242,12 +1242,12 @@ private class ScriptStructure(
             var last = PsiTreeUtil.getDeepestLast(statement)
             while (last is PsiComment || last is PsiWhiteSpace) last = PsiTreeUtil.prevLeaf(last) ?: break
             if (statement in movedStatements || last.node.elementType != KtTokens.SEMICOLON) return@mapNotNull null
-            val lineEnd = script.indexOf('\n', last.endOffset).let { if (it == -1) script.length else it }
-            last.endOffset.takeIf {
-                statements.subList(index + 1, statements.size).asSequence()
-                    .takeWhile { it.startOffset < lineEnd }
-                    .any { it !in movedStatements }
-            }
+            val next = statements.subList(index + 1, statements.size).firstOrNull { it !in movedStatements } ?: return@mapNotNull null
+            // a line break within a comment does not separate the statements, unlike within a moved declaration, keeping its lines
+            val separated = generateSequence(PsiTreeUtil.nextLeaf(last)) { PsiTreeUtil.nextLeaf(it) }
+                .takeWhile { it.startOffset < next.startOffset }
+                .any { leaf -> '\n' in leaf.text && (leaf !is PsiComment || leaf.parents.any { it in movedStatements }) }
+            last.endOffset.takeIf { !separated }
         }
         // unlike an extension function, which cannot be called like the dependency
         val (local, movedOut) = declarations.filter { it.kind == DeclarationKind.FUNCTION && !it.isExtension }.partition { it !in moved }

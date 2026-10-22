@@ -2794,7 +2794,8 @@ class ScriptExecutorTest {
             "inline fun a() = 1; val z = 5\na() + z",
             "enum class E { A }; fun a() = 1; E.A.ordinal + a() + 5",
             "fun a() = 1;\na() + 5",
-            "class C; val z = 6\nz"
+            "class C; val z = 6\nz",
+            "fun a() = 1; /* multi\nline */ val z = 5\na() + z"
         )
         val executor = ScriptExecutor()
 
@@ -2803,6 +2804,55 @@ class ScriptExecutorTest {
 
         // then
         assert(results.map { (it as? ScriptResult.Value)?.value } == List(scripts.size) { 6 })
+    }
+
+    @Test
+    fun `should report error at its column of line split after function with expression body and semicolon`() = runTest {
+        // given
+        val script = "fun a() = 1; val z = q; fun b() = r; b()"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:22: error: Unresolved reference 'q'.
+                  | fun a() = 1; val z = <error>q</error>; fun b() = r; b()
+
+                script.kts:1:35: error: Unresolved reference 'r'.
+                  | fun a() = 1; val z = q; fun b() = <error>r</error>; b()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report exception thrown on line split after function with expression body and semicolon`() = runTest {
+        // given
+        val script = """
+            fun a(): Int = TODO(); val z = 1
+            z + a()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs $$"""
+                kotlin.NotImplementedError: An operation is not implemented.
+                  at a(script.kts:1)
+                  | fun a(): Int = TODO(); val z = 1
+                  at <script body>(script.kts:2)
+                  | z + a()
+            """.trimIndent()
+        }
     }
 
     @Test
