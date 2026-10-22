@@ -931,7 +931,7 @@ private val psiFactory: KtPsiFactory by lazy {
  *
  * @param isQualified whether it has a receiver, like `size` in `list.size`,
  *   so it refers to a member, or an extension.
- * @param isBound whether the name is declared in the element the references are collected from,
+ * @property isBound whether the name is declared in the element the references are collected from,
  *   like a parameter, a local variable or a member, so it does not refer to a top-level declaration.
  * @param element the element it is at, and [scope] the element the references are collected from,
  *   kept only until [canAccessScriptMembers] is computed.
@@ -941,18 +941,8 @@ private class Reference(
     val offset: Int,
     val length: Int,
     val isQualified: Boolean,
-    val isBound: Boolean,
-    /**
-     * Whether it is [isBound] by a declaration other than a function or an extension property, like a parameter, a local variable, or a class,
-     * as these, requiring the arguments or a receiver, do not shadow a class of the same name, like `Regex` in `Regex::class` after `fun Regex() = 1`.
-     */
-    val isBoundByNonFunction: Boolean,
-    /**
-     * Whether it is [isBound] only by the member functions or the extension properties of the enclosing classes,
-     * like `g` in `class A { fun f() = g(); fun g() = 1 }`, so it is resolved on the receiver of the class,
-     * unlike when bound by a local function, which shadows the declarations of the script like a local variable.
-     */
-    val isBoundByMember: Boolean = false,
+    /** How the name is declared in the element the references are collected from, see [isBound]. */
+    val binding: Binding,
     /** Whether it is called, like `foo` in `foo()`, or `foo` in `::foo`, or `until` in `0 until 20`, so it might refer to a function. */
     val isCall: Boolean,
     /** Whether it is a callable reference, like `foo` in `::foo`. */
@@ -975,6 +965,21 @@ private class Reference(
     /** The classes and the objects it is within, whose members it might resolve to, see [mightResolveOnReceiver]. */
     val enclosingClasses: List<KtClassOrObject> = emptyList()
 ) {
+
+    val isBound: Boolean get() = binding != Binding.NONE
+
+    /**
+     * Whether it is [isBound] by a declaration other than a function or an extension property, like a parameter, a local variable, or a class,
+     * as these, requiring the arguments or a receiver, do not shadow a class of the same name, like `Regex` in `Regex::class` after `fun Regex() = 1`.
+     */
+    val isBoundByNonFunction: Boolean get() = binding == Binding.OTHER
+
+    /**
+     * Whether it is [isBound] only by the member functions or the extension properties of the enclosing classes,
+     * like `g` in `class A { fun f() = g(); fun g() = 1 }`, so it is resolved on the receiver of the class,
+     * unlike when bound by a local function, which shadows the declarations of the script like a local variable.
+     */
+    val isBoundByMember: Boolean get() = binding == Binding.MEMBER
 
     /**
      * Whether it is within a declaration, which can access the members of the script, when moved out of the script body,
@@ -1011,7 +1016,6 @@ private fun PsiElement.references(
 }.map { expression ->
     val callableReference = expression.parent as? KtCallableReferenceExpression
     val name = expression.getReferencedName()
-    val bound = binding(expression, name, scope, declaredNames)
     Reference(
         name = name,
         offset = expression.startOffset,
@@ -1019,9 +1023,7 @@ private fun PsiElement.references(
         isQualified = expression.getReceiverExpression() != null || (
                 callableReference?.callableReference == expression && callableReference.receiverExpression != null
         ),
-        isBound = bound != Binding.NONE,
-        isBoundByNonFunction = bound == Binding.OTHER,
-        isBoundByMember = bound == Binding.MEMBER,
+        binding = binding(expression, name, scope, declaredNames),
         // also referred to as a function, like `::println`, or called as infix, like `0 until 20`
         isCall = (expression.parent as? KtCallExpression)?.calleeExpression == expression
                 || callableReference?.callableReference == expression
@@ -1081,8 +1083,7 @@ private fun PsiElement.operatorReferences(
                     offset = offset,
                     length = length,
                     isQualified = true,
-                    isBound = false,
-                    isBoundByNonFunction = false,
+                    binding = Binding.NONE,
                     isCall = true,
                     isCallableReference = false,
                     isType = false,
@@ -1164,7 +1165,10 @@ private fun canAccessScriptMembers(
 /** The members of every class, inherited from `Any`. */
 private val implicitMemberNames = setOf("equals", "hashCode", "toString")
 
-/** How a name is declared in the enclosing elements, see [binding]. */
+/**
+ * How a name is declared in the enclosing elements, see [binding],
+ * declared in the order of their strength, which the comparisons of [binding] and [DeclaredNames.binding] rely on.
+ */
 private enum class Binding {
     NONE,
     /**
@@ -1243,7 +1247,7 @@ private class DeclaredNames {
 
     private class FirstDeclarations(
         val any: Int,
-        var other: Int = Int.MAX_VALUE
+        var other: Int? = null
     )
 
     /** The index of each statement in its block. */
@@ -1261,9 +1265,10 @@ private class DeclaredNames {
             buildMap<String, FirstDeclarations> {
                 block.statements.forEachIndexed { index, statement ->
                     statementIndices[statement] = index
+                    val binding = statement.namesBinding
                     statement.declaredNames().forEach {
                         val first = getOrPut(it) { FirstDeclarations(index) }
-                        if (statement.namesBinding == Binding.OTHER && first.other == Int.MAX_VALUE) first.other = index
+                        if (binding == Binding.OTHER && first.other == null) first.other = index
                     }
                 }
             }
@@ -1272,7 +1277,7 @@ private class DeclaredNames {
         // a child which is not a statement, e.g. of an erroneous script, sees all the statements
         val childIndex = statementIndices[child] ?: Int.MAX_VALUE
         return when {
-            declarations.other < childIndex -> Binding.OTHER
+            declarations.other.let { it != null && it < childIndex } -> Binding.OTHER
             declarations.any < childIndex -> Binding.FUNCTION
             else -> Binding.NONE
         }
@@ -1284,7 +1289,8 @@ private class DeclaredNames {
     ): Binding = classBodyNames.getOrPut(classBody) {
         buildMap<String, Binding> {
             classBody.declarations.forEach { declaration ->
-                declaration.declaredNames().forEach { merge(it, declaration.namesBinding) { a, b -> maxOf(a, b) } }
+                val binding = declaration.namesBinding
+                declaration.declaredNames().forEach { merge(it, binding) { a, b -> maxOf(a, b) } }
             }
         }
     }[name] ?: Binding.NONE
@@ -2250,9 +2256,14 @@ private class ScriptStructure(
         named.filter { it.kind != DeclarationKind.FUNCTION }.forEach { declaration ->
             declaration.supertypeNames.forEach { subtypesByName.getOrPut(it) { mutableListOf() } += declaration }
         }
-        // a qualified reference, like `list.size`, cannot refer to a declaration of the script, unless it is an extension
-        fun Reference.referenced(): List<ParsedDeclaration> = namedByName[name].orEmpty().filter {
-            (!isQualified || it.isExtension) && (!isOperator || it.isOperator)
+        // a qualified reference, like `list.size`, cannot refer to a declaration of the script, unless it is an extension,
+        // nor a value bound by the same name, like `format` in `{ format -> format }`, unlike a call or a type,
+        // which might still refer to the declaration, when the inner one is not applicable, like `format()` of an `Int` parameter,
+        // while only a call, like `work()` or `::work`, unlike `work`, refers to a function
+        fun Reference.referenced(): List<ParsedDeclaration> = if (isBoundByNonFunction && !isCall && !isType) emptyList() else {
+            namedByName[name].orEmpty().filter {
+                (!isQualified || it.isExtension) && (!isOperator || it.isOperator) && (isCall || it.kind != DeclarationKind.FUNCTION)
+            }
         }
         // the operator functions called on the result of `iterator`, like by a for loop
         val iteratorOperators = named.filter { it.isOperator && it.isExtension && (it.name == "hasNext" || it.name == "next") }
@@ -2279,9 +2290,7 @@ private class ScriptStructure(
         }
         val required = declarations.filter { it.mustMove }.toSet()
         val firstReferences = mutableMapOf<ParsedDeclaration, Int>()
-        // not the values bound by the same names, like `format` in `{ format -> format }`, unlike the calls,
-        // which might still refer to the function, when the inner declaration is not applicable, like `format()` of an `Int` parameter
-        bodyReferences.filter { !it.isBoundByNonFunction || it.isCall || it.isType }.forEach { reference ->
+        bodyReferences.forEach { reference ->
             reference.referenced().forEach { firstReferences.putIfAbsent(it, reference.offset) }
         }
         val referredToBefore = declarations.filter { declaration ->

@@ -4493,6 +4493,49 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should execute script with moved declaration having parameter named like class reading local property`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            enum class E { A; fun f(Box: Int) = Box + 1 }
+            class Box { fun add() { log += "box" } }
+            Box().add()
+            E.A.f(1).toString() + log
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "2[box]")
+        }
+    }
+
+    @Test
+    fun `should execute script with loop variable named like moved property of coroutine scope`() = runTest {
+        // given
+        val script = """
+            val isActive get() = "mine"
+            val r = mutableListOf<String>()
+            for (isActive in listOf("loop")) r += isActive
+            r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == listOf("loop"))
+        }
+    }
+
+    @Test
     fun `should execute scripts calling functions of the coroutine scope next to moved declarations of their names which do not apply`() = runTest {
         // given
         val scripts = listOf(
