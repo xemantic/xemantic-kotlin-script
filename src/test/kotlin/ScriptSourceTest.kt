@@ -139,7 +139,7 @@ class ScriptSourceTest {
         assert(source.bodyDeclarationLine("Base", ScriptPosition(3, 8)) == (0 to DeclarationKind.FUNCTION))
         assert(source.bodyDeclarationLine("Base", ScriptPosition(4, 10)) == (0 to DeclarationKind.FUNCTION))
         assert(source.bodyDeclarationLine("Base", ScriptPosition(5, 8)) == (1 to DeclarationKind.CLASS))
-        assert(source.bodyDeclarationLine("Base", ScriptPosition(6, 10)) == (0 to DeclarationKind.FUNCTION))
+        assert(source.bodyDeclarationLine("Base", ScriptPosition(6, 10)) == null)
     }
 
     @Test
@@ -157,6 +157,64 @@ class ScriptSourceTest {
         // then
         assert(source.bodyDeclarationLine("arr", ScriptPosition(1, 8)) == (0 to DeclarationKind.PROPERTY))
         assert(source.bodyDeclarationLine("arr", ScriptPosition(2, 10)) == (0 to DeclarationKind.PROPERTY))
+    }
+
+    @Test
+    fun `should find body declaration of reference indexed or iterated named like its operator`() {
+        // given
+        val script = """
+            val get = listOf(1)
+            val next = listOf(1)
+            val x = get[0]
+            for (y in next) println(y)
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        assert(source.bodyDeclarationLine("get", ScriptPosition(2, 8)) == (0 to DeclarationKind.PROPERTY))
+        assert(source.bodyDeclarationLine("next", ScriptPosition(3, 10)) == (1 to DeclarationKind.PROPERTY))
+    }
+
+    @Test
+    fun `should find body declaration only of extension function for infix call or qualified call`() {
+        // given
+        val script = """
+            fun bar(o: Int) = o
+            infix fun Int.baz(o: Int) = o
+            val x = 1 bar 2
+            val y = 1.bar(2)
+            val z = 1 baz 2
+            val w = 1.baz(2)
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        assert(source.bodyDeclarationLine("bar", ScriptPosition(2, 10)) == null)
+        assert(source.bodyDeclarationLine("bar", ScriptPosition(3, 10)) == null)
+        assert(source.bodyDeclarationLine("baz", ScriptPosition(4, 10)) == (1 to DeclarationKind.FUNCTION))
+        assert(source.bodyDeclarationLine("baz", ScriptPosition(5, 10)) == (1 to DeclarationKind.FUNCTION))
+    }
+
+    @Test
+    fun `should find body declaration of class only for unqualified type`() {
+        // given
+        val script = """
+            class Config
+            class Mode
+            val m: Config.Mode? = null
+            val n: Mode? = null
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        assert(source.bodyDeclarationLine("Mode", ScriptPosition(2, 14)) == null)
+        assert(source.bodyDeclarationLine("Mode", ScriptPosition(3, 7)) == (1 to DeclarationKind.CLASS))
     }
 
     @Test

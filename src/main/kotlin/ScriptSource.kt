@@ -336,8 +336,11 @@ internal class ScriptSource(
     /** The contents of the string literals of the script, with the escapes resolved, and a NUL character in place of each template expression. */
     val stringLiterals: List<String>
 
-    /** See [ScriptStructure.referredKinds]. */
-    private val referredKinds: Map<Pair<Int, String>, List<DeclarationKind>>
+    /**
+     * The references of the script body by their offsets and names, mapped only when an unresolved reference is hinted.
+     * An operator, like `get` of `a[i]`, starts where its operand does, so the operand named like it, like `get` of `get[i]`, overrides it.
+     */
+    private val bodyReferences: Lazy<Map<Pair<Int, String>, Reference>>
 
     /** See [ScriptStructure.propertyReferences]. */
     private val propertyReferences: List<Pair<ScriptReference, Int>>
@@ -377,7 +380,9 @@ internal class ScriptSource(
         classNames = structure.classNames
         enclosingClassNames = structure.enclosingClassNames
         stringLiterals = structure.stringLiterals
-        referredKinds = structure.referredKinds
+        bodyReferences = structure.bodyReferences.let { references ->
+            lazy { references.sortedByDescending { it.isOperator }.associateBy { it.offset to it.name } }
+        }
         fun Pair<String, IntRange>.toScriptReference() = ScriptReference(first, position(second.first), position(second.last + 1))
         conflictingDependencyDeclarations = structure.conflictingDependencyDeclarations.map { it.toScriptReference() }
         fun Reference.toScriptReference() = ScriptReference(name, position(offset), position(offset + length))
@@ -555,26 +560,29 @@ internal class ScriptSource(
     fun movedDeclarationAt(
         position: ScriptPosition
     ): String? {
-        val offset = lineStarts[position.line] + position.column
+        val offset = offset(position)
         return movedDeclarations.find { offset in it.start until it.end }?.name
     }
 
     /**
      * The name in the script, the start and the end of the name of the class moved out of the script body, or nested in one,
-     * reported by the [index]th of the [count] diagnostics without a location naming the class like the compiler,
+     * reported by the [index]th of the [count] diagnostics without a location naming the class and its [kind] like the compiler,
      * without the enclosing classes, and a companion object as `Companion`, also when named.
      * The classes of the [name] are told by their order, counting only the ones referring to the members of the script class,
      * like the dependencies, as only these capture the script class instance, if there are enough of them,
      * otherwise all of them, as the compiler reports also e.g. a companion object calling its own function named like a function of the script.
      */
     fun movedClassName(
+        kind: String,
         name: String,
         index: Int,
         count: Int
     ): Triple<String, ScriptPosition, ScriptPosition>? {
-        val classes = movedDeclarations.flatMap { it.classNames }.filter {
+        val namedClasses = movedDeclarations.flatMap { it.classNames }.filter {
             if (name == "Companion") it.isCompanion || it.name == name else it.name == name && !it.isCompanion
         }
+        // all of them, if none is of the kind, like when another compiler version names a kind differently
+        val classes = namedClasses.filter { it.kind.label == kind }.ifEmpty { namedClasses }
         val candidates = classes.filter { it.refersToScript }.takeIf { it.size >= count } ?: classes
         return (candidates.getOrNull(index) ?: candidates.lastOrNull())?.let {
             Triple(it.name ?: name, position(it.range.first), position(it.range.last + 1))
@@ -596,15 +604,18 @@ internal class ScriptSource(
 
     /**
      * The 0-based line of the declaration of the [name] in the script body, which the reference at the [position] might refer to, and its kind,
-     * the first one of the kind preferred by the reference, like a class of a type, or a function of a call, see [ScriptStructure.referredKinds].
+     * the first one of the kind preferred by the reference, like a class of a type, or a function of a call, see [Reference.referredKinds],
+     * and only an extension function of a qualified one, like `bar` of `1.bar(2)` or `1 bar 2`.
      */
     fun bodyDeclarationLine(
         name: String,
         position: ScriptPosition
     ): Pair<Int, DeclarationKind>? {
-        val declarations = bodyDeclarations.filter { it.name == name || name in it.destructuredNames }
-        val kinds = referredKinds[lineStarts[position.line] + position.column to name]
-        val declaration = if (kinds == null) declarations.firstOrNull() else kinds.firstNotNullOfOrNull { kind ->
+        val reference = bodyReferences.value[offset(position) to name]
+        val declarations = bodyDeclarations.filter {
+            (it.name == name || name in it.destructuredNames) && reference?.mightReferTo(it.isExtension) != false
+        }
+        val declaration = if (reference == null) declarations.firstOrNull() else reference.referredKinds().firstNotNullOfOrNull { kind ->
             declarations.find { it.kind == kind }
         }
         return declaration?.let {
@@ -644,6 +655,10 @@ internal class ScriptSource(
             line in accessor.lines && (accessor.ownerPath?.equals(path) ?: (accessor.ownerClass == path.lastOrNull()))
         }?.name
     }
+
+    private fun offset(
+        position: ScriptPosition
+    ): Int = lineStarts[position.line] + position.column
 
     private fun position(
         offset: Int
@@ -696,6 +711,8 @@ private class Declaration(
     val nameRange: IntRange?,
     /** The names of a destructuring declaration, like `val (a, b) = pair`. */
     val destructuredNames: List<String> = emptyList(),
+    /** Whether it is a function with a receiver, like `fun Int.double()`. */
+    val isExtension: Boolean = false,
     /** The classes of the declaration, including itself, if it is one, in the order of the script. */
     val classNames: List<ClassName> = emptyList(),
     /**
@@ -709,13 +726,23 @@ private class Declaration(
 private class ClassName(
     val name: String?,
     val isCompanion: Boolean,
+    val kind: CapturingClassKind,
     val range: IntRange,
     /**
      * Whether it refers to the members of the script class by their names, outside of its nested classes, so it might capture the script class instance,
-     * unless e.g. the name refers to an inherited member instead.
+     * unless e.g. the name refers to a member inherited from a class of a library instead.
      */
     val refersToScript: Boolean
 )
+
+/** The kinds of the classes, which might capture the script class instance, with the [label]s the compiler names them by in the diagnostics. */
+internal enum class CapturingClassKind(val label: String) {
+    OBJECT("Object"),
+    INTERFACE("Interface"),
+    ENUM_CLASS("Enum class"),
+    ENUM_ENTRY("Enum entry"),
+    NESTED_CLASS("Nested class")
+}
 
 internal enum class DeclarationKind {
     CLASS,
@@ -954,8 +981,8 @@ private val psiFactory: KtPsiFactory by lazy {
 /**
  * A reference by name, like `foo` in `foo()` or `Foo` in `x: Foo`.
  *
- * @param isQualified whether it has a receiver, like `size` in `list.size`,
- *   so it refers to a member, or an extension.
+ * @param isQualified whether it has a receiver, like `size` in `list.size`, or `until` in `0 until 20`,
+ *   so it refers to a member, or an extension, or a qualifier, like `Mode` in `x: Config.Mode`, so it refers to a nested class.
  * @param isBound whether the name is declared in the element the references are collected from,
  *   like a parameter, a local variable or a member, so it does not refer to a top-level declaration.
  */
@@ -990,13 +1017,18 @@ private class Reference(
      * while a qualified one, like `config.timeout`, might refer only to an extension function.
      */
     fun referredKinds(): List<DeclarationKind> = when {
-        isType -> classKinds
+        isType -> if (isQualified) emptyList() else classKinds
         isOperator -> functionKinds
         isQualified -> if (isCall) functionKinds else emptyList()
         isCallableReference -> callableReferenceKinds
         isCall -> callKinds
         else -> valueKinds
     }
+
+    /** Whether it might refer to a declaration of the script, which [isExtension] or not, as a qualified one, like `list.size`, might refer only to an extension. */
+    fun mightReferTo(
+        isExtension: Boolean
+    ): Boolean = !isQualified || isExtension
 
     /** Whether it might refer to one of the local declarations of the script body of these [names]. */
     fun refersToLocal(
@@ -1035,7 +1067,7 @@ private fun PsiElement.references(
         length = expression.textLength,
         isQualified = expression.getReceiverExpression() != null || (
                 callableReference?.callableReference == expression && callableReference.receiverExpression != null
-        ),
+        ) || (expression.parent as? KtUserType)?.qualifier != null,
         isBound = isBound(expression, name, scope, declaredNames),
         // also referred to as a function, like `::println`, or called as infix, like `0 until 20`
         isCall = (expression.parent as? KtCallExpression)?.calleeExpression == expression
@@ -1135,6 +1167,11 @@ private fun PsiElement.operatorReferences(
             else -> {}
         }
     }
+}
+
+/** The names of the supertypes, like `Shape` in `class Circle(val r: Int) : Shape`. */
+private fun KtClassOrObject.supertypeNames(): List<String> = superTypeListEntries.mapNotNull {
+    (it.typeReference?.typeElement as? KtUserType)?.referencedName
 }
 
 /** Whether the [expression] is within a lambda, which might have a receiver, within the [scope], exclusive. */
@@ -1334,11 +1371,8 @@ private class ScriptStructure(
     /** See [ScriptSource.stringLiterals]. */
     val stringLiterals: List<String>
 
-    /**
-     * The kinds of the declarations of the script body, which the references of the script body might refer to, see [Reference.referredKinds],
-     * by their offsets and names, as an operator, like `get` of `a[i]`, starts where its operand does.
-     */
-    val referredKinds: Map<Pair<Int, String>, List<DeclarationKind>>
+    /** The references of the script body, see [ScriptSource.bodyReferences]. */
+    val bodyReferences: List<Reference>
 
     /** See [ScriptSource.accessorName]. */
     val propertyAccessors: List<PropertyAccessor>
@@ -1409,8 +1443,7 @@ private class ScriptStructure(
         val statementReferences = statements.map { statement ->
             declarationsByPsi[statement]?.references ?: statement.references(scope = statement.parent, declaredNames)
         }
-        val bodyReferences = statementReferences.flatten()
-        referredKinds = bodyReferences.associate { (it.offset to it.name) to it.referredKinds() }
+        bodyReferences = statementReferences.flatten()
         // also the ones moved out of the script body, which are the members of the script class
         val scriptProperties = declarations.filter { it.kind == DeclarationKind.PROPERTY }
         // by the offsets of their names, also of the entries of a destructuring declaration
@@ -1461,9 +1494,21 @@ private class ScriptStructure(
             .partition { it.isExtension || (it.psi as? KtProperty)?.receiverTypeReference != null }
         val scriptMemberNames = movedMembers.flatMapTo(HashSet(dependencyNames)) { listOfNotNull(it.name) + it.destructuredNames }
         val scriptExtensionNames = movedExtensions.mapNotNullTo(HashSet()) { it.name }
+        val classesByName = classes.filter { it.name != null }.groupBy { it.name!! }
+        val inheritedMemberNames = HashMap<KtClassOrObject, Set<String>>()
+        // only by the supertypes declared in the script, as the members inherited from the library classes are not known without compiling
+        fun KtClassOrObject.inheritedMemberNames(): Set<String> = inheritedMemberNames[this] ?: run {
+            // against the cyclic supertypes
+            inheritedMemberNames[this] = emptySet()
+            supertypeNames().flatMap { classesByName[it].orEmpty() }.flatMapTo(HashSet()) { supertype ->
+                val members = supertype.declarations + supertype.primaryConstructorParameters.filter { it.hasValOrVar() }
+                members.filter { !it.hasModifier(KtTokens.PRIVATE_KEYWORD) }.mapNotNull { it.name } + supertype.inheritedMemberNames()
+            }.also { inheritedMemberNames[this] = it }
+        }
         movedDeclarations = moved.map { declaration ->
-            declaration.toDeclaration(withNestedNames = true) {
-                it.refersToLocal(scriptMemberNames) || it.name in scriptExtensionNames
+            declaration.toDeclaration(withNestedNames = true, inheritedMemberNames = { it.inheritedMemberNames() }) {
+                // a qualified call, like `"x".up()`, refers to an extension, also when a bound name is like it
+                it.refersToLocal(scriptMemberNames) || ((it.isQualified || !it.isBound) && it.name in scriptExtensionNames)
             }
         }
         scriptMemberCallableReferences = moved.filter { it.kind == DeclarationKind.CLASS }.flatMap { declaration ->
@@ -1727,9 +1772,13 @@ private class ScriptStructure(
         val start = psi.startOffsetSkippingComments
         /** The offset of the name, or of the declaration without a name, like a destructuring one. */
         fun line() = nameRange?.first ?: start
-        /** @param refersToScript whether the reference refers to the members of the script class. */
+        /**
+         * @param inheritedMemberNames the names of the members the class inherits, which its references refer to instead of the members of the script class.
+         * @param refersToScript whether the reference refers to the members of the script class.
+         */
         fun toDeclaration(
             withNestedNames: Boolean = false,
+            inheritedMemberNames: (KtClassOrObject) -> Set<String> = { emptySet() },
             refersToScript: (Reference) -> Boolean = { false }
         ) = Declaration(
             name = name,
@@ -1738,6 +1787,7 @@ private class ScriptStructure(
             end = end,
             nameRange = nameRange,
             destructuredNames = destructuredNames,
+            isExtension = isExtension,
             classNames = if (withNestedNames && psi is KtClassOrObject) {
                 (listOf(psi) + psi.collectDescendantsOfType<KtClassOrObject> { it !== psi }).mapNotNull { declaration ->
                     val isCompanion = declaration is KtObjectDeclaration && declaration.isCompanion()
@@ -1749,12 +1799,24 @@ private class ScriptStructure(
                     val nestedRanges = declaration.collectDescendantsOfType<KtClassOrObject> {
                         it !== declaration && !(it is KtObjectDeclaration && it.isObjectLiteral()) && it !is KtEnumEntry
                     }.map { it.startOffset until it.endOffset }
+                    val inherited = inheritedMemberNames(declaration)
+                    // like the constructor arguments of the supertypes, not seeing the inherited members
+                    val superTypeList = declaration.getSuperTypeList()?.let { it.startOffset until it.endOffset }
                     ClassName(
                         name = declaration.name,
                         isCompanion = isCompanion,
+                        kind = when {
+                            declaration is KtEnumEntry -> CapturingClassKind.ENUM_ENTRY
+                            declaration is KtObjectDeclaration -> CapturingClassKind.OBJECT
+                            declaration is KtClass && declaration.isInterface() -> CapturingClassKind.INTERFACE
+                            declaration is KtClass && declaration.isEnum() -> CapturingClassKind.ENUM_CLASS
+                            else -> CapturingClassKind.NESTED_CLASS
+                        },
                         range = nameElement.startOffset until nameElement.endOffset,
                         refersToScript = references.any { reference ->
-                            reference.offset in range && nestedRanges.none { reference.offset in it } && refersToScript(reference)
+                            reference.offset in range && nestedRanges.none { reference.offset in it }
+                                    && (reference.name !in inherited || superTypeList?.contains(reference.offset) == true)
+                                    && refersToScript(reference)
                         }
                     )
                 }
@@ -1835,9 +1897,7 @@ private class ScriptStructure(
             isSealed = declaration.hasModifier(KtTokens.SEALED_KEYWORD),
             isExtension = declaration is KtNamedFunction && declaration.receiverTypeReference != null,
             isOperator = declaration is KtNamedFunction && declaration.hasModifier(KtTokens.OPERATOR_KEYWORD),
-            supertypeNames = (declaration as? KtClassOrObject)?.superTypeListEntries.orEmpty().mapNotNull {
-                (it.typeReference?.typeElement as? KtUserType)?.referencedName
-            },
+            supertypeNames = (declaration as? KtClassOrObject)?.supertypeNames().orEmpty(),
             references = declaration.references(scope = declaration.parent, declaredNames)
         )
     }
@@ -1875,7 +1935,7 @@ private class ScriptStructure(
         }
         // a qualified reference, like `list.size`, cannot refer to a declaration of the script, unless it is an extension
         fun Reference.referenced(): List<ParsedDeclaration> = namedByName[name].orEmpty().filter {
-            (!isQualified || it.isExtension) && (!isOperator || it.isOperator)
+            mightReferTo(it.isExtension) && (!isOperator || it.isOperator)
         }
         // the operator functions called on the result of `iterator`, like by a for loop
         val iteratorOperators = named.filter { it.isOperator && it.isExtension && (it.name == "hasNext" || it.name == "next") }

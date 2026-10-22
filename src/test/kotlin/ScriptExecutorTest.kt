@@ -3988,6 +3988,135 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report unresolved reference indexed or iterated before its declaration, named like its operator`() = runTest {
+        // given
+        val scripts = listOf(
+            """
+            val k = "a".length
+            val x = get[0]
+            val get = listOf(k)
+            x
+            """,
+            """
+            val k = "a".length
+            for (x in next) println(x)
+            val next = listOf(k)
+            """
+        ).map { it.trimIndent() }
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        results[0] should {
+            be<ScriptResult.Error>()
+            have("""
+                script.kts:2:9: error: Unresolved reference 'get'.
+                  | val x = <error>get</error>[0]
+                  hint: 'get' is declared at line 3, while the properties of the script body are visible only after their declaration - move it before line 2.
+            """.trimIndent() in message)
+        }
+        results[1] should {
+            be<ScriptResult.Error>()
+            have("""
+                script.kts:2:11: error: Unresolved reference 'next'.
+                  | for (x in <error>next</error>) println(x)
+                  hint: 'next' is declared at line 3, while the properties of the script body are visible only after their declaration - move it before line 2.
+            """.trimIndent() in message)
+        }
+    }
+
+    @Test
+    fun `should report unresolved infix or qualified call without hint at later function which is not an extension`() = runTest {
+        // given
+        val scripts = listOf(
+            """
+            val k = "a".length
+            val x = 1 bar 2
+            fun bar(o: Int) = k
+            x
+            """,
+            """
+            val k = "a".length
+            val x = 1.bar(2)
+            fun bar(o: Int) = k
+            x
+            """
+        ).map { it.trimIndent() }
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        results[0] should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                script.kts:2:11: error: Unresolved reference 'bar'.
+                  | val x = 1 <error>bar</error> 2
+            """.trimIndent()
+        }
+        results[1] should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                script.kts:2:11: error: Unresolved reference 'bar'.
+                  | val x = 1.<error>bar</error>(2)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report unresolved infix call before its declaration as extension function`() = runTest {
+        // given
+        val script = """
+            val k = "a".length
+            val x = 1 bar 2
+            infix fun Int.bar(o: Int) = k
+            x
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                script.kts:2:11: error: Unresolved reference 'bar'.
+                  | val x = 1 <error>bar</error> 2
+                  hint: 'bar' is declared at line 3, while the functions of the script body are visible only after their declaration - move it before line 2.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report unresolved qualified type without hint at later local class of its name`() = runTest {
+        // given
+        val script = """
+            val k = "a".length
+            class Config
+            val m: Config.Mode? = null
+            class Mode { val v = k }
+            m
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                script.kts:3:15: error: Unresolved reference 'Mode'.
+                  | val m: Config.<error>Mode</error>? = null
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should report unresolved type declared later as local class named like preceding local function`() = runTest {
         // given
         val scripts = listOf(
@@ -4944,7 +5073,7 @@ class ScriptExecutorTest {
     }
 
     @Test
-    fun `should report error at distinct companion objects, when more of them refer to names of the script class members than capture it`() = runTest {
+    fun `should report error at companion objects capturing the script class instance, not at the one referring to member inherited from class of the script`() = runTest {
         // given
         val script = """
             open class Base { val input = "z" }
@@ -4962,10 +5091,111 @@ class ScriptExecutorTest {
         result should {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
-            // told by the names only, the inherited member is not known
             assert(message.lines().filter { "captures the script class instance" in it } == listOf(
-                "script.kts:2:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead.",
+                "script.kts:3:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead.",
+                "script.kts:4:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead."
+            ))
+        }
+    }
+
+    @Test
+    fun `should report error at distinct companion objects, when more of them refer to names of the script class members than capture it`() = runTest {
+        // given
+        val script = """
+            class A { companion object : java.util.ArrayList<String>() { fun f() = size } }
+            class B { companion object { fun f() = size } }
+            class C { companion object { fun f() = size } }
+            A.f() + B.f() + C.f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("size", 1)))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            // the member inherited from a class of a library is not known, so they are told by their order
+            assert(message.lines().filter { "captures the script class instance" in it } == listOf(
+                "script.kts:1:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead.",
+                "script.kts:2:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead."
+            ))
+        }
+    }
+
+    @Test
+    fun `should report error at companion objects capturing the script class instance, also when referring to name of private member of their supertype`() = runTest {
+        // given
+        val script = """
+            open class Base { private val input = "z" }
+            class Z { companion object { fun f() = 1 } }
+            class A { companion object : Base() { fun f() = input.length } }
+            class B { companion object { fun f() = input.length } }
+            A.f() + B.f() + Z.f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("input", "abc")))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            assert(message.lines().filter { "captures the script class instance" in it } == listOf(
+                "script.kts:3:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead.",
+                "script.kts:4:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead."
+            ))
+        }
+    }
+
+    @Test
+    fun `should report error at companion object capturing the script class instance in supertype constructor argument named like inherited member`() = runTest {
+        // given
+        val script = """
+            open class Base(val s: String) { val input = "z" }
+            class Z { companion object { fun f() = 1 } }
+            class A { companion object : Base(input) { fun f() = 2 } }
+            A.f() + Z.f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("input", "abc")))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            assert(message.lines().filter { "captures the script class instance" in it } == listOf(
                 "script.kts:3:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead."
+            ))
+        }
+    }
+
+    @Test
+    fun `should report error at nested classes capturing the script class instance, also by qualified call of script extension named like parameter`() = runTest {
+        // given
+        val script = """
+            fun String.up() = this + input
+            class P { class N { fun h() = 1 } }
+            class A { class N { fun f(up: Int) = "x".up() } }
+            class B { class N { fun g() = input } }
+            P.N().h().toString() + A.N().f(1) + B.N().g()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("input", "abc")))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            assert(message.lines().filter { "captures the script class instance" in it }.map { it.substringBefore(" error:") } == listOf(
+                "script.kts:3:17:",
+                "script.kts:4:17:"
             ))
         }
     }
@@ -4994,6 +5224,81 @@ class ScriptExecutorTest {
                 script.kts:1:16: error: Enum entry 'X' captures the script class instance. Try to use class or anonymous object instead.
                   | enum class E { <error>X</error> { override fun f() = input }; abstract fun f(): String }
                   hint: 'X' is compiled outside of the script body, where an enum entry cannot access the dependencies, nor the functions of the script - pass them as parameters.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at nested class capturing the script class instance, not at the one with parameter named like script extension`() = runTest {
+        // given
+        val script = """
+            fun String.up() = this + input
+            class A { class N { fun f(up: Int) = up } }
+            class B { class N { fun g() = input } }
+            A.N().f(1).toString() + B.N().g()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("input", "abc")))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:17: error: Nested class 'N' captures the script class instance. Try to use the explicit 'inner' modifier for both the nested 'N' and outer 'B'.
+                  | class B { class <error>N</error> { fun g() = input } }
+                  hint: 'N' is compiled outside of the script body, where a nested class cannot access the dependencies, nor the functions of the script - pass them as parameters.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at each class capturing the script class instance named like one of another kind`() = runTest {
+        // given
+        val scripts = listOf(
+            """
+            class A { class Factory { fun f() = input } }
+            object Factory { fun g() = input }
+            A.Factory().f() + Factory.g()
+            """,
+            """
+            class P { object A { fun f() = input } }
+            class Q { class A { fun g() = input } }
+            P.A.f() + Q.A().g()
+            """
+        ).map { it.trimIndent() }
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, listOf(dependency("input", "abc"))) }
+
+        // then
+        results[0] should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:17: error: Nested class 'Factory' captures the script class instance. Try to use the explicit 'inner' modifier for both the nested 'Factory' and outer 'A'.
+                  | class A { class <error>Factory</error> { fun f() = input } }
+                  hint: 'Factory' is compiled outside of the script body, where a nested class cannot access the dependencies, nor the functions of the script - pass them as parameters.
+
+                script.kts:2:8: error: Object 'Factory' captures the script class instance. Try to use class or anonymous object instead.
+                  | object <error>Factory</error> { fun g() = input }
+                  hint: 'Factory' is compiled outside of the script body, where an object cannot access the dependencies, nor the functions of the script - declare it as a class, or pass them as parameters.
+            """.trimIndent()
+        }
+        results[1] should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:18: error: Object 'A' captures the script class instance. Try to use class or anonymous object instead.
+                  | class P { object <error>A</error> { fun f() = input } }
+                  hint: 'A' is compiled outside of the script body, where an object cannot access the dependencies, nor the functions of the script - declare it as a class, or pass them as parameters.
+
+                script.kts:2:17: error: Nested class 'A' captures the script class instance. Try to use the explicit 'inner' modifier for both the nested 'A' and outer 'Q'.
+                  | class Q { class <error>A</error> { fun g() = input } }
+                  hint: 'A' is compiled outside of the script body, where a nested class cannot access the dependencies, nor the functions of the script - pass them as parameters.
             """.trimIndent()
         }
     }
