@@ -4382,6 +4382,47 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should call dependency within lambdas of scope functions of script instance before local function of the same name`() = runTest {
+        // given
+        // the script instance is the receiver of these lambdas in a regular script, declaring the dependency, which takes precedence there
+        val scripts = listOf(
+            "val p = \"!\"\nval a = f(1)\nclass P\nval b = run { f(null) }\nfun f(x: P?) = \"local\" + p\na + b",
+            "val p = \"!\"\nval b = run { f(null) }\nfun f(x: String?) = \"local\" + p\nb",
+            "val p = \"!\"\nclass P\nval b = run { f(null) }\nfun f(x: P?) = \"local\" + p\nb",
+            "val p = \"!\"\nval b = apply { f(null) }.let { runCatching { f(null) }.getOrThrow() } + with(this) { f(null) }\nfun f(x: String?) = \"local\" + p\nb",
+            "val p = \"!\"\nfun g() = run { f(null) }\nfun f(x: String?) = \"local\" + p\ng()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, listOf(dependency<(Any?) -> String>("f") { "dep" })) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("depdep", "dep", "dep", "depdep", "dep"))
+    }
+
+    @Test
+    fun `should report calls of dependency within lambdas of scope functions of other receivers before local function of the same name`() = runTest {
+        // given
+        val scripts = listOf(
+            "val p = \"!\"\nclass Bar { fun m() = run { f(null) } }\nfun f(x: String?) = \"local\" + p\nBar().m()",
+            "val p = \"!\"\nfun Int.h() = run { f(null) }\nfun f(x: String?) = \"local\" + p\n2.h()",
+            "val p = \"!\"\nval b = with(\"a\") { run { f(null) } }\nfun f(x: String?) = \"local\" + p\nb",
+            "val p = \"!\"\nval b = run<String> { f(null) }\nfun f(x: String?) = \"local\" + p\nb",
+            "val p = \"!\"\nval b = listOf(1).map { f(null) }\nfun f(x: String?) = \"local\" + p\nb"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, listOf(dependency<(Any?) -> String>("f") { "dep" })) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.first()?.substringAfter("error: ") } == List(scripts.size) {
+            "'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 3."
+        })
+    }
+
+    @Test
     fun `should report error at call preceding local function named like library function`() = runTest {
         // given
         val script = """

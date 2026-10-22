@@ -148,7 +148,9 @@ internal class LaterDeclaredDependencyReference(
     override val line: Int,
     override val isFunction: Boolean,
     /** Whether it refers to the declaration as a function, like `::foo`, which might be resolved to a property instead. */
-    val isCallableReference: Boolean
+    val isCallableReference: Boolean,
+    /** The calls of the scope functions, within the lambdas of which it is, like `run` of `run { f(null) }`, see [LaterDeclaredClassReference.scopeCalls]. */
+    val scopeCalls: List<ScriptReference> = emptyList()
 ) : LocalDeclarationReference, PrecedingReference {
 
     override val kind: String get() = super<LocalDeclarationReference>.kind
@@ -660,8 +662,14 @@ internal class ScriptSource private constructor(
             range.toScriptReference(name)
         }
         fun Reference.toScriptReference() = (offset until offset + length).toScriptReference(name)
-        laterDeclaredDependencyCandidates = structure.laterDeclaredDependencyCandidates.map { (reference, offset, isFunction) ->
-            LaterDeclaredDependencyReference(reference.toScriptReference(), position(offset).line, isFunction, reference.isCallableReference)
+        laterDeclaredDependencyCandidates = structure.laterDeclaredDependencyCandidates.map { candidate ->
+            LaterDeclaredDependencyReference(
+                candidate.reference.toScriptReference(),
+                position(candidate.offset).line,
+                candidate.isFunction,
+                candidate.reference.isCallableReference,
+                candidate.scopeCalls.map { it.toScriptReference() }
+            )
         }
         laterDeclaredClassCandidates = structure.laterDeclaredClassCandidates.map { candidate ->
             LaterDeclaredClassReference(
@@ -1124,6 +1132,17 @@ private fun KtFile.argumentStarts(
     }
     return emptyList<Int>() to null
 }
+
+/**
+ * See [ScriptSource.laterDeclaredDependencyCandidates], with the [offset] of the declaration, whether it is a function,
+ * and the ranges of the [LaterDeclaredDependencyReference.scopeCalls].
+ */
+private data class LaterDeclaredCandidate(
+    val reference: Reference,
+    val offset: Int,
+    val isFunction: Boolean,
+    val scopeCalls: List<IntRange> = emptyList()
+)
 
 /** See [ScriptSource.laterDeclaredClassCandidates], with the offset of the class, and the ranges of the [LaterDeclaredClassReference.scopeCalls]. */
 private class ClassCandidate(
@@ -1942,8 +1961,8 @@ private class ScriptStructure(
     /** The copies of the constructors of the local classes, see [ScriptSource.laterDeclaredClassCandidates], with their messages, by the offsets of the statements they precede. */
     private val constructorCopies: Map<Int, List<Pair<String, String>>>
 
-    /** See [ScriptSource.laterDeclaredDependencyCandidates], with the offsets of the declarations, and whether they are functions. */
-    val laterDeclaredDependencyCandidates: List<Triple<Reference, Int, Boolean>>
+    /** See [ScriptSource.laterDeclaredDependencyCandidates]. */
+    val laterDeclaredDependencyCandidates: List<LaterDeclaredCandidate>
 
     /** See [ScriptSource.laterDeclaredClassCandidates]. */
     val laterDeclaredClassCandidates: List<ClassCandidate>
@@ -2296,10 +2315,16 @@ private class ScriptStructure(
             dependencyProperties[reference.name]?.takeIf { (declarationIndex) ->
                 // also when called, as the function of the same name might not apply
                 declarationIndex > index && reference.refersToLocal(localProperties)
-            }?.let { (_, property) -> Triple(reference, property.line(), false) }
+            }?.let { (_, property) -> LaterDeclaredCandidate(reference, property.line(), isFunction = false) }
                 ?: dependencyFunctions[reference.name]?.takeIf { (declarationIndex) ->
                     declarationIndex > index && reference.isCall && reference.refersToLocal(localFunctions)
-                }?.let { (_, function) -> Triple(reference, function.line(), true) }
+                }?.let { (_, function) ->
+                    // the calls, unlike the callable references, within the lambdas of which the script instance declaring the dependency is the receiver
+                    val scopeCalls = if (reference.isCallableReference) emptyList() else {
+                        file.findElementAt(reference.offset)?.let { scopeCalls(it, statements[index].parent) }.orEmpty()
+                    }
+                    LaterDeclaredCandidate(reference, function.line(), isFunction = true, scopeCalls)
+                }
         }
         laterDeclaredDependencyCandidates = laterDeclaredCandidatesByStatement.values.flatten()
         // the first local class of each name of a dependency, by the index of its statement
@@ -2323,7 +2348,9 @@ private class ScriptStructure(
         }
         laterDeclaredClassCandidates = laterDeclaredClassCandidatesByStatement.values.flatten()
         // unless they would conflict with the copies of the moved declarations of these names, see coroutineScopeMembers
-        scopeFunctionCopies = if (laterDeclaredClassCandidates.none { it.scopeCalls.isNotEmpty() }) emptyList() else {
+        scopeFunctionCopies = if (laterDeclaredClassCandidates.none { it.scopeCalls.isNotEmpty() } && laterDeclaredDependencyCandidates.none { it.scopeCalls.isNotEmpty() }) {
+            emptyList()
+        } else {
             scopeFunctions.filterKeys { name -> moved.none { it.name == name } }.values.toList()
         }
         val statementIndices = statements.withIndex().associate { (index, statement) -> statement to index }
@@ -2389,7 +2416,7 @@ private class ScriptStructure(
                 .mapNotNull { function -> function.signature()?.let { message(function) to it } }
         }
         laterDeclaredFunctionCopies = copies(
-            laterDeclaredCandidatesByStatement.mapValues { (_, candidates) -> candidates.filter { it.third }.map { it.first } },
+            laterDeclaredCandidatesByStatement.mapValues { (_, candidates) -> candidates.filter { it.isFunction }.map { it.reference } },
             functionCopies(localFunctionsByName) { LATER_DECLARED_FUNCTION }
         )
         // the local functions, also the extension ones, by the indices of their statements, unless named like the dependencies, see laterDeclaredDependencyCandidates

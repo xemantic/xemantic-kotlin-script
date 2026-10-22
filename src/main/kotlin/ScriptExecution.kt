@@ -575,9 +575,13 @@ internal class DefaultScriptExecutor(
                 val inferred = copies(inInferredTypes) { parsed.source(confirming = true, overloadingFunctionCopies = true) }
                 val declared = copies(inDeclaredTypes) { parsed.source(confirming = true, shadowedFunctionCopies = true) }
                 val shadowed = async { (inferred.await() + declared.await()).distinctBy { it.reference } }
-                // also declaring the copies of the constructors of the local classes, see ScriptSource.laterDeclaredClassCandidates
+                // also declaring the copies of the constructors of the local classes, see ScriptSource.laterDeclaredClassCandidates,
+                // and of the scope functions, the receivers of the lambdas of which are the script instance in the script
                 val scopeCopies = async {
-                    if (confirmedCandidates.isEmpty() && source.laterDeclaredClassCandidates.isEmpty()) null else {
+                    if (
+                        confirmedCandidates.isEmpty() && source.laterDeclaredClassCandidates.isEmpty()
+                        && source.laterDeclaredDependencyCandidates.none { it.scopeCalls.isNotEmpty() }
+                    ) null else {
                         val copies = parsed.source(confirming = true, coroutineScopeCopies = true)
                         copies to confirming(copies).reports
                     }
@@ -589,16 +593,17 @@ internal class DefaultScriptExecutor(
             val constructors = scopeCopies?.let { (copies, reports) -> reports.marked(copies, LATER_DECLARED_CLASS) }.orEmpty()
             // the calls of the scope functions of the coroutine scope of the script body, the script instance in the script
             val toScriptReceiver = scopeCopies?.let { (copies, reports) -> reports.marked(copies, SCRIPT_RECEIVER) }.orEmpty()
+            /** Whether it is within the lambda of a scope function of the script instance, declaring the dependency, which takes precedence there in the script. */
+            fun List<ScriptReference>.toScriptReceiver() = any { call -> toScriptReceiver.any { it in call } }
             val laterDeclaredDependencyReferences = (source.laterDeclaredDependencyCandidates.filter { candidate ->
                 (functions.takeIf { candidate.isFunction }.orEmpty()
                         // like `::x`, resolved to the property of the dependency instead of the local function
                         + dependencies.takeIf { !candidate.isFunction || candidate.isCallableReference }.orEmpty())
-                    .any { it in candidate.reference }
+                    .any { it in candidate.reference } && !candidate.scopeCalls.toScriptReceiver()
             } + source.laterDeclaredClassCandidates.filter { candidate ->
                 // calling the dependency without the copies, rather than e.g. the member of a receiver, which takes precedence in the script,
                 // like the script instance, the receiver of the lambdas of its scope functions, like `run { }`, declaring the dependency
-                constructors.any { it in candidate.reference } && dependencies.any { it in candidate.reference }
-                        && candidate.scopeCalls.none { call -> toScriptReceiver.any { it in call } }
+                constructors.any { it in candidate.reference } && dependencies.any { it in candidate.reference } && !candidate.scopeCalls.toScriptReceiver()
             }).sortedBy { it.reference.start }
             val hiddenLocalFunctionReferences = hiddenCandidates.filter {
                 it in hidden && (it !in source.untypedPropertyCalls || it.reference.name in confirmedTypes)
