@@ -47,6 +47,38 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should recognize classes without members named like function called before its declaration within many members and supertypes`() {
+        // given
+        val count = 20_000
+        val members = buildString {
+            appendLine("val k = \"!\"")
+            appendLine("val s = buildString { append(\"x\") }")
+            appendLine("fun append(t: String) = t + k")
+            appendLine("class A {")
+            (0 until count).forEach { appendLine("    fun m$it() = append(\"$it\")") }
+            appendLine("}")
+            append("A().m0()")
+        }
+        val supertypes = buildString {
+            appendLine("val k = \"!\"")
+            appendLine("val s = buildString { append(\"x\") }")
+            appendLine("fun append(t: String) = t + k")
+            appendLine("open class C0 { fun c0() = append(\"0\") }")
+            (1 until count).forEach { appendLine("open class C$it : C${it - 1}() { fun c$it() = append(\"$it\") }") }
+            append("C${count - 1}().c0()")
+        }
+
+        // when
+        val sources = listOf(members, supertypes).map { ScriptSource(it) }
+
+        // then
+        // not kept local, as no class has a member named `append`
+        sources.forEach { source ->
+            assert("fun append" in source.text.substringAfter("\n$SCRIPT_BLOCK_END\n"))
+        }
+    }
+
+    @Test
     fun `should move many classes accessing local property referred to by declaration which cannot be local`() {
         // given
         val count = 50_000
@@ -182,7 +214,7 @@ class ScriptSourceTest {
     }
 
     @Test
-    fun `should not move function reading constant called before its declaration only where receiver might resolve it`() {
+    fun `should move function reading constant called before its declaration where receiver might resolve it after the script block`() {
         // given
         val scripts = listOf(
             "val k = \"!\"\nval s = buildString { append(\"x\") }\nfun append(t: String) = t + k\nappend(s)",
@@ -195,9 +227,11 @@ class ScriptSourceTest {
         val sources = scripts.map { ScriptSource(it) }
 
         // then
-        sources.forEach { source ->
+        // like in the script, resolved after the receivers
+        sources.zip(listOf("fun append", "fun sum", "fun describe", "fun scale")).forEach { (source, function) ->
             val (moved, body) = source.movedAndBody()
-            assert("val k" !in moved && "val k" in body)
+            assert("val k" in moved && "val k" !in body)
+            assert(function in source.text.substringAfter("\n$SCRIPT_BLOCK_END\n"))
         }
     }
 

@@ -94,6 +94,7 @@ import org.jetbrains.kotlin.psi.psiUtil.forEachDescendantOfType
 import org.jetbrains.kotlin.psi.psiUtil.parents
 import org.jetbrains.kotlin.psi.psiUtil.startOffset
 import org.jetbrains.kotlin.psi.psiUtil.startOffsetSkippingComments
+import java.util.Collections
 import java.util.IdentityHashMap
 import kotlin.concurrent.atomics.AtomicLong
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
@@ -882,6 +883,12 @@ private class Reference(
      * as these, requiring the arguments or a receiver, do not shadow a class of the same name, like `Regex` in `Regex::class` after `fun Regex() = 1`.
      */
     val isBoundByNonFunction: Boolean,
+    /**
+     * Whether it is [isBound] only by the member functions or the extension properties of the enclosing classes,
+     * like `g` in `class A { fun f() = g(); fun g() = 1 }`, so it is resolved on the receiver of the class,
+     * unlike when bound by a local function, which shadows the declarations of the script like a local variable.
+     */
+    val isBoundByMember: Boolean = false,
     /** Whether it is called, like `foo` in `foo()`, or `foo` in `::foo`, or `until` in `0 until 20`, so it might refer to a function. */
     val isCall: Boolean,
     /** Whether it is a callable reference, like `foo` in `::foo`. */
@@ -898,7 +905,11 @@ private class Reference(
      * Whether it is within a lambda, a class, an object, or an extension function,
      * so it might resolve to a member of their receivers, like `append` in `buildString { append("x") }`.
      */
-    val mightResolveOnReceiver: Boolean = false
+    val mightResolveOnReceiver: Boolean = false,
+    /** Whether it is within a lambda or an extension function, see [mightResolveOnReceiver], unlike within the [enclosingClasses] only. */
+    val isInLambdaOrExtension: Boolean = false,
+    /** The classes and the objects it is within, whose members it might resolve to, see [mightResolveOnReceiver]. */
+    val enclosingClasses: List<KtClassOrObject> = emptyList()
 ) {
 
     /**
@@ -946,6 +957,7 @@ private fun PsiElement.references(
         ),
         isBound = bound != Binding.NONE,
         isBoundByNonFunction = bound == Binding.OTHER,
+        isBoundByMember = bound == Binding.MEMBER,
         // also referred to as a function, like `::println`, or called as infix, like `0 until 20`
         isCall = (expression.parent as? KtCallExpression)?.calleeExpression == expression
                 || callableReference?.callableReference == expression
@@ -955,7 +967,11 @@ private fun PsiElement.references(
         element = expression,
         scope = scope,
         isInLambda = isInLambda(expression, scope),
-        mightResolveOnReceiver = mightResolveOnReceiver(expression, scope)
+        mightResolveOnReceiver = mightResolveOnReceiver(expression, scope),
+        isInLambdaOrExtension = expression.parents.takeWhile { it !== scope }.any {
+            it is KtLambdaExpression || (it is KtNamedFunction && it.receiverTypeReference != null)
+        },
+        enclosingClasses = expression.parents.takeWhile { it !== scope }.filterIsInstance<KtClassOrObject>().toList()
     )
 } + operatorReferences(scope)
 
@@ -1081,9 +1097,17 @@ private fun canAccessScriptMembers(
     return true
 }
 
+/** The members of every class, inherited from `Any`. */
+private val implicitMemberNames = setOf("equals", "hashCode", "toString")
+
 /** How a name is declared in the enclosing elements, see [binding]. */
 private enum class Binding {
     NONE,
+    /**
+     * By the member functions or the member extension properties of the enclosing classes only, see [Reference.isBoundByMember],
+     * overridden by the local ones, which shadow the declarations of the script, as the bindings are ordered by their strength.
+     */
+    MEMBER,
     /** By the functions or the extension properties only, see [Reference.isBoundByNonFunction]. */
     FUNCTION,
     OTHER
@@ -1112,14 +1136,14 @@ private fun binding(
             is KtForExpression -> ((child === parent.body || child === parent.body?.parent) && parent.loopParameter?.declares(name) == true).toBinding()
             is KtCatchClause -> (child === parent.catchBody && parent.catchParameter?.name == name).toBinding()
             is KtWhenExpression -> (child !== parent.subjectVariable && parent.subjectVariable?.name == name).toBinding()
-            is KtClassBody -> declaredNames.binding(parent, name)
+            is KtClassBody -> declaredNames.binding(parent, name).let { if (it == Binding.FUNCTION) Binding.MEMBER else it }
             is KtClassOrObject -> parent.primaryConstructorParameters.any {
                 it.name == name && (it.hasValOrVar() || !inFunction)
             }.toBinding()
             else -> Binding.NONE
         }
         if (declares == Binding.OTHER) return declares
-        if (declares == Binding.FUNCTION) binding = declares
+        if (declares > binding) binding = declares
         if (parent is KtNamedFunction || parent is KtPropertyAccessor) inFunction = true
         child = parent
         parent = parent.parent
@@ -1379,10 +1403,6 @@ private class ScriptStructure(
                 insert(property.accessors.last().endOffset, "}")
             }
         }
-        // the ones of the declarations which cannot be local keep their order, when moved, also relative to the ones they refer to
-        val receiverReferences = statements.zip(statementReferences).flatMap { (statement, references) ->
-            if (declarationsByPsi[statement]?.mustMove == true) emptyList() else references.filter { it.mightResolveOnReceiver }
-        }
         // only the properties which require it are moved
         val properties = declarations.filter { it.kind == DeclarationKind.PROPERTY && !it.mustMove }
         val propertyNames = properties.flatMap { it.names }
@@ -1390,17 +1410,30 @@ private class ScriptStructure(
         val propertyNameCounts = propertyNames.groupingBy { it }.eachCount()
         // initialized with a literal, so they can be initialized at any time, moved with the declarations referring to them
         var constants = properties.filter { it.isConstant(dependencyNames, propertyNameCounts) }
+        // the first segments of the qualified ones, like `kotlin` of `kotlin.Result`, which name a local class only as its outer one
         val typeNames = constants.associateWith { constant ->
-            (constant.psi as KtProperty).typeReference?.collectDescendantsOfType<KtUserType>().orEmpty().mapNotNull { it.referencedName }
+            (constant.psi as KtProperty).typeReference?.collectDescendantsOfType<KtUserType> { it.qualifier == null }.orEmpty()
+                .mapNotNull { it.referencedName }
         }
         val classes = declarations.filter { it.kind == DeclarationKind.CLASS && it.name != null }
         var constantNames: Set<String>
         var selected: Set<ParsedDeclaration>
+        val selectMovedDeclarations = movedDeclarationsSelection(
+            declarations,
+            bodyReferences,
+            localReferences = statements.zip(statementReferences).flatMap { (statement, references) ->
+                if (declarationsByPsi[statement]?.mustMove == true) emptyList() else references
+            },
+            // run where they are declared, unlike the functions and the classes
+            executedReferences = statements.zip(statementReferences).filter { (statement) ->
+                declarationsByPsi[statement].let { it == null || it.kind == DeclarationKind.PROPERTY }
+            }.map { (statement, references) -> statement.startOffset to references }
+        )
         // unless their type names a local class, like `val x: Foo? = null`, which would not be visible to them,
         // while the fewer constants, the fewer declarations are moved, possibly not the classes of the remaining ones
         while (true) {
             constantNames = constants.mapTo(HashSet()) { it.name!! }
-            selected = selectMovedDeclarations(declarations, bodyReferences, receiverReferences, propertyNameSet, constantNames)
+            selected = selectMovedDeclarations(propertyNameSet, constants.associate { it.name!! to it.start })
             val localClassNames = classes.filter { it !in selected }.mapTo(HashSet()) { it.name!! }
             val remaining = constants.filter { constant -> typeNames.getValue(constant).none { it in localClassNames } }
             if (remaining.size == constants.size) break
@@ -1997,7 +2030,7 @@ private class ScriptStructure(
         }
     }
 
-    /** Whether the property is initialized with a literal, so it can be initialized at any time, see [selectMovedDeclarations]. */
+    /** Whether the property is initialized with a literal, so it can be initialized at any time, see [movedDeclarationsSelection]. */
     private fun ParsedDeclaration.isConstant(
         dependencyNames: Set<String>,
         propertyNameCounts: Map<String, Int>
@@ -2070,15 +2103,18 @@ private class ScriptStructure(
      * therefore a function is not moved if it, or the declarations it refers to, access the local properties of the script body,
      * except the [constants], which are moved together with the declarations referring to them,
      * unless referred to from where the members of the script are not accessible, like an object.
+     *
+     * Returns the selection by the local properties and the constants among them, with their starts,
+     * sharing what does not depend on them, as the constants are selected repeatedly.
      */
-    private fun selectMovedDeclarations(
+    private fun movedDeclarationsSelection(
         declarations: List<ParsedDeclaration>,
         bodyReferences: List<Reference>,
-        /** The [bodyReferences] which might resolve on receivers, outside of the declarations which cannot be local. */
-        receiverReferences: List<Reference>,
-        localProperties: Set<String>,
-        constants: Set<String>
-    ): Set<ParsedDeclaration> {
+        /** The [bodyReferences] outside of the declarations which cannot be local. */
+        localReferences: List<Reference>,
+        /** The [bodyReferences] of the statements run where they are declared, by their starts, unlike the functions and the classes. */
+        executedReferences: List<Pair<Int, List<Reference>>>
+    ): (localProperties: Set<String>, constantStarts: Map<String, Int>) -> Set<ParsedDeclaration> {
         val named = declarations.filter { it.name != null && it.kind != DeclarationKind.PROPERTY }
         val namedByName = named.groupBy { it.name!! }
         val subtypesByName = mutableMapOf<String, MutableList<ParsedDeclaration>>()
@@ -2113,100 +2149,204 @@ private class ScriptStructure(
             }
         }
         val required = declarations.filter { it.mustMove }.toSet()
-        val variables = localProperties - constants
-        // the declarations reading the constants, or referring to such ones, which would be local, if the constants were
-        val readingConstants = declarations.filterTo(mutableSetOf()) { declaration ->
-            declaration.references.any { it.refersToConstant(constants) }
-        }
-        ArrayDeque(readingConstants).let { queue ->
-            while (queue.isNotEmpty()) {
-                referrers[queue.removeFirst()].orEmpty().forEach { if (readingConstants.add(it)) queue += it }
-            }
-        }
-        // referred to before their declaration where a receiver might resolve them instead, like `append` in `buildString { append("x") }`,
-        // which resolves to the declaration once moved, so they stay local, as if the constants were local
-        val referredToOnReceivers = receiverReferences.flatMapTo(HashSet()) { reference ->
-            reference.referenced().filter { it in readingConstants && reference.offset < it.start }
-        }
-        val accessingLocalProperties = declarations.filter { declaration ->
-            declaration in referredToOnReceivers || declaration.references.any {
-                it.refersToLocal(variables) || (it.refersToLocal(constants) && !it.canAccessScriptMembers)
-            }
-        }.toSet()
-        /** The declarations not [moved] yet, which access the local properties, or refer to such ones not moved yet. */
-        fun accessingLocalProperties(
-            moved: Set<ParsedDeclaration>
-        ): Set<ParsedDeclaration> {
-            val accessing = accessingLocalProperties.filterTo(mutableSetOf()) { it !in moved }
-            val queue = ArrayDeque(accessing)
-            while (queue.isNotEmpty()) {
-                referrers[queue.removeFirst()].orEmpty().forEach {
-                    if (it !in moved && accessing.add(it)) queue += it
-                }
-            }
-            return accessing
-        }
-        val moved = required.toMutableSet()
-        var accessing = accessingLocalProperties(moved)
-        // the accessing functions referred to by the moved declarations
-        val rejected = mutableSetOf<ParsedDeclaration>()
-        var movedAccessing = false
-        val queue = ArrayDeque(moved)
-        while (queue.isNotEmpty()) {
-            references.getValue(queue.removeFirst()).forEach { declaration ->
-                if (declaration !in moved) {
-                    if (declaration.kind == DeclarationKind.FUNCTION && declaration in accessing) {
-                        rejected += declaration
-                    } else {
-                        moved += declaration
-                        queue += declaration
-                        // moving a declaration, which is not accessing, cannot change the accessing ones,
-                        // as they refer to the local properties only through the accessing ones
-                        if (declaration in accessing) movedAccessing = true
-                    }
-                }
-            }
-            // the accessing ones only shrink as more declarations are moved, so the moves allowed by the ones computed before stay allowed,
-            // and they are recomputed only once no more moves are allowed, after which only the rejected functions might be moved
-            if (queue.isEmpty() && movedAccessing) {
-                accessing = accessingLocalProperties(moved)
-                movedAccessing = false
-                val remaining = rejected.iterator()
-                remaining.forEach { declaration ->
-                    if (declaration !in accessing) {
-                        remaining.remove()
-                        moved += declaration
-                        queue += declaration
-                    }
-                }
-            }
-        }
         val firstReferences = mutableMapOf<ParsedDeclaration, Int>()
         // not the values bound by the same names, like `format` in `{ format -> format }`, unlike the calls,
         // which might still refer to the function, when the inner declaration is not applicable, like `format()` of an `Int` parameter
         bodyReferences.filter { !it.isBoundByNonFunction || it.isCall || it.isType }.forEach { reference ->
             reference.referenced().forEach { firstReferences.putIfAbsent(it, reference.offset) }
         }
-        declarations.filter { declaration ->
+        val referredToBefore = declarations.filter { declaration ->
             (declaration.kind == DeclarationKind.FUNCTION || declaration.kind == DeclarationKind.CLASS)
                     && (firstReferences[declaration] ?: Int.MAX_VALUE) < declaration.start
-        }.forEach { declaration ->
-            // moving a declaration, which is not accessing, moves only the ones, which are not accessing either,
-            // while its overloads, which are accessing, would stay in the script body, hiding it there
-            if (declaration !in moved && declaration !in accessing && namedByName.getValue(declaration.name!!).none {
-                    it.isExtension == declaration.isExtension && it in accessing
-                }) {
-                val queue = ArrayDeque(listOf(declaration))
-                moved += declaration
+        }
+        // The functions called before their declarations only where a receiver might resolve the calls instead, like `append` in `buildString { append("x") }`,
+        // and also after their declarations, where a receiver might resolve them, like `append` in a following `buildString { append("y") }`.
+        // A regular script ranks such a function before the receivers after its declaration, unless it resolved a call before it to the function,
+        // so no placement of a moved function matches it for all the calls, unlike the local function, invisible before its declaration.
+        // A function with a declared return type is ranked after the receivers by a regular script also after its declaration, like when moved after the script block.
+        // Also the functions called before their declarations as the members of the classes, like `g` in `class A { fun f() = g(); fun g() = 1 }`,
+        // which the script resolves to the members, and which are resolved to the moved functions declared before the script block instead.
+        val (calledOnReceivers, calledAsMembers) = run {
+            val localReferencesByName = localReferences.groupBy { it.name }
+            val bodyReferencesByName = bodyReferences.groupBy { it.name }
+            val classesByName = declarations.filter { it.kind == DeclarationKind.CLASS }.mapNotNull { it.psi as? KtClassOrObject }
+                .filter { it.name != null }.groupBy { it.name!! }
+            val classes = classesByName.values.flatten().sortedBy { it.startOffset }
+            /** The classes of the script it extends, or `null` if some supertypes are not declared by the script. */
+            val supertypeClasses = IdentityHashMap<KtClassOrObject, List<KtClassOrObject>?>()
+            fun KtClassOrObject.supertypeClasses() = supertypeClasses.getOrPut(this) {
+                superTypeListEntries.flatMap { entry ->
+                    val type = entry.typeReference?.typeElement as? KtUserType
+                    (if (type?.qualifier == null) type?.referencedName?.let { classesByName[it] } else null) ?: return@getOrPut null
+                }
+            }
+            /** The names of the members declared by the class, also by its companion object. */
+            val declaredMemberNames = IdentityHashMap<KtClassOrObject, Set<String>>()
+            fun KtClassOrObject.declaredMemberNames(): Set<String> = declaredMemberNames.getOrPut(this) {
+                buildSet {
+                    this@declaredMemberNames.declarations.forEach { declaration ->
+                        addAll(declaration.declaredNames())
+                        if (declaration is KtObjectDeclaration && declaration.isCompanion()) {
+                            declaration.declarations.forEach { addAll(it.declaredNames()) }
+                        }
+                    }
+                    primaryConstructorParameters.filter { it.hasValOrVar() }.mapNotNullTo(this) { it.name }
+                }
+            }
+            /**
+             * The classes of the script, which satisfy the [condition], or extend such ones, computed once for all of them,
+             * in the order of the script, until no more are found, rather than recursively, as there might be many classes extending each other.
+             */
+            fun inherited(
+                condition: (KtClassOrObject) -> Boolean
+            ): Set<KtClassOrObject> {
+                val result = Collections.newSetFromMap(IdentityHashMap<KtClassOrObject, Boolean>())
+                do {
+                    val found = classes.count {
+                        it !in result && (condition(it) || it.supertypeClasses()?.any { supertype -> supertype in result } == true) && result.add(it)
+                    }
+                } while (found > 0)
+                return result
+            }
+            /** Whether the members of the class are not all known, as inherited from the supertypes not declared by the script, or declared implicitly. */
+            val unknownMembers = IdentityHashMap<KtClassOrObject, Boolean>()
+            fun KtClassOrObject.hasUnknownMembers() = unknownMembers.getOrPut(this) {
+                (this is KtClass && (isEnum() || isData() || isAnnotation())) || supertypeClasses() == null
+                        || this.declarations.any { it is KtObjectDeclaration && it.isCompanion() && it.superTypeListEntries.isNotEmpty() }
+            }
+            val withUnknownMembers = inherited { it.hasUnknownMembers() }
+            val withMembersByName = HashMap<String, Set<KtClassOrObject>>()
+            /** Whether the class might have a member of this [name], also implicitly, like the ones of `Any`. */
+            fun KtClassOrObject.mightHaveMember(
+                name: String
+            ): Boolean = name in implicitMemberNames || this in withUnknownMembers || hasUnknownMembers() || name in declaredMemberNames()
+                    || supertypeClasses()!!.any { supertype ->
+                        supertype in withUnknownMembers || supertype in withMembersByName.getOrPut(name) { inherited { name in it.declaredMemberNames() } }
+                    }
+            // the classes of the script without a member of the same name do not resolve it
+            fun Reference.mightResolveOnReceiver() = isInLambdaOrExtension || enclosingClasses.any { it.mightHaveMember(name) }
+            fun Reference.mightReferTo(function: ParsedDeclaration) = (!isQualified || function.isExtension) && (!isOperator || function.isOperator)
+            val functions = declarations.filter { it.kind == DeclarationKind.FUNCTION && it.name != null }
+            val ambiguouslyCalled = functions.filter { function ->
+                (function.psi as KtNamedFunction).let { !it.hasBlockBody() && it.typeReference == null }
+            }.filter { function ->
+                localReferencesByName[function.name].orEmpty().none {
+                    // resolved to the function, if applicable, ranking it after the receivers everywhere, like when moved after the script block
+                    it.offset < function.start && !it.isBound && !it.isCallableReference && it.mightReferTo(function) && !it.mightResolveOnReceiver()
+                } && bodyReferencesByName[function.name].orEmpty().any {
+                    it.offset >= function.end && it.mightReferTo(function)
+                            && (!it.isBound || it.isBoundByMember || (it.isBoundByNonFunction && it.isCall)) && it.mightResolveOnReceiver()
+                }
+            }
+            fun calledBefore(
+                filter: (Reference) -> Boolean
+            ) = ambiguouslyCalled.filterTo(HashSet()) { function ->
+                localReferencesByName[function.name].orEmpty().any { it.offset < function.start && it.mightReferTo(function) && filter(it) }
+            }
+            calledBefore { !it.isBound && it.mightResolveOnReceiver() } to functions.filterTo(HashSet()) { function ->
+                localReferencesByName[function.name].orEmpty().any { it.offset < function.start && it.isBoundByMember && it.mightReferTo(function) }
+            }
+        }
+        // the start of the first statement run where it is declared, which refers to each declaration, also indirectly
+        val firstRunBy = HashMap<ParsedDeclaration, Int>()
+        executedReferences.forEach { (start, statementReferences) ->
+            val queue = ArrayDeque<ParsedDeclaration>()
+            statementReferences.forEach { reference ->
+                reference.referenced().forEach { if (firstRunBy.putIfAbsent(it, start) == null) queue += it }
+            }
+            while (queue.isNotEmpty()) {
+                references.getValue(queue.removeFirst()).forEach { if (firstRunBy.putIfAbsent(it, start) == null) queue += it }
+            }
+        }
+        return { localProperties, constantStarts ->
+            val constants = constantStarts.keys
+            val variables = localProperties - constants
+            // the declarations reading the constants, or referring to such ones, which would be local, if the constants were
+            val readingConstants = declarations.filterTo(mutableSetOf()) { declaration ->
+                declaration.references.any { it.refersToConstant(constants) }
+            }
+            ArrayDeque(readingConstants).let { queue ->
                 while (queue.isNotEmpty()) {
-                    references.getValue(queue.removeFirst()).forEach {
-                        // referred to by an operator, while accessing the local properties, see the referrers
-                        if ((it.kind != DeclarationKind.FUNCTION || it !in accessing) && moved.add(it)) queue += it
+                    referrers[queue.removeFirst()].orEmpty().forEach { if (readingConstants.add(it)) queue += it }
+                }
+            }
+            // reading a constant, when called before its declaration, like `f` in `val r = f()` followed by `val k = 5` and `fun f() = k`,
+            // which a regular script reads before it is initialized, as `0` or `null`, so they stay local, as if the constant was local
+            val readBeforeInitialized = firstRunBy.filterTo(HashMap()) { (declaration, start) ->
+                declaration.references.any { it.refersToConstant(constants) && constantStarts.getValue(it.name) > start }
+            }.keys
+            val accessingLocalProperties = declarations.filter { declaration ->
+                ((declaration in calledOnReceivers || declaration in calledAsMembers) && declaration in readingConstants)
+                        || declaration in readBeforeInitialized || declaration.references.any {
+                    it.refersToLocal(variables) || (it.refersToLocal(constants) && !it.canAccessScriptMembers)
+                }
+            }.toSet()
+            /** The declarations not [moved] yet, which access the local properties, or refer to such ones not moved yet. */
+            fun accessingLocalProperties(
+                moved: Set<ParsedDeclaration>
+            ): Set<ParsedDeclaration> {
+                val accessing = accessingLocalProperties.filterTo(mutableSetOf()) { it !in moved }
+                val queue = ArrayDeque(accessing)
+                while (queue.isNotEmpty()) {
+                    referrers[queue.removeFirst()].orEmpty().forEach {
+                        if (it !in moved && accessing.add(it)) queue += it
+                    }
+                }
+                return accessing
+            }
+            val moved = required.toMutableSet()
+            var accessing = accessingLocalProperties(moved)
+            // the accessing functions referred to by the moved declarations
+            val rejected = mutableSetOf<ParsedDeclaration>()
+            var movedAccessing = false
+            val queue = ArrayDeque(moved)
+            while (queue.isNotEmpty()) {
+                references.getValue(queue.removeFirst()).forEach { declaration ->
+                    if (declaration !in moved) {
+                        if (declaration.kind == DeclarationKind.FUNCTION && declaration in accessing) {
+                            rejected += declaration
+                        } else {
+                            moved += declaration
+                            queue += declaration
+                            // moving a declaration, which is not accessing, cannot change the accessing ones,
+                            // as they refer to the local properties only through the accessing ones
+                            if (declaration in accessing) movedAccessing = true
+                        }
+                    }
+                }
+                // the accessing ones only shrink as more declarations are moved, so the moves allowed by the ones computed before stay allowed,
+                // and they are recomputed only once no more moves are allowed, after which only the rejected functions might be moved
+                if (queue.isEmpty() && movedAccessing) {
+                    accessing = accessingLocalProperties(moved)
+                    movedAccessing = false
+                    val remaining = rejected.iterator()
+                    remaining.forEach { declaration ->
+                        if (declaration !in accessing) {
+                            remaining.remove()
+                            moved += declaration
+                            queue += declaration
+                        }
                     }
                 }
             }
+            referredToBefore.forEach { declaration ->
+                // moving a declaration, which is not accessing, moves only the ones, which are not accessing either,
+                // while its overloads, which are accessing, would stay in the script body, hiding it there
+                if (declaration !in moved && declaration !in accessing && namedByName.getValue(declaration.name!!).none {
+                        it.isExtension == declaration.isExtension && it in accessing
+                    }) {
+                    val queue = ArrayDeque(listOf(declaration))
+                    moved += declaration
+                    while (queue.isNotEmpty()) {
+                        references.getValue(queue.removeFirst()).forEach {
+                            // referred to by an operator, while accessing the local properties, see the referrers
+                            if ((it.kind != DeclarationKind.FUNCTION || it !in accessing) && moved.add(it)) queue += it
+                        }
+                    }
+                }
+            }
+            moved.sortedBy { it.start }.toCollection(LinkedHashSet())
         }
-        return moved.sortedBy { it.start }.toCollection(LinkedHashSet())
     }
 
 }

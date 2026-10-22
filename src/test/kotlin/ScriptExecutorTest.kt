@@ -3820,13 +3820,39 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should not run function reading constant called before declaration of the constant`() = runTest {
+        // given
+        val scripts = listOf(
+            "val r = f()\nval k = 5\nfun f() = k\nr",
+            "val r = run { f() }\nval k = 5\nfun f() = k\nr",
+            "val r = listOf(1).map { g(it) }\nval k = 5\nfun g(i: Int) = i + k\nr",
+            "val s = buildString { append(f()) }\nval k = \"5\"\nfun f() = k\ns",
+            // through a local function
+            "fun h() = f()\nval r = h()\nval k = 5\nfun f() = k\nr"
+        )
+        val declaredBefore = "val k = 5\nval r = run { f() }\nfun f() = k\nr"
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+        val declaredBeforeResult = executor.execute(declaredBefore)
+
+        // then
+        // not reading the initialized constant, while a regular script reads 0 or null
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+        assert((declaredBeforeResult as? ScriptResult.Value)?.value == 5)
+    }
+
+    @Test
     fun `should execute declarations moved out of the script body reading constants of types of local classes moved as well`() = runTest {
         // given
         val scripts = listOf(
             "class Foo\nval x: Foo? = null\nsealed interface S\nclass T : S { fun f() = x; fun g() = Foo() }\nT().f()",
             "class Foo\nval x: Foo? = null\nsealed class S { fun g(): Foo? = x }\nclass T : S()\nT().g()",
             "data class Foo(val a: Int)\nval x: Foo? = null\nsealed class S { fun g() = \"g\" + x + h() }\nclass T : S()\nfun h() = Foo(1)\nT().g()",
-            "class Foo\ntypealias F = Foo\nval x: F? = null\nsealed class S { fun g(): F? = x }\nclass T : S()\nT().g()"
+            "class Foo\ntypealias F = Foo\nval x: F? = null\nsealed class S { fun g(): F? = x }\nclass T : S()\nT().g()",
+            // a qualified type named like a local class
+            "class Result\nval x: kotlin.Result<Int>? = null\nsealed class S { fun f() = x }\nclass T : S()\nT().f()"
         )
         val executor = ScriptExecutor()
 
@@ -3834,7 +3860,7 @@ class ScriptExecutorTest {
         val results = scripts.map { executor.execute(it) }
 
         // then
-        assert(results.map { (it as? ScriptResult.Value)?.value.toString() } == listOf("null", "null", "gnullFoo(a=1)", "null"))
+        assert(results.map { (it as? ScriptResult.Value)?.value.toString() } == listOf("null", "null", "gnullFoo(a=1)", "null", "null"))
         assert(results.all { it is ScriptResult.Value })
     }
 
@@ -3969,24 +3995,102 @@ class ScriptExecutorTest {
     }
 
     @Test
-    fun `should keep function reading constant local when called before its declaration where receiver might resolve it, also when called by declarations moved out of the script body`() = runTest {
+    fun `should execute function reading constant called before its declaration where receiver might resolve it like in the script`() = runTest {
         // given
-        val script = """
-            val k = "!"
-            val s = buildString { append("x") }
-            fun append(t: String) = t + k
-            sealed class S { fun f() = append("y") }
-            class T : S()
-            s + T().f()
-        """.trimIndent()
+        val scripts = listOf(
+            // within lambdas without a receiver
+            "val k = 2\nval r = run { twice(3) }\nfun twice(i: Int) = i * k\nr",
+            "val k = \"!\"\nval r = listOf(1).map { describe(it) }\nfun describe(i: Int) = \"n${'$'}i${'$'}k\"\nr",
+            "val factor = 2\nval r = listOf(1, 2).map { scale(it) }\nfun scale(i: Int) = i * factor\nr + scale(3)",
+            // also called after its declaration where a receiver resolves the call, local like in the script
+            "val k = \"!\"\nval s = buildString { append(\"x\") }\nfun append(t: String) = t + k\nval u = buildString { append(\"y\") }\ns + \"|\" + u",
+            "val k = 10\nval a = with(listOf(1, 2)) { sum() }\nfun sum() = k\nval b = with(listOf(5)) { sum() }\n\"${'$'}a|${'$'}b\"",
+            // also after its declaration within classes without members of the same name
+            "val k = \"!\"\nval s = buildString { append(\"x\") }\nfun append(t: String) = t + k\nsealed class S { fun f() = append(\"y\") }\nclass T : S()\ns + T().f()",
+            "val k = 1\nval r = run { twice(3) }\nfun twice(i: Int) = i * k\nsealed class S { fun h() = twice(1) }\nclass T : S()\nr + T().h()",
+            // inheriting a member of the same name from a class of the script
+            "val k = \"!\"\nval s = buildString { append(\"x\") }\nfun append(t: String) = t + k\nopen class B { fun append(t: String) = \"b\" + t }\nclass C : B() { fun f() = append(\"y\") }\ns + C().f()"
+        )
         val executor = ScriptExecutor()
 
         // when
-        val result = executor.execute(script)
+        val results = scripts.map { executor.execute(it) }
 
         // then
-        // not silently resolving `append("x")` to the function, as a regular script returns "xy!"
-        assert((result as? ScriptResult.Error)?.phase == ExecutionPhase.COMPILATION)
+        // like in a regular script
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(6, listOf("n1!"), listOf(2, 4, 6), "x|", "3|10", "xy!", 4, "xy!"))
+    }
+
+    @Test
+    fun `should resolve calls of members of classes named like functions declared after them like in the script`() = runTest {
+        // given
+        val scripts = listOf(
+            // reading a constant, kept local
+            "val k = 10\nclass A { fun f() = g(); fun g() = 1 }\nfun g() = k\nA().f() + g()",
+            // also called after the declaration where a receiver resolves the call
+            "class A { fun f() = g(); fun g() = 1 }\nfun g() = \"s\"\nval r = with(A()) { g() }\nr",
+            "class A { fun f() = g(); fun g() = 1 }\nfun g() = \"s\"\nval r = A().run { g() }\nr",
+            "class A { fun f() = g(); fun g() = 1 }\nfun g() = \"s\"\nfun A.h() = g()\nA().h()",
+            "val k = 10\nclass A { fun f() = g(); fun g() = 1 }\nfun g() = k\nval r = with(A()) { g() }\nA().f() + r",
+            "val k = \"!\"\nclass A { fun f() = append(\"q\"); fun append(t: String) = t }\nfun append(t: String) = t + k\nval u = buildString { append(\"y\") }\nu + \"|\" + A().f()",
+            // not applicable, so resolved to the function
+            "class A { fun f() = tag(1); fun tag(t: String) = \"member\" + t }\nfun tag(t: Int) = \"${'$'}t!\"\nA().f() + tag(2)",
+            // also after the declaration within classes without members of the same name
+            "class A { fun f() = g(); fun g() = 1 }\nfun g() = \"s\"\nsealed class S { fun h() = g() }\nclass T : S()\nT().h()",
+            "class A { fun f() = g(); fun g() = 1 }\nfun g() = \"s\"\nsealed class S\nclass T : S() { fun t() = g() }\nT().t()",
+            // or with members of the same name, declared before the function
+            "class A { fun f() = g(); fun g() = 1 }\nfun g() = \"s\"\nsealed class S { fun g() = \"c\"; fun h() = g() }\nclass T : S()\nT().h()",
+            // with a declared return type, resolved after the receivers also after the declaration
+            "class A { fun f() = g(); fun g() = 1 }\nfun g(): String = \"s\"\nval r = with(A()) { g() }\nr",
+            "class A { fun f() = g(); fun g() = 1 }\nfun g(): Int = 10\nval r = with(A()) { g() }\nA().f() + r",
+            "class A { fun f() = g(); fun g() = 1 }\nfun g(): String = \"s\"\nfun A.h() = g()\nA().h()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // like in a regular script
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(11, "s", "s", "s", 11, "|q", "1!2!", "s", "s", "s", 1, 2, 1))
+    }
+
+    @Test
+    fun `should resolve calls of members of classes named like functions declared after them and moved out of the script body differently than the script`() = runTest {
+        // given
+        val scripts = listOf(
+            "class A { fun f() = g(); fun g() = 1 }\nfun g() = 10\nA().f() + g()",
+            "class A { fun f() = g(); fun g() = 1 }\nfun g() = 10\nval r = with(A()) { g() }\nA().f() + r",
+            "class A { fun f() = tag(\"x\"); fun tag(t: String) = \"member\" + t }\nfun tag(t: String) = t + \"!\"\nA().f() + tag(\"y\")"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // the member calls resolved to the functions, as no placement of the functions matches the script for all the calls,
+        // while a regular script returns 11, 11 and "memberxy!"
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(20, 20, "x!y!"))
+    }
+
+    @Test
+    fun `should keep function reading constant local when called before its declaration where receiver might resolve it, also when called by declaration moved out of the script body`() = runTest {
+        // given
+        val scripts = listOf(
+            // the supertype might declare `append`
+            "val k = \"!\"\nval s = buildString { append(\"x\") }\nfun append(t: String) = t + k\nsealed class S : Comparable<S> { fun f() = append(\"y\") }\nclass T : S() { override fun compareTo(other: S) = 0 }\ns + T().f()",
+            // called as a member before
+            "val k = 10\nclass A { fun f() = g(); fun g() = 1 }\nfun g() = k\nsealed class S { fun h() = g() }\nclass T : S()\nA().f() + T().h()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // not resolving the calls differently than the script, which returns "xy!" and 11
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
     }
 
     @Test
