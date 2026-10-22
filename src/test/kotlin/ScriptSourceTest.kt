@@ -179,7 +179,7 @@ class ScriptSourceTest {
             "x\nA().y\nclass A {\n  val y = 1\n",
             "x\nA().y\nclass A {\n  val y = 1\n}\n}\nval x = 2"
         )
-        val dependencies = listOf(PreambleDependency("x", "val x: Int = 42"))
+        val dependencies = listOf(PreambleDependency("x", { _, _ -> "val x: Int = 42" }))
 
         // when
         val sources = scripts.map { ScriptSource(it, dependencies) }
@@ -199,7 +199,7 @@ class ScriptSourceTest {
             "val a = 5\r\nval s = \"\"\"abc",
             "listOf(1,\n/* abc"
         )
-        val dependencies = listOf(PreambleDependency("x", "val x: Int = 42"))
+        val dependencies = listOf(PreambleDependency("x", { _, _ -> "val x: Int = 42" }))
 
         // when
         val sources = scripts.map { ScriptSource(it, dependencies) }
