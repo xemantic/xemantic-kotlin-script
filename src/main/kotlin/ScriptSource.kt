@@ -186,7 +186,7 @@ internal class CoroutineScopeReference(
     /** Whether it is within a lambda, which might have a receiver. */
     val isInLambda: Boolean,
     /**
-     * The position of the operator of the assignment to the moved `var`, like `=` of `isActive = "b"`, if it is assigned,
+     * The position of the operator of the assignment to the moved `var`, like `=` of `isActive = "b"`, or `++` of `isActive++`, if it is assigned,
      * where the compiler reports the errors of the assignment to the property of the coroutine scope instead, like `Assignment type mismatch`.
      */
     val assignment: ScriptPosition? = null
@@ -1619,8 +1619,20 @@ private fun KtExpression.reportedCallee(): KtExpression? = when (val expression 
 private fun isInLambda(
     expression: PsiElement,
     scope: PsiElement
-): Boolean = expression.parents.takeWhile { it !== scope }.any {
-    it is KtLambdaExpression || (it is KtNamedFunction && it.isAnonymous && it.receiverTypeReference != null)
+): Boolean = expression.parents.takeWhile { it !== scope }.any { it.isLambda() }
+
+/** Whether it is a lambda, or an anonymous function with a receiver, like `fun Job.() = isActive`, see [isInLambda]. */
+private fun PsiElement.isLambda(): Boolean =
+    this is KtLambdaExpression || (this is KtNamedFunction && isAnonymous && receiverTypeReference != null)
+
+/** The call taking this lambda as its argument, also as a trailing lambda, or a labeled one, like `run(label@{ })`, with the argument. */
+private fun KtLambdaExpression.argumentOf(): Pair<KtCallExpression, KtValueArgument>? {
+    var argument: PsiElement = this
+    while (argument.parent.let { it is KtLabeledExpression || it is KtParenthesizedExpression || it is KtAnnotatedExpression }) argument = argument.parent
+    val valueArgument = argument.parent as? KtValueArgument ?: return null
+    // also a trailing lambda, which is a value argument as well
+    val call = valueArgument.parent.let { (it as? KtValueArgumentList)?.parent ?: it } as? KtCallExpression ?: return null
+    return call to valueArgument
 }
 
 /** See [Reference.mightResolveOnReceiver]. */
@@ -1652,12 +1664,8 @@ private fun scopeCalls(
     element: PsiElement,
     scope: PsiElement
 ): List<IntRange> = element.parents.takeWhile { it !== scope }.filterIsInstance<KtLambdaExpression>().mapNotNull { lambda ->
-    // like `run(label@{ })`
-    var argument: PsiElement = lambda
-    while (argument.parent.let { it is KtLabeledExpression || it is KtParenthesizedExpression || it is KtAnnotatedExpression }) argument = argument.parent
-    // also a trailing lambda, which is a value argument as well
-    val call = (argument.parent as? KtValueArgument)?.parent.let { (it as? KtValueArgumentList)?.parent ?: it } as? KtCallExpression
-    (call?.calleeExpression as? KtSimpleNameExpression)?.takeIf { it.getReferencedName() in scopeFunctions }?.let { it.startOffset until it.endOffset }
+    (lambda.argumentOf()?.first?.calleeExpression as? KtSimpleNameExpression)
+        ?.takeIf { it.getReferencedName() in scopeFunctions }?.let { it.startOffset until it.endOffset }
 }.toList()
 
 /** The functions of `kotlinx.coroutines`, the block of which has a coroutine scope receiver, nested in the coroutine scope of the script body. */
@@ -1675,17 +1683,12 @@ private fun isInNestedCoroutineScope(
     scope: PsiElement,
     scriptNames: Set<String>
 ): Boolean {
-    val lambda = element.parents.takeWhile { it !== scope }.lastOrNull {
-        it is KtLambdaExpression || (it is KtNamedFunction && it.isAnonymous && it.receiverTypeReference != null)
-    } as? KtLambdaExpression ?: return false
-    var argument: PsiElement = lambda
-    while (argument.parent.let { it is KtLabeledExpression || it is KtParenthesizedExpression || it is KtAnnotatedExpression }) argument = argument.parent
-    val valueArgument = argument.parent as? KtValueArgument ?: return false
-    // the block, which is the last argument, also a trailing lambda
-    val call = valueArgument.parent.let { (it as? KtValueArgumentList)?.parent ?: it } as? KtCallExpression ?: return false
-    if (call.valueArguments.lastOrNull() !== valueArgument) return false
+    val lambda = element.parents.takeWhile { it !== scope }.lastOrNull { it.isLambda() } as? KtLambdaExpression ?: return false
+    val (call, argument) = lambda.argumentOf() ?: return false
     val callee = call.calleeExpression as? KtSimpleNameExpression ?: return false
-    return callee.getReferencedName().let { it in coroutineScopeBuilders && it !in scriptNames }
+    // the block, which is the last argument
+    return call.valueArguments.lastOrNull() === argument
+            && callee.getReferencedName().let { it in coroutineScopeBuilders && it !in scriptNames }
             && call.parent.let { it !is KtQualifiedExpression || it.selectorExpression !== call }
             && !mightResolveOnReceiver(call, scope)
 }
@@ -2250,8 +2253,17 @@ private class ScriptStructure(
             (it.kind == DeclarationKind.FUNCTION || (it.kind == DeclarationKind.PROPERTY && (it.psi as? KtProperty)?.receiverTypeReference == null))
                     && it.name != null && (it.name in coroutineScopeProperties || it.name in coroutineScopeFunctions)
         }.groupBy { it.name!! }
-        // the names of the declarations of the script, and of the dependencies, which the calls by these names might refer to
-        val scriptNames = file.collectDescendantsOfType<KtNamedDeclaration>().mapNotNullTo(HashSet()) { it.name } + dependencyNames
+        // the names, which the calls by these names might refer to: of the declarations of the script, of the dependencies,
+        // and the imported ones, other than the builders of kotlinx.coroutines themselves, like `launch` of `import kotlin.run as launch`,
+        // or all the builders, if a star import of another package might import them
+        val scriptNames by lazy {
+            val imports = file.importDirectives
+            if (imports.any { it.isAllUnder && it.importedFqName?.asString() != "kotlinx.coroutines" }) coroutineScopeBuilders else {
+                file.collectDescendantsOfType<KtNamedDeclaration>().mapNotNullTo(HashSet()) { it.name } + dependencyNames + imports.filter {
+                    !it.isAllUnder && (it.aliasName != null || it.importedFqName?.parent()?.asString() != "kotlinx.coroutines")
+                }.mapNotNull { it.importedName?.asString() }
+            }
+        }
         val coroutineScopeCandidatesByStatement = bodyCandidates { index, reference ->
             coroutineScopeDeclarations[reference.name]?.takeIf {
                 !reference.isQualified && !reference.isBound
@@ -2264,10 +2276,17 @@ private class ScriptStructure(
                 if (reference.isInLambda && element != null && isInNestedCoroutineScope(element, statements[index].parent, scriptNames)) {
                     return@bodyCandidates null
                 }
+                // like `isActive = "b"`, `isActive += "b"`, or `isActive++`
                 val assignment = (declaration.psi as? KtProperty)?.takeIf { it.isVar }?.let {
-                    (element?.parent?.parent as? KtBinaryExpression)?.takeIf { assignment ->
-                        assignment.left === element?.parent && assignment.operationToken in KtTokens.ALL_ASSIGNMENTS
-                    }?.operationReference?.startOffset
+                    when (val operation = element?.parent?.parent) {
+                        is KtBinaryExpression -> operation.takeIf {
+                            it.left === element.parent && it.operationToken in KtTokens.ALL_ASSIGNMENTS
+                        }?.operationReference
+                        is KtUnaryExpression -> operation.takeIf {
+                            it.baseExpression === element.parent && (it.operationToken == KtTokens.PLUSPLUS || it.operationToken == KtTokens.MINUSMINUS)
+                        }?.operationReference
+                        else -> null
+                    }?.startOffset
                 }
                 CoroutineScopeCandidate(reference, declaration.line(), declaration.kind == DeclarationKind.FUNCTION, assignment)
             }
@@ -2351,8 +2370,12 @@ private class ScriptStructure(
             declarations: (name: String, invisibleClasses: Set<String>) -> List<Pair<String, String>>
         ) = buildMap<Int, MutableList<Pair<String, String>>> {
             candidateIndices(candidatesByStatement).forEach { (name, indices) ->
+                // only the ones not declared at the preceding places
+                val declared = HashSet<String>()
                 indices.map { copyPlace(it) }.distinctBy { (_, invisibleClasses) -> invisibleClasses }.forEach { (offset, invisibleClasses) ->
-                    getOrPut(offset) { mutableListOf() } += declarations(name, invisibleClasses)
+                    declarations(name, invisibleClasses).filter { (_, declaration) -> declared.add(declaration) }.takeIf { it.isNotEmpty() }?.let {
+                        getOrPut(offset) { mutableListOf() } += it
+                    }
                 }
             }
         }

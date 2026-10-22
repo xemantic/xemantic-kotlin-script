@@ -5879,7 +5879,10 @@ class ScriptExecutorTest {
         val scripts = listOf(
             "isActive = \"b\"\nvar isActive: String get() = \"a\"; set(v) {}\n1",
             "val r = listOf(1).map { isActive = \"b\"; 1 }\nvar isActive: String get() = \"a\"; set(v) {}\nr",
-            "val r = listOf(1).map { isActive += \"b\"; 1 }\nvar isActive: String get() = \"a\"; set(v) {}\nr"
+            "val r = listOf(1).map { isActive += \"b\"; 1 }\nvar isActive: String get() = \"a\"; set(v) {}\nr",
+            // the increments and decrements, also within lambdas
+            "isActive++\nvar isActive: Int get() = 1; set(v) {}\n1",
+            "val r = listOf(1).map { --isActive; 1 }\nvar isActive: Int get() = 1; set(v) {}\nr"
         )
         val executor = ScriptExecutor()
 
@@ -5888,25 +5891,56 @@ class ScriptExecutorTest {
 
         // then
         // without the errors of the assignments to the property of the coroutine scope, like `'val' cannot be reassigned`
-        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.filter { line -> "error: " in line } } == List(scripts.size) { index ->
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.filter { line -> "error: " in line } } == listOf(1, 25, 25, 1, 27).map { column ->
             listOf(
-                "script.kts:1:${if (index == 0) 1 else 25}: error: 'isActive' refers to the coroutine scope of the script body, " +
+                "script.kts:1:$column: error: 'isActive' refers to the coroutine scope of the script body, " +
                         "instead of the property declared at line 2, which is compiled outside of the script body."
             )
         })
     }
 
     @Test
-    fun `should execute assignments within lambdas to properties of their receivers next to moved properties of their names`() = runTest {
+    fun `should report assignment within lambda to value of its receiver next to moved property of its name as regular script`() = runTest {
         // given
-        val script = "val r = with(object { var isActive = 1 }) { isActive = 2; isActive }\nvar isActive: String get() = \"a\"; set(v) {}\nr"
+        val script = "val r = with(object { val isActive = 1 }) { isActive = 2; isActive }\nvar isActive: String get() = \"a\"; set(v) {}\nr"
         val executor = ScriptExecutor()
 
         // when
         val result = executor.execute(script)
 
         // then
-        assert((result as? ScriptResult.Value)?.value == 2)
+        assert((result as? ScriptResult.Error)?.message?.lines()?.first() == "script.kts:1:45: error: 'val' cannot be reassigned.")
+    }
+
+    @Test
+    fun `should report references within lambdas of functions imported by the names of coroutine scope builders`() = runTest {
+        // given
+        val scripts = listOf(
+            "import kotlin.run as launch\nval r = launch { isActive }\nval isActive get() = \"mine\"\nr",
+            "import kotlin.run as coroutineScope\nval r = coroutineScope { isActive }\nval isActive get() = \"mine\"\nr"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.first()?.substringAfter("error: ") } == List(scripts.size) {
+            "'isActive' refers to the coroutine scope of the script body, instead of the property declared at line 3, which is compiled outside of the script body."
+        })
+    }
+
+    @Test
+    fun `should execute assignments within lambdas to properties of their receivers next to moved properties of their names`() = runTest {
+        // given
+        val script = "val r = with(object { var isActive = 1 }) { isActive = 2; isActive++; isActive }\nvar isActive: String get() = \"a\"; set(v) {}\nr"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert((result as? ScriptResult.Value)?.value == 3)
     }
 
     @Test

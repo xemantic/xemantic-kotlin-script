@@ -187,7 +187,8 @@ class ScriptCompilationCacheTest {
         // given
         val scripts = listOf(
             "val r = supervisorScope { run { isActive } }\nval isActive get() = \"mine\"\nr",
-            "val r = coroutineScope { launch { } }\nfun launch(block: () -> Unit): String = \"mine\"\nr is Job"
+            "val r = coroutineScope { launch { } }\nfun launch(block: () -> Unit): String = \"mine\"\nr is Job",
+            "import kotlinx.coroutines.supervisorScope\nval r = supervisorScope { isActive }\nval isActive get() = \"mine\"\nr"
         )
         val executor = DefaultScriptExecutor()
 
@@ -195,7 +196,7 @@ class ScriptCompilationCacheTest {
         val results = scripts.map { executor.execute(it) }
 
         // then
-        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(true, true))
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(true, true, true))
         assert(executor.compilationCount == scripts.size)
     }
 

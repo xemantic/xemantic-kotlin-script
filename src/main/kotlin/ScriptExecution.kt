@@ -538,13 +538,13 @@ internal class DefaultScriptExecutor(
                     candidate.copy(line = localFunctionLine(message) ?: candidate.line)
                 }
             }
-            // the references not resolved to the moved declarations, unless already reported as errors,
-            // other than of the assignment to the property of the coroutine scope instead of the moved `var`, explained by it
+            // the references not resolved to the moved declarations, unless already reported as errors, other than the one of the assignment
+            // to the property of the coroutine scope instead of the moved `var`, `'val' cannot be reassigned`, at the property, explained by it,
+            // while a reference within a lambda resolved to a value of its receiver, failing the same way, is not confirmed by the copies
             val toDeclarations = deprecated(COROUTINE_SCOPE_ORIGINAL)
             val coroutineScopeReferences = source.coroutineScopeCandidates.filter { candidate ->
-                toDeclarations.none { it in candidate.reference } && errorReports.none { diagnostic ->
-                    diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) in candidate.reference } == true
-                            && (candidate.assignment == null || !diagnostic.message.startsWith(valReassignedError))
+                toDeclarations.none { it in candidate.reference } && errors.none {
+                    it in candidate.reference && (candidate.assignment == null || it != candidate.reference.start)
                 }
             }
             // the calls not referring to the moved functions already, which would refer to them in the script, if they apply
@@ -636,7 +636,7 @@ internal class DefaultScriptExecutor(
                     it.reference.name in source.calledInsteadDependencies
                 }.mapTo(HashSet()) { it.reference.start } + toCoroutineScopeReferences.flatMap { reference ->
                     // `'val' cannot be reassigned` at the property, and the errors of the assignment, like `Assignment type mismatch`,
-                    // or of the operator of `+=` called on the property of the coroutine scope, at the operator
+                    // or of the operator of `+=`, or `++`, called on the property of the coroutine scope, at the operator
                     listOfNotNull(reference.assignment?.let { reference.reference.start }, reference.assignment)
                 } + laterDeclaredFunctionReferences.flatMap { reference ->
                     // like `None of the following candidates is applicable` of `maxOf(W(1), W(2))`, or `Argument type mismatch` at its arguments,
@@ -655,9 +655,6 @@ internal class DefaultScriptExecutor(
                 }
             )
         }
-
-        /** The beginning of the message of the error of the assignment to the property of the coroutine scope, see [CoroutineScopeReference.assignment]. */
-        private val valReassignedError = "'val' cannot be reassigned"
 
         /**
          * The beginnings of the messages of the errors of the calls resolved to the functions, which do not apply, reported at their arguments,
