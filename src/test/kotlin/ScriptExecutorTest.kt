@@ -4739,6 +4739,144 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report error at call of dependency before local function of the same name referring to local class declared later`() = runTest {
+        // given
+        val script = """
+            val p = "!"
+            val r = f(emptyList())
+            class P
+            fun f(xs: List<P>) = "local" + p
+            r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<(List<Any?>) -> String>("f") { "dep" }))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 4.
+                  | val r = <error>f</error>(emptyList())
+                  hint: declare the function before line 2, or rename it.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report errors at calls of dependencies around local classes declared later which local function of the same name refers to`() = runTest {
+        // given
+        val scripts = listOf(
+            // within the supertype of the class
+            "val p = \"!\"\nval a = f(1)\nabstract class S { fun g() = f(null) }\nclass P : S() { val q = p }\nfun f(x: P?) = \"local\" + p\na + P().g()",
+            // following the class, preceded by a call the function does not apply to
+            "val p = \"!\"\nval a = f(1)\nclass P\nval c = f(emptyList())\nfun f(xs: List<P>) = \"local\" + p\na + c",
+            "val p = \"!\"\nval a = f(listOf(1))\nclass P\nval r = f(null)\nfun f(x: P?) = \"local\" + p\na + r",
+            "val p = \"!\"\nval a = f(listOf(1))\nclass P\nval r = f(mutableListOf(P()))\nfun f(xs: MutableList<P>) = \"local\" + p\na + r",
+            // preceding and following it, also another class
+            "val p = \"!\"\nval a = f(null)\nclass P\nval b = f(null)\nval c = f(P())\nfun f(x: P?) = \"local\" + p\na + b + c",
+            "val p = \"!\"\nval a = f(null)\nclass X { val q = p }\nval b = f(null)\nclass P { val q = p }\nfun f(x: P?) = \"local\" + p\na + b",
+            "val p = \"!\"\nval a = f(1)\nclass P { val q = p }\nval b = f(P(), null)\nclass R { val q = p }\nfun f(x: P?, y: R?) = \"local\" + p\na + b",
+            // applying through the supertypes of the class, declared before the call, or later
+            "val p = \"!\"\nval c = Comparator<Runnable> { _, _ -> 0 }\nval r = f(c)\nclass P(val v: Int) : Runnable { override fun run() {} }\nfun f(c: Comparator<in P>) = \"local\" + p\nr",
+            "val p = \"!\"\nopen class Base\nval c = Comparator<Base> { _, _ -> 0 }\nval a = f(c)\nclass P : Base() { val q = p }\nfun f(c: Comparator<in P>) = \"local\" + p\na",
+            "val p = \"!\"\nval c = Comparator<Runnable> { _, _ -> 0 }\nval a = f(c)\nabstract class S : Runnable\nclass P : S() { override fun run() {} }\nfun f(c: Comparator<in P>) = \"local\" + p\na",
+            // of the type parameters, or the bound of the type parameter of the function
+            "val p = \"!\"\nval a = f(emptyList())\nclass P<out T : Number>(val t: T)\nfun f(xs: List<P<Int>>) = \"local\" + p\na",
+            "val p = \"!\"\nval a = f(null)\nclass P { val q = p }\nfun <T : P> f(x: T?) = \"local\" + p\na",
+            // the overloads declared before the class compete with the ones following it, as in the script
+            "val p = \"!\"\nfun h(x: Int): Int = 1 + p.length\nval a = f(\"x\")\nclass P { val q = p }\nfun h(x: Any): String = \"s\" + p\nval b = f(h(1))\nfun f(xs: List<P>) = \"localP\" + p\nfun f(n: Int) = \"localInt\" + p\na + b",
+            // with a multiline literal
+            "val p = \"!\"\nval r = f(null)\nclass P(val s: String = \"\"\"a\nb\"\"\") { val t = p }\nval c = x\nfun f(x: P?) = \"local\" + p\nval x = \"localx\"\nr + c"
+        )
+        val dependencies = listOf(
+            dependency<(Any?) -> String>("f") { "dep" }, dependency<(Any?) -> String>("g") { "depg" }, dependency("x", "depx")
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, dependencies) }
+
+        // then
+        assert(results.map { result -> (result as? ScriptResult.Error)?.message?.lines()?.filter { it.startsWith("script.kts") } } == listOf(
+            listOf("script.kts:3:30: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 5."),
+            // calling the dependency, as the confirmed calls are not explained
+            listOf(
+                "script.kts:4:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 5.",
+                "script.kts:4:11: error: Cannot infer type for type parameter 'T'. Specify it explicitly."
+            ),
+            listOf("script.kts:4:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 5."),
+            listOf("script.kts:4:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 5."),
+            listOf(
+                "script.kts:2:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 6.",
+                "script.kts:4:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 6.",
+                "script.kts:5:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 6."
+            ),
+            listOf(
+                "script.kts:2:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 6.",
+                "script.kts:4:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 6."
+            ),
+            listOf(
+                "script.kts:4:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 6.",
+                "script.kts:4:16: error: Too many arguments for 'fun invoke(p1: Any?): String'."
+            ),
+            listOf("script.kts:3:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 5."),
+            listOf("script.kts:4:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 6."),
+            listOf("script.kts:3:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 6."),
+            listOf(
+                "script.kts:2:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 4.",
+                "script.kts:2:11: error: Cannot infer type for type parameter 'T'. Specify it explicitly."
+            ),
+            listOf("script.kts:2:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 4."),
+            listOf("script.kts:6:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 7."),
+            listOf(
+                "script.kts:2:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 6.",
+                "script.kts:5:9: error: 'x' refers to the dependency, as the property 'x' of the script body is declared later, at line 7."
+            )
+        ))
+    }
+
+    @Test
+    fun `should call dependencies around local classes declared later which local function of the same name does not apply to`() = runTest {
+        // given
+        val scripts = listOf(
+            // the local declarations between the call and the class, and the calls of the other dependencies within the class
+            "val p = \"!\"\nval a = f(1)\nclass R { fun f(x: Int) = \"recv\" }\nclass P { val q = p; fun g() = with(R()) { f(2) } }\nfun f(x: P?) = \"local\" + p\na + P().g()",
+            "val p = \"!\"\nval a = f(1)\nclass P { val q = p; fun h() = g(2) }\nfun f(x: P?) = \"local\" + p\nfun g(s: String) = \"localg\" + p\na + P().h()",
+            "val p = \"!\"\nval r = f(listOf(1))\nclass P\nfun f(xs: List<P>) = \"local\" + p\nr",
+            "val p = \"!\"\nval a = f(listOf(1))\nclass P\nval r = f(listOf(2))\nfun f(xs: List<P>) = \"local\" + p\na + r",
+            "val p = \"!\"\nval c = Comparator<Runnable> { _, _ -> 0 }\nval r = f(c)\nclass P(val v: Int)\nfun f(c: Comparator<in P>) = \"local\" + p\nr",
+            // within the classes, which the function refers to through the other ones, or not at all, or following them on another line
+            "val p = \"!\"\nval a = f(1)\nclass Q { val q = p; fun h() = f(2) }\nclass P(val q: Q)\nfun f(xs: List<P>) = \"local\" + p\na + Q().h()",
+            "val p = \"!\"\nval a = f(1)\nabstract class S { fun g() = f(listOf(2)) }\nclass P : S() { val q = p }\nfun f(x: P?) = \"local\" + p\na + P().g()",
+            "val p = \"!\"\nval a = f(\"s\")\nclass P { val q = p; fun g() = f(\"t\") }\nfun <P : Number> f(x: P) = \"local\" + p\na + P().g()",
+            "val p = \"!\"\nval a = f(1)\nclass P { val q = p }; val b = listOf(\n  1); val c = f(3)\nfun f(xs: List<P>) = \"local\" + p\na + c",
+            // referring also to the local classes declared before the calls
+            "val p = \"!\"\nclass Q { val q = p }\nval a = f(\"s\")\nclass P { val q = p }\nfun f(q: Q?, xs: List<P>? = null) = \"local\" + p\na",
+            "val p = \"!\"\nclass Q { val q = p }\nval a = f(1)\nclass P { val q = p }\nfun f(q: Q, xs: List<P>? = null) = \"local\" + p\na",
+            "val p = \"!\"\nclass Q { val q = p }\nval a = f(listOf(\"s\"))\nclass P { val q = p }\nfun f(xs: List<Q>, ys: List<P>? = null) = \"local\" + p\na",
+            "val p = \"!\"\nclass Q { val q = p }\nval a = f(1)\nclass P { val q = p }\nfun f(q: Q) = \"localQ\" + p\nfun f(x: P) = \"localP\" + p\na",
+            // a qualified type named like a local class, and a call within the class resolved to its member
+            "val p = \"!\"\nval a = f(1)\nclass Pair { val q = p; fun g() = f(2) }\nfun f(x: kotlin.Pair<Int, Int>) = \"local\" + p\na + Pair().g()",
+            "val p = \"!\"\nval a = f(1)\nabstract class S { fun f(x: Int) = \"member\" }\nclass P : S() { val q = p; fun g() = f(2) }\nfun f(xs: List<P>) = \"local\" + p\na + P().g()"
+        )
+        val dependencies = listOf(
+            dependency<(Any?) -> String>("f") { "dep" }, dependency<(Any?) -> String>("g") { "depg" }, dependency("x", "depx")
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, dependencies) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(
+            "deprecv", "depdepg", "dep", "depdep", "dep", "depdep", "depdep", "depdep", "depdep", "dep", "dep", "dep", "dep", "depdep", "depmember"
+        ))
+    }
+
+    @Test
     fun `should report error at call of dependency before local class of the same name declared later`() = runTest {
         // given
         val script = """
