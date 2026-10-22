@@ -402,11 +402,8 @@ class ScriptSourceTest {
         // then
         val (moved, body) = source.movedAndBody()
         assert("logged" !in moved)
-        // as the extension of the outer receiver of the script block, while the rest keeps its columns
-        assert(
-            " ".repeat(7) + "fun \n`_ScriptDependencies`.\n" + " ".repeat(11) + "logged(" +
-                    " ".repeat(12) + "block: () -> Unit, " + " ".repeat(9) + "after: () -> Unit)" in body
-        )
+        // the rest keeps its columns
+        assert(" ".repeat(7) + "fun logged(" + " ".repeat(12) + "block: () -> Unit, " + " ".repeat(9) + "after: () -> Unit)" in body)
     }
 
     @Test

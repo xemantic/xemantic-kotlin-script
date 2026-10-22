@@ -4336,15 +4336,30 @@ class ScriptExecutorTest {
     fun `should execute scripts calling inline functions reading local properties where receivers might resolve the calls`() = runTest {
         // given
         val logged = "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"start\"; block() }\n"
+        val member = "class R { fun logged(block: () -> Unit) { log += \"member\"; block() } }\n"
         val scripts = listOf(
             "${logged}listOf(1, 2).forEach { logged { } }\nlog",
             "${logged}repeat(1) { logged { } }\nlog",
             "${logged}fun Int.go() = logged { }\n3.go()\nlog",
             "${logged}class B { fun go() = logged { } }\nB().go()\nlog",
             "${logged}val s = buildString { logged { append(\"x\") } }\ns + log",
-            // the members of the receivers take precedence, like in the script
+            "${logged}inline fun twice(block: () -> Unit) { listOf(1, 2).forEach { logged(block) } }\ntwice { }\nlog",
+            "${logged}logged(({ return@logged }))\nlog",
+            // a regular script resolves the function before the members of the receivers in the statements,
+            "${logged}${member}with(R()) { logged { } }\nlog",
+            "${logged}${member}listOf(1).forEach { with(R()) { logged { } } }\nlog",
+            "${logged}${member}if (log.isEmpty()) with(R()) { logged { } }\nlog",
+            "${logged}${member}class C { fun go() { with(R()) { logged { } } } }\nC().go()\nlog",
+            "${logged}class B { fun logged(block: () -> Unit) { log += \"member\"; block() }; fun go() { logged { } } }\nB().go()\nlog",
+            "val log = mutableListOf<String>()\ninline fun append(block: () -> Unit): StringBuilder { log += \"start\"; block(); return StringBuilder() }\n" +
+                    "val sb = StringBuilder()\nsb.apply { append { } }\nlog + sb.length",
+            "val log = mutableListOf<String>()\ninline fun trim(block: () -> Unit): String { log += \"start\"; block(); return \"mine\" }\n" +
+                    "with(\" a \") { log += trim { } }\nlog",
+            // and after them within the declarations of the inferred types, and the last expression
+            "${logged}${member}fun h() = with(R()) { logged { } }\nh()\nlog",
+            "${logged}${member}val y = run { with(R()) { logged { } }; 1 }\nlog",
+            "${logged}${member}with(R()) { logged { }; log.toList() }",
             "${logged}class B { fun logged(block: () -> Unit) { log += \"member\"; block() }; fun go() = logged { } }\nB().go()\nlogged { }\nlog",
-            "${logged}class B { fun logged(block: () -> Unit) { log += \"member\"; block() } }\nwith(B()) { logged { } }\nlogged { }\nlog",
             "${logged}class A { fun logged(block: suspend () -> Unit) = 1; fun go() = logged { kotlinx.coroutines.delay(1) } }\nlogged { }\nA().go().toString() + log",
             // calling the function moved out of the script body, as referred to before its declaration
             "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"start\"; helper(); block() }\nfun helper() = 1\nlogged { }\nlog"
@@ -4362,12 +4377,70 @@ class ScriptExecutorTest {
                 listOf("start"),
                 listOf("start"),
                 "x[start]",
-                listOf("member", "start"),
+                listOf("start", "start"),
+                listOf("start"),
+                listOf("start"),
+                listOf("start"),
+                listOf("start"),
+                listOf("start"),
+                listOf("start"),
+                listOf("start", 0),
+                listOf("start", "mine"),
+                listOf("member"),
+                listOf("member"),
+                listOf("member"),
                 listOf("member", "start"),
                 "1[start]",
                 listOf("start")
             )
         )
+    }
+
+    @Test
+    fun `should report inline function reading local property called where receivers resolve the calls of a regular script differently`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            inline fun logged(block: () -> Unit) { log += "start"; block() }
+            class R { fun logged(block: () -> Unit) { log += "member"; block() } }
+            with(R()) { logged { } }
+            val y = with(R()) { logged { }; 1 }
+            log
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:40: error: Unresolved reference 'log'.
+                  | inline fun logged(block: () -> Unit) { <error>log</error> += "start"; block() }
+                  hint: 'logged' is an inline function compiled outside of the script body, where 'log' (line 1) is not visible - pass it as a parameter, or declare it within 'logged'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report call of inline function kept local on other receiver without internal names`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            inline fun logged(block: () -> Unit) { log += "start"; block() }
+            fun h() = buildString { logged { } }
+            "a".logged { }
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        val message = (result as ScriptResult.Error).message
+        assert("_ScriptDependencies" !in message && "script.kts:4:5: error: Unresolved reference 'logged'" in message)
     }
 
     @Test
@@ -4408,7 +4481,9 @@ class ScriptExecutorTest {
             "${logged}logged(({ kotlinx.coroutines.delay(1) }))",
             "${logged}logged(@Suppress(\"UNUSED\") { kotlinx.coroutines.delay(1) })",
             // inlined, if the function was inline
-            "${logged}logged { listOf(1).forEach { kotlinx.coroutines.delay(1) } }"
+            "${logged}logged { listOf(1).forEach { kotlinx.coroutines.delay(1) } }",
+            "${logged}logged { List(2) { kotlinx.coroutines.delay(1); it } }",
+            "${logged}class A { fun logged(x: Int) = x; suspend fun go() = logged { kotlinx.coroutines.delay(1) } }"
         )
         val executor = ScriptExecutor()
 
@@ -4426,7 +4501,10 @@ class ScriptExecutorTest {
         val scripts = listOf(
             "${logged}logged { Runnable { kotlinx.coroutines.delay(1) }.run() }",
             "${logged}logged { fun nested() { kotlinx.coroutines.delay(1) }; nested() }",
-            "${logged}logged { val f = { kotlinx.coroutines.delay(1) }; f() }"
+            "${logged}logged { val f = { kotlinx.coroutines.delay(1) }; f() }",
+            // not suspending, even if inline
+            "${logged}fun f() { logged { kotlinx.coroutines.delay(1) } }",
+            "${logged}logged { val f = { logged { kotlinx.coroutines.delay(1) } }; f() }"
         )
         val executor = ScriptExecutor()
 

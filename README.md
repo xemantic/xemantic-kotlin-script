@@ -109,15 +109,19 @@ when (result) {
   as long as it is not an extension function, nor overloaded, nor recursive, has no reified type parameters, no context parameters, no contract,
   no annotations but `@Suppress`, no modifiers but the visibility and `suspend`, does not refer to `this` or `super`,
   is not called before its declaration,
-  does not refer within a lambda to a name declared by the script body staying there, which might be resolved on its receiver instead, like `name` in `user.run { name }`,
+  does not refer within a lambda to a value declared by the script body staying there, which might be resolved on its receiver instead, like `name` in `user.run { name }`,
   so also not when reading a local value only within a lambda, like `log` in `items.forEach { log += it }`,
+  nor call there such a function, when its own return type is inferred, like `inline fun twice(block: () -> Unit) = listOf(1).forEach { helper() }`,
   nor to a name, which might be resolved on the receivers of the script body instead, like `isActive`, unless it is a local value declared before,
   nor to a property or a function declared after, which stays in the script body, unlike a function compiled outside of it, like `helper` in `fun helper() = 1`,
   and the lambdas passed to it do not return, break or continue to outside of them, like `return` in `fun first(): Int { logged { return 1 }; return 0 }`.
-  A call of such a function is resolved after the members of the receivers, like in a regular script, also within a lambda, a class, or an extension function,
-  like `logged` in `listOf(1, 2).forEach { logged { } }`, unless it is named like a function of the coroutine scope of the script body, like `run`,
-  or like a dependency, or referred to by a callable reference, like `::logged`,
-  in which case it is compiled outside of the script body, if called where a receiver might resolve the call instead, like `run` in `class A { fun go() = run { } }`.
+  Where a receiver might resolve a call of a function of the script, like within a lambda, a class, or an extension function,
+  a regular script resolves the function before the members and the extensions of the receivers, like a local function, like `logged` in `with(r) { logged { } }`,
+  except within a declaration of an inferred type, like `val x = …` or `fun f() = …`, also a member of a class, or within the last expression of the script,
+  where it resolves the function after them, like `logged` in `val x = with(r) { logged { } }`.
+  Such an inline function is resolved like that as well, while it is compiled outside of the script body, when it has both of these calls,
+  or when it is named like a function of the coroutine scope of the script body, like `run`, or like a dependency, or referred to by a callable reference, like `::logged`,
+  and called where a receiver might resolve the call within a declaration of an inferred type, like `run` in `class A { fun go() = run { } }`.
   Unlike when inlined, these lambdas cannot call the suspending functions, which is reported as an error with a hint,
   and the warning of an inline function without parameters of function types is not reported.
   Therefore, they cannot refer to the local values of the script body, only to the dependencies,

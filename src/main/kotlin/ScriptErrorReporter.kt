@@ -36,6 +36,19 @@ private val suspensionOutsideCoroutine = Regex(
     "Suspension functions can only be called within coroutine body\\..*|Suspend function .+ can only be called from a coroutine or another suspend function\\..*"
 )
 
+/**
+ * Reported for a call of an inline function kept local, the extension of the outer receiver of the script block,
+ * see [ScriptSource], on another receiver, like `"a".logged { }`, which is unresolved in the script.
+ */
+private val outerReceiverMismatch = Regex(
+    "Candidate 'fun (?:<[^']*> )?`?$DEPENDENCIES_CLASS_NAME`?\\.`?([^`(]+)`?\\(.*' is inapplicable because of a receiver type mismatch\\."
+)
+
+/** The [message][ScriptDiagnostic.message] without the internal names of the outer receiver of the script block, see [outerReceiverMismatch]. */
+private val ScriptDiagnostic.scriptMessage: String get() = outerReceiverMismatch.matchEntire(message)?.let {
+    "Unresolved reference '${it.groupValues[1]}'."
+} ?: message.replace("`$DEPENDENCIES_CLASS_NAME`.", "").replace("$DEPENDENCIES_CLASS_NAME.", "")
+
 /** Reported without a location, e.g. for an object accessing the dependencies, which are the members of the script class. */
 private val declarationCapturingScript = Regex("(Object|Enum class|Interface|Nested class) '(.+)' captures the script class instance\\..*")
 
@@ -344,7 +357,7 @@ internal class ScriptErrorReporter(
             appendSeverityAndMessage(diagnostic)
             return
         }
-        val capturing = declarationCapturingScript.matchEntire(diagnostic.message)?.groupValues
+        val capturing = declarationCapturingScript.matchEntire(diagnostic.scriptMessage)?.groupValues
         val capturingDeclaration = capturing?.get(2)
         val range = if (location != null) {
             val start = source.toScriptPosition(location.start.line, location.start.col)
@@ -362,7 +375,7 @@ internal class ScriptErrorReporter(
         if (range == null) return
         val (start, end) = range
         appendSourceLines(start, end)
-        unresolvedReference.matchEntire(diagnostic.message)?.let { match ->
+        unresolvedReference.matchEntire(diagnostic.scriptMessage)?.let { match ->
             appendHint(
                 name = match.groupValues[1],
                 position = start,
@@ -372,7 +385,7 @@ internal class ScriptErrorReporter(
                 }
             )
         }
-        if (suspensionOutsideCoroutine.matches(diagnostic.message)) {
+        if (suspensionOutsideCoroutine.matches(diagnostic.scriptMessage)) {
             // the innermost one, if nested
             source.localInlineFunctionArguments.lastOrNull { start in it.lambda }?.takeIf { it.mightSuspendAt(start) }?.lambda?.let { argument ->
                 +"  hint: '${argument.name}' is compiled without 'inline', as it reads the local values of the script body, so its lambdas cannot suspend"
@@ -405,7 +418,7 @@ internal class ScriptErrorReporter(
     ) {
         +diagnostic.severity.name.lowercase()
         +": "
-        diagnostic.message.trimEnd().lines().joinTo(this, "\n  ")
+        diagnostic.scriptMessage.trimEnd().lines().joinTo(this, "\n  ")
         +'\n'
         // e.g. of the failure to instantiate the script class
         diagnostic.exception?.let {
