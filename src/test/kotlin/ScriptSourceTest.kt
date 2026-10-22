@@ -61,9 +61,9 @@ class ScriptSourceTest {
         val source = ScriptSource(script)
 
         // then
-        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        val (moved, body) = source.movedAndBody()
         assert("class C0 { fun v() = x }" in moved && "class C${count - 1} { fun v() = x }" in moved)
-        assert(body.removeSuffix(SCRIPT_BLOCK_END).lines().filter { it.isNotBlank() } == listOf("var x = 1", "All.A.all()"))
+        assert(body.lines().filter { it.isNotBlank() } == listOf("var x = 1", "All.A.all()"))
     }
 
     @Test
@@ -81,9 +81,9 @@ class ScriptSourceTest {
         val source = ScriptSource(script)
 
         // then
-        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        val (moved, body) = source.movedAndBody()
         assert("fun describe()" in moved && "class Counter" in moved)
-        assert(body.removeSuffix(SCRIPT_BLOCK_END).lines().filter { it.isNotBlank() } == listOf("var x = 1", "All.A.all()"))
+        assert(body.lines().filter { it.isNotBlank() } == listOf("var x = 1", "All.A.all()"))
     }
 
     @Test
@@ -101,7 +101,7 @@ class ScriptSourceTest {
         val source = ScriptSource(script)
 
         // then
-        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        val (moved, body) = source.movedAndBody()
         assert("fun b${count - 1}() = ${count - 1}" in moved && "fun a0() = x" in body)
     }
 
@@ -120,9 +120,9 @@ class ScriptSourceTest {
         val source = ScriptSource(script)
 
         // then
-        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        val (moved, body) = source.movedAndBody()
         assert("val RATE = 0.2" in moved && "fun tax(x: Double) = x * RATE" in moved)
-        assert(body.removeSuffix(SCRIPT_BLOCK_END).trim() == "Book(10.0).total()")
+        assert(body.trim() == "Book(10.0).total()")
     }
 
     @Test
@@ -138,7 +138,7 @@ class ScriptSourceTest {
 
         // then
         sources.forEach { source ->
-            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            val (moved, body) = source.movedAndBody()
             assert("fun tax(x: Double)" !in moved && "fun tax(x: Double)" in body)
         }
     }
@@ -158,7 +158,7 @@ class ScriptSourceTest {
         val source = ScriptSource(script)
 
         // then
-        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        val (moved, body) = source.movedAndBody()
         assert("class Foo" in body && "val x: Foo? = null" in body && "fun describe()" in body)
         assert("class Foo" !in moved && "val x: Foo? = null" !in moved && "fun describe()" !in moved)
     }
@@ -176,7 +176,7 @@ class ScriptSourceTest {
 
         // then
         sources.forEach { source ->
-            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            val (moved, body) = source.movedAndBody()
             assert("class Foo" in moved && "val x: Foo? = null" in moved && "val x" !in body)
         }
     }
@@ -196,7 +196,7 @@ class ScriptSourceTest {
 
         // then
         sources.forEach { source ->
-            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            val (moved, body) = source.movedAndBody()
             assert("val k" !in moved && "val k" in body)
         }
     }
@@ -220,7 +220,7 @@ class ScriptSourceTest {
 
         // then
         sources.forEach { source ->
-            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            val (moved, body) = source.movedAndBody()
             assert("fun format()" !in moved && "fun format()" in body)
         }
     }
@@ -244,7 +244,7 @@ class ScriptSourceTest {
 
         // then
         sources.forEach { (source, declaration) ->
-            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            val (moved, body) = source.movedAndBody()
             assert(declaration in moved && declaration !in body)
         }
     }
@@ -264,7 +264,7 @@ class ScriptSourceTest {
         val source = ScriptSource(script)
 
         // then
-        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        val (moved, body) = source.movedAndBody()
         assert("items" !in moved)
         val lines = body.lines()
         // the accessors retain their columns, like the copies of the types, mapped to their lines
@@ -289,7 +289,7 @@ class ScriptSourceTest {
         val source = ScriptSource(script)
 
         // then
-        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        val (moved, body) = source.movedAndBody()
         assert("val p" !in moved)
         assert(body.lines().count { it == " by object {" } == count)
     }
@@ -334,7 +334,7 @@ class ScriptSourceTest {
 
         // then
         sources.forEach { source ->
-            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            val (moved, body) = source.movedAndBody()
             assert("get()" in moved || "set(value)" in moved)
             assert(" by object " !in body)
         }
@@ -349,7 +349,7 @@ class ScriptSourceTest {
         val source = ScriptSource(script, listOf(PreambleDependency("let", "val let: Int = 1")))
 
         // then
-        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        val (moved, body) = source.movedAndBody()
         assert("get()" in moved && " by object " !in body)
     }
 
@@ -366,7 +366,7 @@ class ScriptSourceTest {
         val source = ScriptSource(script)
 
         // then
-        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        val (moved, body) = source.movedAndBody()
         assert("logged" !in moved)
         // the rest keeps its columns
         assert(" ".repeat(7) + "fun logged(" + " ".repeat(12) + "block: () -> Unit, " + " ".repeat(9) + "after: () -> Unit)" in body)
@@ -419,7 +419,7 @@ class ScriptSourceTest {
 
         // then
         sources.forEach { source ->
-            val (moved, _) = source.text.split(SCRIPT_BLOCK_START)
+            val (moved, _) = source.movedAndBody()
             assert("inline fun" in moved)
         }
     }
@@ -477,4 +477,17 @@ class ScriptSourceTest {
         assert("fun f(): Int {" in body && "class C {" in body)
     }
 
+}
+
+/**
+ * The declarations moved out of the script body, also the ones following the script block, and the script body,
+ * assuming that no line of the script ends like the script block.
+ */
+private fun ScriptSource.movedAndBody(): List<String> {
+    val start = text.indexOf(SCRIPT_BLOCK_START)
+    val end = text.lastIndexOf("\n$SCRIPT_BLOCK_END")
+    return listOf(
+        text.substring(0, start) + text.substring(end + SCRIPT_BLOCK_END.length + 1),
+        text.substring(start + SCRIPT_BLOCK_START.length, end)
+    )
 }

@@ -3875,6 +3875,100 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should resolve calls on receivers before functions moved out of the script body referred to before their declarations like in the script`() = runTest {
+        // given
+        val scripts = listOf(
+            "val s = buildString { append(\"x\") }\nfun append(t: String) = t + \"!\"\nappend(s)",
+            // an extension of the receiver
+            "val r = with(listOf(1, 2)) { sum() }\nfun sum() = 10\nr",
+            // within a local function declared before
+            "fun g() = buildString { append(\"x\") }\nfun append(t: String) = t + \"!\"\ng()",
+            // nested in a lambda without a receiver
+            "val s = buildString { listOf(1).forEach { append(\"x\") } }\nfun append(t: String) = t + \"!\"\nappend(s)",
+            // an inherited member of a local class
+            "open class Base { fun tag(t: String) = \"base\" + t }\nclass A : Base() { fun f() = tag(\"x\") }\nfun tag(t: String) = t + \"!\"\nA().f()",
+            // overloads
+            "val s = buildString { append(\"x\") }\nfun append(i: Int) = \"\$i?\"\nfun append(t: String) = t + \"!\"\ns",
+            // also after the declaration, once referred to before it, with an inferred or a declared type
+            "val first = append(\"a\")\nfun append(t: String) = t + \"!\"\nfirst + \"|\" + buildString { append(\"x\") }",
+            "val first = append(\"a\")\nfun append(t: String): String = t + \"!\"\nfirst + \"|\" + buildString { append(\"x\") }",
+            // within a function referred to before its declaration
+            "val r = g()\nfun append(t: String) = t + \"!\"\nfun g() = buildString { append(\"x\") }\nr",
+            // also called by a declaration which cannot be local
+            "val s = buildString { append(\"x\") }\nfun append(t: String) = t + \"!\"\nsealed class S { fun f() = append(\"y\") }\nclass T : S()\ns + T().f()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // like in a regular script
+        assert(
+            results.map { (it as? ScriptResult.Value)?.value } == listOf("x!", 3, "x", "x!", "basex", "x", "a!|x", "a!|x", "x", "xy!")
+        )
+    }
+
+    @Test
+    fun `should resolve calls on receivers before functions moved out of the script body referred to before their declarations by other moved functions like in the script`() = runTest {
+        // given
+        val scripts = listOf(
+            "val z = f()\nfun f() = append(\"a\")\nfun append(t: String) = t + \"!\"\nval s = buildString { append(\"x\") }\nz + \"|\" + s",
+            // transitively
+            "val z = f()\nfun f() = g()\nfun g() = append(\"a\")\nfun append(t: String) = t + \"!\"\nval s = buildString { append(\"x\") }\nz + \"|\" + s"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // like in a regular script
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("a!|x", "a!|x"))
+    }
+
+    @Test
+    fun `should execute nested calls of overloads of functions moved out of the script body within lambdas`() = runTest {
+        // given
+        val scripts = listOf(
+            "val r = listOf(1, 2).map { pick(twice(it)) }\nfun twice(i: Int) = i * 2\nfun pick(i: Int) = \"i\$i\"\nfun pick(s: String) = \"s\$s\"\nr",
+            "val r = listOf(1, 2).map { describe(wrap(it)) }\nfun wrap(i: Int) = listOf(i)\nfun describe(i: Int) = \"i\$i\"\nfun describe(l: List<Int>) = \"l\$l\"\nr"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(listOf("i2", "i4"), listOf("l[1]", "l[2]")))
+    }
+
+    @Test
+    fun `should execute calls within lambdas preceding functions moved out of the script body where no receiver resolves them`() = runTest {
+        // given
+        val scripts = listOf(
+            "val s = buildString { append(foo()) }\nfun foo() = \"f\"\ns",
+            "val l = mutableListOf<String>()\nlistOf(1, 2).forEach { l += show(it) }\nfun show(i: Int) = \"n\$i\"\nl",
+            // not applicable, so resolved on the receiver also when moved
+            "val s = buildString { append(1) }\nfun append(t: String) = t + \"!\"\ns",
+            "val r = run { twice(3) }\nfun twice(i: Int) = i * 2\nr",
+            // a property of the receiver, which cannot be called
+            "val r = with(listOf(1, 2)) { size() }\nfun size() = 10\nr",
+            // declared before, also in a regular script resolved before the receiver
+            "fun append(t: String) = t + \"!\"\nval s = buildString { append(\"x\") }\nappend(s)",
+            "class A { fun f() = describe(1) }\nfun describe(i: Int) = \"n\$i\"\nA().f()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // like in a regular script
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("f", listOf("n1", "n2"), "1", 6, 10, "!", "n1"))
+    }
+
+    @Test
     fun `should keep function reading constant local when called before its declaration where receiver might resolve it, also when called by declarations moved out of the script body`() = runTest {
         // given
         val script = """

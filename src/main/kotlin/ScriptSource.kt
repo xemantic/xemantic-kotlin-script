@@ -225,6 +225,9 @@ private const val DEPENDENCIES_CLASS = "`$DEPENDENCIES_CLASS_NAME`"
 /** The line starting the script block in the [ScriptSource.text]. */
 internal const val SCRIPT_BLOCK_START = "_script($DEPENDENCIES_CLASS()) { {"
 
+/** The script body, when followed by the [ScriptStructure.forwardReferencedFunctions]. */
+private const val SCRIPT_BODY = "`_scriptBody`"
+
 /** The line ending the script block in the [ScriptSource.text]. */
 internal const val SCRIPT_BLOCK_END = "} }"
 
@@ -242,6 +245,9 @@ internal const val SCRIPT_BLOCK_END = "} }"
  * <the rest of the script>
  * } }
  * ```
+ *
+ * The functions among them, which the script body refers to before their declarations, follow the script block instead,
+ * which is then assigned to `_scriptBody`, ending the script, see [ScriptStructure.forwardReferencedFunctions].
  *
  * The script refers to the dependencies as the members of the script,
  * resolved after the members of the receivers, like `size` in `list.run { size }`.
@@ -470,7 +476,7 @@ internal class ScriptSource(
         } else {
             emptySet()
         }
-        movedDeclarations.forEach { declaration ->
+        fun addMoved(declaration: Declaration) {
             // opt-in markers, which can mark the same declaration, unlike the deprecations
             if (declaration.kind == DeclarationKind.FUNCTION && declaration.name in deprecatedFunctions) {
                 lines += "@${optInMarker(SHADOWED_ORIGINAL)}"
@@ -484,7 +490,9 @@ internal class ScriptSource(
                 it in declaration.start until declaration.end && !movedExcluded[it]
             }
         }
-        lines += SCRIPT_BLOCK_START
+        val (laterMoved, earlierMoved) = movedDeclarations.partition { it.start in structure.forwardReferencedFunctions }
+        earlierMoved.forEach { addMoved(it) }
+        lines += if (laterMoved.isEmpty()) SCRIPT_BLOCK_START else "val $SCRIPT_BODY = $SCRIPT_BLOCK_START"
         mapping += null
         // the copies preceding the statements, where the local classes declared before them are visible
         val blockCopies = structure.blockCopies.entries.groupBy({ lineOf(it.key) }) { it.value }
@@ -522,6 +530,11 @@ internal class ScriptSource(
         }
         lines += SCRIPT_BLOCK_END
         mapping += null
+        if (laterMoved.isNotEmpty()) {
+            laterMoved.forEach { addMoved(it) }
+            lines += SCRIPT_BODY
+            mapping += null
+        }
 
         text = lines.joinToString(separator = "\n")
         lineMapping = mapping
@@ -1238,6 +1251,17 @@ private class ScriptStructure(
     /** See [ScriptSource.shadowedFunctionCandidates], with the offsets of the properties and the functions. */
     val shadowedFunctionCandidates: List<Triple<Reference, Int, Int>>
 
+    /**
+     * The starts of the moved functions, which the script body refers to before their declarations, declared after the script block,
+     * as the compiler resolves a function of the script, once referred to before its declaration,
+     * after the members and the extensions of the implicit receivers, also where referred to after its declaration,
+     * like `append` in `buildString { append("x") }` followed by `fun append(t: String) = t + "!"`,
+     * while the ones declared before the script block are resolved before them, like the local functions.
+     * Recognized by the names only, the references might be resolved on the receivers instead,
+     * in which case the script would resolve the function before the receivers after its declaration.
+     */
+    val forwardReferencedFunctions: Set<Int>
+
     /** See [ScriptSource.coroutineScopeCandidates], with the offsets of the declarations, and whether they are functions. */
     val coroutineScopeCandidates: List<Triple<Reference, Int, Boolean>>
 
@@ -1547,6 +1571,33 @@ private class ScriptStructure(
                 Triple(it, declaration.line(), declaration.kind == DeclarationKind.FUNCTION)
             }
         }
+        // also the extension ones
+        val movedFunctionsByAnyName = moved.filter { it.kind == DeclarationKind.FUNCTION && it.name != null }.groupBy { it.name!! }
+        /** The moved functions referred to by the [references] preceding them. */
+        fun referredToBefore(
+            references: List<Reference>
+        ): List<ParsedDeclaration> = references.filter {
+            // unlike the ones bound by the local functions, while a value bound by the same name might not be called, like `format()` of an `Int`
+            (!it.isBound || (it.isBoundByNonFunction && it.isCall))
+                    // which would be resolved on the coroutine scope instead, see coroutineScopeCandidates
+                    && it.name !in coroutineScopeFunctions
+                    // resolved to the property of the dependency of the same name instead, if declared before
+                    && !it.isCallableReference
+        }.flatMap { reference ->
+            movedFunctionsByAnyName[reference.name].orEmpty().filter {
+                reference.offset < it.start && (!reference.isQualified || it.isExtension) && (!reference.isOperator || it.isOperator)
+            }
+        }
+        val forwardReferenced = referredToBefore(
+            statements.indices.flatMap { index -> if (declarationsByPsi[statements[index]] in moved) emptyList() else statementReferences[index] }
+        ).toMutableSet()
+        // also the ones referred to before their declarations by these, which would follow them otherwise
+        ArrayDeque(forwardReferenced).let { queue ->
+            while (queue.isNotEmpty()) {
+                referredToBefore(queue.removeFirst().references).forEach { if (forwardReferenced.add(it)) queue += it }
+            }
+        }
+        forwardReferencedFunctions = forwardReferenced.mapTo(HashSet()) { it.start }
         coroutineScopeCandidates = coroutineScopeCandidatesByStatement.values.flatten()
         val laterDeclaredCandidatesByStatement = statements.indices.associateWith { index ->
             if (declarationsByPsi[statements[index]] in moved) return@associateWith emptyList()

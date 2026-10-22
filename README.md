@@ -138,9 +138,16 @@ Most of these cases are reported as errors, while the following ones still resol
 * a call preceding a local class named like a callable dependency ([#31](https://github.com/xemantic/xemantic-kotlin-script/issues/31)),
 * a call from outside of the script body to a local property, whose function type is known only to the compiler, like `val print = printer()` ([#32](https://github.com/xemantic/xemantic-kotlin-script/issues/32)),
 * a call preceding a local function named like a callable dependency, which refers to a local class declared later ([#33](https://github.com/xemantic/xemantic-kotlin-script/issues/33)),
-* a call within a lambda to a function compiled outside of the script body, named like a function of its `CoroutineScope`, like `cancel` ([#44](https://github.com/xemantic/xemantic-kotlin-script/issues/44)).
+* a call within a lambda to a function compiled outside of the script body, named like a function of its `CoroutineScope`, like `cancel` ([#44](https://github.com/xemantic/xemantic-kotlin-script/issues/44)),
+* a call where a receiver might resolve it, like within a lambda, following the declaration of a function, which is called before its declaration only where the receivers resolve the calls instead,
+  like the second `append` in `buildString { append("x") }`, `fun append(t: String) = t + "!"`, `fun g() = buildString { append("y") }`,
+  as the function is resolved after the receivers, like when called before its declaration, while a regular script resolves it before them.
 
 Giving the declarations and the dependencies distinct names avoids them.
+
+A function called by the script body before its declaration is compiled after it,
+so the raw JVM line numbers of its frames, seen only by a script inspecting its own stack trace, differ from the ones of the script,
+while the messages of the errors refer to the lines of the script.
 
 ### Error reporting
 
