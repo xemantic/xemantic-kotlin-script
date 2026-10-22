@@ -5447,16 +5447,18 @@ class ScriptExecutorTest {
             "Cfg()!!", "cfg as Cfg", "null ?: cfg", "when { cfg is Cfg -> cfg else -> Cfg() }", "@Deprecated(\"x\") cfg", "l@ cfg", "mkf(cfg)()",
             "cfg + cfg", "-cfg", "!cfg", "cfg with cfg", "cfg..cfg", "(cfg)()", "(mkf(cfg))()", "@Suppress(\"x\") Cfg()",
             // the call of the same name, bound by name to the member of the enum class
-            "mapOf(1 to cfg).getValue(1)", "l@ (mapOf(1 to cfg)).getValue(1)"
+            "mapOf(1 to cfg).getValue(1)", "l@ (mapOf(1 to cfg)).getValue(1)",
+            // starting with the local of the same name, where the compiler reports the delegate convention as well
+            "getValue[0]"
         )
         val scripts = operators.flatMap { (name, operator) ->
             delegates.map { delegate ->
-                "$declarations${operator}enum class E { A; fun getValue() = 0; fun f(): Int { val cfg = Cfg(); val v: Int by $delegate; return v } }\nE.A.f()" to name
+                "$declarations${operator}enum class E { A; fun getValue() = 0; fun f(): Int { val cfg = Cfg(); val getValue = listOf(cfg); val v: Int by $delegate; return v } }\nE.A.f()" to name
             }
         } + delegates.map { delegate ->
             val variable = "class Cfg { $members; operator fun getValue(t: Any?, p: KProperty<*>) = 1 }\n" +
                     "operator fun Cfg.setValue(t: Any?, p: KProperty<*>, v: Int) { println(scale) }\n"
-            "${declarations.replace("class Cfg { $members }\n", variable)}enum class E { A; fun getValue() = 0; fun f(): Int { val cfg = Cfg(); var v: Int by $delegate; v = 2; return v } }\nE.A.f()" to "setValue"
+            "${declarations.replace("class Cfg { $members }\n", variable)}enum class E { A; fun getValue() = 0; fun f(): Int { val cfg = Cfg(); val getValue = listOf(cfg); var v: Int by $delegate; v = 2; return v } }\nE.A.f()" to "setValue"
         }
         val executor = ScriptExecutor()
 
@@ -5497,6 +5499,31 @@ class ScriptExecutorTest {
 
         // then
         assert(results.all { it is ScriptResult.Error && "does not refer to the function" !in it.message })
+    }
+
+    @Test
+    fun `should report invisible delegate convention reported at callee of the same name`() = runTest {
+        // given
+        val script = """
+            import kotlin.reflect.KProperty
+            val scale = listOf(10).first()
+            class Cfg
+            operator fun Cfg.getValue(t: Any?, p: KProperty<*>): Int = scale
+            fun getValue(c: Cfg): Cfg = c
+            sealed class E { fun f(): Int { val cfg = Cfg(); val v: Int by getValue(cfg); return v } }
+            class F : E()
+            F().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert(result is ScriptResult.Error && result.message.startsWith(
+            "script.kts:6:61: error: 'getValue' does not refer to the function of the script body declared at line 4, which is not visible in 'E'.\n" +
+                    "  | sealed class E { fun f(): Int { val cfg = Cfg(); val v: Int <error>by getValue(cfg)</error>; return v } }\n"
+        ))
     }
 
     @Test

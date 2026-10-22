@@ -164,7 +164,9 @@ internal class HiddenLocalFunctionReference(
     /** Whether it is an operator, or a convention, like `[]` of `get`, sharing its position with other ones, like `set`. */
     val isOperator: Boolean,
     /** The references of its name within it, the warnings at which are of them, see [Reference.inner]. */
-    val inner: List<ScriptReference>
+    val inner: List<ScriptReference>,
+    /** The callee of the delegate expression, where the compiler reports the delegate convention, see [Reference.callee]. */
+    val callee: ScriptReference?
 ) : LocalDeclarationReference, CandidateReference
 
 /**
@@ -238,10 +240,15 @@ internal const val SCRIPT_RECEIVER = "xemantic-kotlin-script: script receiver"
 /** The deprecation message of the copies of the local functions, see [ScriptSource.hiddenLocalFunctionCandidates]. */
 internal const val HIDDEN_LOCAL_FUNCTION = "xemantic-kotlin-script: hidden local function"
 
-/** The deprecation message of the copy of the local declaration of this [name], see [ScriptSource.hiddenLocalFunctionCandidates]. */
+/**
+ * The deprecation message of the copy of the local declaration of this [name], see [ScriptSource.hiddenLocalFunctionCandidates],
+ * marked, if it [isOperator], which the delegate conventions reported at the calls of the same name might call, like `by getValue(cfg)`,
+ * while containing the message of any declaration of the name.
+ */
 internal fun hiddenLocalFunctionMessage(
-    name: String
-): String = "$HIDDEN_LOCAL_FUNCTION: $name;"
+    name: String,
+    isOperator: Boolean = false
+): String = "$HIDDEN_LOCAL_FUNCTION: $name;" + if (isOperator) " operator;" else ""
 
 /**
  * The string literal of this [value], escaping the characters ending it, or starting an escape, or a template,
@@ -567,10 +574,13 @@ internal class ScriptSource private constructor(
         unmatchedClosingBrace = structure.unmatchedClosingBrace?.let { position(it) }
         movedDeclarations = structure.movedDeclarations
         returnsUnit = structure.endsWithMovedDeclaration
+        fun IntRange.toScriptReference(
+            name: String = script.substring(first, last + 1)
+        ) = ScriptReference(name, position(first), position(last + 1))
         conflictingDependencyDeclarations = structure.conflictingDependencyDeclarations.map { (name, range) ->
-            ScriptReference(name, position(range.first), position(range.last + 1))
+            range.toScriptReference(name)
         }
-        fun Reference.toScriptReference() = ScriptReference(name, position(offset), position(offset + length))
+        fun Reference.toScriptReference() = (offset until offset + length).toScriptReference(name)
         laterDeclaredDependencyCandidates = structure.laterDeclaredDependencyCandidates.map { (reference, offset, isFunction) ->
             LaterDeclaredDependencyReference(reference.toScriptReference(), position(offset).line, isFunction, reference.isCallableReference)
         }
@@ -578,13 +588,14 @@ internal class ScriptSource private constructor(
             LaterDeclaredClassReference(
                 candidate.reference.toScriptReference(),
                 position(candidate.classOffset).line,
-                candidate.scopeCalls.map { ScriptReference(script.substring(it.first, it.last + 1), position(it.first), position(it.last + 1)) }
+                candidate.scopeCalls.map { it.toScriptReference() }
             )
         }
         hiddenLocalFunctionCandidates = structure.hiddenLocalFunctionCandidates.map { (reference, offset, isFunction) ->
             HiddenLocalFunctionReference(
                 reference.toScriptReference(), position(offset).line, isFunction, reference.isOperator,
-                reference.inner.map { ScriptReference(reference.name, position(it.first), position(it.last + 1)) }
+                reference.inner.map { it.toScriptReference(reference.name) },
+                reference.callee?.toScriptReference(reference.name)
             )
         }
         untypedPropertyCalls = structure.hiddenLocalFunctionCandidates.zip(hiddenLocalFunctionCandidates)
@@ -657,10 +668,10 @@ internal class ScriptSource private constructor(
         if (confirming) {
             // named in the message, as the operators of the same position refer to different functions, like `get` and `set`,
             // unlike the copies of the local functions overloading the moved ones, see overloadingFunctionCopies
-            if (!overloadingFunctionCopies) structure.hiddenLocalFunctionCopies(copiedPropertyTypes).forEach { (name, declaration) ->
+            if (!overloadingFunctionCopies) structure.hiddenLocalFunctionCopies(copiedPropertyTypes).forEach { (name, declaration, isOperator) ->
                 // the type of the copy of the property might be an invalid one, see confirmedPropertyTypes
                 if (name in copiedProperties) propertyTypeLines[lines.size] = name
-                lines += "@kotlin.Deprecated(${stringLiteral(hiddenLocalFunctionMessage(name))}) $declaration"
+                lines += "@kotlin.Deprecated(${stringLiteral(hiddenLocalFunctionMessage(name, isOperator))}) $declaration"
                 mapping += null
             }
             // resolved together with the moved functions they overload, as in the script, see shadowedFunctionCopies
@@ -1247,7 +1258,12 @@ private class Reference(
      * like `getValue` of `by lazy { "a".getValue(null, p) }`, the warnings at which are of them,
      * even if not candidates themselves, like when bound by name to a member, which does not apply.
      */
-    val inner: List<IntRange> = emptyList()
+    val inner: List<IntRange> = emptyList(),
+    /**
+     * The range of the callee of the delegate expression of the delegate convention, where the compiler reports it,
+     * like `getValue` of `by getValue(cfg)`, which might be a reference of its name, calling another function.
+     */
+    val callee: IntRange? = null
 ) {
 
     /** Whether it might refer to one of the local declarations of the script body of these [names]. */
@@ -1322,6 +1338,7 @@ private fun PsiElement.operatorReferences(
         element: PsiElement,
         offset: Int = element.startOffset,
         length: Int = element.textLength,
+        callee: IntRange? = null,
         inner: (String) -> List<IntRange> = { emptyList() }
     ) {
         val canAccessScriptMembers = canAccessScriptMembers(element, scope)
@@ -1337,7 +1354,8 @@ private fun PsiElement.operatorReferences(
                     isCallableReference = false,
                     canAccessScriptMembers = canAccessScriptMembers,
                     isOperator = true,
-                    inner = inner(name)
+                    inner = inner(name),
+                    callee = callee
                 )
             )
         }
@@ -1374,9 +1392,12 @@ private fun PsiElement.operatorReferences(
             // the compiler reports the calls on the delegate expression, or at its callee, like `let` of `by Cfg().let { it }`,
             // which might be a reference of the same name, like in `by map.getValue("a")`
             is KtPropertyDelegate -> {
+                val conventions = listOf("getValue", "setValue", "provideDelegate")
                 val callee = element.expression?.reportedCallee()
-                val names = element.collectDescendantsOfType<KtSimpleNameExpression> { it !== callee }.groupBy { it.getReferencedName() }
-                add(listOf("getValue", "setValue", "provideDelegate"), element) { name ->
+                val names = element.collectDescendantsOfType<KtSimpleNameExpression> {
+                    it !== callee && it.getReferencedName() in conventions
+                }.groupBy { it.getReferencedName() }
+                add(conventions, element, callee = callee?.let { it.startOffset until it.endOffset }) { name ->
                     names[name].orEmpty().map { it.startOffset until it.endOffset }
                 }
             }
@@ -1839,7 +1860,7 @@ private class ScriptStructure(
                 // the moved declarations cannot refer to the values of the local classes
                 functions = (localFunctionsByName[name].orEmpty() + localExtensions[name].orEmpty())
                     .filterNot { it.refersToTypes(localClassNames) }
-                    .mapNotNull { it.signature() },
+                    .mapNotNull { function -> function.signature()?.let { it to function.isOperator } },
                 propertyTypes = callableProperties[name]?.map { it.second },
                 // referred to as values, like `E`, unlike the properties of unknown types, which might not be callable
                 isReferredToAsValue = name in localPropertiesByName && hiddenLocalFunctionCandidates.any { (reference) -> reference.name == name && reference !in untypedCalls }
@@ -2088,14 +2109,17 @@ private class ScriptStructure(
         } == true
     }
 
-    /** The deprecated copies of the local declarations, see [ScriptSource.hiddenLocalFunctionCandidates], given the [copiedPropertyTypes]. */
+    /**
+     * The deprecated copies of the local declarations, see [ScriptSource.hiddenLocalFunctionCandidates], given the [copiedPropertyTypes],
+     * with their names, and whether they are operators.
+     */
     fun hiddenLocalFunctionCopies(
         copiedPropertyTypes: Map<String, String>
-    ): List<Pair<String, String>> = hiddenLocalDeclarations.flatMap { declarations ->
+    ): List<Triple<String, String, Boolean>> = hiddenLocalDeclarations.flatMap { declarations ->
         val name = declarations.name
         (declarations.functions + (declarations.propertyTypes ?: listOfNotNull(
             copiedPropertyTypes[name] ?: if (declarations.isReferredToAsValue) "Nothing" else null
-        )).map { "val `$name`: $it get() = kotlin.TODO()" }).map { name to it }
+        )).map { "val `$name`: $it get() = kotlin.TODO()" to false }).map { (declaration, isOperator) -> Triple(name, declaration, isOperator) }
     }
 
     /** The functions checking the types of the copies of the [untypedProperties] of these [copiedPropertyTypes], by their names, see [ScriptSource.propertyTypes]. */
@@ -2157,7 +2181,8 @@ private class ScriptStructure(
      */
     private class HiddenLocalDeclarations(
         val name: String,
-        val functions: List<String>,
+        /** With whether they are operators. */
+        val functions: List<Pair<String, Boolean>>,
         val propertyTypes: List<String>?,
         /** Whether the moved declarations refer to the local property as a value, like `E`, so its copy is declared even if its type is not known. */
         val isReferredToAsValue: Boolean

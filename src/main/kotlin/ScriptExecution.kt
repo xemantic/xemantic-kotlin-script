@@ -488,11 +488,17 @@ internal class DefaultScriptExecutor(
             val hidden = hiddenWarnings.mapNotNullTo(HashSet()) { (start, end, message) ->
                 hiddenCandidates.filter { candidate ->
                     start in candidate.reference && hiddenLocalFunctionMessage(candidate.reference.name) in message
-                            // like a delegate convention, not of a call of the same name within it
-                            && candidate.inner.none { start in it }
+                            // like a delegate convention, not of a call of the same name within it, unless reported on the whole expression,
+                            // starting with it, like `getValue[0]`
+                            && candidate.inner.none { start in it && (end == null || end == it.end) }
                 }.let { matching ->
-                    // the innermost one, nested ones start later, or at the same position, ending earlier
-                    matching.firstOrNull { it.reference.end == end } ?: matching.maxWithOrNull(
+                    // the operator called by the delegate convention reported at its callee, rather than by the call of the same name,
+                    // like `getValue` of `by getValue(cfg)`,
+                    // otherwise the innermost one, nested ones start later, or at the same position, ending earlier
+                    matching.firstOrNull { candidate ->
+                        candidate.callee?.let { start in it && end == it.end } == true
+                                && hiddenLocalFunctionMessage(candidate.reference.name, isOperator = true) in message
+                    } ?: matching.firstOrNull { it.reference.end == end } ?: matching.maxWithOrNull(
                         compareBy<HiddenLocalFunctionReference> { it.reference.start }.thenByDescending { it.reference.end }
                     )
                 }?.takeIf { candidate ->
