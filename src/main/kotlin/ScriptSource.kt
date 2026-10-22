@@ -55,6 +55,7 @@ import org.jetbrains.kotlin.psi.KtDestructuringDeclarationEntry
 import org.jetbrains.kotlin.psi.KtElement
 import org.jetbrains.kotlin.psi.KtExpression
 import org.jetbrains.kotlin.psi.KtForExpression
+import org.jetbrains.kotlin.psi.KtFunctionLiteral
 import org.jetbrains.kotlin.psi.KtLabelReferenceExpression
 import org.jetbrains.kotlin.psi.KtNamedDeclaration
 import org.jetbrains.kotlin.psi.KtNamedFunction
@@ -1757,7 +1758,10 @@ private class ScriptStructure(
         // the names of the values, which the calls by name might invoke, see Reference.mightCallOperator
         val valueNames = file.collectDescendantsOfType<KtNamedDeclaration> {
             it is KtProperty || it is KtParameter || it is KtDestructuringDeclarationEntry
-        }.mapNotNullTo(HashSet()) { it.name } + dependencyNames
+        }.mapNotNullTo(HashSet()) { it.name } + dependencyNames + listOfNotNull(
+            // the implicit parameter of a lambda, like `it("x")` of `listOf(3).map { it("x") }`
+            "it".takeIf { file.anyDescendantOfType<KtFunctionLiteral> { !it.hasParameterSpecification() } }
+        )
         // only the properties which require it are moved
         val properties = declarations.filter { it.kind == DeclarationKind.PROPERTY && !it.requiresMove }
         val propertyNames = properties.flatMap { listOfNotNull(it.name) + it.destructuredNames }
@@ -1770,7 +1774,12 @@ private class ScriptStructure(
                     && property.name !in dependencyNames && property.name !in coroutineScopeProperties
                     && propertyNameCounts[property.name] == 1
         }
-        val selected = selectMovedDeclarations(declarations, bodyReferences, propertyNameSet, valueNames)
+        // referred to by the statements, which stay in the script body, unlike the declarations
+        val statementNames = statements.zip(statementReferences).filter { (statement) -> statement !in declarationsByPsi }
+            .flatMap { it.second }
+            .filter { it.mightCallOperator(valueNames) }
+            .mapTo(HashSet()) { it.name }
+        val selected = selectMovedDeclarations(declarations, bodyReferences, statementNames, propertyNameSet, valueNames)
         // referred to by the moved declarations, which can access the members of the script, unlike e.g. an object
         val referredConstants = selected.flatMapTo(HashSet()) { declaration ->
             declaration.references.filter { it.canAccessScriptMembers && it.refersToLocal(propertyNameSet) }.map { it.name }
@@ -2371,6 +2380,7 @@ private class ScriptStructure(
     private fun selectMovedDeclarations(
         declarations: List<ParsedDeclaration>,
         bodyReferences: List<Reference>,
+        statementNames: Set<String>,
         localProperties: Set<String>,
         valueNames: Set<String>
     ): Set<ParsedDeclaration> {
@@ -2430,15 +2440,22 @@ private class ScriptStructure(
         var accessing = accessingLocalProperties(moved)
         /**
          * Whether the [declaration] is a function, which cannot be moved, as it is accessing, or it is an extension overloaded by an accessing one,
-         * which would stay in the script body, hiding the moved one there, like `fun Any.f()` accessing and `fun Int.f()`,
-         * or `invoke` operators, referred to by any call of a value,
+         * which would stay in the script body, hiding the moved one there for the references staying there,
+         * like `3.f()` of `fun Any.f()` accessing and `fun Int.f()`, or `3("x")` of the `invoke` operators,
+         * except the ones of the overloads themselves, like `this + v.n` of `operator fun String.plus(v: V)`,
          * unlike the plain functions, the calls of which split this way are confirmed, see ScriptSource.shadowedFunctionCandidates.
          */
         fun isAccessingFunction(
             declaration: ParsedDeclaration
-        ) = declaration.kind == DeclarationKind.FUNCTION && (declaration in accessing || declaration.isExtension && namedByName.getValue(declaration.name!!).any {
-            it.kind == DeclarationKind.FUNCTION && it.isExtension && it in accessing
-        })
+        ): Boolean {
+            if (declaration.kind != DeclarationKind.FUNCTION) return false
+            if (declaration in accessing) return true
+            val name = declaration.name!!
+            return declaration.isExtension && namedByName.getValue(name).any { it.kind == DeclarationKind.FUNCTION && it.isExtension && it in accessing }
+                    && (name in statementNames || accessing.any { staying ->
+                        staying.name != name && staying.references.any { it.name == name && it.mightCallOperator(valueNames) }
+                    })
+        }
         val queue = ArrayDeque(moved)
         while (queue.isNotEmpty()) {
             references.getValue(queue.removeFirst()).forEach { declaration ->

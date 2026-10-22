@@ -5028,6 +5028,44 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should move extension overloads not referred to by the script body despite overloads accessing local properties`() = runTest {
+        // given
+        val scripts = listOf(
+            "val p = listOf(\"!\").first()\nfun String.f(): String = \"s\" + p\nfun Int.f(): String = \"int\"\nsealed class S { fun g() = 1.f() }\nclass T : S()\nT().g()",
+            "class V(val n: Int)\nval p = listOf(1).first()\noperator fun String.plus(v: V): String = this + v.n + p\noperator fun V.plus(v: V): V = V(n + v.n)\n" +
+                    "sealed class S { fun g() = (V(1) + V(2)).n }\nclass T : S()\nT().g()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("int", 3))
+    }
+
+    @Test
+    fun `should move local invoke operator called on implicit lambda parameter by declaration moved out of the script body`() = runTest {
+        // given
+        val script = """
+            operator fun Int.invoke(x: Any?): String = "int:${'$'}x"
+            sealed class S { fun g() = listOf(3).map { it("x") } }
+            class T : S()
+            T().g()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == listOf("int:x"))
+        }
+    }
+
+    @Test
     fun `should not move local invoke operator overloading one accessing local properties`() = runTest {
         // given
         val script = """
