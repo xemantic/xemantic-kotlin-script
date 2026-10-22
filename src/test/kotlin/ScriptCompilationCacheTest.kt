@@ -235,21 +235,6 @@ class ScriptCompilationCacheTest {
     }
 
     @Test
-    fun `should not confirm calls preceding local functions reported as unresolved`() = runTest {
-        // given
-        val script = "val p = \"0\".toInt()\nval r = format(\"x\")\nfun format(s: String) = s + p\nr"
-        val executor = DefaultScriptExecutor()
-
-        // when
-        val result = executor.execute(script)
-
-        // then
-        assert((result as? ScriptResult.Error)?.message?.lines()?.first() == "script.kts:2:9: error: Unresolved reference 'format'.")
-        // without the confirming compilation
-        assert(executor.compilationCount == 1)
-    }
-
-    @Test
     fun `should serve the compiled scripts rejected for referring to wrong declarations from the cache`() = runTest {
         // given
         val scripts = listOf(

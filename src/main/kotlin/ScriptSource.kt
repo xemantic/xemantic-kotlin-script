@@ -215,8 +215,6 @@ internal data class LaterDeclaredFunctionReference(
     override val reference: ScriptReference,
     /** Of the first local function of the name declared later, or of the one the confirming compilation resolves the call to. */
     val line: Int,
-    /** Whether it is an operator, or a convention, like `+`, see [Reference.isOperator]. */
-    val isOperator: Boolean,
     /**
      * Whether it is within a lambda, a class, or an extension function, and confirmed by the copies of the local functions declared as the local functions preceding it,
      * which take precedence over the members of the receivers, unlike the functions of the script in a regular script,
@@ -669,7 +667,6 @@ internal class ScriptSource private constructor(
             LaterDeclaredFunctionReference(
                 candidate.reference.toScriptReference(),
                 position(candidate.offset).line,
-                candidate.reference.isOperator,
                 candidate.isConfirmedOnlyWhenFailing,
                 candidate.arguments.map { position(it) }
             )

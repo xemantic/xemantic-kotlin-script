@@ -4497,6 +4497,36 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should keep errors of arguments of call preceding local function independent of function called`() = runTest {
+        // given
+        val scripts = listOf(
+            "val p = \"0\".toInt()\nabstract class A\nprint(A())\nfun print(x: Any) = kotlin.io.print(\"${'$'}p${'$'}x\")",
+            "val p = \"0\".toInt()\nval u: Int\nprint(u)\nfun print(x: Any) = kotlin.io.print(\"${'$'}p${'$'}x\")",
+            "val p = \"0\".toInt()\nabstract class A\ndata class V(val x: Int)\nval r = V(1) + A()\noperator fun V.plus(o: Any) = V(x + p)\nr"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { result -> (result as? ScriptResult.Error)?.message?.lines()?.filter { it.startsWith("script.kts:") } } == listOf(
+            listOf(
+                "script.kts:3:1: error: 'print' does not refer to the function of the script body declared at line 4, which is not visible before its declaration.",
+                "script.kts:3:7: error: Cannot create an instance of an abstract class."
+            ),
+            listOf(
+                "script.kts:3:1: error: 'print' does not refer to the function of the script body declared at line 4, which is not visible before its declaration.",
+                "script.kts:3:7: error: Variable 'u' must be initialized."
+            ),
+            listOf(
+                "script.kts:4:14: error: 'plus' does not refer to the function of the script body declared at line 5, which is not visible before its declaration.",
+                "script.kts:4:16: error: Cannot create an instance of an abstract class."
+            )
+        ))
+    }
+
+    @Test
     fun `should report error at nested array access preceding local operator function only at the innermost one`() = runTest {
         // given
         val script = """

@@ -388,18 +388,9 @@ internal class DefaultScriptExecutor(
                 return Compilation(source, result = null)
             }
             if (source.candidates.isEmpty()) return Compilation(source, compile(source))
-            // the calls by name preceding the local functions only, which are mostly unresolved, like `format("x")` followed by `fun format(s: String)`,
-            // hinted at already, so the compilation precedes the confirming ones, which are not needed then, see ScriptSource.laterDeclaredFunctionCandidates
-            val compilesFirst = source.candidates.all { it is LaterDeclaredFunctionReference && !it.isOperator }
+            // the confirming compilations do not depend on this one
             return coroutineScope {
-                // otherwise the confirming compilations do not depend on this one
-                val compiled = if (compilesFirst) CompletableDeferred(compile(source)) else async { compile(source) }
-                if (compilesFirst) {
-                    val unresolved = compiled.await().reports.unresolvedReferences(source)
-                    if (source.candidates.all { (it.reference.start to it.reference.name) in unresolved }) {
-                        return@coroutineScope Compilation(source, compiled.await())
-                    }
-                }
+                val compiled = async { compile(source) }
                 try {
                     confirm(parsed, source, compiled)
                 } catch (failure: ConfirmingCompilationFailure) {
@@ -643,16 +634,26 @@ internal class DefaultScriptExecutor(
                     it.reference.name in source.calledInsteadDependencies
                 }.mapTo(HashSet()) { it.reference.start } + laterDeclaredFunctionReferences.flatMap { reference ->
                     // like `None of the following candidates is applicable` of `maxOf(W(1), W(2))`, or `Argument type mismatch` at its arguments,
-                    // unlike the errors of the arguments themselves, like an unresolved reference
+                    // unlike the errors of the arguments themselves, like `Cannot create an instance of an abstract class`
                     val positions = reference.arguments + reference.reference.start
                     errorReports.mapNotNull { diagnostic ->
-                        diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }?.takeIf {
-                            it in positions && unresolvedReference.matchEntire(diagnostic.message) == null
+                        diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }?.takeIf { position ->
+                            position in positions && inapplicableCallErrors.any { diagnostic.message.startsWith(it) }
                         }
                     }
                 }
             )
         }
+
+        /**
+         * The beginnings of the messages of the errors of the calls resolved to the functions, which do not apply,
+         * reported at the calls, or at their arguments, see [LaterDeclaredFunctionReference.arguments].
+         */
+        private val inapplicableCallErrors = listOf(
+            "Argument type mismatch", "None of the following candidates is applicable", "Too many arguments",
+            "No value passed for parameter", "No parameter with name", "No 'get' operator method", "No 'set' operator method",
+            "Candidate '", "Inapplicable candidate"
+        )
 
         /** The positions of the unresolved references among these reports of the compilation of the [source], with their names. */
         private fun List<ScriptDiagnostic>.unresolvedReferences(
