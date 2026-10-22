@@ -634,11 +634,16 @@ internal class DefaultScriptExecutor(
                     it.reference.name in source.calledInsteadDependencies
                 }.mapTo(HashSet()) { it.reference.start } + laterDeclaredFunctionReferences.flatMap { reference ->
                     // like `None of the following candidates is applicable` of `maxOf(W(1), W(2))`, or `Argument type mismatch` at its arguments,
-                    // unlike the errors of the arguments themselves, like `Cannot create an instance of an abstract class`
-                    val positions = reference.arguments + reference.reference.start
+                    // unlike the errors of the arguments themselves, like `Cannot create an instance of an abstract class`,
+                    // or of the calls as arguments, which start there, like `None of the following candidates is applicable` of `print(maxOf("a", 2))`
                     errorReports.mapNotNull { diagnostic ->
                         diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }?.takeIf { position ->
-                            position in positions && inapplicableCallErrors.any { diagnostic.message.startsWith(it) }
+                            when (position) {
+                                reference.reference.start -> inapplicableCallErrors
+                                reference.indices -> argumentErrors + missingOperatorErrors
+                                in reference.arguments -> argumentErrors
+                                else -> emptyList()
+                            }.any { diagnostic.message.startsWith(it) }
                         }
                     }
                 }
@@ -646,12 +651,17 @@ internal class DefaultScriptExecutor(
         }
 
         /**
-         * The beginnings of the messages of the errors of the calls resolved to the functions, which do not apply,
-         * reported at the calls, or at their arguments, see [LaterDeclaredFunctionReference.arguments].
+         * The beginnings of the messages of the errors of the calls resolved to the functions, which do not apply, reported at their arguments,
+         * see [LaterDeclaredFunctionReference.arguments], unlike the errors of the calls as arguments, which start there.
          */
-        private val inapplicableCallErrors = listOf(
-            "Argument type mismatch", "None of the following candidates is applicable", "Too many arguments",
-            "No value passed for parameter", "No parameter with name", "No 'get' operator method", "No 'set' operator method",
+        private val argumentErrors = listOf("Argument type mismatch", "Too many arguments")
+
+        /** The beginnings of the messages of the errors of the missing operators, reported at the indices of the array access, see [LaterDeclaredFunctionReference.indices]. */
+        private val missingOperatorErrors = listOf("No 'get' operator method", "No 'set' operator method")
+
+        /** The beginnings of the messages of the errors of the calls resolved to the functions, which do not apply, reported at the calls. */
+        private val inapplicableCallErrors = argumentErrors + missingOperatorErrors + listOf(
+            "None of the following candidates is applicable", "No value passed for parameter", "No parameter with name",
             "Candidate '", "Inapplicable candidate"
         )
 

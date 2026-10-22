@@ -225,7 +225,9 @@ internal data class LaterDeclaredFunctionReference(
      * The positions of its arguments, or of the indices of the array access, or of the right operand of the binary operator,
      * where the compiler reports the errors of the function called instead, like `Argument type mismatch`, explained by it.
      */
-    val arguments: List<ScriptPosition>
+    val arguments: List<ScriptPosition>,
+    /** The position of the indices of the array access, like `[0]` of `a[0]`, where the compiler reports the missing operator, like `No 'get' operator method`. */
+    val indices: ScriptPosition?
 ) : CandidateReference
 
 /** A reference to a local declaration of the script body, a function, if [isFunction], or a property. */
@@ -668,7 +670,8 @@ internal class ScriptSource private constructor(
                 candidate.reference.toScriptReference(),
                 position(candidate.offset).line,
                 candidate.isConfirmedOnlyWhenFailing,
-                candidate.arguments.map { position(it) }
+                candidate.arguments.map { position(it) },
+                candidate.indices?.let { position(it) }
             )
         }
         hiddenLocalFunctionCandidates = structure.hiddenLocalFunctionCandidates.map { (reference, offset, isFunction) ->
@@ -1075,33 +1078,35 @@ private class ShadowedCandidate(
 
 /**
  * See [ScriptSource.laterDeclaredFunctionCandidates], with the [offset] of the name of the first local function declared later,
- * and the offsets of the [arguments], see [LaterDeclaredFunctionReference].
+ * and the offsets of the [arguments] and the [indices], see [LaterDeclaredFunctionReference].
  */
 private class LaterFunctionCandidate(
     val reference: Reference,
     val offset: Int,
     val isConfirmedOnlyWhenFailing: Boolean,
-    val arguments: List<Int>
+    val arguments: List<Int>,
+    val indices: Int?
 )
 
 /**
  * The starts of the arguments of the call of this [reference], or of the indices of the array access, or of the right operand of the binary operator,
- * where the compiler reports the errors of the function called instead, like `Argument type mismatch`, see [LaterDeclaredFunctionReference.arguments].
+ * where the compiler reports the errors of the function called instead, like `Argument type mismatch`, see [LaterDeclaredFunctionReference.arguments],
+ * and the start of the indices of the array access, see [LaterDeclaredFunctionReference.indices].
  */
 private fun KtFile.argumentStarts(
     reference: Reference
-): List<Int> {
+): Pair<List<Int>, Int?> {
     generateSequence(findElementAt(reference.offset)) { it.parent }.forEach { element ->
         when {
             element is KtCallExpression && element.calleeExpression?.let { it.startOffset == reference.offset && it.textLength == reference.length } == true ->
-                return element.valueArguments.mapNotNull { it.getArgumentExpression()?.startOffset }
+                return element.valueArguments.mapNotNull { it.getArgumentExpression()?.startOffset } to null
             element is KtArrayAccessExpression && element.startOffset == reference.offset && element.textLength == reference.length ->
-                return listOf(element.indicesNode.startOffset) + element.indexExpressions.map { it.startOffset }
+                return element.indexExpressions.map { it.startOffset } to element.indicesNode.startOffset
             element is KtBinaryExpression && element.operationReference.startOffset == reference.offset ->
-                return listOfNotNull(element.right?.startOffset)
+                return listOfNotNull(element.right?.startOffset) to null
         }
     }
-    return emptyList()
+    return emptyList<Int>() to null
 }
 
 /** See [ScriptSource.laterDeclaredClassCandidates], with the offset of the class, and the ranges of the [LaterDeclaredClassReference.scopeCalls]. */
@@ -2325,10 +2330,12 @@ private class ScriptStructure(
             name in coroutineScopeFunctions || functions.any { it.second.refersToTypes(localClassNames) }
         }.keys
         laterDeclaredFunctionCandidates = laterFunctionCandidatesByStatement.values.flatten().map { (reference, offset) ->
+            val (arguments, indices) = file.argumentStarts(reference)
             LaterFunctionCandidate(
                 reference, offset,
                 isConfirmedOnlyWhenFailing = reference.name in locallyCopied && reference.mightResolveOnReceiver,
-                arguments = file.argumentStarts(reference)
+                arguments = arguments,
+                indices = indices
             )
         }
         /** The copy of the local function, of the return type declared, as an inferred one would take precedence over the members of the receivers. */

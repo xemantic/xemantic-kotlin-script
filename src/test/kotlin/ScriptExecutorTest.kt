@@ -4502,7 +4502,10 @@ class ScriptExecutorTest {
         val scripts = listOf(
             "val p = \"0\".toInt()\nabstract class A\nprint(A())\nfun print(x: Any) = kotlin.io.print(\"${'$'}p${'$'}x\")",
             "val p = \"0\".toInt()\nval u: Int\nprint(u)\nfun print(x: Any) = kotlin.io.print(\"${'$'}p${'$'}x\")",
-            "val p = \"0\".toInt()\nabstract class A\ndata class V(val x: Int)\nval r = V(1) + A()\noperator fun V.plus(o: Any) = V(x + p)\nr"
+            "val p = \"0\".toInt()\nabstract class A\ndata class V(val x: Int)\nval r = V(1) + A()\noperator fun V.plus(o: Any) = V(x + p)\nr",
+            // the errors of the calls as arguments, which do not apply themselves
+            "val p = \"0\".toInt()\nprint(maxOf(\"a\", 2))\nfun print(x: Any) = kotlin.io.print(\"${'$'}p${'$'}x\")",
+            "val p = \"0\".toInt()\nprint(Pair(1))\nfun print(x: Any) = kotlin.io.print(\"${'$'}p${'$'}x\")"
         )
         val executor = ScriptExecutor()
 
@@ -4522,6 +4525,15 @@ class ScriptExecutorTest {
             listOf(
                 "script.kts:4:14: error: 'plus' does not refer to the function of the script body declared at line 5, which is not visible before its declaration.",
                 "script.kts:4:16: error: Cannot create an instance of an abstract class."
+            ),
+            listOf(
+                "script.kts:2:1: error: 'print' does not refer to the function of the script body declared at line 3, which is not visible before its declaration.",
+                "script.kts:2:7: error: None of the following candidates is applicable:"
+            ),
+            listOf(
+                "script.kts:2:1: error: 'print' does not refer to the function of the script body declared at line 3, which is not visible before its declaration.",
+                "script.kts:2:7: error: Cannot infer type for type parameter 'B'. Specify it explicitly.",
+                "script.kts:2:7: error: No value passed for parameter 'second'."
             )
         ))
     }
