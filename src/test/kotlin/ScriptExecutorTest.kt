@@ -4029,7 +4029,7 @@ class ScriptExecutorTest {
             local + "class T : S { fun f(log: Int) = log(\"x\") }\nT().f(1)",
             local + "class T : S { fun f(): String { val log = 1; return log(\"x\") } }\nT().f()",
             local + "class T : S { fun f() = listOf(1).map { log -> log(\"x\") } }\nT().f()",
-            // the copies of the local functions referring to the type aliases are not compiled
+            // the copies of the local functions referring to the type aliases follow them
             "val k = 1\ntypealias N = String\nfun log(n: N) = \"local:\$n\$k\"\nsealed interface S\nclass T : S { fun f() = log(\"x\") }\nT().f()",
             "val k = 1\ntypealias L<X> = List<X>\nfun log(l: L<String>) = \"local:\$l\$k\"\nsealed interface S\nclass T : S { fun f() = log(listOf(\"x\")) }\nT().f()",
             "val k = 1\ntypealias Fn = () -> String\nfun log(f: Fn) = \"local:\${f()}\$k\"\nsealed interface S\nclass T : S { fun f() = log { \"x\" } }\nT().f()"
@@ -4048,11 +4048,10 @@ class ScriptExecutorTest {
             "script.kts:4:33: error: Cannot infer type for type parameter 'T'. Specify it explicitly.",
             "script.kts:4:53: error: Cannot infer type for type parameter 'T'. Specify it explicitly.",
             "script.kts:4:35: error: Cannot infer type for type parameter 'R'. Specify it explicitly.",
-            "script.kts:5:25: error: Unresolved reference 'log'.",
-            "script.kts:5:25: error: Unresolved reference 'log'.",
-            "script.kts:5:25: error: Unresolved reference 'log'."
+            "script.kts:5:25: error: 'log' does not refer to the function of the script body declared at line 3, which is not visible in 'T'.",
+            "script.kts:5:25: error: 'log' does not refer to the function of the script body declared at line 3, which is not visible in 'T'.",
+            "script.kts:5:25: error: 'log' does not refer to the function of the script body declared at line 3, which is not visible in 'T'."
         ))
-        // as the dependency is not visible in 'T', like the local function
         assert(results.takeLast(3).all { "hint: 'T' is compiled outside of the script body, where 'log' (line 3) is not visible" in it.valueOrMessage.toString() })
     }
 
@@ -4699,6 +4698,88 @@ class ScriptExecutorTest {
                   | class T : S { fun f() = <error>check</error>(false) }
                   hint: 'T' is compiled outside of the script body, where 'check' (line 2) is not visible - pass it as a parameter, or declare it within 'T'.
             """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at declaration moved out of the script body calling local function referring to type alias named like library function`() = runTest {
+        // given
+        // the type alias is moved out of the script body, and visible only to the declarations following it there
+        val script = """
+            typealias N = Boolean
+            val k = 1
+            fun check(n: N) = "local:${'$'}n${'$'}k"
+            sealed interface S
+            class T : S { fun f() = check(true) }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:5:25: error: 'check' does not refer to the function of the script body declared at line 3, which is not visible in 'T'.
+                  | class T : S { fun f() = <error>check</error>(true) }
+                  hint: 'T' is compiled outside of the script body, where 'check' (line 3) is not visible - pass it as a parameter, or declare it within 'T'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at declaration moved out of the script body calling local function referring to type aliases of type arguments or function types`() = runTest {
+        // given
+        val scripts = listOf(
+            "val k = 1\ntypealias L<X> = List<X>\ntypealias N = Boolean\nfun check(l: L<N>) = \"local:\$l\$k\"\nsealed interface S\nclass T : S { fun f() = check(listOf(true)) }\nT().f()",
+            "val k = 1\ntypealias Fn = () -> Boolean\nfun check(f: Fn): String = \"local:\${f()}\$k\"\nsealed interface S\nclass T : S { fun f() = check { true } }\nT().f()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.firstOrNull() } == listOf(
+            "script.kts:6:25: error: 'check' does not refer to the function of the script body declared at line 4, which is not visible in 'T'.",
+            "script.kts:5:25: error: 'check' does not refer to the function of the script body declared at line 3, which is not visible in 'T'."
+        ))
+    }
+
+    @Test
+    fun `should call library function from declaration moved out of the script body like a regular script when local function refers to type alias declared later`() = runTest {
+        // given
+        // the type alias is not visible to the local function preceding it in a regular script, which calls the library function then
+        val script = "val k = 1\nfun check(n: N) = \"local:\$n\$k\"\nsealed interface S\nclass T : S { fun f() = check(true) }\ntypealias N = Boolean\nT().f()"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == Unit)
+        }
+    }
+
+    @Test
+    fun `should call callable dependency from declaration moved out of the script body like a regular script when local function of its name refers to type alias declared later`() = runTest {
+        // given
+        // the copy of the local function precedes the type alias, so it does not apply, like the local function in a regular script
+        val script = "val k = 1\nfun log(n: N) = \"local:\$n\$k\"\nsealed interface S\nclass T : S { fun f() = log(\"x\") }\ntypealias N = String\nT().f()"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<(Any?) -> String>("log") { "dep:$it" }))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "dep:x")
         }
     }
 
@@ -5888,6 +5969,42 @@ class ScriptExecutorTest {
         assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.firstOrNull()?.substringBefore(": error") } == listOf(
             "script.kts:6:17", "script.kts:6:19", "script.kts:6:11", "script.kts:6:21"
         ))
+    }
+
+    @Test
+    fun `should confirm calls of local overloads referring to type aliases within declarations of inferred types`() = runTest {
+        // given
+        val scripts = listOf(
+            // the moved overload of an inferred type, which a regular script prefers
+            "val p = \"!\".trim()\ntypealias N = Int\nfun show(x: Any) = \"any\"\nfun show(x: N): String = \"int\$p\"\nsealed interface S\nclass T : S { fun f() = show(\"a\") }\nfun h() = show(1)\nh() + T().f()",
+            // the local overload of an inferred type, which a regular script prefers
+            "val p = \"!\".trim()\ntypealias N = Int\nfun show(x: N): String = \"int\"\nfun show(x: Any) = \"any\$p\"\nsealed interface S\nclass T : S { fun f(): String = show(1) }\nfun h() = show(1)\nh() + T().f()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { it.valueOrMessage.toString().lines().first() } == listOf(
+            "script.kts:7:11: error: 'show' refers to the function of the script body declared at line 4, instead of its overload declared at line 3, which a regular script calls.",
+            "any!int"
+        ))
+    }
+
+    @Test
+    fun `should report calls of local overloads referring to type aliases declared later within declarations of inferred types`() = runTest {
+        // given
+        // the local overload, which the type alias declared after it is visible to only in the script block, does not apply in a regular script
+        val script = "val p = \"!\".trim()\nfun show(x: Any) = \"any\"\nfun show(x: N): String = \"int\$p\"\ntypealias N = Int\nsealed interface S\nclass T : S { fun f() = show(\"a\") }\nfun h() = show(1)\nh() + T().f()"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert((result as? ScriptResult.Error)?.message?.lines()?.firstOrNull() ==
+                "script.kts:7:11: error: 'show' refers to the function of the script body declared at line 3, instead of its overload declared at line 2, which a regular script calls.")
     }
 
     @Test
