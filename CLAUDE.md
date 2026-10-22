@@ -87,8 +87,7 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 
 - A `VirtualMachineError`, like the `OutOfMemoryError` the fatal error tests throw, escaping a test does not fail it, but aborts the whole Gradle test executor (`Could not complete execution for Gradle Test Executor`) —
   catch it with `runCatching` and assert on it, also where only a regression would let it escape.
-- `runTest` fails on its timeout only once the test body can be cancelled: waiting in `withContext(dispatcher)` for a block queued behind blocked dispatcher threads never completes, so the regression hangs the build forever —
-  wait for such a block with a `CompletableDeferred` instead (see `onOtherThread` in `ScriptExecutorTest`).
+- `runTest` fails on its timeout only once the test body can be cancelled, so a regression blocking the dispatcher threads hangs the build forever, unless the test waits for them cancellably (see `onOtherThread` in `ScriptExecutorTest`).
 
 ## Anti-patterns to avoid
 

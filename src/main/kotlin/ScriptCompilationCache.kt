@@ -71,7 +71,7 @@ internal class ScriptCompilationCache<T : Any>(
      * @param compile throws [CancellationException] only when its caller is cancelled,
      *   as the waiting callers would be cancelled by it as well,
      *   and [InterruptedException] only when the thread of its caller is interrupted,
-     *   after both of which, as well as after a fatal error, see [isFatal], the waiting callers compile again,
+     *   after both of which, as well as after a fatal error, see [shareFailure], the waiting callers compile again,
      *   while any other failure is shared with them.
      */
     suspend fun getOrCompile(
@@ -97,16 +97,21 @@ internal class ScriptCompilationCache<T : Any>(
                 synchronized(entries) {
                     entries.remove(key, entry)
                 }
-                if (e is CancellationException || e is InterruptedException || e.isFatal) {
-                    entry.result.complete(null)
-                } else {
-                    entry.result.completeExceptionally(e)
-                }
+                entry.result.shareFailure(e)
                 throw e
             }
-            synchronized(entries) {
-                entry.isCompiled = true
-                if (isReusable(result)) evict() else entries.remove(key, entry)
+            try {
+                synchronized(entries) {
+                    entry.isCompiled = true
+                    if (isReusable(result)) evict() else entries.remove(key, entry)
+                }
+            } catch (e: Throwable) {
+                // e.g. a fatal error, which is not the failure of the compilation, so the waiting callers compile again
+                synchronized(entries) {
+                    entries.remove(key, entry)
+                }
+                entry.result.complete(null)
+                throw e
             }
             // outside the lock, as the waiting callers might be resumed in place,
             // and outside the try, so that the failure of the one resumed in place, e.g. a fatal error, does not drop the cached compilation

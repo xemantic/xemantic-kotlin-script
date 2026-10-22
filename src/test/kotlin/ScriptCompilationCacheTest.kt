@@ -602,6 +602,29 @@ class ScriptCompilationCacheTest {
     }
 
     @Test
+    fun `should compile again when storing the compilation fails`() = runTest {
+        // given
+        var failing = true
+        val cache = ScriptCompilationCache<String>(maxSize = 10) {
+            if (failing) throw IllegalStateException("not stored") else true
+        }
+        val key = ScriptCompilationCache.Key(script = "foo", dependencies = emptyList())
+        var compilations = 0
+        val failure = runCatching {
+            cache.getOrCompile(key) { compilations++; "foo" }
+        }.exceptionOrNull()
+        failing = false
+
+        // when
+        val result = cache.getOrCompile(key) { compilations++; "bar" }
+
+        // then
+        assert(failure is IllegalStateException && failure.message == "not stored")
+        assert(result == "bar")
+        assert(compilations == 2)
+    }
+
+    @Test
     @OptIn(ExperimentalCoroutinesApi::class)
     fun `should compile again for the waiting caller when the compilation fails fatally`() = runTest {
         // given
