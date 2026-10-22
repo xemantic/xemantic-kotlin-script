@@ -337,8 +337,8 @@ internal class ScriptSource(
     val stringLiterals: List<String>
 
     /**
-     * The references of the script body by their offsets and names, as an operator, like `get` of `a[i]`, starts where its operand does,
-     * which takes precedence, when named like the operator, like `get` of `get[i]`, read only for the hints of the unresolved references.
+     * The references of the script body by their offsets and names, mapped only when an unresolved reference is hinted.
+     * An operator, like `get` of `a[i]`, starts where its operand does, so the operand named like it, like `get` of `get[i]`, overrides it.
      */
     private val bodyReferences: Lazy<Map<Pair<Int, String>, Reference>>
 
@@ -581,8 +581,8 @@ internal class ScriptSource(
         val namedClasses = movedDeclarations.flatMap { it.classNames }.filter {
             if (name == "Companion") it.isCompanion || it.name == name else it.name == name && !it.isCompanion
         }
-        // all of them, if the kind is not recognized, like of a kind added by another compiler version
-        val classes = namedClasses.filter { it.kind == kind }.ifEmpty { namedClasses }
+        // all of them, if none is of the kind, like when another compiler version names a kind differently
+        val classes = namedClasses.filter { it.kind.label == kind }.ifEmpty { namedClasses }
         val candidates = classes.filter { it.refersToScript }.takeIf { it.size >= count } ?: classes
         return (candidates.getOrNull(index) ?: candidates.lastOrNull())?.let {
             Triple(it.name ?: name, position(it.range.first), position(it.range.last + 1))
@@ -613,7 +613,7 @@ internal class ScriptSource(
     ): Pair<Int, DeclarationKind>? {
         val reference = bodyReferences.value[offset(position) to name]
         val declarations = bodyDeclarations.filter {
-            (it.name == name || name in it.destructuredNames) && (reference?.isQualified != true || it.isExtension)
+            (it.name == name || name in it.destructuredNames) && reference?.mightReferTo(it.isExtension) != false
         }
         val declaration = if (reference == null) declarations.firstOrNull() else reference.referredKinds().firstNotNullOfOrNull { kind ->
             declarations.find { it.kind == kind }
@@ -726,8 +726,7 @@ private class Declaration(
 private class ClassName(
     val name: String?,
     val isCompanion: Boolean,
-    /** The kind of the class as the compiler names it in the diagnostics, like `Object`, `Interface`, `Enum class`, `Enum entry`, or `Nested class`. */
-    val kind: String,
+    val kind: CapturingClassKind,
     val range: IntRange,
     /**
      * Whether it refers to the members of the script class by their names, outside of its nested classes, so it might capture the script class instance,
@@ -735,6 +734,15 @@ private class ClassName(
      */
     val refersToScript: Boolean
 )
+
+/** The kinds of the classes, which might capture the script class instance, with the [label]s the compiler names them by in the diagnostics. */
+internal enum class CapturingClassKind(val label: String) {
+    OBJECT("Object"),
+    INTERFACE("Interface"),
+    ENUM_CLASS("Enum class"),
+    ENUM_ENTRY("Enum entry"),
+    NESTED_CLASS("Nested class")
+}
 
 internal enum class DeclarationKind {
     CLASS,
@@ -1017,6 +1025,11 @@ private class Reference(
         else -> valueKinds
     }
 
+    /** Whether it might refer to a declaration of the script, which [isExtension] or not, as a qualified one, like `list.size`, might refer only to an extension. */
+    fun mightReferTo(
+        isExtension: Boolean
+    ): Boolean = !isQualified || isExtension
+
     /** Whether it might refer to one of the local declarations of the script body of these [names]. */
     fun refersToLocal(
         names: Set<String>
@@ -1154,6 +1167,11 @@ private fun PsiElement.operatorReferences(
             else -> {}
         }
     }
+}
+
+/** The names of the supertypes, like `Shape` in `class Circle(val r: Int) : Shape`. */
+private fun KtClassOrObject.supertypeNames(): List<String> = superTypeListEntries.mapNotNull {
+    (it.typeReference?.typeElement as? KtUserType)?.referencedName
 }
 
 /** Whether the [expression] is within a lambda, which might have a receiver, within the [scope], exclusive. */
@@ -1477,19 +1495,20 @@ private class ScriptStructure(
         val scriptMemberNames = movedMembers.flatMapTo(HashSet(dependencyNames)) { listOfNotNull(it.name) + it.destructuredNames }
         val scriptExtensionNames = movedExtensions.mapNotNullTo(HashSet()) { it.name }
         val classesByName = classes.filter { it.name != null }.groupBy { it.name!! }
+        val inheritedMemberNames = HashMap<KtClassOrObject, Set<String>>()
         // only by the supertypes declared in the script, as the members inherited from the library classes are not known without compiling
-        fun KtClassOrObject.inheritedMemberNames(
-            visited: MutableSet<KtClassOrObject> = HashSet()
-        ): Set<String> = superTypeListEntries
-            .flatMap { entry -> (entry.typeReference?.typeElement as? KtUserType)?.referencedName?.let { classesByName[it] }.orEmpty() }
-            .filter { visited.add(it) }
-            .flatMapTo(HashSet()) { supertype ->
-                supertype.declarations.mapNotNull { it.name } + supertype.primaryConstructorParameters.filter { it.hasValOrVar() }.mapNotNull { it.name } +
-                        supertype.inheritedMemberNames(visited)
-            }
+        fun KtClassOrObject.inheritedMemberNames(): Set<String> = inheritedMemberNames[this] ?: run {
+            // against the cyclic supertypes
+            inheritedMemberNames[this] = emptySet()
+            supertypeNames().flatMap { classesByName[it].orEmpty() }.flatMapTo(HashSet()) { supertype ->
+                val members = supertype.declarations + supertype.primaryConstructorParameters.filter { it.hasValOrVar() }
+                members.filter { !it.hasModifier(KtTokens.PRIVATE_KEYWORD) }.mapNotNull { it.name } + supertype.inheritedMemberNames()
+            }.also { inheritedMemberNames[this] = it }
+        }
         movedDeclarations = moved.map { declaration ->
             declaration.toDeclaration(withNestedNames = true, inheritedMemberNames = { it.inheritedMemberNames() }) {
-                it.refersToLocal(scriptMemberNames) || (!it.isBound && it.name in scriptExtensionNames)
+                // a qualified call, like `"x".up()`, refers to an extension, also when a bound name is like it
+                it.refersToLocal(scriptMemberNames) || ((it.isQualified || !it.isBound) && it.name in scriptExtensionNames)
             }
         }
         scriptMemberCallableReferences = moved.filter { it.kind == DeclarationKind.CLASS }.flatMap { declaration ->
@@ -1781,19 +1800,22 @@ private class ScriptStructure(
                         it !== declaration && !(it is KtObjectDeclaration && it.isObjectLiteral()) && it !is KtEnumEntry
                     }.map { it.startOffset until it.endOffset }
                     val inherited = inheritedMemberNames(declaration)
+                    // like the constructor arguments of the supertypes, not seeing the inherited members
+                    val superTypeList = declaration.getSuperTypeList()?.let { it.startOffset until it.endOffset }
                     ClassName(
                         name = declaration.name,
                         isCompanion = isCompanion,
                         kind = when {
-                            declaration is KtEnumEntry -> "Enum entry"
-                            declaration is KtObjectDeclaration -> "Object"
-                            declaration is KtClass && declaration.isInterface() -> "Interface"
-                            declaration is KtClass && declaration.isEnum() -> "Enum class"
-                            else -> "Nested class"
+                            declaration is KtEnumEntry -> CapturingClassKind.ENUM_ENTRY
+                            declaration is KtObjectDeclaration -> CapturingClassKind.OBJECT
+                            declaration is KtClass && declaration.isInterface() -> CapturingClassKind.INTERFACE
+                            declaration is KtClass && declaration.isEnum() -> CapturingClassKind.ENUM_CLASS
+                            else -> CapturingClassKind.NESTED_CLASS
                         },
                         range = nameElement.startOffset until nameElement.endOffset,
                         refersToScript = references.any { reference ->
-                            reference.offset in range && nestedRanges.none { reference.offset in it } && reference.name !in inherited
+                            reference.offset in range && nestedRanges.none { reference.offset in it }
+                                    && (reference.name !in inherited || superTypeList?.contains(reference.offset) == true)
                                     && refersToScript(reference)
                         }
                     )
@@ -1875,9 +1897,7 @@ private class ScriptStructure(
             isSealed = declaration.hasModifier(KtTokens.SEALED_KEYWORD),
             isExtension = declaration is KtNamedFunction && declaration.receiverTypeReference != null,
             isOperator = declaration is KtNamedFunction && declaration.hasModifier(KtTokens.OPERATOR_KEYWORD),
-            supertypeNames = (declaration as? KtClassOrObject)?.superTypeListEntries.orEmpty().mapNotNull {
-                (it.typeReference?.typeElement as? KtUserType)?.referencedName
-            },
+            supertypeNames = (declaration as? KtClassOrObject)?.supertypeNames().orEmpty(),
             references = declaration.references(scope = declaration.parent, declaredNames)
         )
     }
@@ -1915,7 +1935,7 @@ private class ScriptStructure(
         }
         // a qualified reference, like `list.size`, cannot refer to a declaration of the script, unless it is an extension
         fun Reference.referenced(): List<ParsedDeclaration> = namedByName[name].orEmpty().filter {
-            (!isQualified || it.isExtension) && (!isOperator || it.isOperator)
+            mightReferTo(it.isExtension) && (!isOperator || it.isOperator)
         }
         // the operator functions called on the result of `iterator`, like by a for loop
         val iteratorOperators = named.filter { it.isOperator && it.isExtension && (it.name == "hasNext" || it.name == "next") }

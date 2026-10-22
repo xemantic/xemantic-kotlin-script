@@ -5073,7 +5073,7 @@ class ScriptExecutorTest {
     }
 
     @Test
-    fun `should report error at distinct companion objects, when more of them refer to names of the script class members than capture it`() = runTest {
+    fun `should report error at companion objects capturing the script class instance, not at the one referring to member inherited from class of the script`() = runTest {
         // given
         val script = """
             open class Base { val input = "z" }
@@ -5094,6 +5094,108 @@ class ScriptExecutorTest {
             assert(message.lines().filter { "captures the script class instance" in it } == listOf(
                 "script.kts:3:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead.",
                 "script.kts:4:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead."
+            ))
+        }
+    }
+
+    @Test
+    fun `should report error at distinct companion objects, when more of them refer to names of the script class members than capture it`() = runTest {
+        // given
+        val script = """
+            class A { companion object : java.util.ArrayList<String>() { fun f() = size } }
+            class B { companion object { fun f() = size } }
+            class C { companion object { fun f() = size } }
+            A.f() + B.f() + C.f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("size", 1)))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            // the member inherited from a class of a library is not known, so they are told by their order
+            assert(message.lines().filter { "captures the script class instance" in it } == listOf(
+                "script.kts:1:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead.",
+                "script.kts:2:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead."
+            ))
+        }
+    }
+
+    @Test
+    fun `should report error at companion objects capturing the script class instance, also when referring to name of private member of their supertype`() = runTest {
+        // given
+        val script = """
+            open class Base { private val input = "z" }
+            class Z { companion object { fun f() = 1 } }
+            class A { companion object : Base() { fun f() = input.length } }
+            class B { companion object { fun f() = input.length } }
+            A.f() + B.f() + Z.f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("input", "abc")))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            assert(message.lines().filter { "captures the script class instance" in it } == listOf(
+                "script.kts:3:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead.",
+                "script.kts:4:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead."
+            ))
+        }
+    }
+
+    @Test
+    fun `should report error at companion object capturing the script class instance in supertype constructor argument named like inherited member`() = runTest {
+        // given
+        val script = """
+            open class Base(val s: String) { val input = "z" }
+            class Z { companion object { fun f() = 1 } }
+            class A { companion object : Base(input) { fun f() = 2 } }
+            A.f() + Z.f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("input", "abc")))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            assert(message.lines().filter { "captures the script class instance" in it } == listOf(
+                "script.kts:3:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead."
+            ))
+        }
+    }
+
+    @Test
+    fun `should report error at nested classes capturing the script class instance, also by qualified call of script extension named like parameter`() = runTest {
+        // given
+        val script = """
+            fun String.up() = this + input
+            class P { class N { fun h() = 1 } }
+            class A { class N { fun f(up: Int) = "x".up() } }
+            class B { class N { fun g() = input } }
+            P.N().h().toString() + A.N().f(1) + B.N().g()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("input", "abc")))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            assert(message.lines().filter { "captures the script class instance" in it }.map { it.substringBefore(" error:") } == listOf(
+                "script.kts:3:17:",
+                "script.kts:4:17:"
             ))
         }
     }

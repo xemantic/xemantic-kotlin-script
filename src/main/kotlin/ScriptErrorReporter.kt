@@ -35,7 +35,9 @@ private val unresolvedReference = Regex("Unresolved reference '(.+)'\\.")
 private val constantRequired = Regex(".* must be a compile-time constant\\.|Only 'const val' can be used in constant expressions\\.")
 
 /** Reported without a location, e.g. for an object accessing the dependencies, which are the members of the script class. */
-private val declarationCapturingScript = Regex("(Object|Enum class|Enum entry|Interface|Nested class) '(.+)' captures the script class instance\\..*")
+private val declarationCapturingScript = Regex(
+    "(${CapturingClassKind.entries.joinToString("|") { it.label }}) '(.+)' captures the script class instance\\..*"
+)
 
 /**
  * The first line of the failure of the compiler backend, reported without a location, followed by the intermediate representation of the code,
