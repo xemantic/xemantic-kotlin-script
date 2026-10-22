@@ -66,6 +66,79 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should declare local functions preceding the statements calling them`() {
+        // given
+        val script = """
+            val factor = 2
+            val y = 1; fun a() = b() + y
+            fun b() = c() * factor
+            fun c() = factor
+            a()
+        """.trimIndent()
+        val parsed = ScriptSource.Parsed(script)
+
+        // when
+        val hoisted = parsed.hoisted(parsed.source(), setOf(ScriptPosition(1, 21) to "b", ScriptPosition(2, 10) to "c"))
+
+        // then
+        val block = hoisted?.source()?.text?.substringAfter(SCRIPT_BLOCK_START)?.substringBefore(SCRIPT_BLOCK_END)
+        // each following the ones it calls, separated from the statements, keeping the columns, while the originals are blanked out
+        assert(block?.lines()?.map { it.trimEnd() } == listOf(
+            "",
+            "val factor = 2",
+            ";",
+            "fun c() = factor",
+            "fun b() = c() * factor",
+            ";",
+            "val y = 1; fun a() = b() + y",
+            "",
+            "",
+            "a()",
+            ""
+        ))
+    }
+
+    @Test
+    fun `should not declare local function preceding the statement calling it when it refers to declaration in between`() {
+        // given
+        val script = """
+            val factor = 2
+            fun a() = c()
+            val d = factor + 1
+            fun c() = d
+            a()
+        """.trimIndent()
+        val parsed = ScriptSource.Parsed(script)
+
+        // when
+        val hoisted = parsed.hoisted(parsed.source(), setOf(ScriptPosition(1, 10) to "c"))
+
+        // then
+        assert(hoisted == null)
+    }
+
+    @Test
+    fun `should declare long chain of local functions preceding the statements calling them`() {
+        // given
+        val count = 2000
+        val script = buildString {
+            appendLine("val x = 1")
+            (0 until count - 1).forEach { appendLine("fun f$it() = f${it + 1}() + x") }
+            appendLine("fun f${count - 1}() = x")
+            append("f0()")
+        }
+        val parsed = ScriptSource.Parsed(script)
+        val unresolved = (0 until count - 1).mapTo(HashSet()) { ScriptPosition(it + 1, "fun f$it() = ".length) to "f${it + 1}" }
+
+        // when
+        val hoisted = parsed.hoisted(parsed.source(), unresolved)
+
+        // then
+        val block = hoisted?.source()?.text?.substringAfter(SCRIPT_BLOCK_START)?.lines()
+        assert(block?.subList(1, 5) == listOf("val x = 1", ";", "fun f${count - 1}() = x", "fun f${count - 2}() = f${count - 1}() + x"))
+    }
+
+    @Test
     fun `should recognize calls preceding local functions of their names as candidates`() {
         // given
         val script = """

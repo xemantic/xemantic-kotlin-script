@@ -89,6 +89,12 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   catch it with `runCatching` and assert on it, also where only a regression would let it escape.
 - `runTest` fails on its timeout only once the test body can be cancelled, so a regression blocking the dispatcher threads hangs the build forever, unless the test waits for them cancellably (see `onOtherThread` in `ScriptExecutorTest`).
 
+- In a regular `.kts`, K2 resolves a script function declared *before* the reference ahead of the members of the implicit receivers, and one declared *later* after them (a script property always after them, see #36).
+  But once a function of an inferred return type is called before its declaration, its body resolves *all* script functions after the receiver members, also the ones declared before the call:
+  `fun c() = with(Obj()) { b() }` calls `Obj.b` when `fun a() = c()` precedes it, even with `fun b()` declared first.
+  A declared return type restores the order, a block body too.
+  Probe both orders and both kinds of return types when comparing the resolution with a regular script.
+
 ## Anti-patterns to avoid
 
 - Inside a lambda walking a chain of exceptions in a `Throwable` extension, like `generateSequence(this) { read(null) { cause } }`,
