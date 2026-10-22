@@ -1201,7 +1201,11 @@ private fun KtDeclaration.memberOnlyAnnotationEntries(): List<KtAnnotationEntry>
  * otherwise declared as `Nothing`, like the return type of a block body.
  */
 private fun KtNamedFunction.signature(
-    keepsInferredType: Boolean = true
+    keepsInferredType: Boolean = true,
+    /** The replacements of the names of the types, see [singleLineText]. */
+    renamed: Map<PsiElement, String> = emptyMap(),
+    /** The receiver of the copy, like `kotlinx.coroutines.CoroutineScope`, unless the function has one already. */
+    receiver: String? = null
 ): String? = if (
     typeParameters.any { it.nameIdentifier == null } || valueParameters.any { it.typeReference == null || it.name == null }
 ) {
@@ -1213,25 +1217,28 @@ private fun KtNamedFunction.signature(
         +" "
     }
     +"fun "
-    +typeParameters.copiedTypeParameters()
+    +typeParameters.copiedTypeParameters(renamed)
     receiverTypeReference?.let {
         +"("
-        +it.singleLineText()
+        +it.singleLineText(renamed)
         +")."
+    } ?: receiver?.let {
+        +it
+        +"."
     }
     +"`$name`("
-    +valueParameters.copiedParameters()
+    +valueParameters.copiedParameters(renamed)
     +")"
     // keeping the type of the call, which might be an argument of another one, inferred if it is inferred from the expression,
     // as the compiler prefers the script functions of the inferred types to the other ones, see CLAUDE.md,
     // so the confirming compilation reports that the inferred `Nothing` should be declared, an error ignored there
     when {
-        typeReference != null -> +": ${typeReference!!.singleLineText()}"
+        typeReference != null -> +": ${typeReference!!.singleLineText(renamed)}"
         !isOfInferredType() || !keepsInferredType -> +": Nothing"
     }
     typeConstraintList?.let {
         +" where "
-        +it.singleLineText()
+        +it.singleLineText(renamed)
     }
     +" = kotlin.TODO()"
 }
@@ -1306,6 +1313,44 @@ private fun KtClass.constructorCopies(
 
 /** The prefix of the name of the class replacing a local class in the copies of its constructors, see [constructorCopies]. */
 private const val LATER_DECLARED_CLASS_PREFIX = "_LaterDeclaredClass_"
+
+/**
+ * The declaration of the class replacing this local class, named [name], in the copies preceding its declaration, see [ScriptSource.laterDeclaredDependencyCandidates],
+ * of the same type parameters and supertypes, of the names of their types [renamed], like `abstract class P_ : Runnable` of `class P(val v: Int) : Runnable`,
+ * so the copies apply to the same arguments as the declarations referring to the local class, as no value preceding it is of the local class.
+ * The supertypes are not initialized, an error ignored there, as the class is never instantiated.
+ */
+private fun KtClassOrObject.placeholder(
+    name: String,
+    renamed: Map<PsiElement, String>
+): String = buildString {
+    +"abstract class $name"
+    typeParameterList?.let { +it.singleLineText(renamed) }
+    superTypeListEntries.mapNotNull { it.typeReference }.takeIf { it.isNotEmpty() }?.let { types ->
+        +" : "
+        +types.joinToString { it.singleLineText(renamed) }
+    }
+    typeConstraintList?.let {
+        +" where "
+        +it.singleLineText(renamed)
+    }
+}
+
+/** The prefix of the name of the class replacing a local class in the copies preceding its declaration, see [placeholder]. */
+private const val PLACEHOLDER_CLASS_PREFIX = "_InvisibleClass_"
+
+/** These elements, and the ones they refer to, transitively. */
+private inline fun <T> List<T>.closure(
+    references: (T) -> List<T>
+): Set<T> {
+    val closure = LinkedHashSet<T>()
+    var elements = distinct()
+    while (elements.isNotEmpty()) {
+        closure += elements
+        elements = elements.flatMap { references(it) }.distinct().filter { it !in closure }
+    }
+    return closure
+}
 
 /**
  * The overriding declaration of the member of `Any` of the same signature as this function, like `override fun toString(): kotlin.String`,
@@ -2415,9 +2460,76 @@ private class ScriptStructure(
                 .filterNot { it.refersToTypes(invisibleClasses) }
                 .mapNotNull { function -> function.signature()?.let { message(function) to it } }
         }
+        // the local classes of the names declared once, which the placeholders replace, see placeholderCopies
+        val uniqueLocalClasses = localClasses.groupBy { it.name!! }.filterValues { it.size == 1 }.mapValues { it.value.single() }
+        /**
+         * The references of these parts of a declaration to the local classes of these [invisibleClasses] names, unqualified, unless shadowed by its type parameters,
+         * which are the only declarations taking precedence over the local classes of the script body there, as the classes declared later than them are not visible,
+         * or `null`, if it refers to them qualified, like `P.Inner`, which their placeholders do not declare, or to a class of a name declared more than once.
+         */
+        fun List<PsiElement>.invisibleClassReferences(
+            invisibleClasses: Set<String>,
+            typeParameters: List<KtTypeParameter>
+        ): List<Pair<PsiElement, ParsedDeclaration>>? {
+            val shadowed = typeParameters.mapNotNullTo(HashSet()) { it.name }
+            return flatMap { part -> part.collectDescendantsOfType<KtUserType> { it.qualifier == null && it.referencedName in invisibleClasses && it.referencedName !in shadowed } }
+                .map { type ->
+                    val name = type.referenceExpression?.getReferencedNameElement()
+                    val localClass = uniqueLocalClasses[type.referencedName]
+                    if (name == null || localClass == null || type.parent is KtUserType) return null
+                    name to localClass
+                }
+        }
+        /** The references of the declaration of the local class, which its placeholder copies, see [placeholder]. */
+        fun ParsedDeclaration.placeholderReferences(
+            invisibleClasses: Set<String>
+        ) = (psi as KtClassOrObject).let { declaration ->
+            (listOfNotNull(declaration.typeParameterList, declaration.typeConstraintList) + declaration.superTypeListEntries.mapNotNull { it.typeReference })
+                .invisibleClassReferences(invisibleClasses, declaration.typeParameters)
+        }
+        /**
+         * The copies of the local functions of each name, like [functionCopies], while the ones referring to the local classes not visible there
+         * refer to their placeholders instead, declared preceding them, of the same type parameters and supertypes, see [placeholder],
+         * so they apply to the same arguments, as no value preceding a local class is of it.
+         * These are the extensions of the coroutine scope of the script body, ranking below the local functions, like the copies following the classes,
+         * so a call applying to both, like `f(null)` of `fun f(x: P?)` following `class P`, is not ambiguous,
+         * and above the dependencies, the members of the receivers of the script block.
+         * The ones of a function at the places, where different classes it refers to are not visible, rank the same,
+         * so a call applying to both of them is ambiguous, see README.
+         */
+        val placeholderCopies = { name: String, invisibleClasses: Set<String> ->
+            localFunctionsByName[name].orEmpty().flatMap { function ->
+                val declaration = function.psi as KtNamedFunction
+                // the types of the signature, unlike the default values replaced in the copy, of a function without a receiver, like the dependency
+                val references = (
+                    declaration.valueParameters.mapNotNull { it.typeReference }
+                        + listOfNotNull(declaration.typeParameterList, declaration.typeConstraintList, declaration.typeReference)
+                ).invisibleClassReferences(invisibleClasses, declaration.typeParameters) ?: return@flatMap emptyList()
+                if (references.isEmpty()) return@flatMap listOfNotNull(declaration.signature()?.let { LATER_DECLARED_FUNCTION to it })
+                // also the ones their declarations refer to, like their supertypes, by the classes
+                val classReferences = HashMap<ParsedDeclaration, List<Pair<PsiElement, ParsedDeclaration>>>()
+                references.map { it.second }.closure { localClass ->
+                    classReferences.getOrPut(localClass) { localClass.placeholderReferences(invisibleClasses) ?: return@flatMap emptyList() }.map { it.second }
+                }
+                // named after the first declared of the classes it replaces, itself or the ones it refers to, which tells which of them are replaced,
+                // so the copies at the places, where the same ones are not visible, like preceding and following an unrelated class, declare the same placeholders
+                val placeholderNames = classReferences.keys.associateWith { localClass ->
+                    val replaced = listOf(localClass).closure { classReferences.getValue(it).map { (_, referred) -> referred } }
+                    "`$PLACEHOLDER_CLASS_PREFIX${replaced.minOf { statementIndices.getValue(it.psi) }}_${localClass.name}`"
+                }
+                fun List<Pair<PsiElement, ParsedDeclaration>>.renamed() = associate { (name, localClass) -> name to placeholderNames.getValue(localClass) }
+                // in the order of the declarations, which refer only to the ones preceding them
+                val placeholders = classReferences.entries.sortedBy { statementIndices.getValue(it.key.psi) }.map { (localClass, classReferences) ->
+                    (localClass.psi as KtClassOrObject).placeholder(placeholderNames.getValue(localClass), classReferences.renamed())
+                }
+                val copy = declaration.signature(renamed = references.renamed(), receiver = "kotlinx.coroutines.CoroutineScope")
+                    ?: return@flatMap emptyList()
+                (placeholders + copy).map { LATER_DECLARED_FUNCTION to it }
+            }
+        }
         laterDeclaredFunctionCopies = copies(
             laterDeclaredCandidatesByStatement.mapValues { (_, candidates) -> candidates.filter { it.isFunction }.map { it.reference } },
-            functionCopies(localFunctionsByName) { LATER_DECLARED_FUNCTION }
+            placeholderCopies
         )
         // the local functions, also the extension ones, by the indices of their statements, unless named like the dependencies, see laterDeclaredDependencyCandidates
         val namedFunctions = buildMap<String, MutableList<Pair<Int, ParsedDeclaration>>> {

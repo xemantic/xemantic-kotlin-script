@@ -163,6 +163,29 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should replace in copies only local classes declared later which their parameter types refer to`() {
+        // given
+        val script = """
+            val p = 1
+            val a = f(null)
+            class P { val q = p }
+            class R { val q = p }
+            fun f(x: P?, y: Any = emptyList<R>()) = p
+            a
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script, listOf(PreambleDependency("f", "val `f`: (Any?) -> Int = TODO()", isCallable = true)), confirming = true)
+
+        // then
+        val copies = source.text.lines().filter { "_InvisibleClass_" in it }.map { it.substringAfter("` ") }
+        assert(copies == listOf(
+            "abstract class `_InvisibleClass_2_P`",
+            "fun kotlinx.coroutines.CoroutineScope.`f`(`x`: `_InvisibleClass_2_P`?, `y`: Any = kotlin.TODO()) = kotlin.TODO()"
+        ))
+    }
+
+    @Test
     fun `should derive the sources of all the compilations from the script parsed once`() {
         // given
         val script = """
