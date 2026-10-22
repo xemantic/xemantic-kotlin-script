@@ -2254,6 +2254,52 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report construct of script left unclosed at its end like regular script`() = runTest {
+        // given
+        val scripts = listOf(
+            "A().x\nclass A {\n  val x = 1\n  /* abc\n}",
+            "f()\nfun f(): Int {\n  /* abc\n  return 1\n}",
+            "A().x\nclass A {\n  val x = 1\n",
+            "val a = 5\n\"\${a",
+            "f()\nfun f() = \"\${1 + \n"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message } == listOf(
+            "script.kts:3:12: error: Syntax error: Missing '}.\n  |   val x = 1<error></error>",
+            "script.kts:2:15: error: Syntax error: Expecting '}'.\n  | fun f(): Int {<error></error>",
+            "script.kts:3:12: error: Syntax error: Missing '}.\n  |   val x = 1<error></error>",
+            "script.kts:2:5: error: Syntax error: Expecting '}'.\n  | \"\${a<error></error>",
+            "script.kts:2:17: error: Syntax error: Expecting an element.\n  | fun f() = \"\${1 +<error></error>"
+        ))
+    }
+
+    @Test
+    fun `should report only syntax error of script left unclosed at its end referring to dependency`() = runTest {
+        // given
+        val script = "val y = x + 1\nfun f(): Int {\n  return y"
+        val dependencies = listOf(dependency("x", 42))
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, dependencies)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:11: error: Syntax error: Expecting '}'.
+                  |   return y<error></error>
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should call function declared later when its own names shadow local declarations of the script body`() = runTest {
         // given
         val script = """

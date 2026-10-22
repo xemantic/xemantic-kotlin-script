@@ -262,6 +262,15 @@ internal class ScriptSource(
     val unmatchedClosingBrace: ScriptPosition?
 
     /**
+     * Whether the script ends with a construct left open, like a block, a string, a string template,
+     * or a block comment within them, which would swallow the code generated around the script body,
+     * or would be closed by it, misplacing the syntax errors.
+     * The [text] is the script alone then, failing with the syntax errors of a regular script,
+     * as a script ending this way is never valid.
+     */
+    val endsUnclosed: Boolean
+
+    /**
      * Whether the script ends with a declaration moved out of the script body, so it returns `Unit`,
      * while the block returns `null` instead, as `Unit` might be shadowed by a declaration or a dependency of the script.
      */
@@ -336,6 +345,7 @@ internal class ScriptSource(
             coroutineScopeCopies
         )
         unmatchedClosingBrace = structure.unmatchedClosingBrace?.let { position(it) }
+        endsUnclosed = structure.endsUnclosed
         movedDeclarations = structure.movedDeclarations
         returnsUnit = structure.endsWithMovedDeclaration
         conflictingDependencyDeclarations = structure.conflictingDependencyDeclarations.map { (name, range) ->
@@ -470,8 +480,14 @@ internal class ScriptSource(
         lines += SCRIPT_BLOCK_END
         mapping += null
 
-        text = lines.joinToString(separator = "\n")
-        lineMapping = mapping
+        if (endsUnclosed) {
+            preambleDependencies.clear()
+            text = scriptLines.joinToString(separator = "\n")
+            lineMapping = scriptLines.indices.toList()
+        } else {
+            text = lines.joinToString(separator = "\n")
+            lineMapping = mapping
+        }
         // unique, as the frames of the script are recognized by it, also among the frames of other scripts
         @OptIn(ExperimentalAtomicApi::class)
         locationId = "\$${sourceIdSeq.incrementAndFetch()}.kts"
@@ -1039,6 +1055,9 @@ private class ScriptStructure(
 
     /** The start of the block comment ending the script unterminated, which would swallow the closing of the script block. */
     val unterminatedComment: Int? = lexed.unterminatedComment
+
+    /** See [ScriptSource.endsUnclosed]. */
+    val endsUnclosed: Boolean = lexed.endsUnclosed
 
     val movedDeclarations: List<Declaration>
 
@@ -1642,17 +1661,19 @@ private val enclosingOf = mapOf<IElementType, Set<IElementType>>(
     KtTokens.CLOSING_QUOTE to emptySet()
 )
 
-/** The offsets of the [ScriptStructure.unmatchedClosingBrace] and of the [ScriptStructure.unterminatedComment]. */
+/** The offsets of the [ScriptStructure.unmatchedClosingBrace] and of the [ScriptStructure.unterminatedComment], see also [ScriptStructure.endsUnclosed]. */
 private class LexedScript(
     val unmatchedClosingBrace: Int?,
-    val unterminatedComment: Int?
+    val unterminatedComment: Int?,
+    val endsUnclosed: Boolean = false
 )
 
 /**
  * Finds the first `}` closing the script block, which the script is wrapped in,
  * recognized with the lexer, as the parser of the script alone recovers from it differently,
  * and the block comment, or the KDoc, ending the script unterminated at the top level,
- * also when it closes only a nested comment, while within a block or a string it is a missing closing token.
+ * also when it closes only a nested comment, while within a block or a string it is a missing closing token,
+ * and whether the script ends with anything left open.
  */
 private fun lexScript(
     script: String
@@ -1661,7 +1682,7 @@ private fun lexScript(
     lexer.start(script)
     val opened = mutableListOf<IElementType>()
     while (true) {
-        val type = lexer.tokenType ?: return LexedScript(null, null)
+        val type = lexer.tokenType ?: return LexedScript(null, null, endsUnclosed = opened.isNotEmpty())
         if (type in openingTokens) opened += type
         // ends the unterminated single-line string instead of the closing quote
         if (type == KtTokens.DANGLING_NEWLINE) {

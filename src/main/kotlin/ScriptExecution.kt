@@ -304,6 +304,10 @@ internal class DefaultScriptExecutor(
                 return Compilation(source, result = null)
             }
             val result = compile(source)
+            if (source.endsUnclosed) {
+                // the script alone, failing with the syntax errors only, so the candidates are never reported
+                return Compilation(source, result)
+            }
             // unless already reported as unresolved
             val errors = result.reports.filter { it.severity == ScriptDiagnostic.Severity.ERROR }.mapNotNull { diagnostic ->
                 diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }
