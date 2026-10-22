@@ -1481,6 +1481,79 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report lambda class name followed by other names`() = runTest {
+        // given
+        val script = """
+            class Box
+            val f = { 1 }
+            throw IllegalStateException(Box::class.java.name + " vs " + f.javaClass.name)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first() sameAs "java.lang.IllegalStateException: Box vs <lambda>"
+        }
+    }
+
+    @Test
+    fun `should report very long exception message of many names resembling classes of the script`() = runTest {
+        // given
+        val script = """
+            throw IllegalStateException("_.Nope ".repeat(100_000) + (1..100_000).joinToString(" ") { "_.Nope${'$'}it" })
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first() sameAs "java.lang.IllegalStateException: " + "_.Nope ".repeat(100_000) + (1..100_000).joinToString(" ") { "_.Nope$it" }
+        }
+    }
+
+    @Test
+    fun `should keep names written by script with carriage return line breaks`() = runTest {
+        // given
+        val script = "// the class\renum class C { X }\rthrow IllegalStateException(\"_.C \" + C.X)"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first() sameAs "java.lang.IllegalStateException: _.C X"
+        }
+    }
+
+    @Test
+    fun `should keep names written in string literals with unicode escapes`() = runTest {
+        // given
+        val script = $$"""
+            enum class Box { A }
+            throw IllegalStateException("_${'\u0024'}Box")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first() sameAs $$"java.lang.IllegalStateException: _$Box"
+        }
+    }
+
+    @Test
     fun `should report exception with a very long message resembling the name of the script class`() = runTest {
         // given
         val script = """
@@ -3338,6 +3411,124 @@ class ScriptExecutorTest {
                 java.lang.IllegalStateException: x
                   at C.f(script.kts:3)
                   |     override fun f(n: Int): Int = if (n == 0) error("x") else f(n - 1)
+                  ... (the frame above repeated 2 more times)
+                  at <script body>(script.kts:5)
+                  | (C() as I<Int>).f(2)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frames of generic override recursing directly without dropping them as bridges`() = runTest {
+        // given
+        val script = """
+            interface I<T> { fun f(n: Int): T }
+            class C : I<Int> {
+                override fun f(n: Int): Int = if (n == 0) error("x") else f(n - 1)
+            }
+            C().f(1)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: x
+                  at C.f(script.kts:3)
+                  |     override fun f(n: Int): Int = if (n == 0) error("x") else f(n - 1)
+                  ... (the frame above repeated 1 more times)
+                  at <script body>(script.kts:5)
+                  | C().f(1)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frames of generic override recursing directly from another line of its body`() = runTest {
+        // given
+        val script = """
+            interface I<T> { fun f(n: Int): T }
+            class C : I<Int> {
+                override fun f(n: Int): Int {
+                    if (n == 0) error("x")
+                    return f(n - 1)
+                }
+            }
+            C().f(1)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: x
+                  at C.f(script.kts:4)
+                  |         if (n == 0) error("x")
+                  at C.f(script.kts:5)
+                  |         return f(n - 1)
+                  at <script body>(script.kts:8)
+                  | C().f(1)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frames of generic override in the line of its class recursing directly`() = runTest {
+        // given
+        val script = """
+            interface I<T> { fun f(n: Int): T }
+            class C : I<Int> { override fun f(n: Int): Int = if (n == 0) error("x") else f(n - 1) }
+            C().f(1)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: x
+                  at C.f(script.kts:2)
+                  | class C : I<Int> { override fun f(n: Int): Int = if (n == 0) error("x") else f(n - 1) }
+                  ... (the frame above repeated 1 more times)
+                  at <script body>(script.kts:3)
+                  | C().f(1)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frames of generic override recursing through its interface without its bridges`() = runTest {
+        // given
+        val script = """
+            interface I<T> { fun f(n: Int): T }
+            class C : I<Int> {
+                override fun f(n: Int): Int = if (n == 0) error("x") else (this as I<Int>).f(n - 1)
+            }
+            (C() as I<Int>).f(2)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: x
+                  at C.f(script.kts:3)
+                  |     override fun f(n: Int): Int = if (n == 0) error("x") else (this as I<Int>).f(n - 1)
                   ... (the frame above repeated 2 more times)
                   at <script body>(script.kts:5)
                   | (C() as I<Int>).f(2)

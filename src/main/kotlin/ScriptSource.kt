@@ -352,19 +352,28 @@ internal class ScriptSource(
      * The constant parts of the string literals of the script, with the escapes resolved, like `_$Box` of `"_${'$'}Box"`,
      * split at the other template expressions, parsed only when an exception message might name a class of the script.
      */
-    val stringLiterals: List<String> by lazy {
-        psiFactory.createFile("script.kts", script).collectDescendantsOfType<KtStringTemplateExpression>().flatMap { literal ->
+    val stringLiterals: List<String> get() = literalsAndNames.first
+
+    /** The names of the classes declared in the script, which are not identifiers, like the backticked `My Box`, parsed like the [stringLiterals]. */
+    val backtickedClassNames: List<String> get() = literalsAndNames.second
+
+    private val literalsAndNames: Pair<List<String>, List<String>> by lazy {
+        // parsed like the script structure, while the text of the literals is taken from the script, like a carriage return of a raw string
+        val file = psiFactory.createFile("script.kts", script.replace('\r', '\n'))
+        file.collectDescendantsOfType<KtStringTemplateExpression>().flatMap { literal ->
             val parts = mutableListOf(StringBuilder())
             literal.entries.forEach { entry ->
                 when (entry) {
                     is KtEscapeStringTemplateEntry -> parts.last().append(entry.unescapedValue)
                     // like `${'$'}`, the idiom of a dollar in a raw string
                     is KtStringTemplateEntryWithExpression -> entry.expression?.constantText()?.let { parts.last().append(it) } ?: parts.add(StringBuilder())
-                    else -> parts.last().append(entry.text)
+                    else -> parts.last().append(script, entry.startOffset, entry.endOffset)
                 }
             }
             parts.map { it.toString() }
-        }
+        } to file.collectDescendantsOfType<KtClassOrObject>().mapNotNull { it.name }.filter { name ->
+            name.any { !it.isLetterOrDigit() && it != '_' }
+        }.distinct()
     }
 
     /**
@@ -873,11 +882,14 @@ private fun KtProperty.functionType(
     }
 }
 
-/** The text without the comments and the line breaks, as each declaration of the preamble is a single line. */
 /** The value of a character or a string literal without templates, like `'$'` or `"$"`, or `null`. */
 private fun KtExpression.constantText(): String? = when (this) {
     is KtConstantExpression -> text.takeIf { node.elementType == KtNodeTypes.CHARACTER_CONSTANT }?.removeSurrounding("'")?.let { character ->
-        if (character.startsWith('\\')) characterEscapes[character] else character
+        when {
+            unicodeEscape.matches(character) -> character.drop(2).toInt(16).toChar().toString()
+            character.startsWith('\\') -> characterEscapes[character]
+            else -> character
+        }
     }
     is KtStringTemplateExpression -> if (hasInterpolation()) null else entries.joinToString("") { entry ->
         (entry as? KtEscapeStringTemplateEntry)?.unescapedValue ?: entry.text
@@ -891,6 +903,10 @@ private val characterEscapes = mapOf(
     "\\'" to "'", "\\\"" to "\"", "\\\\" to "\\", "\\$" to "$"
 )
 
+/** Like `\u0024` of `'\u0024'`. */
+private val unicodeEscape = Regex("\\\\u\\p{XDigit}{4}")
+
+/** The text without the comments and the line breaks, as each declaration of the preamble is a single line. */
 private fun PsiElement.singleLineText(): String = buildString {
     collectDescendantsOfType<PsiElement> { it.firstChild == null }.forEach { leaf ->
         +(if (leaf is PsiComment || leaf is PsiWhiteSpace) " " else leaf.text)

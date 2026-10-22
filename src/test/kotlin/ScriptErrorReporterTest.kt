@@ -70,12 +70,15 @@ class ScriptErrorReporterTest {
 
     class Box { companion object }
 
+    @Suppress("ClassName")
+    class _ScriptDependencies
+
     @Test
     fun `should report exception message naming only the classes declared in the script without the name of the script class`() {
         // given
         val name = ScriptErrorReporterTest::class.java.name
         val throwable = RuntimeException(
-            "$name.Color.RED, $name\$Box\$Companion@1f, $name.Cat, $name\$Cat, x$name.Color, ${name}x.Color"
+            "$name.Color.RED, $name\$Box\$Companion@1f, $name.Cat, $name\$Cat, $name\$_ScriptDependencies, x$name.Color, ${name}x.Color"
         ).apply { stackTrace = emptyArray() }
         val reporter = ScriptErrorReporter(ScriptSource("throw x"), scriptClassName = name, classLoader = javaClass.classLoader)
 
@@ -84,7 +87,7 @@ class ScriptErrorReporterTest {
 
         // then
         message sameAs
-                "java.lang.RuntimeException: Color.RED, Box.Companion@1f, $name.Cat, $name\$Cat, x$name.Color, ${name}x.Color"
+                "java.lang.RuntimeException: Color.RED, Box.Companion@1f, $name.Cat, $name\$Cat, $name\$_ScriptDependencies, x$name.Color, ${name}x.Color"
     }
 
     @Test
@@ -287,6 +290,21 @@ class ScriptErrorReporterTest {
               Caused by: java.lang.AssertionError: Non-mapped local declaration
               |     class <error>T</error> { fun f() = 1 }
         """.trimIndent()
+    }
+
+    @Test
+    fun `should report compiler backend crash without cause without intermediate representation`() {
+        // given
+        val reporter = ScriptErrorReporter(ScriptSource("inline fun map() = 1\nmap()"))
+        val crash = backendCrash("public final fun map (): kotlin.Int declared in kotlin.collections.CollectionsKt").let {
+            it.copy(exception = RuntimeException(it.message))
+        }
+
+        // when
+        val message = reporter.toFailureMessage(listOf(crash))
+
+        // then
+        message sameAs "error: Exception while generating code for public final fun map (): kotlin.Int declared in kotlin.collections.CollectionsKt"
     }
 
     /** Like the one reported by the compiler, followed by the intermediate representation of the [code]. */
