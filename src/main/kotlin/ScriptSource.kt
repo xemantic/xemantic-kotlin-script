@@ -224,6 +224,8 @@ internal const val SCRIPT_BLOCK_END = "} }"
  * Declarations are moved by blanking them out with spaces in one copy of their lines,
  * and everything else in the other, so the columns of the script are retained,
  * while each line of the [text] maps back to the line of the script.
+ *
+ * A script which cannot be turned into a block this way, see [isWrapped], is the [text] as it is.
  */
 internal class ScriptSource(
     source: String,
@@ -258,8 +260,27 @@ internal class ScriptSource(
 
     override val locationId: String
 
-    /** The first `}` closing the script block, which would otherwise end the script early. */
+    /** The first `}` closing nothing, which would close the script block, see [isWrapped]. */
     val unmatchedClosingBrace: ScriptPosition?
+
+    /**
+     * The innermost opening token left open at the end of the script, like `{`, `(`, `${'$'}{` or `"`, see [isWrapped],
+     * with its text as the name.
+     */
+    val unclosedOpening: ScriptReference?
+
+    /** The start of the block comment within the [unclosedOpening], which is not terminated, running to the end of the script. */
+    val unterminatedComment: ScriptPosition?
+
+    /**
+     * Whether the [text] is the script turned into a block, see [ScriptSource],
+     * unless the script has an [unmatchedClosingBrace], or an [unclosedOpening],
+     * where the code generated around the script body would be closed by the script, or would be swallowed or closed by it,
+     * misplacing the syntax errors.
+     * The [text] is the script alone then, as it is never valid, failing with the syntax errors of a regular script,
+     * and the script is not analyzed, without any moved declarations, nor candidates.
+     */
+    val isWrapped: Boolean
 
     /**
      * Whether the script ends with a declaration moved out of the script body, so it returns `Unit`,
@@ -311,7 +332,7 @@ internal class ScriptSource(
 
     private val lineStarts: List<Int>
 
-    /** For each line of the [text], the line of the script, or `null` for the lines of the block and the preamble. */
+    /** For each line of the [text], the line of the script, or `null` for the generated lines of the block and the preamble, see [isWrapped]. */
     private val lineMapping: List<Int?>
 
     /** The names of the dependencies, by the 0-based lines of the [text] declaring their accessors. */
@@ -328,30 +349,62 @@ internal class ScriptSource(
         lineStarts = lineBounds.map { it.first }
         scriptLines = lineBounds.map { script.substring(it.first, it.last + 1) }
         // the parser recognizes only `\n` as a line terminator, replacing each character keeps the offsets
-        val structure = ScriptStructure(
-            script.replace('\r', '\n'),
-            dependencies.mapTo(HashSet()) { it.name },
-            confirming,
-            shadowedFunctionCopies,
-            coroutineScopeCopies
-        )
-        unmatchedClosingBrace = structure.unmatchedClosingBrace?.let { position(it) }
-        movedDeclarations = structure.movedDeclarations
-        returnsUnit = structure.endsWithMovedDeclaration
-        conflictingDependencyDeclarations = structure.conflictingDependencyDeclarations.map { (name, range) ->
+        val normalized = script.replace('\r', '\n')
+        val lexed = lexScript(normalized)
+        unmatchedClosingBrace = (lexed as? LexedScript.UnmatchedClosingBrace)?.let { position(it.offset) }
+        val unclosed = lexed as? LexedScript.Unclosed
+        unclosedOpening = unclosed?.let {
+            ScriptReference(normalized.substring(it.opening.first, it.opening.last + 1), position(it.opening.first), position(it.opening.last + 1))
+        }
+        unterminatedComment = unclosed?.unterminatedComment?.let { position(it) }
+        // never valid, so not analyzed
+        val structure = (lexed as? LexedScript.Wrappable)?.let {
+            ScriptStructure(
+                normalized,
+                it.unterminatedComment,
+                dependencies.mapTo(HashSet()) { dependency -> dependency.name },
+                confirming,
+                shadowedFunctionCopies,
+                coroutineScopeCopies
+            )
+        }
+        isWrapped = structure != null
+        movedDeclarations = structure?.movedDeclarations.orEmpty()
+        returnsUnit = structure?.endsWithMovedDeclaration == true
+        conflictingDependencyDeclarations = structure?.conflictingDependencyDeclarations.orEmpty().map { (name, range) ->
             ScriptReference(name, position(range.first), position(range.last + 1))
         }
         fun Reference.toScriptReference() = ScriptReference(name, position(offset), position(offset + length))
         fun Triple<Reference, Int, Boolean>.toLaterDeclaredReference() = LaterDeclaredReference(
             first.toScriptReference(), position(second).line, third, first.isCallableReference, first.isOperator
         )
-        laterDeclaredDependencyCandidates = structure.laterDeclaredDependencyCandidates.map { it.toLaterDeclaredReference() }
-        hiddenLocalFunctionCandidates = structure.hiddenLocalFunctionCandidates.map { it.toLaterDeclaredReference() }
-        shadowedFunctionCandidates = structure.shadowedFunctionCandidates.map { (reference, property, function) ->
+        laterDeclaredDependencyCandidates = structure?.laterDeclaredDependencyCandidates.orEmpty().map { it.toLaterDeclaredReference() }
+        hiddenLocalFunctionCandidates = structure?.hiddenLocalFunctionCandidates.orEmpty().map { it.toLaterDeclaredReference() }
+        shadowedFunctionCandidates = structure?.shadowedFunctionCandidates.orEmpty().map { (reference, property, function) ->
             Triple(reference.toScriptReference(), position(property).line, position(function).line)
         }
-        coroutineScopeCandidates = structure.coroutineScopeCandidates.map { it.toLaterDeclaredReference() }
-        bodyDeclarations = structure.bodyDeclarations
+        coroutineScopeCandidates = structure?.coroutineScopeCandidates.orEmpty().map { it.toLaterDeclaredReference() }
+        bodyDeclarations = structure?.bodyDeclarations.orEmpty()
+        if (structure == null) {
+            text = scriptLines.joinToString(separator = "\n")
+            lineMapping = scriptLines.indices.toList()
+        } else {
+            val (lines, mapping) = wrap(script, lineBounds, structure, dependencies)
+            text = lines.joinToString(separator = "\n")
+            lineMapping = mapping
+        }
+        // unique, as the frames of the script are recognized by it, also among the frames of other scripts
+        @OptIn(ExperimentalAtomicApi::class)
+        locationId = "\$${sourceIdSeq.incrementAndFetch()}.kts"
+    }
+
+    /** The lines of the [text] turned into a block, see [ScriptSource], with their [lineMapping]. */
+    private fun wrap(
+        script: String,
+        lineBounds: List<IntRange>,
+        structure: ScriptStructure,
+        dependencies: List<PreambleDependency>
+    ): Pair<List<String>, List<Int?>> {
         val deprecatedDependencies = if (confirming) {
             laterDeclaredDependencyCandidates.mapTo(HashSet()) { it.reference.name }
         } else {
@@ -380,7 +433,7 @@ internal class ScriptSource(
         movedDeclarations.forEach { excluded.fill(true, it.start, it.end) }
         structure.blankedRanges.forEach { excluded.fill(true, it.first, it.last + 1) }
         val movedExcluded = BooleanArray(script.length)
-        // the comment runs to the end of the script, like in a regular script
+        // the comment runs to the end of the script, like in a regular script, while it would swallow the end of the script block
         structure.unterminatedComment?.let {
             excluded.fill(true, it, script.length)
             movedExcluded.fill(true, it, script.length)
@@ -389,7 +442,7 @@ internal class ScriptSource(
 
         val headerEnd = structure.headerEnd
         if (headerEnd > 0) {
-            addLines(0..lineOf(headerEnd - 1)) { it < headerEnd && !excluded[it] }
+            addLines(0..lineOf(headerEnd - 1)) { it < headerEnd && it < (structure.unterminatedComment ?: script.length) }
         }
         fun addAccessor(
             dependency: PreambleDependency
@@ -469,12 +522,7 @@ internal class ScriptSource(
         }
         lines += SCRIPT_BLOCK_END
         mapping += null
-
-        text = lines.joinToString(separator = "\n")
-        lineMapping = mapping
-        // unique, as the frames of the script are recognized by it, also among the frames of other scripts
-        @OptIn(ExperimentalAtomicApi::class)
-        locationId = "\$${sourceIdSeq.incrementAndFetch()}.kts"
+        return lines to mapping
     }
 
     /** The end of the last non-blank line, where the errors of the script block are reported. */
@@ -1021,6 +1069,8 @@ private class DeclaredNames {
  */
 private class ScriptStructure(
     private val script: String,
+    /** The start of the block comment ending the script unterminated at the top level, which would swallow the closing of the script block. */
+    val unterminatedComment: Int?,
     dependencyNames: Set<String>,
     /** Whether to compute the copies of the declarations, see [ScriptSource.confirming]. */
     confirming: Boolean,
@@ -1031,14 +1081,6 @@ private class ScriptStructure(
 ) {
 
     val headerEnd: Int
-
-    private val lexed = lexScript(script)
-
-    /** The offset of the first `}` closing the script block, which would otherwise end the script early. */
-    val unmatchedClosingBrace: Int? = lexed.unmatchedClosingBrace
-
-    /** The start of the block comment ending the script unterminated, which would swallow the closing of the script block. */
-    val unterminatedComment: Int? = lexed.unterminatedComment
 
     val movedDeclarations: List<Declaration>
 
@@ -1642,63 +1684,73 @@ private val enclosingOf = mapOf<IElementType, Set<IElementType>>(
     KtTokens.CLOSING_QUOTE to emptySet()
 )
 
-/** The offsets of the [ScriptStructure.unmatchedClosingBrace] and of the [ScriptStructure.unterminatedComment]. */
-private class LexedScript(
-    val unmatchedClosingBrace: Int?,
-    val unterminatedComment: Int?
-)
+/** How the script ends, recognized with the lexer, see [ScriptSource.isWrapped]. */
+private sealed interface LexedScript {
+
+    /** It can be wrapped, ending with the [unterminatedComment] at the top level, if any, see [ScriptStructure.unterminatedComment]. */
+    class Wrappable(val unterminatedComment: Int?) : LexedScript
+
+    /** See [ScriptSource.unmatchedClosingBrace]. */
+    class UnmatchedClosingBrace(val offset: Int) : LexedScript
+
+    /** See [ScriptSource.unclosedOpening] and [ScriptSource.unterminatedComment]. */
+    class Unclosed(val opening: IntRange, val unterminatedComment: Int?) : LexedScript
+
+}
 
 /**
  * Finds the first `}` closing the script block, which the script is wrapped in,
  * recognized with the lexer, as the parser of the script alone recovers from it differently,
- * and the block comment, or the KDoc, ending the script unterminated at the top level,
- * also when it closes only a nested comment, while within a block or a string it is a missing closing token.
+ * or the opening token left open at the end of the script,
+ * and the block comment, or the KDoc, ending the script unterminated,
+ * also when it closes only a nested comment.
  */
 private fun lexScript(
     script: String
 ): LexedScript {
     val lexer = KotlinLexer()
     lexer.start(script)
-    val opened = mutableListOf<IElementType>()
+    // the types and the ranges of the opening tokens
+    val opened = mutableListOf<Pair<IElementType, IntRange>>()
+    var unterminatedComment: Int? = null
     while (true) {
-        val type = lexer.tokenType ?: return LexedScript(null, null)
-        if (type in openingTokens) opened += type
+        val type = lexer.tokenType ?: return when (opened.isEmpty()) {
+            true -> LexedScript.Wrappable(unterminatedComment)
+            false -> LexedScript.Unclosed(opened.last().second, unterminatedComment)
+        }
+        if (type in openingTokens) opened += type to (lexer.tokenStart until lexer.tokenEnd)
         // ends the unterminated single-line string instead of the closing quote
         if (type == KtTokens.DANGLING_NEWLINE) {
-            val quote = opened.lastIndexOf(KtTokens.OPEN_QUOTE)
+            val quote = opened.indexOfLast { it.first == KtTokens.OPEN_QUOTE }
             if (quote >= 0) opened.subList(quote, opened.size).clear()
         }
         openingOf[type]?.let { closed ->
-            val opening = opened.lastIndexOf(closed)
-            val enclosing = opened.indexOfLast { it in enclosingOf.getValue(type) }
+            val opening = opened.indexOfLast { it.first == closed }
+            val enclosing = opened.indexOfLast { it.first in enclosingOf.getValue(type) }
             if (opening > enclosing) {
                 opened.subList(opening, opened.size).clear()
             } else if (type == KtTokens.RBRACE && enclosing == -1) {
-                return LexedScript(lexer.tokenStart, null)
+                return LexedScript.UnmatchedClosingBrace(lexer.tokenStart)
             }
         }
         if ((type == KtTokens.BLOCK_COMMENT || type == KtTokens.DOC_COMMENT) && lexer.tokenEnd == lexer.bufferEnd
-            && opened.isEmpty() && isUnterminatedComment(script, lexer.tokenStart)
+            && isUnterminatedComment(script.substring(lexer.tokenStart))
         ) {
-            return LexedScript(null, lexer.tokenStart)
+            unterminatedComment = lexer.tokenStart
         }
         lexer.advance()
     }
 }
 
-/** Whether the block comment starting at [start] is not closed, counting the nested comments like the lexer. */
+/**
+ * Whether the block [comment] ending the script is not terminated, also when it closes only a nested comment,
+ * as the lexer ends such a comment only at the end of the text, unlike the terminated one.
+ */
 private fun isUnterminatedComment(
-    script: String,
-    start: Int
+    comment: String
 ): Boolean {
-    var depth = 0
-    var offset = start
-    while (offset < script.length - 1) {
-        when {
-            script[offset] == '/' && script[offset + 1] == '*' -> { depth++; offset += 2 }
-            script[offset] == '*' && script[offset + 1] == '/' -> { depth--; offset += 2 }
-            else -> offset++
-        }
-    }
-    return depth > 0
+    val text = "$comment\n"
+    val lexer = KotlinLexer()
+    lexer.start(text)
+    return lexer.tokenEnd == text.length
 }

@@ -48,7 +48,12 @@ internal fun Iterable<ScriptDiagnostic>.filterNonIgnorable(
             "Loading modules:"
         ).any { diagnostic.message.startsWith(it) }
         ScriptDiagnostic.Severity.WARNING -> diagnostic.location?.let { source.isGeneratedLine(it.start.line) } == true
-        else -> false
+        // the parser of a regular script reports each token following the unmatched closing brace as unexpected
+        else -> source.unmatchedClosingBrace?.let { brace ->
+            diagnostic.location?.start?.let { start ->
+                source.toScriptPosition(start.line, start.col).let { it.line > brace.line || (it.line == brace.line && it.column > brace.column) }
+            }
+        } == true
     }
 }
 
@@ -68,9 +73,22 @@ internal class ScriptErrorReporter(
 
     fun toFailureMessage(
         diagnostics: List<ScriptDiagnostic>
-    ): String = diagnostics.describe().joinToString(separator = "\n").trimEnd().ifEmpty {
+    ): String = (diagnostics.describe() + listOfNotNull(unterminatedCommentHint())).joinToString(separator = "\n").trimEnd().ifEmpty {
         // e.g. when all the diagnostics of the failure were ignorable
         "error: Failed without any diagnostic message."
+    }
+
+    /**
+     * The block comment swallowing the rest of the script, see [ScriptSource.unterminatedComment],
+     * reported by the compiler as the missing closing tokens only, which might be within the comment.
+     */
+    private fun unterminatedCommentHint(): String? = source.unterminatedComment?.let { start ->
+        buildString {
+            appendPosition(start)
+            +"info: Unterminated block comment, running to the end of the script.\n"
+            appendSourceLines(start, start.copy(column = start.column + 2))
+            +"  hint: close the comment with '*/' - the tokens reported as missing might be within it.\n"
+        }
     }
 
     fun toFailureMessage(
@@ -94,10 +112,16 @@ internal class ScriptErrorReporter(
         buildString { appendDiagnostic(diagnostic) }
     }.distinct()
 
-    /** The failure recognized in the [source] before compiling it. */
+    /** The failure recognized in the [source] without the compilation reporting it, like the conflicting declarations. */
     fun toSourceFailureMessage(): String = source.unmatchedClosingBrace?.let {
-        // the brace would close the script block, misplacing all the errors
+        // the script alone compiled, contrary to the lexer, see [ScriptSource.isWrapped]
         toUnmatchedClosingBraceMessage(it)
+    } ?: source.unclosedOpening?.let { opening ->
+        buildString {
+            appendPosition(opening.start)
+            +"error: Syntax error: '${opening.name}' is not closed.\n"
+            appendSourceLines(opening.start, opening.end)
+        }.trimEnd()
     } ?: source.conflictingDependencyDeclarations.map { declaration ->
         buildString {
             appendPosition(declaration.start)
@@ -167,7 +191,7 @@ internal class ScriptErrorReporter(
         position: ScriptPosition
     ): String = buildString {
         appendPosition(position)
-        +"error: Syntax error: Unexpected '}' without matching '{'.\n"
+        +"error: $UNMATCHED_CLOSING_BRACE\n"
         appendSourceLines(position, position.copy(column = position.column + 1))
     }.trimEnd()
 
@@ -364,7 +388,18 @@ internal class ScriptErrorReporter(
             capturingDeclaration?.let { source.movedDeclarationName(it) }
         }
         range?.let { appendPosition(it.first) }
-        appendSeverityAndMessage(diagnostic)
+        appendSeverityAndMessage(
+            // more specific than the "Unexpected symbol" of the compiler, covering the brace,
+            // unlike e.g. the empty range of `Expecting ')'` of `foo(1}` at the same position
+            if (
+                range != null && range.first == source.unmatchedClosingBrace && range.second != range.first
+                && diagnostic.message.startsWith("Syntax error:")
+            ) {
+                diagnostic.copy(message = UNMATCHED_CLOSING_BRACE)
+            } else {
+                diagnostic
+            }
+        )
         if (range == null) return
         val (start, end) = range
         appendSourceLines(start, end)
@@ -458,6 +493,8 @@ internal class ScriptErrorReporter(
     }
 
 }
+
+private const val UNMATCHED_CLOSING_BRACE = "Syntax error: Unexpected '}' without matching '{'."
 
 /** Like in [StackTraceElement.toString], e.g. `Native Method`, instead of the negative line number. */
 private val StackTraceElement.source: String get() = when {

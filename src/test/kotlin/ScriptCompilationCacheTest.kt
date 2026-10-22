@@ -176,7 +176,7 @@ class ScriptCompilationCacheTest {
     }
 
     @Test
-    fun `should report unmatched closing brace of the script without compiling it`() = runTest {
+    fun `should report unmatched closing brace of the script without caching its failed compilation`() = runTest {
         // given
         val script = """
             42 }
@@ -198,7 +198,7 @@ class ScriptCompilationCacheTest {
                 """.trimIndent()
             }
         }
-        assert(executor.compilationCount == 0)
+        assert(executor.compilationCount == 2)
     }
 
     @Test

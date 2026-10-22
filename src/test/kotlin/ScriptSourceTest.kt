@@ -149,6 +149,46 @@ class ScriptSourceTest {
         // then
         assert(topLevelSources.none { "abc" in it.text })
         assert(nestedSources.all { "abc" in it.text })
+        assert((topLevel + nested).zip(topLevelSources + nestedSources).all { (script, source) ->
+            script.substringBefore("/*").lines().map { it.trim() }.filter { it.isNotEmpty() }.all { it in source.text }
+        })
+    }
+
+    @Test
+    fun `should not analyze structure of script which is not wrapped`() {
+        // given
+        val scripts = listOf(
+            "x\nA().y\nclass A {\n  val y = 1\n",
+            "x\nA().y\nclass A {\n  val y = 1\n}\n}\nval x = 2"
+        )
+        val dependencies = listOf(PreambleDependency("x", "val x: Int = 42"))
+
+        // when
+        val sources = scripts.map { ScriptSource(it, dependencies) }
+
+        // then
+        assert(sources.none { it.isWrapped })
+        assert(sources.all { it.movedDeclarationName("A") == null && it.laterDeclaredDependencyCandidates.isEmpty() })
+    }
+
+    @Test
+    fun `should not wrap script left unclosed at its end, which would swallow or be closed by generated code`() {
+        // given
+        val scripts = listOf(
+            "A().x\nclass A {\n  val x = 1\n  /* abc\n}",
+            "f()\nfun f(): Int {\n  /* abc\n  return 1\n}",
+            "val a = 5\n\"\${a",
+            "val a = 5\r\nval s = \"\"\"abc",
+            "listOf(1,\n/* abc"
+        )
+        val dependencies = listOf(PreambleDependency("x", "val x: Int = 42"))
+
+        // when
+        val sources = scripts.map { ScriptSource(it, dependencies) }
+
+        // then
+        assert(sources.zip(scripts).all { (source, script) -> source.text == script.replace("\r\n", "\n") })
+        assert(sources.none { source -> (1..source.scriptLines.size).any { source.isGeneratedLine(it) } })
     }
 
     @Test
