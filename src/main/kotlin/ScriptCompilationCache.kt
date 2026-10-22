@@ -30,6 +30,8 @@ import kotlin.reflect.KType
  */
 internal class ScriptCompilationCache<T : Any>(
     private val maxSize: Int,
+    /** Completes the [CompletableDeferred] of the compilation with its result, replaced only by the tests of resuming the waiting callers. */
+    private val resume: (CompletableDeferred<T?>, T) -> Unit = { entry, result -> entry.complete(result) },
     private val isReusable: (T) -> Boolean
 ) {
 
@@ -45,18 +47,32 @@ internal class ScriptCompilationCache<T : Any>(
         val dependencies: List<Pair<String, KType>>
     )
 
+    /** The compilation of a script, shared with the callers waiting for it. */
+    private class Entry<T : Any> {
+
+        /** Completed with `null` when the compiling caller was cancelled, or interrupted, or failed fatally. */
+        val result = CompletableDeferred<T?>()
+
+        /**
+         * Set while holding the lock of the [entries], once the compilation is done,
+         * before the waiting callers are resumed outside the lock, so it might be evicted in the meantime.
+         */
+        var isCompiled = false
+
+    }
+
     /**
-     * The compilations, completed with `null` when the compiling caller was cancelled, or interrupted,
-     * in the order of access, while the ones in progress are never evicted,
+     * The compilations in the order of access, while the ones in progress are never evicted,
      * so there might be more of them than the [maxSize].
      */
-    private val entries = LinkedHashMap<Key, CompletableDeferred<T?>>(16, 0.75f, true)
+    private val entries = LinkedHashMap<Key, Entry<T>>(16, 0.75f, true)
 
     /**
      * @param compile throws [CancellationException] only when its caller is cancelled,
      *   as the waiting callers would be cancelled by it as well,
      *   and [InterruptedException] only when the thread of its caller is interrupted,
-     *   after both of which the waiting callers compile again.
+     *   after both of which, as well as after a fatal error, see [isFatal], the waiting callers compile again,
+     *   while any other failure is shared with them.
      */
     suspend fun getOrCompile(
         key: Key,
@@ -68,44 +84,42 @@ internal class ScriptCompilationCache<T : Any>(
                 // evicting only once the compilation is reusable, so the failing ones do not evict the others
                 entries.getOrPut(key) {
                     owner = true
-                    CompletableDeferred()
+                    Entry()
                 }
             }
             if (!owner) {
-                // the compiling caller was cancelled, or interrupted, compile again
-                return entry.await() ?: continue
+                // the compiling caller was cancelled, or interrupted, or failed fatally, compile again
+                return entry.result.await() ?: continue
             }
-            try {
-                val result = compile()
-                synchronized(entries) {
-                    if (isReusable(result)) evict() else entries.remove(key, entry)
-                }
-                // outside the lock, as the waiting callers might be resumed in place
-                entry.complete(result)
-                return result
+            val result = try {
+                compile()
             } catch (e: Throwable) {
-                remove(key, entry)
-                // unlike the cancellation, or the interruption, of the caller, the failure of the compilation is shared
-                if (e is CancellationException || e is InterruptedException) entry.complete(null) else entry.completeExceptionally(e)
+                synchronized(entries) {
+                    entries.remove(key, entry)
+                }
+                if (e is CancellationException || e is InterruptedException || e.isFatal) {
+                    entry.result.complete(null)
+                } else {
+                    entry.result.completeExceptionally(e)
+                }
                 throw e
             }
+            synchronized(entries) {
+                entry.isCompiled = true
+                if (isReusable(result)) evict() else entries.remove(key, entry)
+            }
+            // outside the lock, as the waiting callers might be resumed in place,
+            // and outside the try, so that the failure of the one resumed in place, e.g. a fatal error, does not drop the cached compilation
+            resume(entry.result, result)
+            return result
         }
     }
 
-    /** Evicts the least recently used compilations, which are completed, while holding the lock of the [entries]. */
+    /** Evicts the least recently used compilations, which are done, while holding the lock of the [entries]. */
     private fun evict() {
         val iterator = entries.values.iterator()
         while (entries.size > maxSize && iterator.hasNext()) {
-            if (iterator.next().isCompleted) iterator.remove()
-        }
-    }
-
-    private fun remove(
-        key: Key,
-        entry: CompletableDeferred<T?>
-    ) {
-        synchronized(entries) {
-            entries.remove(key, entry)
+            if (iterator.next().isCompiled) iterator.remove()
         }
     }
 

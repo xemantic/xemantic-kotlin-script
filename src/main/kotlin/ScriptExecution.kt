@@ -20,6 +20,7 @@ package com.xemantic.kotlin.script
 
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
@@ -41,6 +42,7 @@ import kotlin.coroutines.CoroutineContext
 import kotlin.reflect.KClass
 import java.lang.reflect.Modifier
 import java.util.Collections
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.reflect.KFunction
 import kotlin.reflect.KVisibility
 import kotlin.reflect.full.extensionReceiverParameter
@@ -52,8 +54,10 @@ import kotlin.script.experimental.api.ResultWithDiagnostics
 import kotlin.script.experimental.api.ScriptCompilationConfiguration
 import kotlin.script.experimental.api.ScriptDiagnostic
 import kotlin.script.experimental.api.ScriptEvaluationConfiguration
+import kotlin.script.experimental.api.ScriptEvaluator
 import kotlin.script.experimental.api.defaultImports
 import kotlin.script.experimental.api.providedProperties
+import kotlin.script.experimental.jvm.BasicJvmScriptEvaluator
 import kotlin.script.experimental.jvm.baseClassLoader
 import kotlin.script.experimental.jvm.dependenciesFromClassloader
 import kotlin.script.experimental.jvm.jvm
@@ -93,7 +97,9 @@ internal class DefaultScriptExecutor(
     compilationCacheSize: Int = 0,
     maxConcurrentCompilations: Int = defaultMaxConcurrentCompilations(),
     /** Replaced only by the tests of the internal failures of the compiler. */
-    compiler: JvmScriptCompiler = JvmScriptCompiler()
+    compiler: JvmScriptCompiler = JvmScriptCompiler(),
+    /** Replaced only by the tests of the failures of the evaluator. */
+    evaluator: ScriptEvaluator = BasicJvmScriptEvaluator()
 ) : ScriptExecutor {
 
     private val logger = KotlinLogging.logger {}
@@ -136,7 +142,7 @@ internal class DefaultScriptExecutor(
      */
     private val compilationPermits = Semaphore(maxConcurrentCompilations)
 
-    private val scriptingHost = BasicJvmScriptingHost(compiler = compiler)
+    private val scriptingHost = BasicJvmScriptingHost(compiler = compiler, evaluator = evaluator)
 
     /**
      * The class loader the script is compiled against, also evaluating it,
@@ -146,26 +152,53 @@ internal class DefaultScriptExecutor(
         ?: DefaultScriptExecutor::class.java.classLoader
 
     /**
+     * Resolving the classpath, see [compilationConfigurationTemplate],
+     * `null` until the first compilation, or after the failure of the previous one.
+     */
+    private val classpathResolution = AtomicReference<Deferred<ScriptCompilationConfiguration?>?>()
+
+    /**
      * Built on the first compilation, on the [dispatcher], as resolving the whole classpath
      * would otherwise block the caller creating the executor, even if it never executes a script.
-     * The concurrent first compilations wait for it, holding their permits,
-     * while its failure, reported as an internal failure, is not kept,
+     * The concurrent first compilations wait for it suspended, without holding their permits, nor their threads,
+     * and share its failure, reported as an internal failure, which is not kept,
      * so the next compilation resolves the classpath again, as the failure might be transient.
+     * After a fatal error, see [isFatal], the waiting compilations resolve it again.
      */
-    private val compilationConfigurationTemplate by lazy {
-        ScriptCompilationConfiguration {
-            jvm {
-                dependenciesFromClassloader(
-                    classLoader = classLoader,
-                    wholeClasspath = true
-                )
-                // the default 1.8 target cannot inline functions of the classpath, e.g. `dependency(...)`
-                jvmTarget(scriptJvmTarget(System.getProperty("java.specification.version")))
+    private suspend fun compilationConfigurationTemplate(): ScriptCompilationConfiguration {
+        while (true) {
+            val resolution = CompletableDeferred<ScriptCompilationConfiguration?>()
+            val resolving = classpathResolution.compareAndExchange(null, resolution)
+            if (resolving != null) {
+                return resolving.await() ?: continue
             }
-            // the script body has a CoroutineScope receiver, so it can launch coroutines without imports
-            defaultImports(
-                "kotlinx.coroutines.*"
-            )
+            val template = try {
+                ScriptCompilationConfiguration {
+                    jvm {
+                        dependenciesFromClassloader(
+                            classLoader = classLoader,
+                            wholeClasspath = true
+                        )
+                        // the default 1.8 target cannot inline functions of the classpath, e.g. `dependency(...)`
+                        jvmTarget(scriptJvmTarget(System.getProperty("java.specification.version")))
+                    }
+                    // the script body has a CoroutineScope receiver, so it can launch coroutines without imports
+                    defaultImports(
+                        "kotlinx.coroutines.*"
+                    )
+                }
+            } catch (e: Throwable) {
+                classpathResolution.set(null)
+                // like the cache of the compilations, the cancellation, or the interruption, of the resolving caller is not shared
+                if (e is CancellationException || e is InterruptedException || e.isFatal) {
+                    resolution.complete(null)
+                } else {
+                    resolution.completeExceptionally(e)
+                }
+                throw e
+            }
+            resolution.complete(template)
+            return template
         }
     }
 
@@ -333,9 +366,8 @@ internal class DefaultScriptExecutor(
                 }
             }
         } catch (e: Throwable) {
+            // also causing the exception thrown by the compiler, like the one reported as a diagnostic
             e.rethrowIfCancelledOrFatal()
-            // like the compiler reporting it as a diagnostic
-            e.fatalCause()?.let { throw it }
             // with the interrupt status restored where it was caught, see compile(source)
             if (e is InterruptedException) throw e
             logger.warn(e) { "Script[$scriptId]: Compilation (1/2) failed internally" }
@@ -376,11 +408,30 @@ internal class DefaultScriptExecutor(
             compiled: Deferred<ResultWithDiagnostics<CompiledScript>>
         ): Compilation {
             val candidates = source.candidates
+            // the internal failures of the confirming compilations reported by the compiler, like its crash
+            val failures = Collections.synchronizedList(mutableListOf<ScriptDiagnostic>())
+            suspend fun confirming(
+                source: ScriptSource
+            ) = compile(source).also { result ->
+                result.reports.filterTo(failures) { it.severity == ScriptDiagnostic.Severity.ERROR && it.exception != null }
+            }
+            /**
+             * The [result] of the compilation of the script, unless it compiled, while a confirming compilation failed internally,
+             * as the references it would confirm would be silently resolved to the wrong declarations.
+             */
+            fun confirmed(
+                result: ResultWithDiagnostics<CompiledScript>
+            ): ResultWithDiagnostics<CompiledScript> {
+                if (result is Success) failures.firstOrNull()?.let { failure ->
+                    throw IllegalStateException(failure.message, failure.exception)
+                }
+                return result
+            }
             // the types of the local properties, which are known only to the compiler, see ScriptSource.untypedPropertyCalls
             val propertyTypes = if (source.untypedProperties.isEmpty()) emptyMap() else {
                 val typeProbes = parsed.source(propertyTypeProbes = true)
                 val unexpected = mutableListOf<String>()
-                val types = typeProbes.propertyTypes(compile(typeProbes).reports) { unexpected += it.message }
+                val types = typeProbes.propertyTypes(confirming(typeProbes).reports) { unexpected += it.message }
                 val (mismatches, others) = unexpected.partition { it.startsWith("Initializer type mismatch") }
                 // like after the upgrade of the compiler, changing the message naming the type
                 if (mismatches.isNotEmpty()) logger.warn { "Script[$scriptId]: Unexpected messages of the type probes: ${mismatches.joinToString(separator = "; ")}" }
@@ -392,7 +443,7 @@ internal class DefaultScriptExecutor(
             val probe = parsed.source(confirming = true, propertyTypes = propertyTypes)
             // only the calls of the properties of unknown types, which cannot be confirmed without their copies
             if (probe.copiedProperties.isEmpty() && candidates.all { it in source.untypedPropertyCalls }) {
-                return Compilation(source, compiled.await())
+                return Compilation(source, confirmed(compiled.await()))
             }
             /**
              * The positions, from the start to the end, if known, of the warnings of the deprecated,
@@ -416,7 +467,7 @@ internal class DefaultScriptExecutor(
                 source: ScriptSource,
                 message: String
             ) = markedRanges(source, message).map { it.first }
-            val reports = compile(probe).reports
+            val reports = confirming(probe).reports
             val result = compiled.await()
             // unless already reported as unresolved
             val errors = result.reports.filter { it.severity == ScriptDiagnostic.Severity.ERROR }.mapNotNull { diagnostic ->
@@ -472,7 +523,7 @@ internal class DefaultScriptExecutor(
                 ) = async {
                     if (candidates.isEmpty()) emptyList() else {
                         val source = copies()
-                        compile(source).reports.markedRanges(source, SHADOWED_FUNCTION).mapNotNull { (start, _, message) ->
+                        confirming(source).reports.markedRanges(source, SHADOWED_FUNCTION).mapNotNull { (start, _, message) ->
                             candidates.find { start in it.reference }?.let { candidate ->
                                 // naming the overload called in the script
                                 candidate.copy(functionLine = source.shadowedFunctionLine(message) ?: candidate.functionLine)
@@ -487,7 +538,7 @@ internal class DefaultScriptExecutor(
                 val scopeCopies = async {
                     if (confirmedCandidates.isEmpty() && source.laterDeclaredClassCandidates.isEmpty()) null else {
                         val copies = parsed.source(confirming = true, coroutineScopeCopies = true)
-                        copies to compile(copies).reports
+                        copies to confirming(copies).reports
                     }
                 }
                 shadowed.await() to scopeCopies.await()
@@ -519,7 +570,7 @@ internal class DefaultScriptExecutor(
             ) = references.takeIf { it.isNotEmpty() }?.let { reporter.toMessage(it) }
             return Compilation(
                 source,
-                result,
+                confirmed(result),
                 confirmedFailures = listOfNotNull(
                     // in the order of the script
                     message(
@@ -556,10 +607,12 @@ internal class DefaultScriptExecutor(
         ): ResultWithDiagnostics<CompiledScript> {
             compiledSources += source
             val result = try {
+                // resolving the classpath on the first compilation, which is not counted if it fails
+                val configuration = compilationConfig()
                 compilationPermits.withPermit {
-                    // resolving the classpath on the first compilation, which is not counted if it fails
-                    val configuration = compilationConfig()
-                    // not counting the callers cancelled while waiting for the permit
+                    // as a free permit is taken without checking it, e.g. by the confirming compilations of the cancelled caller,
+                    // not counting the callers cancelled while waiting for the permit, or for the classpath
+                    currentCoroutineContext().ensureActive()
                     @OptIn(ExperimentalAtomicApi::class)
                     compilations.incrementAndFetch()
                     scriptingHost.compiler(
@@ -602,6 +655,8 @@ internal class DefaultScriptExecutor(
                     evaluationResult.value.returnValue.toScriptResult(warnings)
                 }
                 is Failure -> {
+                    // e.g. while loading the script class
+                    evaluationResult.reports.firstNotNullOfOrNull { it.exception?.fatalCause() }?.let { throw it }
                     // in practice, this never happens
                     val failureMessage = reporter.toFailureMessage(
                         evaluationResult.reports.filterNonIgnorable()
@@ -645,7 +700,10 @@ internal class DefaultScriptExecutor(
             }
             // the script block closed early as well, followed by a statement of Unit type, or a declaration
             is ResultValue.Unit -> earlyClosedBlockError()
-            is ResultValue.Error -> failure(error, warnings, blockClassName = null)
+            is ResultValue.Error -> {
+                error.fatalCause()?.let { throw it }
+                failure(error, warnings, blockClassName = null)
+            }
             is ResultValue.NotEvaluated -> throw IllegalStateException(
                 "Should never happen"
             )
@@ -686,7 +744,7 @@ internal class DefaultScriptExecutor(
             )
         }
 
-        private fun compilationConfig() = ScriptCompilationConfiguration(compilationConfigurationTemplate) {
+        private suspend fun compilationConfig() = ScriptCompilationConfiguration(compilationConfigurationTemplate()) {
             providedProperties(
                 *(allDependencies.map { it.providedName to it.providedType }.toTypedArray())
             )
@@ -726,22 +784,23 @@ private class ContextClassLoader(
 }
 
 /**
- * Rethrows this exception, unless it is a failure of the script, or of its compilation:
- * the cancellation of the caller, or a [VirtualMachineError], after which, unlike after the [StackOverflowError],
- * the JVM might not be able to continue.
+ * Whether this exception is a [VirtualMachineError], after which, unlike after the [StackOverflowError],
+ * the JVM might not be able to continue, so it is not reported as a failure of the script, or of its compilation, but thrown.
+ */
+internal val Throwable.isFatal: Boolean
+    get() = this is VirtualMachineError && this !is StackOverflowError
+
+/**
+ * Rethrows this exception, if it is the cancellation of the caller, or its [fatalCause],
+ * neither of which is a failure of the script, or of its compilation.
  */
 private suspend fun Throwable.rethrowIfCancelledOrFatal() {
     if (this is CancellationException) currentCoroutineContext().ensureActive()
-    if (this is VirtualMachineError && this !is StackOverflowError) throw this
+    fatalCause()?.let { throw it }
 }
 
-/**
- * This exception, or its first cause, which is a [VirtualMachineError] other than [StackOverflowError],
- * see [rethrowIfCancelledOrFatal], if any.
- */
-private fun Throwable.fatalCause(): Throwable? = firstCause {
-    it is VirtualMachineError && it !is StackOverflowError
-}
+/** This exception, or its first cause, which [isFatal], if any. */
+private fun Throwable.fatalCause(): Throwable? = firstCause { it.isFatal }
 
 /**
  * Throws the [interruption] caught by this thread, restoring its interrupt status,

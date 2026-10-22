@@ -85,6 +85,11 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 - In a regular script, a constructor of a script class ranks below the receivers of the lambdas, including the script instance in `run { Foo(2) }`, and above the dependencies,
   while a local function of the block ranks above them all, see `ScriptSource.laterDeclaredClassCandidates`.
 
+- A `VirtualMachineError`, like the `OutOfMemoryError` the fatal error tests throw, escaping a test does not fail it, but aborts the whole Gradle test executor (`Could not complete execution for Gradle Test Executor`) —
+  catch it with `runCatching` and assert on it, also where only a regression would let it escape.
+- `runTest` fails on its timeout only once the test body can be cancelled: waiting in `withContext(dispatcher)` for a block queued behind blocked dispatcher threads never completes, so the regression hangs the build forever —
+  wait for such a block with a `CompletableDeferred` instead (see `onOtherThread` in `ScriptExecutorTest`).
+
 ## Anti-patterns to avoid
 
 - Inside a lambda walking a chain of exceptions in a `Throwable` extension, like `generateSequence(this) { read(null) { cause } }`,
