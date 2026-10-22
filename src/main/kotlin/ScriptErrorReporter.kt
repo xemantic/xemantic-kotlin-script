@@ -115,20 +115,6 @@ internal class ScriptErrorReporter(
         }
     }.trimEnd()
 
-    /** The [references] of the script body to the moved functions instead of the receivers, see [ScriptSource.receiverCallCandidates]. */
-    fun toReceiverCallMessage(
-        references: List<LaterDeclaredReference>
-    ): String = references.joinToString(separator = "\n") { call ->
-        val reference = call.reference
-        buildString {
-            appendPosition(reference.start)
-            +"error: '${reference.name}' refers to the function declared at line ${call.line + 1}, which is compiled outside of the script body, "
-            +"while a regular script calls the one of the receiver, as the function is declared later.\n"
-            appendSourceLines(reference.start, reference.end)
-            +"  hint: rename the function.\n"
-        }
-    }.trimEnd()
-
     /** The [references] of the script body to the local properties instead of the functions, see [ScriptSource.shadowedFunctionCandidates]. */
     fun toShadowedFunctionMessage(
         references: List<Triple<ScriptReference, Int, Int>>

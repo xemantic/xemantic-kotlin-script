@@ -134,6 +134,25 @@ class ScriptCompilationCacheTest {
     }
 
     @Test
+    fun `should compile the script calling functions before their declarations within lambdas, classes and extension functions once`() = runTest {
+        // given
+        val scripts = listOf(
+            "val l = mutableListOf<String>()\nlistOf(1, 2).forEach { l += show(it) }\nfun show(i: Int) = \"n\$i\"\nl",
+            "val r = listOf(1, 2).map { format(it) }.filter { valid(it) }\nfun format(i: Int) = \"#\$i\"\nfun valid(s: String) = s.isNotEmpty()\nr",
+            "val s = buildString { append(\"x\") }\nfun append(t: String) = t + \"!\"\nappend(s)",
+            "class A { fun f() = describe(1) }\nfun describe(i: Int) = \"n\$i\"\nA().f()",
+            "fun Int.twice() = double(this)\nfun double(i: Int) = i * 2\n3.twice()"
+        )
+        val executor = DefaultScriptExecutor()
+
+        // when
+        scripts.forEach { executor.execute(it) }
+
+        // then
+        assert(executor.compilationCount == scripts.size)
+    }
+
+    @Test
     fun `should compile the script on every execution by default`() = runTest {
         // given
         val script = """

@@ -3875,35 +3875,10 @@ class ScriptExecutorTest {
     }
 
     @Test
-    fun `should report call within lambda resolved on its receiver in the script to function moved out of the script body declared later`() = runTest {
-        // given
-        val script = """
-            val s = buildString { append("x") }
-            fun append(t: String) = t + "!"
-            append(s)
-        """.trimIndent()
-        val executor = ScriptExecutor()
-
-        // when
-        val result = executor.execute(script)
-
-        // then
-        // not silently returning "!", as a regular script returns "x!"
-        result should {
-            be<ScriptResult.Error>()
-            have(phase == ExecutionPhase.COMPILATION)
-            message sameAs """
-                script.kts:1:23: error: 'append' refers to the function declared at line 2, which is compiled outside of the script body, while a regular script calls the one of the receiver, as the function is declared later.
-                  | val s = buildString { <error>append</error>("x") }
-                  hint: rename the function.
-            """.trimIndent()
-        }
-    }
-
-    @Test
-    fun `should report calls resolved on receivers in the script to functions moved out of the script body declared later`() = runTest {
+    fun `should resolve calls on receivers before functions moved out of the script body referred to before their declarations like in the script`() = runTest {
         // given
         val scripts = listOf(
+            "val s = buildString { append(\"x\") }\nfun append(t: String) = t + \"!\"\nappend(s)",
             // an extension of the receiver
             "val r = with(listOf(1, 2)) { sum() }\nfun sum() = 10\nr",
             // within a local function declared before
@@ -3911,7 +3886,16 @@ class ScriptExecutorTest {
             // nested in a lambda without a receiver
             "val s = buildString { listOf(1).forEach { append(\"x\") } }\nfun append(t: String) = t + \"!\"\nappend(s)",
             // an inherited member of a local class
-            "open class Base { fun tag(t: String) = \"base\" + t }\nclass A : Base() { fun f() = tag(\"x\") }\nfun tag(t: String) = t + \"!\"\nA().f()"
+            "open class Base { fun tag(t: String) = \"base\" + t }\nclass A : Base() { fun f() = tag(\"x\") }\nfun tag(t: String) = t + \"!\"\nA().f()",
+            // overloads
+            "val s = buildString { append(\"x\") }\nfun append(i: Int) = \"\$i?\"\nfun append(t: String) = t + \"!\"\ns",
+            // also after the declaration, once referred to before it, with an inferred or a declared type
+            "val first = append(\"a\")\nfun append(t: String) = t + \"!\"\nfirst + \"|\" + buildString { append(\"x\") }",
+            "val first = append(\"a\")\nfun append(t: String): String = t + \"!\"\nfirst + \"|\" + buildString { append(\"x\") }",
+            // within a function referred to before its declaration
+            "val r = g()\nfun append(t: String) = t + \"!\"\nfun g() = buildString { append(\"x\") }\nr",
+            // also called by a declaration which cannot be local
+            "val s = buildString { append(\"x\") }\nfun append(t: String) = t + \"!\"\nsealed class S { fun f() = append(\"y\") }\nclass T : S()\ns + T().f()"
         )
         val executor = ScriptExecutor()
 
@@ -3919,8 +3903,26 @@ class ScriptExecutorTest {
         val results = scripts.map { executor.execute(it) }
 
         // then
-        // while a regular script returns 3, "x", "x!" and "basex"
-        assert(results.all { (it as? ScriptResult.Error)?.message?.contains("while a regular script calls the one of the receiver") == true })
+        // like in a regular script
+        assert(
+            results.map { (it as? ScriptResult.Value)?.value } == listOf("x!", 3, "x", "x!", "basex", "x", "a!|x", "a!|x", "x", "xy!")
+        )
+    }
+
+    @Test
+    fun `should execute nested calls of overloads of functions moved out of the script body within lambdas`() = runTest {
+        // given
+        val scripts = listOf(
+            "val r = listOf(1, 2).map { pick(twice(it)) }\nfun twice(i: Int) = i * 2\nfun pick(i: Int) = \"i\$i\"\nfun pick(s: String) = \"s\$s\"\nr",
+            "val r = listOf(1, 2).map { describe(wrap(it)) }\nfun wrap(i: Int) = listOf(i)\nfun describe(i: Int) = \"i\$i\"\nfun describe(l: List<Int>) = \"l\$l\"\nr"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(listOf("i2", "i4"), listOf("l[1]", "l[2]")))
     }
 
     @Test

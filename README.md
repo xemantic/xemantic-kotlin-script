@@ -82,10 +82,6 @@ when (result) {
 * A reference to a dependency preceding the declaration of a local property of the same name, like `x` in `fun show() = x` followed by `val x = 2`,
   or a call preceding the declaration of a local function of the same name,
   is reported as an error, as in a regular script it refers to the declaration.
-* A call within a lambda, a class or an extension function, preceding the declaration of a function compiled outside of the script body,
-  like `append` in `buildString { append("x") }` followed by `fun append(t: String) = t + "!"`,
-  is reported as an error, when it refers to the function, while a regular script resolves it on the receiver,
-  as the members and the extensions of the receivers are resolved before the functions declared later.
 * Scripts executed repeatedly, like an agent harness defined as a script, can skip the recompilation
   with `ScriptExecutor(compilationCacheSize = ...)`, keeping that many compiled scripts, the least recently used evicted first.
   A compiled script is reused when the script text, and the names and types of the dependencies are the same,
@@ -142,7 +138,10 @@ Most of these cases are reported as errors, while the following ones still resol
 * a call preceding a local class named like a callable dependency ([#31](https://github.com/xemantic/xemantic-kotlin-script/issues/31)),
 * a call from outside of the script body to a local property, whose function type is known only to the compiler, like `val print = printer()` ([#32](https://github.com/xemantic/xemantic-kotlin-script/issues/32)),
 * a call preceding a local function named like a callable dependency, which refers to a local class declared later ([#33](https://github.com/xemantic/xemantic-kotlin-script/issues/33)),
-* a call within a lambda to a function compiled outside of the script body, named like a function of its `CoroutineScope`, like `cancel` ([#44](https://github.com/xemantic/xemantic-kotlin-script/issues/44)).
+* a call within a lambda to a function compiled outside of the script body, named like a function of its `CoroutineScope`, like `cancel` ([#44](https://github.com/xemantic/xemantic-kotlin-script/issues/44)),
+* a call where a receiver might resolve it, like within a lambda, following the declaration of a function, which is called before its declaration only where the receivers resolve the calls instead,
+  like the second `append` in `buildString { append("x") }`, `fun append(t: String) = t + "!"`, `fun g() = buildString { append("y") }`,
+  as the function is resolved after the receivers, like when called before its declaration, while a regular script resolves it before them.
 
 Giving the declarations and the dependencies distinct names avoids them.
 
