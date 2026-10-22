@@ -150,4 +150,86 @@ class ScriptErrorReporterTest {
         """.trimIndent()
     }
 
+    @Test
+    fun `should report crash of the compiler in generated code without position and generated names`() {
+        // given
+        val source = ScriptSource("foo")
+        val location = "${source.locationId}:1:1"
+        val diagnostic = ScriptDiagnostic(
+            code = ScriptDiagnostic.unspecifiedError,
+            message = "While analysing $location: java.lang.IllegalStateException: Exception in expression checkers",
+            exception = RuntimeException(
+                "While analysing $location: java.lang.IllegalStateException: Exception in expression checkers",
+                IllegalStateException("Exception in expression checkers", IllegalArgumentException("Unexpected element at $location"))
+            )
+        )
+        val reporter = ScriptErrorReporter(source)
+
+        // when
+        val message = reporter.toCompilationFailureMessage(listOf(diagnostic))
+
+        // then
+        message sameAs """
+            error: The compiler failed internally: java.lang.IllegalStateException: Exception in expression checkers
+              Caused by: java.lang.IllegalArgumentException: Unexpected element at script.kts
+              hint: it is a failure of the compiler itself - express the script differently.
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report limited number of causes of internal failure`() {
+        // given
+        val throwable = (1..20).fold(null as Throwable?) { cause, index ->
+            RuntimeException("failure ${21 - index}", cause)
+        }!!
+
+        // when
+        val message = internalFailureMessage(throwable)
+
+        // then
+        message sameAs """
+            error: The script could not be compiled because of an internal failure: java.lang.RuntimeException: failure 1
+              Caused by: java.lang.RuntimeException: failure 2
+              Caused by: java.lang.RuntimeException: failure 3
+              Caused by: java.lang.RuntimeException: failure 4
+              Caused by: java.lang.RuntimeException: failure 5
+              Caused by: java.lang.RuntimeException: failure 6
+              Caused by: java.lang.RuntimeException: failure 7
+              Caused by: java.lang.RuntimeException: failure 8
+              [FURTHER CAUSES OMITTED]
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report circular causes of internal failure once`() {
+        // given
+        val first = RuntimeException("first")
+        val second = IllegalStateException("second", first)
+        first.initCause(second)
+
+        // when
+        val message = internalFailureMessage(first)
+
+        // then
+        message sameAs """
+            error: The script could not be compiled because of an internal failure: java.lang.RuntimeException: first
+              Caused by: java.lang.IllegalStateException: second
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report internal failure with multiline message indented`() {
+        // given
+        val throwable = IllegalStateException("Back-end failed\nFile being compiled: (1,1)")
+
+        // when
+        val message = internalFailureMessage(throwable)
+
+        // then
+        message sameAs """
+            error: The script could not be compiled because of an internal failure: java.lang.IllegalStateException: Back-end failed
+              File being compiled: (1,1)
+        """.trimIndent()
+    }
+
 }

@@ -29,6 +29,12 @@ private const val MAX_REPEATED_FRAMES = 16
 /** The most exceptions reported, including causes and suppressed ones, as the script might chain them endlessly. */
 private const val MAX_REPORTED_EXCEPTIONS = 32
 
+/** The most causes of an internal failure reported, as they tell little about the script. */
+private const val MAX_INTERNAL_FAILURE_CAUSES = 8
+
+/** The longest message of an internal failure reported, as it might carry a dump of the bytecode, or of the source. */
+private const val MAX_INTERNAL_FAILURE_MESSAGE_LENGTH = 500
+
 private val unresolvedReference = Regex("Unresolved reference '(.+)'\\.")
 
 /** Reported without a location, e.g. for an object accessing the dependencies, which are the members of the script class. */
@@ -57,7 +63,19 @@ internal class ScriptErrorReporter(
 
     fun toFailureMessage(
         diagnostics: List<ScriptDiagnostic>
-    ): String = diagnostics.describe().joinToString(separator = "\n").trimEnd().ifEmpty {
+    ): String = diagnostics.toFailureMessage(compilation = false)
+
+    /**
+     * Like [toFailureMessage], while the errors carrying an exception are the internal failures of the compiler,
+     * reported without its stack traces, and generated names.
+     */
+    fun toCompilationFailureMessage(
+        diagnostics: List<ScriptDiagnostic>
+    ): String = diagnostics.toFailureMessage(compilation = true)
+
+    private fun List<ScriptDiagnostic>.toFailureMessage(
+        compilation: Boolean
+    ): String = describe(compilation).joinToString(separator = "\n").trimEnd().ifEmpty {
         // e.g. when all the diagnostics of the failure were ignorable
         "error: Failed without any diagnostic message."
     }
@@ -79,9 +97,55 @@ internal class ScriptErrorReporter(
     }.trimEnd()
 
     /** The descriptions of the diagnostics, without the repeated ones, e.g. of the same type used twice in an accessor. */
-    private fun List<ScriptDiagnostic>.describe(): List<String> = map { diagnostic ->
-        buildString { appendDiagnostic(diagnostic) }
+    private fun List<ScriptDiagnostic>.describe(
+        compilation: Boolean = false
+    ): List<String> = map { diagnostic ->
+        buildString {
+            val exception = diagnostic.exception
+            if (compilation && exception != null && diagnostic.severity == ScriptDiagnostic.Severity.ERROR) {
+                appendCompilerFailure(diagnostic, exception)
+            } else {
+                appendDiagnostic(diagnostic)
+            }
+        }
     }.distinct()
+
+    /**
+     * The [exception] the compiler failed with internally, reported as the [diagnostic],
+     * like `While analysing $1.kts:6:15: ...: Exception in expression checkers`,
+     * at the position in the script, if the message refers to one.
+     */
+    private fun StringBuilder.appendCompilerFailure(
+        diagnostic: ScriptDiagnostic,
+        exception: Throwable
+    ) {
+        val generatedLocation = Regex(Regex.escape(source.locationId) + "(?::(\\d+):(\\d+))?")
+        // only the lines of the script, not the generated ones
+        fun MatchResult.position() = groups[1]?.let { line ->
+            source.toScriptLine(line.value.toInt())?.let {
+                ScriptPosition(it, (groupValues[2].toInt() - 1).coerceAtLeast(0))
+            }
+        }
+        val location = diagnostic.location
+        val position = if (location != null) {
+            source.toScriptLine(location.start.line)?.let { source.toScriptPosition(location.start.line, location.start.col) }
+        } else {
+            generatedLocation.find(diagnostic.message)?.position()
+        }
+        position?.let { appendPosition(it) }
+        +"error: The compiler failed internally: "
+        appendInternalFailure(exception) { message ->
+            message.replace(generatedLocation) { match ->
+                match.position()?.let { "script.kts:${it.line + 1}:${it.column + 1}" } ?: "script.kts"
+            }
+        }
+        if (position != null) {
+            appendSourceLines(position, position)
+            +"  hint: it is a failure of the compiler itself - express this code differently.\n"
+        } else {
+            +"  hint: it is a failure of the compiler itself - express the script differently.\n"
+        }
+    }
 
     /** The failure recognized in the [source] before compiling it. */
     fun toSourceFailureMessage(): String = source.unmatchedClosingBrace?.let {
@@ -461,6 +525,64 @@ internal class ScriptErrorReporter(
     }
 
 }
+
+/**
+ * The failure message of the [throwable] failing the compilation internally, rather than the error of the script,
+ * e.g. of the compiler, or of this library preparing the compilation.
+ */
+internal fun internalFailureMessage(
+    throwable: Throwable
+): String = buildString {
+    +"error: The script could not be compiled because of an internal failure: "
+    appendInternalFailure(throwable)
+}.trimEnd()
+
+/**
+ * The [throwable] and its causes, without their stack traces, which are internal,
+ * and without the ones just wrapping their causes, like the copies made by the coroutine stack trace recovery,
+ * with their messages bounded, and rewritten by the [rewrite], e.g. to replace the generated names.
+ */
+private fun StringBuilder.appendInternalFailure(
+    throwable: Throwable,
+    rewrite: (String) -> String = { it }
+) {
+    val visited = Collections.newSetFromMap<Throwable>(IdentityHashMap())
+    var reported = 0
+    var current: Throwable? = throwable
+    while (current != null && visited.add(current)) {
+        val cause = current.read(null) { cause }
+        val description = current.internalDescription()
+        // like `RuntimeException(cause)`, or `While analysing $1.kts:6:15: ` followed by the description of the cause
+        val isWrapper = cause != null && cause !in visited && cause.internalDescription() in description
+        if (!isWrapper) {
+            if (reported == MAX_INTERNAL_FAILURE_CAUSES) {
+                +"  [FURTHER CAUSES OMITTED]\n"
+                return
+            }
+            if (reported > 0) +"  Caused by: "
+            +current.javaClass.name
+            current.read(null) { message }?.let { message ->
+                +": "
+                val rewritten = rewrite(message).trimEnd()
+                val bounded = if (rewritten.length > MAX_INTERNAL_FAILURE_MESSAGE_LENGTH) {
+                    rewritten.take(MAX_INTERNAL_FAILURE_MESSAGE_LENGTH) + "... [TRUNCATED]"
+                } else {
+                    rewritten
+                }
+                bounded.lines().joinTo(this, "\n  ")
+            }
+            +'\n'
+            reported++
+        }
+        current = cause
+    }
+}
+
+/** The class name and the message, unless it cannot be read, as the exception might override it. */
+private fun Throwable.internalDescription(): String = listOfNotNull(
+    javaClass.name,
+    read(null) { message }
+).joinToString(": ")
 
 /** Like in [StackTraceElement.toString], e.g. `Native Method`, instead of the negative line number. */
 private val StackTraceElement.source: String get() = when {

@@ -97,7 +97,8 @@ public interface ScriptExecutor {
      * Note that cancellation cannot interrupt a blocking call of the script, like `Thread.sleep`.
      *
      * A failure of the compilation, even an internal one of the compiler, is reported as a [ExecutionPhase.COMPILATION] error,
-     * unless it is the cancellation of the caller, or a [VirtualMachineError] other than [StackOverflowError], which are thrown.
+     * unless it is the cancellation of the caller, a [VirtualMachineError] other than [StackOverflowError],
+     * or the [InterruptedException] of the interrupted thread compiling the script, with its interrupt status restored, which are thrown.
      *
      * @throws IllegalArgumentException if the [dependencies] have duplicate, or reserved, names.
      */

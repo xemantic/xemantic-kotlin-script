@@ -122,8 +122,8 @@ internal class DefaultScriptExecutor(
     }
 
     private val compilationCache = if (compilationCacheSize > 0) {
-        ScriptCompilationCache<Compilation>(compilationCacheSize) {
-            it.result is ResultWithDiagnostics.Success
+        ScriptCompilationCache<CompilationOutcome>(compilationCacheSize) {
+            it is Compilation && it.result is ResultWithDiagnostics.Success
         }
     } else {
         null
@@ -148,7 +148,7 @@ internal class DefaultScriptExecutor(
      * Built on the first compilation, on the [dispatcher], as resolving the whole classpath
      * would otherwise block the caller creating the executor, even if it never executes a script.
      * The concurrent first compilations wait for it, holding their permits,
-     * while its failure, reported as the internal failure of the compiler, is not kept,
+     * while its failure, reported as an internal failure, is not kept,
      * so the next compilation resolves the classpath again, as the failure might be transient.
      */
     private val compilationConfigurationTemplate by lazy {
@@ -202,6 +202,9 @@ internal class DefaultScriptExecutor(
         return result
     }
 
+    /** What compiling the script gives, shared with the callers waiting for it in the cache. */
+    private sealed interface CompilationOutcome
+
     /**
      * The [source] of the script, together with the [result] of its compilation,
      * or `null`, if the script was not compiled because of the failure recognized in its source.
@@ -213,7 +216,12 @@ internal class DefaultScriptExecutor(
         val confirmedFailures: List<String> = emptyList(),
         /** The positions of the errors of the compilation explained by the [confirmedFailures], which are omitted. */
         val explainedErrors: Set<ScriptPosition> = emptySet()
-    )
+    ) : CompilationOutcome
+
+    /** The compilation failed without giving a result, e.g. internally, reported with the failure [message]. */
+    private class FailedCompilation(
+        val message: String
+    ) : CompilationOutcome
 
     private inner class ScriptHandler(
         private val scriptId: Int,
@@ -235,24 +243,9 @@ internal class DefaultScriptExecutor(
         private val reporter by lazy { ScriptErrorReporter(source) }
 
         suspend fun handle(): ScriptResult {
-            val compilation = try {
-                compile()
-            } catch (_: StackOverflowError) {
-                // thrown by parsing the script, while the compiler reports it as a diagnostic
-                return ScriptResult.Error(
-                    "error: The script is nested too deeply to be parsed.",
-                    ExecutionPhase.COMPILATION
-                )
-            } catch (e: Throwable) {
-                e.rethrowIfCancelledOrFatal()
-                // the internal failure of the parser, or of the compiler, shared by the callers waiting in the cache
-                logger.warn(e) { "Script[$scriptId]: Compilation (1/2) failed internally" }
-                return ScriptResult.Error(
-                    "error: The script could not be compiled because of an internal failure of the compiler: "
-                            // the callers waiting in the cache receive the copy recovered by kotlinx.coroutines
-                            + e.unwrapRecoveredCopy().let { listOfNotNull(it, it.cause) }.joinToString(", caused by: "),
-                    ExecutionPhase.COMPILATION
-                )
+            val compilation = when (val outcome = compile()) {
+                is Compilation -> outcome
+                is FailedCompilation -> return compilationFailure(outcome.message)
             }
             source = compilation.source
             val compilationResult = compilation.result ?: return compilationFailure(
@@ -266,7 +259,7 @@ internal class DefaultScriptExecutor(
                             source.toScriptPosition(start.line, start.col) in compilation.explainedErrors
                         } == true
                     }?.takeIf { reports -> reports.any { it.severity == ScriptDiagnostic.Severity.ERROR } }?.let {
-                        reporter.toFailureMessage(it)
+                        reporter.toCompilationFailureMessage(it)
                     }
                 )).joinToString(separator = "\n\n")
                 return compilationFailure(failureMessage)
@@ -281,7 +274,7 @@ internal class DefaultScriptExecutor(
                     )
                 }
                 is Failure -> compilationFailure(
-                    reporter.toFailureMessage(compilationResult.reports.filterNonIgnorable())
+                    reporter.toCompilationFailureMessage(compilationResult.reports.filterNonIgnorable())
                 )
             }
 
@@ -297,7 +290,7 @@ internal class DefaultScriptExecutor(
             return ScriptResult.Error(failureMessage, ExecutionPhase.COMPILATION)
         }
 
-        private suspend fun compile(): Compilation {
+        private suspend fun compile(): CompilationOutcome {
 
             logger.debug { "Script[$scriptId]: Compiling (1/2)" }
 
@@ -308,11 +301,11 @@ internal class DefaultScriptExecutor(
                         script = script,
                         dependencies = allDependencies.map { it.name to it.type }
                     ),
-                    ::doCompile
-                ) ?: doCompile()
+                    ::compileOrFail
+                ) ?: compileOrFail()
             }
 
-            when (compilation.result) {
+            when ((compilation as? Compilation)?.result) {
                 is Success -> logger.debug {
                     "Script[$scriptId]: Compilation (1/2) succeeded after $duration"
                 }
@@ -324,10 +317,32 @@ internal class DefaultScriptExecutor(
             return compilation
         }
 
-        private suspend fun doCompile(): Compilation {
+        /**
+         * The [doCompile], or its internal failure, logged once, as it is shared with the callers waiting for it in the cache,
+         * unless it is the cancellation of the caller, or fatal, see [rethrowIfCancelledOrFatal],
+         * or the interruption of the thread, all of which are thrown.
+         */
+        private suspend fun compileOrFail(): CompilationOutcome = try {
+            doCompile()
+        } catch (e: Throwable) {
+            e.rethrowIfCancelledOrFatal()
+            // with the interrupt status restored where it was caught, see compile(source)
+            if (e is InterruptedException) throw e
+            logger.warn(e) { "Script[$scriptId]: Compilation (1/2) failed internally" }
+            FailedCompilation(internalFailureMessage(e))
+        }
+
+        private suspend fun doCompile(): CompilationOutcome {
             // the sources of all the compilations are derived from the script parsed once
-            val parsed = ScriptSource.Parsed(script, preambleDependencies)
-            val source = parsed.source()
+            val parsed: ScriptSource.Parsed
+            val source: ScriptSource
+            try {
+                parsed = ScriptSource.Parsed(script, preambleDependencies)
+                source = parsed.source()
+            } catch (_: StackOverflowError) {
+                // while the compiler reports it as a diagnostic, and its other failures are internal
+                return FailedCompilation("error: The script is nested too deeply to be parsed.")
+            }
             if (source.unmatchedClosingBrace != null || source.conflictingDependencyDeclarations.isNotEmpty()) {
                 return Compilation(source, result = null)
             }
@@ -543,9 +558,13 @@ internal class DefaultScriptExecutor(
                 // otherwise it would silently cancel the active caller, and the ones waiting in the cache, instead of failing them
                 currentCoroutineContext().ensureActive()
                 throw IllegalStateException("The compilation of the script was cancelled", e)
+            } catch (e: Throwable) {
+                e.interruption()?.let { throwRestoringInterruptStatus(it) }
+                throw e
             }
             // the compiler reports what it throws as a diagnostic, like `error: Java heap space`, not an error of the script
             result.reports.firstNotNullOfOrNull { it.exception?.fatalCause() }?.let { throw it }
+            result.reports.firstNotNullOfOrNull { it.exception?.interruption() }?.let { throwRestoringInterruptStatus(it) }
             return result
         }
 
@@ -706,14 +725,35 @@ private suspend fun Throwable.rethrowIfCancelledOrFatal() {
  * This exception, or its first cause, which is a [VirtualMachineError] other than [StackOverflowError],
  * see [rethrowIfCancelledOrFatal], if any.
  */
-private fun Throwable.fatalCause(): Throwable? = generateSequence(this) { exception ->
-    exception.read(null) { cause }?.takeUnless { it === exception }
-}.take(MAX_FATAL_CAUSE_DEPTH).firstOrNull {
+private fun Throwable.fatalCause(): Throwable? = firstCause {
     it is VirtualMachineError && it !is StackOverflowError
 }
 
+/** This exception, or its first cause, which is the [InterruptedException] of the interrupted thread, if any. */
+private fun Throwable.interruption(): InterruptedException? = firstCause {
+    it is InterruptedException
+} as InterruptedException?
+
+/**
+ * Throws the [interruption] caught by this thread, restoring its interrupt status,
+ * as the interruption, like on shutdown, is not a failure of the compilation.
+ */
+private fun throwRestoringInterruptStatus(
+    interruption: InterruptedException
+): Nothing {
+    Thread.currentThread().interrupt()
+    throw interruption
+}
+
+/** This exception, or its first cause, matching the [predicate], if any. */
+private fun Throwable.firstCause(
+    predicate: (Throwable) -> Boolean
+): Throwable? = generateSequence(this) { exception ->
+    exception.read(null) { cause }?.takeUnless { it === exception }
+}.take(MAX_CAUSE_DEPTH).firstOrNull(predicate)
+
 /** Bounds the chain of causes, which might be cyclic. */
-private const val MAX_FATAL_CAUSE_DEPTH = 100
+private const val MAX_CAUSE_DEPTH = 100
 
 /**
  * The original exception, if this one is its copy made by the coroutine stack trace recovery,
