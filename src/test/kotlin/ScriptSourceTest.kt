@@ -160,6 +160,24 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should find body declaration of reference indexed or iterated named like its operator`() {
+        // given
+        val script = """
+            val get = listOf(1)
+            val next = listOf(1)
+            val x = get[0]
+            for (y in next) println(y)
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        assert(source.bodyDeclarationLine("get", ScriptPosition(2, 8)) == (0 to DeclarationKind.PROPERTY))
+        assert(source.bodyDeclarationLine("next", ScriptPosition(3, 10)) == (1 to DeclarationKind.PROPERTY))
+    }
+
+    @Test
     fun `should find body declaration only of the kinds the reference might refer to`() {
         // given
         val script = """

@@ -3988,6 +3988,46 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report unresolved reference indexed or iterated before its declaration, named like its operator`() = runTest {
+        // given
+        val scripts = listOf(
+            """
+            val k = "a".length
+            val x = get[0]
+            val get = listOf(k)
+            x
+            """,
+            """
+            val k = "a".length
+            for (x in next) println(x)
+            val next = listOf(k)
+            """
+        ).map { it.trimIndent() }
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        results[0] should {
+            be<ScriptResult.Error>()
+            have("""
+                script.kts:2:9: error: Unresolved reference 'get'.
+                  | val x = <error>get</error>[0]
+                  hint: 'get' is declared at line 3, while the properties of the script body are visible only after their declaration - move it before line 2.
+            """.trimIndent() in message)
+        }
+        results[1] should {
+            be<ScriptResult.Error>()
+            have("""
+                script.kts:2:11: error: Unresolved reference 'next'.
+                  | for (x in <error>next</error>) println(x)
+                  hint: 'next' is declared at line 3, while the properties of the script body are visible only after their declaration - move it before line 2.
+            """.trimIndent() in message)
+        }
+    }
+
+    @Test
     fun `should report unresolved type declared later as local class named like preceding local function`() = runTest {
         // given
         val scripts = listOf(
@@ -4994,6 +5034,55 @@ class ScriptExecutorTest {
                 script.kts:1:16: error: Enum entry 'X' captures the script class instance. Try to use class or anonymous object instead.
                   | enum class E { <error>X</error> { override fun f() = input }; abstract fun f(): String }
                   hint: 'X' is compiled outside of the script body, where an enum entry cannot access the dependencies, nor the functions of the script - pass them as parameters.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at each class capturing the script class instance named like one of another kind`() = runTest {
+        // given
+        val scripts = listOf(
+            """
+            class A { class Factory { fun f() = input } }
+            object Factory { fun g() = input }
+            A.Factory().f() + Factory.g()
+            """,
+            """
+            class P { object A { fun f() = input } }
+            class Q { class A { fun g() = input } }
+            P.A.f() + Q.A().g()
+            """
+        ).map { it.trimIndent() }
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, listOf(dependency("input", "abc"))) }
+
+        // then
+        results[0] should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:17: error: Nested class 'Factory' captures the script class instance. Try to use the explicit 'inner' modifier for both the nested 'Factory' and outer 'A'.
+                  | class A { class <error>Factory</error> { fun f() = input } }
+                  hint: 'Factory' is compiled outside of the script body, where a nested class cannot access the dependencies, nor the functions of the script - pass them as parameters.
+
+                script.kts:2:8: error: Object 'Factory' captures the script class instance. Try to use class or anonymous object instead.
+                  | object <error>Factory</error> { fun g() = input }
+                  hint: 'Factory' is compiled outside of the script body, where an object cannot access the dependencies, nor the functions of the script - declare it as a class, or pass them as parameters.
+            """.trimIndent()
+        }
+        results[1] should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:18: error: Object 'A' captures the script class instance. Try to use class or anonymous object instead.
+                  | class P { object <error>A</error> { fun f() = input } }
+                  hint: 'A' is compiled outside of the script body, where an object cannot access the dependencies, nor the functions of the script - declare it as a class, or pass them as parameters.
+
+                script.kts:2:17: error: Nested class 'A' captures the script class instance. Try to use the explicit 'inner' modifier for both the nested 'A' and outer 'Q'.
+                  | class Q { class <error>A</error> { fun g() = input } }
+                  hint: 'A' is compiled outside of the script body, where a nested class cannot access the dependencies, nor the functions of the script - pass them as parameters.
             """.trimIndent()
         }
     }

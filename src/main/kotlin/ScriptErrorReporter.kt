@@ -460,8 +460,8 @@ internal class ScriptErrorReporter(
             }?.takeIf { it >= start } ?: start
             start to end
         } else {
-            capturingDeclaration?.let { name ->
-                capturingOccurrence?.let { (index, count) -> source.movedClassName(name, index, count) }
+            capturing?.let { (_, kind, name) ->
+                capturingOccurrence?.let { (index, count) -> source.movedClassName(kind, name, index, count) }
             }?.let { (declared, start, end) ->
                 // like `Factory`, which the compiler calls `Companion`
                 capturingDeclaration = declared

@@ -561,20 +561,23 @@ internal class ScriptSource(
 
     /**
      * The name in the script, the start and the end of the name of the class moved out of the script body, or nested in one,
-     * reported by the [index]th of the [count] diagnostics without a location naming the class like the compiler,
+     * reported by the [index]th of the [count] diagnostics without a location naming the class and its [kind] like the compiler,
      * without the enclosing classes, and a companion object as `Companion`, also when named.
      * The classes of the [name] are told by their order, counting only the ones referring to the members of the script class,
      * like the dependencies, as only these capture the script class instance, if there are enough of them,
      * otherwise all of them, as the compiler reports also e.g. a companion object calling its own function named like a function of the script.
      */
     fun movedClassName(
+        kind: String,
         name: String,
         index: Int,
         count: Int
     ): Triple<String, ScriptPosition, ScriptPosition>? {
-        val classes = movedDeclarations.flatMap { it.classNames }.filter {
+        val namedClasses = movedDeclarations.flatMap { it.classNames }.filter {
             if (name == "Companion") it.isCompanion || it.name == name else it.name == name && !it.isCompanion
         }
+        // all of them, if the kind is not recognized, like of a kind added by another compiler version
+        val classes = namedClasses.filter { it.kind == kind }.ifEmpty { namedClasses }
         val candidates = classes.filter { it.refersToScript }.takeIf { it.size >= count } ?: classes
         return (candidates.getOrNull(index) ?: candidates.lastOrNull())?.let {
             Triple(it.name ?: name, position(it.range.first), position(it.range.last + 1))
@@ -709,6 +712,8 @@ private class Declaration(
 private class ClassName(
     val name: String?,
     val isCompanion: Boolean,
+    /** The kind of the class as the compiler names it in the diagnostics, like `Object`, `Interface`, `Enum class`, `Enum entry`, or `Nested class`. */
+    val kind: String,
     val range: IntRange,
     /**
      * Whether it refers to the members of the script class by their names, outside of its nested classes, so it might capture the script class instance,
@@ -1336,7 +1341,8 @@ private class ScriptStructure(
 
     /**
      * The kinds of the declarations of the script body, which the references of the script body might refer to, see [Reference.referredKinds],
-     * by their offsets and names, as an operator, like `get` of `a[i]`, starts where its operand does.
+     * by their offsets and names, as an operator, like `get` of `a[i]`, starts where its operand does,
+     * which takes precedence, when named like the operator, like `get` of `get[i]`.
      */
     val referredKinds: Map<Pair<Int, String>, List<DeclarationKind>>
 
@@ -1410,7 +1416,7 @@ private class ScriptStructure(
             declarationsByPsi[statement]?.references ?: statement.references(scope = statement.parent, declaredNames)
         }
         val bodyReferences = statementReferences.flatten()
-        referredKinds = bodyReferences.associate { (it.offset to it.name) to it.referredKinds() }
+        referredKinds = bodyReferences.sortedByDescending { it.isOperator }.associate { (it.offset to it.name) to it.referredKinds() }
         // also the ones moved out of the script body, which are the members of the script class
         val scriptProperties = declarations.filter { it.kind == DeclarationKind.PROPERTY }
         // by the offsets of their names, also of the entries of a destructuring declaration
@@ -1752,6 +1758,13 @@ private class ScriptStructure(
                     ClassName(
                         name = declaration.name,
                         isCompanion = isCompanion,
+                        kind = when {
+                            declaration is KtEnumEntry -> "Enum entry"
+                            declaration is KtObjectDeclaration -> "Object"
+                            declaration is KtClass && declaration.isInterface() -> "Interface"
+                            declaration is KtClass && declaration.isEnum() -> "Enum class"
+                            else -> "Nested class"
+                        },
                         range = nameElement.startOffset until nameElement.endOffset,
                         refersToScript = references.any { reference ->
                             reference.offset in range && nestedRanges.none { reference.offset in it } && refersToScript(reference)
