@@ -87,6 +87,10 @@ when (result) {
   Such a call within the lambda of a scope function receiving the script instance, which calls the dependency in a regular script,
   is recognized only for an unqualified `run`, `apply`, `runCatching` or `with`, while e.g. `kotlin.with(this) { Foo(2) }`,
   or a scope function declared by the script, is reported as well.
+* A call preceding the declaration of a local function of its name, like `print("x")` followed by `fun print(x: Any)`,
+  which calls another function instead, like `print` of the standard library, or fails, like an operator resolved to the `CoroutineScope`,
+  is reported as an error, if the local function applies, as in a regular script it calls the local function,
+  unless the call is resolved to a member of a receiver, like `append` in `buildString { append("x") }`, as in a regular script.
 * Scripts executed repeatedly, like an agent harness defined as a script, can skip the recompilation
   with `ScriptExecutor(compilationCacheSize = ...)`, keeping that many compiled scripts, the least recently used evicted first.
   A compiled script is reused when the script text, and the names and types of the dependencies are the same,
@@ -135,6 +139,8 @@ Most of these cases are reported as errors, while the following ones still resol
   or when the property is assigned after its declaration, like `val print: Printer` followed by `print = Printer()`,
   or when another statement follows the property on the same line ([#32](https://github.com/xemantic/xemantic-kotlin-script/issues/32)),
 * a call preceding a local function named like a callable dependency, which refers to a local class declared later ([#33](https://github.com/xemantic/xemantic-kotlin-script/issues/33)),
+* a call preceding a local function, which compiles, when another local function of its name is visible already,
+  or when it is within a lambda, a class, or an extension function, while the local function refers to a local class, or is named like a function of its `CoroutineScope`, like `run { V(1) + V(2) }` calling another `plus` before `operator fun V.plus(o: V)` ([#51](https://github.com/xemantic/xemantic-kotlin-script/issues/51)),
 * a call within a lambda to a property compiled outside of the script body, named like a function of its `CoroutineScope`, whose function type is known only to the compiler, like `val launch get() = launcher()` ([#44](https://github.com/xemantic/xemantic-kotlin-script/issues/44)).
 
 Giving the declarations and the dependencies distinct names avoids them.

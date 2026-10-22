@@ -519,6 +519,21 @@ internal class DefaultScriptExecutor(
                     (candidate.isOperator && candidate.invokedValue == null) || (start to (candidate.invokedValue ?: candidate.reference.name)) !in unresolved
                 }?.let { candidate -> hidden.putIfAbsent(candidate, hiddenLocalFunctionLine(message)) }
             }
+            // the calls of the local functions declared later, which apply, recognized also by the copies of the hidden local functions,
+            // unless already reported as unresolved, see ScriptSource.laterDeclaredFunctionCandidates
+            val laterFunctionWarnings = reports.markedRanges(probe, LATER_DECLARED_LOCAL_FUNCTION) + hiddenWarnings
+            val laterDeclaredFunctionReferences = source.laterDeclaredFunctionCandidates.mapNotNull { candidate ->
+                val name = candidate.reference.name
+                laterFunctionWarnings.firstOrNull { (start, _, message) ->
+                    start in candidate.reference && (laterDeclaredFunctionMessage(name) in message || hiddenLocalFunctionMessage(name) in message)
+                }?.takeIf {
+                    (candidate.reference.start to name) !in unresolved
+                            && (!candidate.isConfirmedOnlyWhenFailing || errors.any { it in candidate.reference })
+                }?.let { (_, _, message) ->
+                    // naming the overload called in the script
+                    candidate.copy(line = probe.laterDeclaredFunctionLine(message) ?: hiddenLocalFunctionLine(message) ?: candidate.line)
+                }
+            }
             // the references not resolved to the moved declarations, unless already reported as errors
             val toDeclarations = deprecated(COROUTINE_SCOPE_ORIGINAL)
             val coroutineScopeReferences = source.coroutineScopeCandidates.filter { candidate ->
@@ -606,13 +621,14 @@ internal class DefaultScriptExecutor(
                         ScriptErrorReporter::toShadowedFunctionMessage
                     ),
                     message(hiddenLocalFunctionReferences, ScriptErrorReporter::toHiddenLocalFunctionMessage),
+                    message(laterDeclaredFunctionReferences, ScriptErrorReporter::toLaterDeclaredFunctionMessage),
                     message(laterDeclaredDependencyReferences, ScriptErrorReporter::toLaterDeclaredDependencyMessage)
                 ),
                 // the errors of the calls resolved to the dependency instead, like `No value passed for parameter 'p1'` of `log()`,
                 // see ScriptSource.calledInsteadDependencies
                 explainedErrors = hiddenLocalFunctionReferences.filter {
                     it.reference.name in source.calledInsteadDependencies
-                }.mapTo(HashSet()) { it.reference.start }
+                }.mapTo(HashSet()) { it.reference.start } + laterDeclaredFunctionReferences.map { it.reference.start }
             )
         }
 

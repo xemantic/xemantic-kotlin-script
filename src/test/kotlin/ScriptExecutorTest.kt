@@ -4382,6 +4382,118 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report error at call preceding local function named like library function`() = runTest {
+        // given
+        val script = """
+            val prefix = ">".trim()
+            print("raw\n")
+            fun print(x: Any) = kotlin.io.print("${'$'}prefix${'$'}x")
+            print("1\n")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:1: error: 'print' does not refer to the function of the script body declared at line 3, which is not visible before its declaration.
+                  | <error>print</error>("raw\n")
+                  hint: 'print' is declared at line 3, while the functions of the script body are visible only after their declaration - move it before line 2.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at operator preceding local operator function instead of resolving it to coroutine scope`() = runTest {
+        // given
+        val script = """
+            val p = "0".toInt()
+            data class V(val x: Int)
+            val r = V(1) + V(2)
+            operator fun V.plus(o: V) = V(x + o.x + p)
+            r.x
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:14: error: 'plus' does not refer to the function of the script body declared at line 4, which is not visible before its declaration.
+                  | val r = V(1) <error>+</error> V(2)
+                  hint: 'plus' is declared at line 4, while the functions of the script body are visible only after their declaration - move it before line 3.
+
+                script.kts:5:3: error: Unresolved reference 'x' on receiver of type 'CoroutineScope'.
+                  | r.<error>x</error>
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at calls preceding local functions named like library functions`() = runTest {
+        // given
+        val scripts = listOf(
+            // returning another value
+            "val p = \"9\".toInt()\nval r = listOf(1)\nfun listOf(x: Int) = kotlin.collections.listOf(x, p)\nr",
+            // an extension function, called on a receiver
+            "val p = \"0\".toInt()\nval r = listOf(1, 2).sum()\nfun List<Int>.sum() = 100 + p\nr",
+            // within a lambda without a receiver
+            "val p = \"0\".toInt()\nval r = listOf(1, 2).map { maxOf(it, 5) }\nfun maxOf(a: Int, b: Int) = a + b + p\nr",
+            // within a lambda with a receiver, which does not declare it
+            "val p = \"9\".toInt()\nval r = run { listOf(3) }\nfun listOf(x: Int) = kotlin.collections.listOf(x, p)\nr",
+            // within a local class
+            "val p = \"0\".toInt()\nclass Foo { fun bar() = maxOf(1, 2) }\nval r = Foo().bar()\nfun maxOf(a: Int, b: Int) = a + b + p\nr",
+            // within a local function
+            "val p = \"9\".toInt()\nfun f() = listOf(1)\nval r = f()\nfun listOf(x: Int) = kotlin.collections.listOf(x, p)\nr",
+            // an operator of a local class, failing within a lambda
+            "val p = \"0\".toInt()\ndata class V(val x: Int)\nval r = run { V(1) + V(2) }\noperator fun V.plus(o: V) = V(x + o.x + p)\nr.x"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.first() } == listOf(
+            "script.kts:2:9: error: 'listOf' does not refer to the function of the script body declared at line 3, which is not visible before its declaration.",
+            "script.kts:2:22: error: 'sum' does not refer to the function of the script body declared at line 3, which is not visible before its declaration.",
+            "script.kts:2:28: error: 'maxOf' does not refer to the function of the script body declared at line 3, which is not visible before its declaration.",
+            "script.kts:2:15: error: 'listOf' does not refer to the function of the script body declared at line 3, which is not visible before its declaration.",
+            "script.kts:2:25: error: 'maxOf' does not refer to the function of the script body declared at line 4, which is not visible before its declaration.",
+            "script.kts:2:11: error: 'listOf' does not refer to the function of the script body declared at line 4, which is not visible before its declaration.",
+            "script.kts:3:20: error: 'plus' does not refer to the function of the script body declared at line 4, which is not visible before its declaration."
+        ))
+    }
+
+    @Test
+    fun `should execute calls preceding local functions like regular script when they do not apply or receivers resolve them`() = runTest {
+        // given
+        val scripts = listOf(
+            // the member of the receiver of the lambda takes precedence
+            "val p = \"1\".toInt()\nval r = buildString { append(\"x\") }\nfun append(s: String): StringBuilder = throw Exception(\"local ${'$'}p\")\nr",
+            // the local function does not apply
+            "val p = \"1\".toInt()\nval r = listOf(\"a\")\nfun listOf(x: Int) = kotlin.collections.listOf(x, p)\nr",
+            // the member of a local class takes precedence over the extension operator
+            "val p = \"0\".toInt()\ndata class V(val x: Int) { operator fun plus(o: V) = V(x * o.x) }\nval r = V(2) + V(3)\noperator fun V.plus(o: V) = V(x + o.x + p)\nr.x"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("x", listOf("a"), 6))
+    }
+
+    @Test
     fun `should report error at reference to dependency before local property of the same name despite suppressed deprecation error`() = runTest {
         // given
         val scripts = listOf(
