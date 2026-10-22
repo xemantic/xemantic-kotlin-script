@@ -4006,7 +4006,12 @@ class ScriptExecutorTest {
             "val factor = 2\nval r = listOf(1, 2).map { scale(it) }\nfun scale(i: Int) = i * factor\nr + scale(3)",
             // also called after its declaration where a receiver resolves the call, local like in the script
             "val k = \"!\"\nval s = buildString { append(\"x\") }\nfun append(t: String) = t + k\nval u = buildString { append(\"y\") }\ns + \"|\" + u",
-            "val k = 10\nval a = with(listOf(1, 2)) { sum() }\nfun sum() = k\nval b = with(listOf(5)) { sum() }\n\"${'$'}a|${'$'}b\""
+            "val k = 10\nval a = with(listOf(1, 2)) { sum() }\nfun sum() = k\nval b = with(listOf(5)) { sum() }\n\"${'$'}a|${'$'}b\"",
+            // also after its declaration within classes without members of the same name
+            "val k = \"!\"\nval s = buildString { append(\"x\") }\nfun append(t: String) = t + k\nsealed class S { fun f() = append(\"y\") }\nclass T : S()\ns + T().f()",
+            "val k = 1\nval r = run { twice(3) }\nfun twice(i: Int) = i * k\nsealed class S { fun h() = twice(1) }\nclass T : S()\nr + T().h()",
+            // inheriting a member of the same name from a class of the script
+            "val k = \"!\"\nval s = buildString { append(\"x\") }\nfun append(t: String) = t + k\nopen class B { fun append(t: String) = \"b\" + t }\nclass C : B() { fun f() = append(\"y\") }\ns + C().f()"
         )
         val executor = ScriptExecutor()
 
@@ -4015,7 +4020,7 @@ class ScriptExecutorTest {
 
         // then
         // like in a regular script
-        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(6, listOf("n1!"), listOf(2, 4, 6), "x|", "3|10"))
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(6, listOf("n1!"), listOf(2, 4, 6), "x|", "3|10", "xy!", 4, "xy!"))
     }
 
     @Test
@@ -4032,7 +4037,15 @@ class ScriptExecutorTest {
             "val k = 10\nclass A { fun f() = g(); fun g() = 1 }\nfun g() = k\nval r = with(A()) { g() }\nA().f() + r",
             "val k = \"!\"\nclass A { fun f() = append(\"q\"); fun append(t: String) = t }\nfun append(t: String) = t + k\nval u = buildString { append(\"y\") }\nu + \"|\" + A().f()",
             // not applicable, so resolved to the function
-            "class A { fun f() = tag(1); fun tag(t: String) = \"member\" + t }\nfun tag(t: Int) = \"${'$'}t!\"\nA().f() + tag(2)"
+            "class A { fun f() = tag(1); fun tag(t: String) = \"member\" + t }\nfun tag(t: Int) = \"${'$'}t!\"\nA().f() + tag(2)",
+            // also after the declaration within classes without members of the same name
+            "class A { fun f() = g(); fun g() = 1 }\nfun g() = \"s\"\nsealed class S { fun h() = g() }\nclass T : S()\nT().h()",
+            "class A { fun f() = g(); fun g() = 1 }\nfun g() = \"s\"\nsealed class S\nclass T : S() { fun t() = g() }\nT().t()",
+            "val k = 10\nclass A { fun f() = g(); fun g() = 1 }\nfun g() = k\nsealed class S { fun h() = g() }\nclass T : S()\nA().f() + T().h()",
+            // with a declared return type, resolved after the receivers also after the declaration
+            "class A { fun f() = g(); fun g() = 1 }\nfun g(): String = \"s\"\nval r = with(A()) { g() }\nr",
+            "class A { fun f() = g(); fun g() = 1 }\nfun g(): Int = 10\nval r = with(A()) { g() }\nA().f() + r",
+            "class A { fun f() = g(); fun g() = 1 }\nfun g(): String = \"s\"\nfun A.h() = g()\nA().h()"
         )
         val executor = ScriptExecutor()
 
@@ -4041,26 +4054,28 @@ class ScriptExecutorTest {
 
         // then
         // like in a regular script
-        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(11, 11, "s", "s", "s", 11, 11, "|q", "1!2!"))
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(11, 11, "s", "s", "s", 11, 11, "|q", "1!2!", "s", "s", 11, 1, 2, 1))
     }
 
     @Test
-    fun `should keep function reading constant local when called before its declaration where receiver might resolve it, and after it from declarations moved out of the script body`() = runTest {
+    fun `should keep function reading constant local when called before its declaration where receiver might resolve it, and after it within declaration moved out of the script body with unknown supertype`() = runTest {
         // given
-        val scripts = listOf(
-            "val k = \"!\"\nval s = buildString { append(\"x\") }\nfun append(t: String) = t + k\nsealed class S { fun f() = append(\"y\") }\nclass T : S()\ns + T().f()",
-            "val k = 1\nval r = run { twice(3) }\nfun twice(i: Int) = i * k\nsealed class S { fun h() = twice(1) }\nclass T : S()\nr + T().h()",
-            "val k = 10\nclass A { fun f() = g(); fun g() = 1 }\nfun g() = k\nsealed class S { fun h() = g() }\nclass T : S()\nA().f() + T().h()"
-        )
+        val script = """
+            val k = "!"
+            val s = buildString { append("x") }
+            fun append(t: String) = t + k
+            sealed class S : Comparable<S> { fun f() = append("y") }
+            class T : S() { override fun compareTo(other: S) = 0 }
+            s + T().f()
+        """.trimIndent()
         val executor = ScriptExecutor()
 
         // when
-        val results = scripts.map { executor.execute(it) }
+        val result = executor.execute(script)
 
         // then
-        // not resolving the calls differently than the script, which returns "xy!", 4 and 11,
-        // as the calls after the declaration might be resolved on the receivers otherwise
-        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+        // not resolving the call differently than the script, which returns "xy!", as the supertype might declare `append`
+        assert((result as? ScriptResult.Error)?.phase == ExecutionPhase.COMPILATION)
     }
 
     @Test

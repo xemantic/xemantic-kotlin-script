@@ -904,7 +904,11 @@ private class Reference(
      * Whether it is within a lambda, a class, an object, or an extension function,
      * so it might resolve to a member of their receivers, like `append` in `buildString { append("x") }`.
      */
-    val mightResolveOnReceiver: Boolean = false
+    val mightResolveOnReceiver: Boolean = false,
+    /** Whether it is within a lambda or an extension function, see [mightResolveOnReceiver], unlike within the [enclosingClasses] only. */
+    val isInLambdaOrExtension: Boolean = false,
+    /** The classes and the objects it is within, whose members it might resolve to, see [mightResolveOnReceiver]. */
+    val enclosingClasses: List<KtClassOrObject> = emptyList()
 ) {
 
     /**
@@ -962,7 +966,11 @@ private fun PsiElement.references(
         element = expression,
         scope = scope,
         isInLambda = isInLambda(expression, scope),
-        mightResolveOnReceiver = mightResolveOnReceiver(expression, scope)
+        mightResolveOnReceiver = mightResolveOnReceiver(expression, scope),
+        isInLambdaOrExtension = expression.parents.takeWhile { it !== scope }.any {
+            it is KtLambdaExpression || (it is KtNamedFunction && it.receiverTypeReference != null)
+        },
+        enclosingClasses = expression.parents.takeWhile { it !== scope }.filterIsInstance<KtClassOrObject>().toList()
     )
 } + operatorReferences(scope)
 
@@ -1087,6 +1095,9 @@ private fun canAccessScriptMembers(
     }
     return true
 }
+
+/** The members of every class, inherited from `Any`. */
+private val implicitMemberNames = setOf("equals", "hashCode", "toString")
 
 /** How a name is declared in the enclosing elements, see [binding]. */
 private enum class Binding {
@@ -2153,26 +2164,52 @@ private class ScriptStructure(
         // and also after their declarations, where a receiver might resolve them, like `append` in a following `buildString { append("y") }`.
         // A regular script ranks such a function before the receivers after its declaration, unless it resolved a call before it to the function,
         // so no placement of a moved function matches it for all the calls, unlike the local function, invisible before its declaration.
+        // A function with a declared return type is ranked after the receivers by a regular script also after its declaration, like when moved after the script block.
         val (calledOnReceivers, calledAsMembers) = run {
             val localReferencesByName = localReferences.groupBy { it.name }
             val bodyReferencesByName = bodyReferences.groupBy { it.name }
-            val functions = declarations.filter { it.kind == DeclarationKind.FUNCTION && it.name != null }
+            val classesByName = declarations.filter { it.kind == DeclarationKind.CLASS }.mapNotNull { it.psi as? KtClassOrObject }
+                .filter { it.name != null }.groupBy { it.name!! }
+            /**
+             * Whether the class might have a member of this [name], declared, inherited from the classes of the script,
+             * or from the other supertypes, whose members are not known, also implicitly, like the ones of `Any` or of a data class.
+             */
+            fun KtClassOrObject.mightHaveMember(
+                name: String,
+                visited: MutableSet<KtClassOrObject> = HashSet()
+            ): Boolean = visited.add(this) && (
+                    name in implicitMemberNames || (this is KtClass && (isEnum() || isData() || isAnnotation()))
+                            || this.declarations.any {
+                                name in it.declaredNames() || (it is KtObjectDeclaration && it.isCompanion() && it.mightHaveMember(name, visited))
+                            }
+                            || primaryConstructorParameters.any { it.hasValOrVar() && it.name == name }
+                            || superTypeListEntries.any { entry ->
+                                val type = entry.typeReference?.typeElement as? KtUserType
+                                val supertypes = if (type?.qualifier == null) type?.referencedName?.let { classesByName[it] } else null
+                                supertypes == null || supertypes.any { it.mightHaveMember(name, visited) }
+                            }
+                    )
+            // the classes of the script without a member of the same name do not resolve it
+            fun Reference.mightResolveOnReceiver() = isInLambdaOrExtension || enclosingClasses.any { it.mightHaveMember(name) }
             fun Reference.mightReferTo(function: ParsedDeclaration) = (!isQualified || function.isExtension) && (!isOperator || function.isOperator)
-            val ambiguouslyCalled = functions.filter { function ->
+            val ambiguouslyCalled = declarations.filter { declaration ->
+                declaration.kind == DeclarationKind.FUNCTION && declaration.name != null
+                        && (declaration.psi as KtNamedFunction).let { !it.hasBlockBody() && it.typeReference == null }
+            }.filter { function ->
                 localReferencesByName[function.name].orEmpty().none {
                     // resolved to the function, if applicable, ranking it after the receivers everywhere, like when moved after the script block
-                    it.offset < function.start && !it.isBound && !it.mightResolveOnReceiver && !it.isCallableReference && it.mightReferTo(function)
+                    it.offset < function.start && !it.isBound && !it.isCallableReference && it.mightReferTo(function) && !it.mightResolveOnReceiver()
                 } && bodyReferencesByName[function.name].orEmpty().any {
-                    it.offset >= function.end && it.mightResolveOnReceiver && it.mightReferTo(function)
-                            && (!it.isBound || it.isBoundByMember || (it.isBoundByNonFunction && it.isCall))
+                    it.offset >= function.end && it.mightReferTo(function)
+                            && (!it.isBound || it.isBoundByMember || (it.isBoundByNonFunction && it.isCall)) && it.mightResolveOnReceiver()
                 }
             }
             fun calledBefore(
                 filter: (Reference) -> Boolean
             ) = ambiguouslyCalled.filterTo(HashSet()) { function ->
-                localReferencesByName[function.name].orEmpty().any { it.offset < function.start && filter(it) && it.mightReferTo(function) }
+                localReferencesByName[function.name].orEmpty().any { it.offset < function.start && it.mightReferTo(function) && filter(it) }
             }
-            calledBefore { !it.isBound && it.mightResolveOnReceiver } to calledBefore { it.isBoundByMember }
+            calledBefore { !it.isBound && it.mightResolveOnReceiver() } to calledBefore { it.isBoundByMember }
         }
         // the start of the first statement run where it is declared, which refers to each declaration, also indirectly
         val firstRunBy = HashMap<ParsedDeclaration, Int>()

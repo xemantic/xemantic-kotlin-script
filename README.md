@@ -122,8 +122,10 @@ when (result) {
   when they call it, or when it is called before its declaration,
   unless called before the declaration of such a value, like `f` in `val r = f()` followed by `val k = 5` and `fun f() = k`,
   which a regular script reads before it is initialized, as `0` or `null`,
-  or called before its declaration only where a receiver might resolve the call instead, like `append` in `buildString { append("x") }`,
-  and also after it, where a receiver might resolve the call, like in a following `buildString { append("y") }`,
+  reported also when such a call is only stored, like `{ f() }` or `::f`, or never made, like `if (false) f()`,
+  or when its return type is inferred, and it is called before its declaration only where a receiver might resolve the call instead, like `append` in `buildString { append("x") }`,
+  and also after it, where a receiver might resolve the call, like in a following `buildString { append("y") }`, within a lambda, an extension function,
+  or a class, which might have a member of the same name,
   as no placement outside of the script body resolves all these calls like a regular script (see the last of the known limitations below),
   and referring to a local value or function of the same name as a dependency is reported as unresolved, instead of using the dependency,
   while an object, an enum class, an interface or a nested class cannot refer even to the dependencies,
@@ -146,9 +148,11 @@ Most of these cases are reported as errors, while the following ones still resol
 * a call within a lambda to a function compiled outside of the script body, named like a function of its `CoroutineScope`, like `cancel` ([#44](https://github.com/xemantic/xemantic-kotlin-script/issues/44)),
 * a call where a receiver might resolve it, like within a lambda, following the declaration of a function, which is called before its declaration only where the receivers resolve the calls instead,
   like the second `append` in `buildString { append("x") }`, `fun append(t: String) = t + "!"`, `fun g() = buildString { append("y") }`,
-  as the function is resolved after the receivers, like when called before its declaration, while a regular script resolves it before them
+  as the function is resolved after the receivers, like when called before its declaration, while a regular script resolves it before them,
+  when its return type is inferred, unlike a declared one, like `fun append(t: String): String`
   ([#73](https://github.com/xemantic/xemantic-kotlin-script/issues/73)), unless the function reads the values initialized with a literal,
-  or is called before its declaration as a member of a class of the same name, like `g` in `class A { fun f() = g(); fun g() = 1 }`, which keeps it in the script body.
+  or is called before its declaration as a member of a class of the same name, like `g` in `class A { fun f() = g(); fun g() = 1 }`, which keeps it in the script body,
+  where a call within a declaration compiled outside of the script body is resolved to a member of the same name of its class, while a regular script resolves it to the function.
 
 Giving the declarations and the dependencies distinct names avoids them.
 
