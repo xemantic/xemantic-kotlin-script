@@ -1324,7 +1324,7 @@ private val prefixOperatorNames = mapOf(
 
 /**
  * The references to the operator functions called by the operators and the conventions,
- * like `plus` of `a + b`, `get` of `a[i]`, `iterator` of `for (x in a)`, `component1` of `val (a, b) = p`, or `invoke` of `f()()`,
+ * like `plus` of `a + b`, `get` of `a[i]`, `iterator` of `for (x in a)`, `component1` of `val (a, b) = p`, or `invoke` of `f()()`, or of `n(1)`, calling a value,
  * which are qualified, by the operands, so they might refer to the extension functions only,
  * at the positions where the compiler reports the calls, like the whole array access expression,
  * which might contain the references of the operands, and other operators, like `set` and `get`,
@@ -1388,6 +1388,9 @@ private fun PsiElement.operatorReferences(
             is KtCallExpression -> if (element.calleeExpression !is KtSimpleNameExpression && element.calleeExpression != null) {
                 val arguments = element.valueArgumentList ?: element.lambdaArguments.firstOrNull() ?: element
                 add(listOf("invoke"), element, arguments.startOffset, arguments.textLength)
+            } else if (element.calleeExpression != null) {
+                // the call of a value by name, like `print("")` of `val print = 3`, which might call an extension, unlike a function
+                add(listOf("invoke"), element)
             }
             // the compiler reports the calls on the delegate expression, or at its callee, like `let` of `by Cfg().let { it }`,
             // which might be a reference of the same name, like in `by map.getValue("a")`

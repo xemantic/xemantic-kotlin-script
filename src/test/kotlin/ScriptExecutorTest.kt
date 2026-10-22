@@ -4982,6 +4982,49 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should move local invoke operator called on value by declaration moved out of the script body`() = runTest {
+        // given
+        val script = """
+            operator fun Int.invoke(x: Any?): String = "int:${'$'}x"
+            val print: Int = 3
+            sealed class S { fun show(): String = print("") }
+            class T : S()
+            T().show()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "int:")
+        }
+    }
+
+    @Test
+    fun `should report calls of declarations moved out of the script body on values made callable by hidden local invoke operator`() = runTest {
+        // given
+        val invoke = "val p = \"!\"\noperator fun Int.invoke(x: Any?): String = \"int:${'$'}x${'$'}p\"\n"
+        val scripts = listOf(
+            // failing as resolved to `kotlin.io.print` instead, of the constant moved with the class
+            "${invoke}val print: Int = 3\nsealed class S { fun show(): String = print(\"\") }\nclass T : S()\nT().show()",
+            // returning `Unit` of `kotlin.io.print` instead
+            "${invoke}val print: Int = 3\nsealed class S { fun show(): Any = print(\"\") }\nclass T : S()\nT().show()",
+            "${invoke}sealed class S { fun show(n: Int): Any = n(\"\") }\nclass T : S()\nT().show(4)"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+        assert(results.all { "'invoke' does not refer to the function of the script body declared at line 2" in (it as ScriptResult.Error).message })
+    }
+
+    @Test
     fun `should report call of declaration moved out of the script body failing as resolved to another function than the local one`() = runTest {
         // given
         val script = """
