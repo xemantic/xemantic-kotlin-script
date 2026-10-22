@@ -3254,6 +3254,194 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report frames of accessors of companion object, delegated property and local class of getter by the property names`() = runTest {
+        // given
+        val script = """
+            class C {
+                companion object { val x: Int get() = O.z }
+            }
+            object O {
+                var z: Int by mutableMapOf<String, Int>()
+            }
+            val g: Int get() { class M { val y: Int get() = C.x }; return M().y }
+            g
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            // the first frame is the one of the standard library throwing the exception
+            assert(message.endsWith("""
+                  at O.<get-z>(script.kts:5)
+                  |     var z: Int by mutableMapOf<String, Int>()
+                  at Companion.<get-x>(script.kts:2)
+                  |     companion object { val x: Int get() = O.z }
+                  at M.<get-y>(script.kts:7)
+                  | val g: Int get() { class M { val y: Int get() = C.x }; return M().y }
+                  at <get-g>(script.kts:7)
+                  | val g: Int get() { class M { val y: Int get() = C.x }; return M().y }
+                  at <script body>(script.kts:8)
+                  | g
+            """.trimIndent().prependIndent("  ")))
+        }
+    }
+
+    @Test
+    fun `should report frame of generic override of property getter in the line of its class without its bridge`() = runTest {
+        // given
+        val script = """
+            interface I<T> { val x: T }
+            class C : I<Int> { override val x: Int get() = error("x") }
+            (C() as I<Int>).x
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: x
+                  at C.<get-x>(script.kts:2)
+                  | class C : I<Int> { override val x: Int get() = error("x") }
+                  at <script body>(script.kts:3)
+                  | (C() as I<Int>).x
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frames of recursive generic override without its bridge`() = runTest {
+        // given
+        val script = """
+            interface I<T> { fun f(n: Int): T }
+            class C : I<Int> {
+                override fun f(n: Int): Int = if (n == 0) error("x") else f(n - 1)
+            }
+            (C() as I<Int>).f(2)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: x
+                  at C.f(script.kts:3)
+                  |     override fun f(n: Int): Int = if (n == 0) error("x") else f(n - 1)
+                  ... (the frame above repeated 2 more times)
+                  at <script body>(script.kts:5)
+                  | (C() as I<Int>).f(2)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frames of inherited interface getter and private getter without the compiler generated ones`() = runTest {
+        // given
+        val script = """
+            interface I { val x: Int get() = error("x") }
+            class C : I
+            class Foo {
+                private val y: Int get() = C().x
+                companion object { fun f(foo: Foo) = foo.y }
+            }
+            Foo.f(Foo())
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: x
+                  at I.<get-x>(script.kts:1)
+                  | interface I { val x: Int get() = error("x") }
+                  at Foo.<get-y>(script.kts:4)
+                  |     private val y: Int get() = C().x
+                  at Companion.f(script.kts:5)
+                  |     companion object { fun f(foo: Foo) = foo.y }
+                  at <script body>(script.kts:7)
+                  | Foo.f(Foo())
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frames of internal members by their names`() = runTest {
+        // given
+        val script = """
+            internal val y: Int get() = Foo().f()
+            class Foo {
+                internal val x: Int get() = error("x")
+                internal fun f(): Int = x
+            }
+            y
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: x
+                  at Foo.<get-x>(script.kts:3)
+                  |     internal val x: Int get() = error("x")
+                  at Foo.f(script.kts:4)
+                  |     internal fun f(): Int = x
+                  at <get-y>(script.kts:1)
+                  | internal val y: Int get() = Foo().f()
+                  at <script body>(script.kts:6)
+                  | y
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frame of property getter throwing in inlined function, and of getter with JVM name, by the property names`() = runTest {
+        // given
+        val script = """
+            class C {
+                @get:JvmName("ex") val x: Int get() = y
+                val y: Int get() = listOf<Int>().first { it > 0 }
+            }
+            C().x
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.util.NoSuchElementException: Collection contains no element matching the predicate.
+                  at C.<get-y>(script.kts)
+                  at C.<get-x>(script.kts:2)
+                  |     @get:JvmName("ex") val x: Int get() = y
+                  at <script body>(script.kts:5)
+                  | C().x
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should use class declared later in the script`() = runTest {
         // given
         val script = """
