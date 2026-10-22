@@ -316,6 +316,7 @@ internal class ScriptErrorReporter(
         val regex = scriptQualifiedName ?: return this
         val message = this
         val prefixLength = scriptClassName!!.length
+        val written by lazy { message.writtenEnds() }
         return buildString {
             var index = 0
             while (true) {
@@ -334,7 +335,7 @@ internal class ScriptErrorReporter(
                     } ?: (null to nameEnd)
                 }
                 index = end
-                if (name == null || message.isWrittenAt(start, maxOf(nameEnd, end))) {
+                if (name == null || written[start] >= maxOf(nameEnd, end)) {
                     append(message, start, end)
                 } else {
                     +name
@@ -344,12 +345,42 @@ internal class ScriptErrorReporter(
         }
     }
 
-    /** Whether a constant part of a string literal of the script contains this text from the [start] to the [end] at this place. */
-    private fun String.isWrittenAt(
-        start: Int,
-        end: Int
-    ): Boolean = writtenNames.any { written ->
-        (maxOf(0, end - written.length)..minOf(start, length - written.length)).any { regionMatches(it, written, 0, written.length) }
+    /**
+     * For each position of this text, the furthest end of the constant parts of the string literals of the script found in it,
+     * which start at the position or before it, or `-1`, so the text from a position to an end is written by the script,
+     * if the end is not further, the occurrences of each one found in linear time.
+     */
+    private fun String.writtenEnds(): IntArray {
+        val ends = IntArray(length + 1) { -1 }
+        writtenNames.forEach { written ->
+            occurrences(written).forEach { start -> ends[start] = maxOf(ends[start], start + written.length) }
+        }
+        for (index in 1..length) ends[index] = maxOf(ends[index], ends[index - 1])
+        return ends
+    }
+
+    /** The starts of the occurrences of the [pattern] in this text, with the Knuth-Morris-Pratt algorithm. */
+    private fun String.occurrences(
+        pattern: String
+    ): List<Int> {
+        val prefixes = IntArray(pattern.length)
+        var matched = 0
+        for (index in 1 until pattern.length) {
+            while (matched > 0 && pattern[index] != pattern[matched]) matched = prefixes[matched - 1]
+            if (pattern[index] == pattern[matched]) matched++
+            prefixes[index] = matched
+        }
+        val starts = mutableListOf<Int>()
+        matched = 0
+        for (index in indices) {
+            while (matched > 0 && this[index] != pattern[matched]) matched = prefixes[matched - 1]
+            if (this[index] == pattern[matched]) matched++
+            if (matched == pattern.length) {
+                starts += index - pattern.length + 1
+                matched = prefixes[matched - 1]
+            }
+        }
+        return starts
     }
 
     /**
@@ -368,27 +399,29 @@ internal class ScriptErrorReporter(
             source.backtickedClassNames.filter { startsWith(it, separator + 1) }.map { separator + 1 + it.length }
         }
         return ends.distinct().sortedDescending().firstNotNullOfOrNull { classEnd ->
-            scriptClass(scriptClassName + substring(start, classEnd).replace('.', '$'), loader)?.let { it to classEnd }
+            scriptClass(scriptClassName + substring(start, classEnd).replace('.', '$'), loader, inMessage = true)?.let { it to classEnd }
         }
     }
 
     /**
      * The class of the script of this binary [name], or `null`, if there is no such class, also remembered,
-     * while no further classes are looked up after too many were not found, like in a long message resembling their names.
+     * while no further classes named [inMessage] are looked up after too many were not found, like in a long message resembling their names,
+     * unlike the classes of the frames.
      */
     private fun scriptClass(
         name: String,
-        loader: ClassLoader
+        loader: ClassLoader,
+        inMessage: Boolean = false
     ): Class<*>? {
         if (name in scriptClasses) return scriptClasses[name]
-        if (missingClassCount >= MAX_MISSING_CLASSES) return null
+        if (inMessage && missingClassCount >= MAX_MISSING_CLASSES) return null
         val type = try {
             Class.forName(name, false, loader)
         } catch (e: Throwable) {
             if (e is VirtualMachineError) throw e
             null
         }
-        if (type == null) missingClassCount++
+        if (type == null && inMessage) missingClassCount++
         scriptClasses[name] = type
         return type
     }
@@ -444,12 +477,14 @@ internal class ScriptErrorReporter(
         if (bridges.isEmpty() || above.className != element.className || above.methodName != element.methodName) return false
         if (bridges.none { element.lineNumber in it.lines }) return false
         if (methods.none { !it.isBridge && element.lineNumber in it.lines }) return true
-        // declared in the line of its class, so told by the call
+        // declared in the line of its class, so told by the call of the method of the frame below, which contains its line
         val calls = stackTrace.getOrNull(index + 1)?.let { caller ->
-            caller.methods()?.get(caller.methodName)?.flatMap { it.calls[caller.lineNumber].orEmpty() }
-        }.orEmpty().filter { it.first == element.methodName }.map { it.second }
+            caller.methods()?.get(caller.methodName)?.filter { caller.lineNumber in it.lines }?.flatMap { it.calls[caller.lineNumber].orEmpty() }
+        }.orEmpty().filter { it.name == element.methodName }
+        val owner = element.className.replace('.', '/')
         val bridgeDescriptors = bridges.mapTo(HashSet()) { it.descriptor }
-        return calls.any { it in bridgeDescriptors } && calls.none { call -> methods.any { !it.isBridge && it.descriptor == call } }
+        return calls.any { it.descriptor in bridgeDescriptors }
+                && calls.none { call -> call.owner == owner && methods.any { !it.isBridge && it.descriptor == call.descriptor } }
     }
 
     /** A method of a class of the script, as compiled. */
@@ -460,8 +495,15 @@ internal class ScriptErrorReporter(
         val isSynthetic: Boolean,
         /** The lines of its code. */
         val lines: Set<Int>,
-        /** The names and the descriptors of the methods it calls, by the lines of the calls. */
-        val calls: Map<Int, List<Pair<String, String>>>
+        /** The methods it calls, by the lines of the calls. */
+        val calls: Map<Int, List<Call>>
+    )
+
+    /** A call of the method of the [name] and the [descriptor] declared by the [owner], like `C` or `I`, by its internal name. */
+    private class Call(
+        val owner: String,
+        val name: String,
+        val descriptor: String
     )
 
     /** See [methods]. */
@@ -491,7 +533,7 @@ internal class ScriptErrorReporter(
                     exceptions: Array<out String>?
                 ): MethodVisitor {
                     val lines = HashSet<Int>()
-                    val calls = HashMap<Int, MutableList<Pair<String, String>>>()
+                    val calls = HashMap<Int, MutableList<Call>>()
                     var line = -1
                     return object : MethodVisitor(Opcodes.API_VERSION) {
                         override fun visitLineNumber(
@@ -509,7 +551,7 @@ internal class ScriptErrorReporter(
                             descriptor: String,
                             isInterface: Boolean
                         ) {
-                            calls.getOrPut(line) { mutableListOf() } += name to descriptor
+                            calls.getOrPut(line) { mutableListOf() } += Call(owner, name, descriptor)
                         }
 
                         override fun visitEnd() {

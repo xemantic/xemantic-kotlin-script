@@ -1519,6 +1519,55 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report exception message of many names resembling a long string literal of the script`() = runTest {
+        // given
+        val literal = "_\${'$'}Box ".repeat(10_000) + "Z"
+        val script = """
+            enum class Box { A }
+            val written = "$literal"
+            throw IllegalStateException(written.dropLast(1).repeat(2) + "Y")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first() sameAs "java.lang.IllegalStateException: " + "Box ".repeat(20_000) + "Y"
+        }
+    }
+
+    @Test
+    fun `should report frames by the Kotlin names after exception message of many names resembling classes of the script`() = runTest {
+        // given
+        val script = $$"""
+            enum class Box { A }
+            class G { val x: Int get() = error((1..400).joinToString(" ") { Box::class.java.name + "\$Nope" + it }) }
+            fun h() = G().x
+            h()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().drop(1).joinToString("\n") sameAs listOf(
+                "  at G.<get-x>(script.kts:2)",
+                $$"""  | class G { val x: Int get() = error((1..400).joinToString(" ") { Box::class.java.name + "\$Nope" + it }) }""",
+                "  at h(script.kts:3)",
+                "  | fun h() = G().x",
+                "  at <script body>(script.kts:4)",
+                "  | h()"
+            ).joinToString("\n")
+        }
+    }
+
+    @Test
     fun `should keep names written by script with carriage return line breaks`() = runTest {
         // given
         val script = "// the class\renum class C { X }\rthrow IllegalStateException(\"_.C \" + C.X)"
@@ -3503,6 +3552,36 @@ class ScriptExecutorTest {
                   ... (the frame above repeated 1 more times)
                   at <script body>(script.kts:3)
                   | C().f(1)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frames of generic override in the line of its class called through its interface by another one without its bridge`() = runTest {
+        // given
+        val script = """
+            interface I<T> { fun f(n: Int): T }
+            class B : I<Int> { override fun f(n: Int): Int = if (n == 0) error("x") else f(n - 1) }
+            class A : I<Int> { override fun f(n: Int): Int = (B() as I<Int>).f(1) }
+            A().f(0)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: x
+                  at B.f(script.kts:2)
+                  | class B : I<Int> { override fun f(n: Int): Int = if (n == 0) error("x") else f(n - 1) }
+                  ... (the frame above repeated 1 more times)
+                  at A.f(script.kts:3)
+                  | class A : I<Int> { override fun f(n: Int): Int = (B() as I<Int>).f(1) }
+                  at <script body>(script.kts:4)
+                  | A().f(0)
             """.trimIndent()
         }
     }
