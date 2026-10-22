@@ -267,9 +267,11 @@ private const val CONFIRMING_SCRIPT_BLOCK_END = "}) }"
  * The accessors refer to the classes of the root package by aliases, chosen not to occur in the script,
  * where they cannot refer to them by their names: if the script has a `package` directive,
  * or imports another class under the same name, or the class under another name.
+ * A type alias imported under the name of such a class is not told apart from a function,
+ * as it has no class at runtime, so the accessor refers to the type alias then.
  * A script without a `package` directive, declaring a classifier moved out of the script body named like such a class,
  * shadows it also in the alias, like in a regular script, where it shadows the type of the property of the base class,
- * so the accessor casts the value only when the script refers to it.
+ * so the accessor casts the value only in its getter, letting the script run, if it does not refer to the dependency.
  *
  * Declarations are moved by blanking them out with spaces in one copy of their lines,
  * and everything else in the other, so the columns of the script are retained,
@@ -280,6 +282,11 @@ private const val CONFIRMING_SCRIPT_BLOCK_END = "}) }"
 internal class ScriptSource(
     source: String,
     dependencies: List<PreambleDependency> = emptyList(),
+    /**
+     * Whether this qualified name, which the script imports under the name of a class of the root package, see [ScriptSource],
+     * might be of a class, unlike e.g. of a function.
+     */
+    private val mightBeClass: (qualifiedName: String) -> Boolean = { true },
     /**
      * Whether it is the source of the compilation confirming the [laterDeclaredDependencyCandidates]
      * and the [hiddenLocalFunctionCandidates], with the declarations they might refer to deprecated, with a warning, as the declarations deprecated with an error are less preferred by the overload resolution,
@@ -508,8 +515,11 @@ internal class ScriptSource(
         }
         val usedAliases = mutableSetOf<String>()
         val rootPackageAliases = dependencies.flatMapTo(sortedSetOf()) { it.rootPackageClasses }.filter { name ->
-            // as an alias hides the name of the class also from the script, like the alias of the script, e.g. `import A as B`
-            structure.isPackaged || structure.imports.any { (fqName, importedName) -> (fqName == name) != (importedName == name) }
+            // as an alias hides the name of the class also from the script, like the alias of the script, e.g. `import A as B`,
+            // while a function imported under the name of the class does not hide it, e.g. `import a.f as A`
+            structure.isPackaged || structure.imports.any { (fqName, importedName) ->
+                if (fqName == name) importedName != name else importedName == name && mightBeClass(fqName)
+            }
         }.associateWith { name ->
             generateSequence("_root_${name.filter { it.isLetterOrDigit() || it == '_' }}") { "${it}_" }.first {
                 // an alias quoted in backticks is not resolved, so the script might refer to it

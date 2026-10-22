@@ -29,9 +29,13 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
+import org.jetbrains.kotlin.builtins.PrimitiveType
+import org.jetbrains.kotlin.builtins.StandardNames
+import org.jetbrains.kotlin.builtins.jvm.JavaToKotlinClassMap
 import org.jetbrains.kotlin.config.JvmTarget
 import org.jetbrains.kotlin.lexer.KotlinLexer
 import org.jetbrains.kotlin.lexer.KtTokens
+import org.jetbrains.kotlin.name.FqName
 import kotlin.concurrent.atomics.AtomicInt
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.concurrent.atomics.fetchAndIncrement
@@ -125,6 +129,34 @@ internal class DefaultScriptExecutor(
      */
     private val classLoader: ClassLoader = Thread.currentThread().contextClassLoader
         ?: DefaultScriptExecutor::class.java.classLoader
+
+    /**
+     * Whether the [qualifiedName] might be of a class, see [ScriptSource],
+     * unless no class of this name can be found, like of a function, or of a type alias,
+     * while a built-in class, like `kotlin.String`, is mapped to a Java class, or has none, like `kotlin.IntArray`.
+     */
+    private fun mightBeClass(
+        qualifiedName: String
+    ): Boolean {
+        val fqName = FqName(qualifiedName)
+        if (JavaToKotlinClassMap.mapKotlinToJava(fqName.toUnsafe()) != null || fqName in builtInArrays) return true
+        val segments = fqName.pathSegments().map { it.asString() }
+        // the binary names of the classes nested in the classes of the preceding segments, like `a.B${'$'}C` of `a.B.C`
+        return segments.indices.reversed().any { index ->
+            val binaryName = segments.subList(0, index + 1).joinToString(".") +
+                    segments.subList(index + 1, segments.size).joinToString("") { "${'$'}$it" }
+            try {
+                Class.forName(binaryName, false, classLoader)
+                true
+            } catch (_: ClassNotFoundException) {
+                false
+            } catch (e: Throwable) {
+                if (e is VirtualMachineError) throw e
+                // e.g. a class referring to an optional class, which is missing
+                true
+            }
+        }
+    }
 
 
     private val compilationConfigurationTemplate = ScriptCompilationConfiguration {
@@ -436,7 +468,7 @@ internal class DefaultScriptExecutor(
             confirming: Boolean = false,
             shadowedFunctionCopies: Boolean = false,
             coroutineScopeCopies: Boolean = false
-        ) = ScriptSource(script, preambleDependencies, confirming, shadowedFunctionCopies, coroutineScopeCopies)
+        ) = ScriptSource(script, preambleDependencies, ::mightBeClass, confirming, shadowedFunctionCopies, coroutineScopeCopies)
 
         private suspend fun compile(
             source: ScriptSource
@@ -649,11 +681,15 @@ private val ScriptExecutor.Dependency<*>.providedName: String
 private val ScriptExecutor.Dependency<*>.providedType: KotlinType
     get() = if (isHidden) KotlinType(typeOf<Any?>()) else KotlinType(type)
 
+/** The built-in array classes, which have no class at runtime, like `kotlin.IntArray`, see [DefaultScriptExecutor.mightBeClass]. */
+private val builtInArrays = PrimitiveType.entries.map { it.arrayTypeFqName } + StandardNames.FqNames.array.toSafe()
+
 /** The dependency, as declared in the preamble of the script. */
 private val ScriptExecutor.Dependency<*>.preambleDependency: PreambleDependency
     get() {
         val rootPackageClasses = type.rootPackageClasses()
         val renderedType = type.toString()
+        val rootPackageClassRanges = renderedType.rootPackageClassRanges(rootPackageClasses)
         return PreambleDependency(
             name = name,
             // with an initializer, unlike a getter, the dependency can be smart cast,
@@ -661,7 +697,7 @@ private val ScriptExecutor.Dependency<*>.preambleDependency: PreambleDependency
             // to a name with `$`, which no function of the script can have, unless quoted in backticks
             // its warnings, like of the unchecked cast, are not reported, see [filterNonIgnorable]
             accessor = { aliases, lazy ->
-                val type = renderedType.withRootPackageAliases(rootPackageClasses, aliases)
+                val type = renderedType.withRootPackageAliases(rootPackageClassRanges, aliases)
                 "@get:kotlin.jvm.JvmName(\"$name\\\$dependency\") val `$name`: $type ${if (lazy) "get() =" else "="} `$providedName` as $type"
             },
             isCallable = isCallable,
@@ -689,14 +725,14 @@ private fun KType.rootPackageClasses(): Map<String, String> = buildMap {
 }
 
 /**
- * This [KType.toString] rendering, referring to the [classes] of the root package, see [rootPackageClasses],
- * by the [aliases] of the top-level classes, by their names, like `_root_Outer.Nested` instead of `Outer.Nested`.
+ * The ranges of the names of the top-level classes of the root package in this [KType.toString] rendering,
+ * referring to the [classes] of the root package, see [rootPackageClasses], with these names,
+ * like `Outer` of `Outer.Nested`.
  */
-private fun String.withRootPackageAliases(
-    classes: Map<String, String>,
-    aliases: Map<String, String>
-): String {
-    if (classes.isEmpty()) return this
+private fun String.rootPackageClassRanges(
+    classes: Map<String, String>
+): List<Pair<IntRange, String>> {
+    if (classes.isEmpty()) return emptyList()
     val lexer = KotlinLexer()
     lexer.start(this)
     val tokens = buildList {
@@ -705,27 +741,37 @@ private fun String.withRootPackageAliases(
             lexer.advance()
         }
     }
-    val rendered = this
-    return buildString {
-        var copied = 0
-        tokens.forEachIndexed { index, (type, start, end) ->
-            if (type != KtTokens.IDENTIFIER || tokens.getOrNull(index - 1)?.first == KtTokens.DOT) return@forEachIndexed
-            // the segments of the qualified name, like `kotlin.collections.List`, quoted in backticks if needed, like `in`
-            val segments = generateSequence(index) { it + 2 }.takeWhile {
-                it == index || (tokens.getOrNull(it - 1)?.first == KtTokens.DOT && tokens.getOrNull(it)?.first == KtTokens.IDENTIFIER)
-            }.map { rendered.substring(tokens[it].second, tokens[it].third) }.toList()
-            // a soft keyword, like the variance `out` in `List<out T>`, which is lexed as an identifier, is followed by a space,
-            // unlike a name, which is quoted in backticks if it is a keyword
-            val isModifier = segments.size == 1 && !segments[0].startsWith('`') && tokens.getOrNull(index + 1)?.first == KtTokens.WHITE_SPACE
-            val alias = classes[segments.joinToString(".") { it.removeSurrounding("`") }]?.let { aliases[it] }
-            if (!isModifier && alias != null) {
-                append(rendered, copied, start)
-                append(alias)
-                copied = end
-            }
-        }
-        append(rendered, copied, rendered.length)
+    return tokens.indices.mapNotNull { index ->
+        val (type, start, end) = tokens[index]
+        if (type != KtTokens.IDENTIFIER || tokens.getOrNull(index - 1)?.first == KtTokens.DOT) return@mapNotNull null
+        // the segments of the qualified name, like `kotlin.collections.List`, quoted in backticks if needed, like `in`
+        val segments = generateSequence(index) { it + 2 }.takeWhile {
+            it == index || (tokens.getOrNull(it - 1)?.first == KtTokens.DOT && tokens.getOrNull(it)?.first == KtTokens.IDENTIFIER)
+        }.map { substring(tokens[it].second, tokens[it].third) }.toList()
+        // a soft keyword, like the variance `out` in `List<out T>`, which is lexed as an identifier, is followed by a space,
+        // unlike a name, which is quoted in backticks if it is a keyword
+        val isModifier = segments.size == 1 && !segments[0].startsWith('`') && tokens.getOrNull(index + 1)?.first == KtTokens.WHITE_SPACE
+        classes[segments.joinToString(".") { it.removeSurrounding("`") }]?.takeUnless { isModifier }?.let { (start until end) to it }
     }
+}
+
+/**
+ * This [KType.toString] rendering, referring to the classes of the root package by the [aliases] of the top-level classes,
+ * by their names, at their [ranges], see [rootPackageClassRanges], like `_root_Outer.Nested` instead of `Outer.Nested`.
+ */
+private fun String.withRootPackageAliases(
+    ranges: List<Pair<IntRange, String>>,
+    aliases: Map<String, String>
+): String = buildString {
+    var copied = 0
+    ranges.forEach { (range, name) ->
+        aliases[name]?.let { alias ->
+            append(this@withRootPackageAliases, copied, range.first)
+            append(alias)
+            copied = range.last + 1
+        }
+    }
+    append(this@withRootPackageAliases, copied, this@withRootPackageAliases.length)
 }
 
 /** Whether it is of a function type, or of a type with the public `invoke` operator, so the script can call it. */

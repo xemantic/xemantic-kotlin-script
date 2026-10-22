@@ -676,6 +676,52 @@ class ScriptDependenciesTest {
     }
 
     @Test
+    fun `should provide dependency of root package type to script importing function under its name`() = runTest {
+        // given
+        val script = """
+            import kotlin.collections.listOf as RootConfig
+
+            val x: RootConfig = cfg
+            RootConfig(x).single().v
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "cfg" provides RootConfig(42)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+        }
+    }
+
+    @Test
+    fun `should provide dependency of root package type to script importing built-in class under its name`() = runTest {
+        // given
+        val script = """
+            import kotlin.String as RootConfig
+
+            val text: RootConfig = "x"
+            text + cfg.v
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "cfg" provides RootConfig(42)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "x42")
+        }
+    }
+
+    @Test
     fun `should provide dependency of root package type to script naming its import alias`() = runTest {
         // given
         val script = """
@@ -701,7 +747,7 @@ class ScriptDependenciesTest {
     }
 
     @Test
-    fun `should run script declaring class shadowing root package type of unused dependency`() = runTest {
+    fun `should run script declaring class shadowing root package type of dependency it does not refer to`() = runTest {
         // given
         val script = """
             enum class RootConfig { A, B }
