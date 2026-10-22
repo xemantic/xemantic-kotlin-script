@@ -470,9 +470,16 @@ internal class DefaultScriptExecutor(
             ) = markedRanges(source, message).map { it.first }
             val reports = confirming(probe).reports
             val result = compiled.await()
+            val errorReports = result.reports.filter { it.severity == ScriptDiagnostic.Severity.ERROR }
             // unless already reported as unresolved
-            val errors = result.reports.filter { it.severity == ScriptDiagnostic.Severity.ERROR }.mapNotNull { diagnostic ->
+            val errors = errorReports.mapNotNull { diagnostic ->
                 diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }
+            }
+            // with their names, hinted at as not visible by the reporter of the errors already
+            val unresolved = errorReports.mapNotNullTo(HashSet()) { diagnostic ->
+                unresolvedReference.matchEntire(diagnostic.message)?.let { match ->
+                    diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) to match.groupValues[1] }
+                }
             }
             // unlike the other ones, the calls of which cannot be confirmed
             val confirmedTypes = probe.confirmedPropertyTypes(reports)
@@ -504,8 +511,9 @@ internal class DefaultScriptExecutor(
                 }?.takeIf { candidate ->
                     // chosen first, so that the warning of a plain call, like `get(1)` in `m[get(1)]`, is not assigned to the enclosing operator,
                     // the compiler reports the operators as unresolved, misleading, so they are hinted at as well,
-                    // like the calls failing as resolved to the dependency of the same name, see ScriptSource.calledInsteadDependencies
-                    candidate.isOperator || start !in errors || candidate.reference.name in source.calledInsteadDependencies
+                    // like the calls failing as resolved to other functions, like `print("")` returning `Unit` of `kotlin.io.print`,
+                    // or to the dependency of the same name, see ScriptSource.calledInsteadDependencies
+                    candidate.isOperator || (start to candidate.reference.name) !in unresolved
                 }
             }
             // the references not resolved to the moved declarations, unless already reported as errors

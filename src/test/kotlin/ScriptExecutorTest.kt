@@ -4960,6 +4960,54 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report calls of declarations moved out of the script body to local properties made callable by local invoke operators`() = runTest {
+        // given
+        val invoke = "operator fun Int.invoke(x: Any?): String = \"int:${'$'}x\"\n"
+        val scripts = listOf(
+            // failing as resolved to `kotlin.io.print` instead
+            "${invoke}val print = 1 + 2\nsealed class S { fun show(): String = print(\"\") }\nclass T : S()\nT().show()",
+            "${invoke}val print = three()\nfun three() = 3\nsealed class S { fun show(): String = print(\"\") }\nclass T : S()\nT().show()",
+            "${invoke}val print: Int = listOf(3).first()\nsealed class S { fun show(): String = print(\"\") }\nclass T : S()\nT().show()",
+            // returning `Unit` of `kotlin.io.print` instead
+            "${invoke}val print = 1 + 2\nsealed class S { fun show(): Any = print(\"\") }\nclass T : S()\nT().show()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+        assert(results.all { "'print' does not refer to the property of the script body declared at line 2" in (it as ScriptResult.Error).message })
+    }
+
+    @Test
+    fun `should report call of declaration moved out of the script body failing as resolved to another function than the local one`() = runTest {
+        // given
+        val script = """
+            val p = "!"
+            fun print(x: Int): String = "n${'$'}x${'$'}p"
+            sealed class S { fun f(): String = print(1) }
+            class T : S()
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert(result is ScriptResult.Error && result.message == """
+            script.kts:3:36: error: 'print' does not refer to the function of the script body declared at line 2, which is not visible in 'S'.
+              | sealed class S { fun f(): String = <error>print</error>(1) }
+              hint: 'S' is compiled outside of the script body, where 'print' (line 2) is not visible - pass it as a parameter, or declare it within 'S'.
+
+            script.kts:3:36: error: Return type mismatch: expected 'String', actual 'Unit'.
+              | sealed class S { fun f(): String = <error>print(1)</error> }
+        """.trimIndent())
+    }
+
+    @Test
     fun `should report calls of declarations moved out of the script body to local properties of inferred types on receivers named like packages`() = runTest {
         // given
         val scripts = listOf(

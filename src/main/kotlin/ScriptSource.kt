@@ -1854,7 +1854,12 @@ private class ScriptStructure(
         }
         untypedPropertyCalls = untypedCalls
         untypedProperties = untypedCalls.mapTo(LinkedHashSet()) { it.name }
-        hiddenLocalDeclarations = hiddenLocalFunctionCandidates.mapTo(LinkedHashSet()) { it.first.name }.map { name ->
+        // also the local invoke operators, which the calls of the local properties might call, like `print("")` of `val print = 1 + 2`
+        // with `operator fun Int.invoke(x: Any?)`, resolved to `kotlin.io.print` instead without them
+        val invokedProperties = hiddenLocalFunctionCandidates.any { (reference, _, isFunction) -> reference.isCall && !isFunction }
+        hiddenLocalDeclarations = (hiddenLocalFunctionCandidates.mapTo(LinkedHashSet()) { it.first.name }.also { names ->
+            if (invokedProperties && localExtensions["invoke"].orEmpty().any { it.isOperator }) names += "invoke"
+        }).map { name ->
             HiddenLocalDeclarations(
                 name,
                 // the moved declarations cannot refer to the values of the local classes
