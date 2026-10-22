@@ -67,6 +67,8 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 - When comparing a script with a regular `.kts` evaluated by `BasicJvmScriptingHost`, remember that its body cannot call suspending functions, unlike the script block,
   and that the compiler reports such a call there with another message ("Suspend function '…' can only be called from a coroutine…") than within a non-inline lambda of the block ("Suspension functions can only be called within coroutine body.").
 - In a regular `.kts`, a call before a function's declaration ranks it after the receivers everywhere, but only if the compiler resolves that call to it, not `append` of `buildString { append("x") }` — see `ScriptStructure.forwardReferencedFunctions`.
+- A local function of the script block takes precedence over the members of every implicit receiver, even over the own member of a local class calling it,
+  while a function of a regular `.kts` ranks after them — a local extension of the outermost receiver ranks like the latter, see `ScriptStructure.isExtensionOfOuterReceiver`.
 
 ## Anti-patterns to avoid
 

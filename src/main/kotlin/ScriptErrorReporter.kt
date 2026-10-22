@@ -139,7 +139,7 @@ internal class ScriptErrorReporter(
             appendPosition(reference.start)
             +"error: '${reference.name}' does not refer to the $kind of the script body declared at line ${hidden.line + 1}, which is not visible in '$declaration'.\n"
             appendSourceLines(reference.start, reference.end)
-            appendNotVisibleHint(declaration, reference.name, hidden.line, source.isMovedInlineFunction(declaration))
+            appendNotVisibleHint(declaration, reference.name, hidden.line, source.isMovedInlineFunctionAt(reference.start))
         }
     }.trimEnd()
 
@@ -374,7 +374,7 @@ internal class ScriptErrorReporter(
         }
         if (suspensionOutsideCoroutine.matches(diagnostic.message)) {
             // the innermost one, if nested
-            source.localInlineFunctionArguments.lastOrNull { start in it }?.let { argument ->
+            source.localInlineFunctionArguments.lastOrNull { start in it.lambda }?.takeIf { it.mightSuspendAt(start) }?.lambda?.let { argument ->
                 +"  hint: '${argument.name}' is compiled without 'inline', as it reads the local values of the script body, so its lambdas cannot suspend"
                 +" - pass the local values to '${argument.name}' as parameters to keep it inline.\n"
             }
@@ -448,7 +448,7 @@ internal class ScriptErrorReporter(
             ?: source.bodyDeclarationLine(name) ?: return
         val declaration = source.movedDeclarationAt(position)
         if (declaration != null) {
-            appendNotVisibleHint(declaration, name, line, source.isMovedInlineFunction(declaration))
+            appendNotVisibleHint(declaration, name, line, source.isMovedInlineFunctionAt(position))
         } else if (line > position.line) {
             val declarations = when (kind) {
                 CLASS -> "classes"

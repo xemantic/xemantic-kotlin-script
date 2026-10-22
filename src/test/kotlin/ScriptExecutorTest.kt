@@ -4267,7 +4267,9 @@ class ScriptExecutorTest {
             // called where a receiver resolves it in the script, like `run` of the class
             "val log = mutableListOf<String>()\ninline fun run(block: () -> String): String { log += \"mine\"; return block() }\nclass A { fun go() = run { \"a\" } }\nA().go() + log",
             // an inline function cannot be recursive
-            "val log = mutableListOf<String>()\ninline fun count(n: Int): Int = if (n == 0) log.size else count(n - 1)\ncount(2)"
+            "val log = mutableListOf<String>()\ninline fun count(n: Int): Int = if (n == 0) log.size else count(n - 1)\ncount(2)",
+            // reading the local property only within a lambda, which might have a receiver resolving it instead
+            "val log = mutableListOf<String>()\ninline fun logAll(items: List<Int>, block: () -> Unit) { items.forEach { log += it.toString() }; block() }\nlogAll(listOf(1)) { }\nlog"
         )
         val executor = ScriptExecutor()
 
@@ -4326,6 +4328,166 @@ class ScriptExecutorTest {
                 script.kts:3:29: error: Suspension functions can only be called within coroutine body.
                   | logged { kotlinx.coroutines.<error>delay</error>(1) }
                   hint: 'logged' is compiled without 'inline', as it reads the local values of the script body, so its lambdas cannot suspend - pass the local values to 'logged' as parameters to keep it inline.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should execute scripts calling inline functions reading local properties where receivers might resolve the calls`() = runTest {
+        // given
+        val logged = "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"start\"; block() }\n"
+        val scripts = listOf(
+            "${logged}listOf(1, 2).forEach { logged { } }\nlog",
+            "${logged}repeat(1) { logged { } }\nlog",
+            "${logged}fun Int.go() = logged { }\n3.go()\nlog",
+            "${logged}class B { fun go() = logged { } }\nB().go()\nlog",
+            "${logged}val s = buildString { logged { append(\"x\") } }\ns + log",
+            // the members of the receivers take precedence, like in the script
+            "${logged}class B { fun logged(block: () -> Unit) { log += \"member\"; block() }; fun go() = logged { } }\nB().go()\nlogged { }\nlog",
+            "${logged}class B { fun logged(block: () -> Unit) { log += \"member\"; block() } }\nwith(B()) { logged { } }\nlogged { }\nlog",
+            "${logged}class A { fun logged(block: suspend () -> Unit) = 1; fun go() = logged { kotlinx.coroutines.delay(1) } }\nlogged { }\nA().go().toString() + log",
+            // calling the function moved out of the script body, as referred to before its declaration
+            "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"start\"; helper(); block() }\nfun helper() = 1\nlogged { }\nlog"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(
+            results.map { (it as? ScriptResult.Value)?.value } == listOf(
+                listOf("start", "start"),
+                listOf("start"),
+                listOf("start"),
+                listOf("start"),
+                "x[start]",
+                listOf("member", "start"),
+                listOf("member", "start"),
+                "1[start]",
+                listOf("start")
+            )
+        )
+    }
+
+    @Test
+    fun `should report inline function reading local property called by class member of the same name`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            inline fun run(block: () -> String): String { log += "mine"; return block() }
+            class A { fun run(block: () -> String) = "member"; fun go() = run { "a" } }
+            A().go() + run { "b" } + log
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:12: error: 'run' refers to the coroutine scope of the script body, instead of the function declared at line 2, which is compiled outside of the script body.
+                  | A().go() + <error>run</error> { "b" } + log
+                  hint: rename the function.
+
+                script.kts:2:47: error: Unresolved reference 'log'.
+                  | inline fun run(block: () -> String): String { <error>log</error> += "mine"; return block() }
+                  hint: 'run' is an inline function compiled outside of the script body, where 'log' (line 1) is not visible - pass it as a parameter, or declare it within 'run'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report suspending calls in parenthesized annotated and nested lambdas of inline function reading local property`() = runTest {
+        // given
+        val logged = "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"start\"; block() }\n"
+        val scripts = listOf(
+            "${logged}logged(({ kotlinx.coroutines.delay(1) }))",
+            "${logged}logged(@Suppress(\"UNUSED\") { kotlinx.coroutines.delay(1) })",
+            // inlined, if the function was inline
+            "${logged}logged { listOf(1).forEach { kotlinx.coroutines.delay(1) } }"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.all { (it as? ScriptResult.Error)?.message?.contains("hint: 'logged' is compiled without 'inline'") == true })
+    }
+
+    @Test
+    fun `should not hint at inline function for suspending calls which cannot suspend when inlined`() = runTest {
+        // given
+        val logged = "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"start\"; block() }\n"
+        val scripts = listOf(
+            "${logged}logged { Runnable { kotlinx.coroutines.delay(1) }.run() }",
+            "${logged}logged { fun nested() { kotlinx.coroutines.delay(1) }; nested() }",
+            "${logged}logged { val f = { kotlinx.coroutines.delay(1) }; f() }"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+        assert(results.none { (it as ScriptResult.Error).message.contains("hint: 'logged' is compiled without 'inline'") })
+    }
+
+    @Test
+    fun `should report inline function with contract reading local property`() = runTest {
+        // given
+        val script = """
+            @file:OptIn(kotlin.contracts.ExperimentalContracts::class)
+            import kotlin.contracts.*
+            val log = mutableListOf<String>()
+            inline fun logged(block: () -> Unit) { contract { callsInPlace(block, InvocationKind.AT_LEAST_ONCE) }; log += "s"; block() }
+            logged { }
+            log
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:104: error: Unresolved reference 'log'.
+                  | inline fun logged(block: () -> Unit) { contract { callsInPlace(block, InvocationKind.AT_LEAST_ONCE) }; <error>log</error> += "s"; block() }
+                  hint: 'logged' is an inline function compiled outside of the script body, where 'log' (line 3) is not visible - pass it as a parameter, or declare it within 'logged'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not hint at inline function for moved overload which is not inline`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            @JvmName("tagInt") fun tag(x: Int) = log.size + x
+            inline fun tag(block: () -> Unit) { block() }
+            tag(1)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:38: error: Unresolved reference 'log'.
+                  | @JvmName("tagInt") fun tag(x: Int) = <error>log</error>.size + x
+                  hint: 'tag' is compiled outside of the script body, where 'log' (line 1) is not visible - pass it as a parameter, or declare it within 'tag'.
             """.trimIndent()
         }
     }
