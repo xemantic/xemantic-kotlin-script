@@ -4382,6 +4382,47 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should call dependency within lambdas of scope functions of script instance before local function of the same name`() = runTest {
+        // given
+        // the script instance is the receiver of these lambdas in a regular script, declaring the dependency, which takes precedence there
+        val scripts = listOf(
+            "val p = \"!\"\nval a = f(1)\nclass P\nval b = run { f(null) }\nfun f(x: P?) = \"local\" + p\na + b",
+            "val p = \"!\"\nval b = run { f(null) }\nfun f(x: String?) = \"local\" + p\nb",
+            "val p = \"!\"\nclass P\nval b = run { f(null) }\nfun f(x: P?) = \"local\" + p\nb",
+            "val p = \"!\"\nval b = apply { f(null) }.let { runCatching { f(null) }.getOrThrow() } + with(this) { f(null) }\nfun f(x: String?) = \"local\" + p\nb",
+            "val p = \"!\"\nfun g() = run { f(null) }\nfun f(x: String?) = \"local\" + p\ng()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, listOf(dependency<(Any?) -> String>("f") { "dep" })) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("depdep", "dep", "dep", "depdep", "dep"))
+    }
+
+    @Test
+    fun `should report calls of dependency within lambdas of scope functions of other receivers before local function of the same name`() = runTest {
+        // given
+        val scripts = listOf(
+            "val p = \"!\"\nclass Bar { fun m() = run { f(null) } }\nfun f(x: String?) = \"local\" + p\nBar().m()",
+            "val p = \"!\"\nfun Int.h() = run { f(null) }\nfun f(x: String?) = \"local\" + p\n2.h()",
+            "val p = \"!\"\nval b = with(\"a\") { run { f(null) } }\nfun f(x: String?) = \"local\" + p\nb",
+            "val p = \"!\"\nval b = run<String> { f(null) }\nfun f(x: String?) = \"local\" + p\nb",
+            "val p = \"!\"\nval b = listOf(1).map { f(null) }\nfun f(x: String?) = \"local\" + p\nb"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, listOf(dependency<(Any?) -> String>("f") { "dep" })) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.first()?.substringAfter("error: ") } == List(scripts.size) {
+            "'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 3."
+        })
+    }
+
+    @Test
     fun `should report error at call preceding local function named like library function`() = runTest {
         // given
         val script = """
@@ -4771,6 +4812,35 @@ class ScriptExecutorTest {
         assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.first()?.substringAfter("error: ") } == List(scripts.size) {
             "'Foo' refers to the dependency, as the class 'Foo' of the script body is declared later, at line 3."
         })
+    }
+
+    @Test
+    fun `should report later call of dependency before local class of the same name whose constructor refers to local class declared after first call`() = runTest {
+        // given
+        val script = """
+            val p = "1".toInt()
+            val a = Foo(null)
+            class Bar { fun g() = p }
+            val r = Foo(Bar())
+            class Foo(val b: Bar?) { fun g() = p }
+            r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<(Any?) -> Int>("Foo") { 7 }))
+
+        // then
+        // unlike the first call, preceding the class of the parameter, see README
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:9: error: 'Foo' refers to the dependency, as the class 'Foo' of the script body is declared later, at line 5.
+                  | val r = <error>Foo</error>(Bar())
+                  hint: declare the class before line 4, or rename it.
+            """.trimIndent()
+        }
     }
 
     @Test
@@ -5807,6 +5877,133 @@ class ScriptExecutorTest {
 
         // then
         assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(true, 1, true, true))
+    }
+
+    @Test
+    fun `should execute references within anonymous functions with receivers next to moved declarations of their names`() = runTest {
+        // given
+        val scripts = listOf(
+            "val r = with(Job(), fun Job.(): Any = isActive)\nval isActive get() = \"mine\"\nr",
+            "val r = (fun CoroutineScope.(): Any = isActive)(CoroutineScope(Job()))\nval isActive get() = \"mine\"\nr",
+            "val r = Job().run(fun Job.(): Any { cancel(); return isCancelled })\nfun cancel(): String = \"mine\"\nr"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(true, true, true))
+    }
+
+    @Test
+    fun `should report references within anonymous functions resolved to the coroutine scope of the script body instead of moved declarations`() = runTest {
+        // given
+        val scripts = listOf(
+            "val r = with(\"a\", fun String.(): Any = isActive)\nval isActive get() = \"mine\"\nr",
+            "val r = (fun(): Any = isActive)()\nval isActive get() = \"mine\"\nr"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.first()?.substringAfter("error: ") } == List(scripts.size) {
+            "'isActive' refers to the coroutine scope of the script body, instead of the property declared at line 2, which is compiled outside of the script body."
+        })
+    }
+
+    @Test
+    fun `should report assignments resolved to the coroutine scope of the script body instead of moved properties`() = runTest {
+        // given
+        val scripts = listOf(
+            "isActive = \"b\"\nvar isActive: String get() = \"a\"; set(v) {}\n1",
+            "val r = listOf(1).map { isActive = \"b\"; 1 }\nvar isActive: String get() = \"a\"; set(v) {}\nr",
+            "val r = listOf(1).map { isActive += \"b\"; 1 }\nvar isActive: String get() = \"a\"; set(v) {}\nr",
+            // the increments and decrements, also within lambdas
+            "isActive++\nvar isActive: Int get() = 1; set(v) {}\n1",
+            "val r = listOf(1).map { --isActive; 1 }\nvar isActive: Int get() = 1; set(v) {}\nr"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // without the errors of the assignments to the property of the coroutine scope, like `'val' cannot be reassigned`
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.filter { line -> "error: " in line } } == listOf(1, 25, 25, 1, 27).map { column ->
+            listOf(
+                "script.kts:1:$column: error: 'isActive' refers to the coroutine scope of the script body, " +
+                        "instead of the property declared at line 2, which is compiled outside of the script body."
+            )
+        })
+    }
+
+    @Test
+    fun `should report assignment within lambda to value of its receiver next to moved property of its name as regular script`() = runTest {
+        // given
+        val script = "val r = with(object { val isActive = 1 }) { isActive = 2; isActive }\nvar isActive: String get() = \"a\"; set(v) {}\nr"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert((result as? ScriptResult.Error)?.message?.lines()?.first() == "script.kts:1:45: error: 'val' cannot be reassigned.")
+    }
+
+    @Test
+    fun `should report references within lambdas of functions imported by the names of coroutine scope builders`() = runTest {
+        // given
+        val scripts = listOf(
+            "import kotlin.run as launch\nval r = launch { isActive }\nval isActive get() = \"mine\"\nr",
+            "import kotlin.run as coroutineScope\nval r = coroutineScope { isActive }\nval isActive get() = \"mine\"\nr"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.first()?.substringAfter("error: ") } == List(scripts.size) {
+            "'isActive' refers to the coroutine scope of the script body, instead of the property declared at line 3, which is compiled outside of the script body."
+        })
+    }
+
+    @Test
+    fun `should execute assignments within lambdas to properties of their receivers next to moved properties of their names`() = runTest {
+        // given
+        val script = "val r = with(object { var isActive = 1 }) { isActive = 2; isActive++; isActive }\nvar isActive: String get() = \"a\"; set(v) {}\nr"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert((result as? ScriptResult.Value)?.value == 3)
+    }
+
+    @Test
+    fun `should report call within lambda resolved to the coroutine scope of the script body given the moved member of any of other return type`() = runTest {
+        // given
+        val script = """
+            val r = listOf(1).map { cancel(toString()) }
+            fun toString(): Int = 1
+            fun cancel(x: Int): String = "mine"
+            r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        // `cancel(toString())` resolves to `cancel(message: String)` of the coroutine scope, while a regular script calls `cancel(x: Int)`
+        assert((result as? ScriptResult.Error)?.message?.lines()?.filter { "error: " in it }?.map { it.substringBefore(" refers") } == listOf(
+            "script.kts:1:25: error: 'cancel'",
+            "script.kts:1:32: error: 'toString'"
+        ))
     }
 
     @Test

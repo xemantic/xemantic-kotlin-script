@@ -538,10 +538,14 @@ internal class DefaultScriptExecutor(
                     candidate.copy(line = localFunctionLine(message) ?: candidate.line)
                 }
             }
-            // the references not resolved to the moved declarations, unless already reported as errors
+            // the references not resolved to the moved declarations, unless already reported as errors, other than the one of the assignment
+            // to the property of the coroutine scope instead of the moved `var`, `'val' cannot be reassigned`, at the property, explained by it,
+            // while a reference within a lambda resolved to a value of its receiver, failing the same way, is not confirmed by the copies
             val toDeclarations = deprecated(COROUTINE_SCOPE_ORIGINAL)
             val coroutineScopeReferences = source.coroutineScopeCandidates.filter { candidate ->
-                toDeclarations.none { it in candidate.reference } && errors.none { it in candidate.reference }
+                toDeclarations.none { it in candidate.reference } && errors.none {
+                    it in candidate.reference && (candidate.assignment == null || it != candidate.reference.start)
+                }
             }
             // the calls not referring to the moved functions already, which would refer to them in the script, if they apply
             val toFunctions = deprecated(SHADOWED_ORIGINAL)
@@ -571,9 +575,13 @@ internal class DefaultScriptExecutor(
                 val inferred = copies(inInferredTypes) { parsed.source(confirming = true, overloadingFunctionCopies = true) }
                 val declared = copies(inDeclaredTypes) { parsed.source(confirming = true, shadowedFunctionCopies = true) }
                 val shadowed = async { (inferred.await() + declared.await()).distinctBy { it.reference } }
-                // also declaring the copies of the constructors of the local classes, see ScriptSource.laterDeclaredClassCandidates
+                // also declaring the copies of the constructors of the local classes, see ScriptSource.laterDeclaredClassCandidates,
+                // and of the scope functions, the receivers of the lambdas of which are the script instance in the script
                 val scopeCopies = async {
-                    if (confirmedCandidates.isEmpty() && source.laterDeclaredClassCandidates.isEmpty()) null else {
+                    if (
+                        confirmedCandidates.isEmpty() && source.laterDeclaredClassCandidates.isEmpty()
+                        && source.laterDeclaredDependencyCandidates.none { it.scopeCalls.isNotEmpty() }
+                    ) null else {
                         val copies = parsed.source(confirming = true, coroutineScopeCopies = true)
                         copies to confirming(copies).reports
                     }
@@ -585,16 +593,17 @@ internal class DefaultScriptExecutor(
             val constructors = scopeCopies?.let { (copies, reports) -> reports.marked(copies, LATER_DECLARED_CLASS) }.orEmpty()
             // the calls of the scope functions of the coroutine scope of the script body, the script instance in the script
             val toScriptReceiver = scopeCopies?.let { (copies, reports) -> reports.marked(copies, SCRIPT_RECEIVER) }.orEmpty()
+            /** Whether it is within the lambda of a scope function of the script instance, declaring the dependency, which takes precedence there in the script. */
+            fun List<ScriptReference>.toScriptReceiver() = any { call -> toScriptReceiver.any { it in call } }
             val laterDeclaredDependencyReferences = (source.laterDeclaredDependencyCandidates.filter { candidate ->
                 (functions.takeIf { candidate.isFunction }.orEmpty()
                         // like `::x`, resolved to the property of the dependency instead of the local function
                         + dependencies.takeIf { !candidate.isFunction || candidate.isCallableReference }.orEmpty())
-                    .any { it in candidate.reference }
+                    .any { it in candidate.reference } && !candidate.scopeCalls.toScriptReceiver()
             } + source.laterDeclaredClassCandidates.filter { candidate ->
                 // calling the dependency without the copies, rather than e.g. the member of a receiver, which takes precedence in the script,
                 // like the script instance, the receiver of the lambdas of its scope functions, like `run { }`, declaring the dependency
-                constructors.any { it in candidate.reference } && dependencies.any { it in candidate.reference }
-                        && candidate.scopeCalls.none { call -> toScriptReceiver.any { it in call } }
+                constructors.any { it in candidate.reference } && dependencies.any { it in candidate.reference } && !candidate.scopeCalls.toScriptReceiver()
             }).sortedBy { it.reference.start }
             val hiddenLocalFunctionReferences = hiddenCandidates.filter {
                 it in hidden && (it !in source.untypedPropertyCalls || it.reference.name in confirmedTypes)
@@ -608,17 +617,15 @@ internal class DefaultScriptExecutor(
                 references: List<T>,
                 toMessage: ScriptErrorReporter.(List<T>) -> String
             ) = references.takeIf { it.isNotEmpty() }?.let { reporter.toMessage(it) }
+            val toCoroutineScopeReferences = coroutineScopeReferences.filter { candidate ->
+                !candidate.isConfirmedByCopies() || toCoroutineScope.any { it in candidate.reference }
+            }
             return Compilation(
                 source,
                 result,
                 confirmedFailures = listOfNotNull(
                     // in the order of the script
-                    message(
-                        coroutineScopeReferences.filter { candidate ->
-                            !candidate.isConfirmedByCopies() || toCoroutineScope.any { it in candidate.reference }
-                        },
-                        ScriptErrorReporter::toCoroutineScopeMessage
-                    ),
+                    message(toCoroutineScopeReferences, ScriptErrorReporter::toCoroutineScopeMessage),
                     // in the order of the script
                     message(
                         toLocals.mapNotNull { candidate -> shadowed.find { it.reference === candidate.reference } },
@@ -632,7 +639,11 @@ internal class DefaultScriptExecutor(
                 // see ScriptSource.calledInsteadDependencies
                 explainedErrors = hiddenLocalFunctionReferences.filter {
                     it.reference.name in source.calledInsteadDependencies
-                }.mapTo(HashSet()) { it.reference.start } + laterDeclaredFunctionReferences.flatMap { reference ->
+                }.mapTo(HashSet()) { it.reference.start } + toCoroutineScopeReferences.flatMap { reference ->
+                    // `'val' cannot be reassigned` at the property, and the errors of the assignment, like `Assignment type mismatch`,
+                    // or of the operator of `+=`, or `++`, called on the property of the coroutine scope, at the operator
+                    listOfNotNull(reference.assignment?.let { reference.reference.start }, reference.assignment)
+                } + laterDeclaredFunctionReferences.flatMap { reference ->
                     // like `None of the following candidates is applicable` of `maxOf(W(1), W(2))`, or `Argument type mismatch` at its arguments,
                     // unlike the errors of the arguments themselves, like `Cannot create an instance of an abstract class`,
                     // or of the calls as arguments, which start there, like `None of the following candidates is applicable` of `print(maxOf("a", 2))`
