@@ -4774,6 +4774,35 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report later call of dependency before local class of the same name whose constructor refers to local class declared after first call`() = runTest {
+        // given
+        val script = """
+            val p = "1".toInt()
+            val a = Foo(null)
+            class Bar { fun g() = p }
+            val r = Foo(Bar())
+            class Foo(val b: Bar?) { fun g() = p }
+            r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<(Any?) -> Int>("Foo") { 7 }))
+
+        // then
+        // unlike the first call, preceding the class of the parameter, see README
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:9: error: 'Foo' refers to the dependency, as the class 'Foo' of the script body is declared later, at line 5.
+                  | val r = <error>Foo</error>(Bar())
+                  hint: declare the class before line 4, or rename it.
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should call dependency before local class of the same name whose constructors do not apply`() = runTest {
         // given
         val scripts = listOf(

@@ -2342,15 +2342,18 @@ private class ScriptStructure(
         }
         /**
          * The copies of the declarations of each name, with their messages, preceding the first statement of the candidates of this name,
-         * given the names of the local classes declared from this statement on, which are not visible there.
+         * given the names of the local classes declared from this statement on, which are not visible there,
+         * and preceding each following one, which more local classes are visible to, like `Foo(Bar())` following `Foo(null)` and `class Bar`,
+         * declaring the copies referring to them, while each copy is declared once, preceding its first use, see blockCopies.
          */
         fun copies(
             candidatesByStatement: Map<Int, List<Reference>>,
             declarations: (name: String, invisibleClasses: Set<String>) -> List<Pair<String, String>>
         ) = buildMap<Int, MutableList<Pair<String, String>>> {
             candidateIndices(candidatesByStatement).forEach { (name, indices) ->
-                val (offset, invisibleClasses) = copyPlace(indices.first())
-                getOrPut(offset) { mutableListOf() } += declarations(name, invisibleClasses)
+                indices.map { copyPlace(it) }.distinctBy { (_, invisibleClasses) -> invisibleClasses }.forEach { (offset, invisibleClasses) ->
+                    getOrPut(offset) { mutableListOf() } += declarations(name, invisibleClasses)
+                }
             }
         }
         /** The copies of these [functions] of each name, see [signature]. */
