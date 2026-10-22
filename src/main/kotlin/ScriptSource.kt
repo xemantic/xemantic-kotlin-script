@@ -1476,7 +1476,9 @@ private class ScriptStructure(
         if (nameIdentifier == null && declaration !is KtDestructuringDeclaration) return null
         // like in the script, also the accessors starting a line, which is not indented more than the property, are its part,
         // moved or blanked out with it, as the local property in the script block has none, so they would be the statements following it,
-        // unless they do nothing, like `get()`, or do not parse, like `get(3)` or `get("/") { }`, being rather the calls following it
+        // unless they do nothing, like `get()`, or do not parse, like `get(3)` or `get("/") { }`, being rather the calls following it,
+        // while along with an accessor which is its part, like `get() = field + 1`, also the other one is, whatever it is,
+        // like a bare `set`, or `set(3)` with the syntax errors of a regular script
         val accessors = (declaration as? KtProperty)?.accessors.orEmpty().let { parsed ->
             fun KtPropertyAccessor.isUnindented() = isOnNewLine(startOffset)
                     && columnOf(startOffset) <= columnOf(declaration.startOffsetSkippingComments)
@@ -1485,11 +1487,16 @@ private class ScriptStructure(
             } else {
                 emptyList()
             }
-            val wellFormed = parsed.takeWhile { accessor ->
-                !accessor.isUnindented() || errorOffsets.none { it >= accessor.startOffset }
+            // the errors of an accessor might follow it, up to the next one
+            fun KtPropertyAccessor.isWellFormed(): Boolean {
+                val next = parsed.getOrNull(parsed.indexOf(this) + 1)
+                return errorOffsets.none { it >= startOffset && (next == null || it < next.startOffset) }
             }
-            // a bare `set` preceding a getter with a body is still the part of the property
-            wellFormed.take(wellFormed.indexOfLast { !it.isUnindented() || it.hasBody() || it.modifierList != null } + 1)
+            if (parsed.any { !it.isUnindented() || (it.isWellFormed() && (it.hasBody() || it.modifierList != null)) }) {
+                parsed
+            } else {
+                emptyList()
+            }
         }
         val end = (declaration as? KtProperty)?.accessors?.getOrNull(accessors.size)?.let { firstOmitted ->
             declaration.allChildren.toList().last {

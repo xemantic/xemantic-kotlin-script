@@ -2707,6 +2707,81 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report only syntax error of accessor following valid accessor without indentation`() = runTest {
+        // given
+        val script = "var v = 0\nget() = field + 1\nset(3)\nv"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:5: error: Syntax error: Expecting parameter name.
+                  | set(<error>3</error>)
+
+                script.kts:3:7: error: Syntax error: Expecting function body.
+                  | set(3)<error></error>
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report only syntax error in body of getter without indentation`() = runTest {
+        // given
+        val script = "val size: Int\nget() {\n  return listOf(1, 2).sum(\n}\nsize"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:1: error: Syntax error: Expecting an argument.
+                  | <error></error>}
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should execute bare setter following getter without indentation as part of property`() = runTest {
+        // given
+        val script = "var v = 0\nget() = field + 1\nset\nv"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 1)
+        }
+    }
+
+    @Test
+    fun `should execute call with trailing lambda spelled like setter as setter of preceding property`() = runTest {
+        // given
+        val script = "fun set(i: Int, b: () -> Int) = b()\nval v = 2\nvar x = 1\nset(v) { 6 }"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == Unit)
+        }
+    }
+
+    @Test
     fun `should execute calls of get and set on the lines after properties without indentation`() = runTest {
         // given
         val scripts = listOf(
