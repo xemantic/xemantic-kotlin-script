@@ -2782,6 +2782,30 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should execute statements following function with expression body and semicolon on the same line`() = runTest {
+        // given
+        val scripts = listOf(
+            "fun a() = 1; val z = 5\na() + z",
+            "val a = 6; fun b() = a; b()",
+            "fun a() = 1; fun b() = 5; a() + b()",
+            "val f = fun() = 1; val z = 5\nf() + z",
+            "fun a() = 1 /* c */; /* d */ val z = 5\na() + z",
+            "fun a() = b(); val z = 4\nfun b() = 2\na() + z",
+            "inline fun a() = 1; val z = 5\na() + z",
+            "enum class E { A }; fun a() = 1; E.A.ordinal + a() + 5",
+            "fun a() = 1;\na() + 5",
+            "class C; val z = 6\nz"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == List(scripts.size) { 6 })
+    }
+
+    @Test
     fun `should execute calls of get and set on the lines after properties without indentation`() = runTest {
         // given
         val scripts = listOf(

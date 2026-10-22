@@ -29,6 +29,7 @@ import org.jetbrains.kotlin.com.intellij.psi.PsiElement
 import org.jetbrains.kotlin.com.intellij.psi.PsiErrorElement
 import org.jetbrains.kotlin.com.intellij.psi.PsiWhiteSpace
 import org.jetbrains.kotlin.com.intellij.psi.tree.IElementType
+import org.jetbrains.kotlin.com.intellij.psi.util.PsiTreeUtil
 import org.jetbrains.kotlin.compiler.plugin.CompilerPluginRegistrar
 import org.jetbrains.kotlin.compiler.plugin.ExperimentalCompilerApi
 import org.jetbrains.kotlin.config.CompilerConfiguration
@@ -506,13 +507,19 @@ internal class ScriptSource(
         mapping += null
         // the copies preceding the statements, where the local classes declared before them are visible
         val blockCopies = structure.blockCopies.entries.groupBy({ lineOf(it.key) }) { it.value }
+        val lineSplits = structure.lineSplits.groupBy { lineOf(it) }
         (lineOf(headerEnd)..lineBounds.lastIndex).forEach { line ->
             blockCopies[line]?.flatten()?.forEach { (messages, declaration) ->
                 lines += messages.joinToString(separator = " ", postfix = " ") { "@${optInMarker(it)}" } + declaration
                 mapping += null
             }
-            addLines(line..line) { offset ->
-                offset >= headerEnd && !excluded[offset]
+            // each part of the split line keeps its columns, the others blanked out
+            val starts = listOf(lineBounds[line].first) + lineSplits[line].orEmpty()
+            starts.forEachIndexed { index, start ->
+                val end = starts.getOrNull(index + 1) ?: script.length
+                addLines(line..line) { offset ->
+                    offset in start until end && offset >= headerEnd && !excluded[offset]
+                }
             }
         }
         if (returnsUnit) {
@@ -1133,6 +1140,14 @@ private class ScriptStructure(
     /** The modifiers of the moved declarations, which are not applicable to the members of the script class, like `const`. */
     val movedBlankedRanges = mutableListOf<IntRange>()
 
+    /**
+     * The offsets following the `;` ending a statement of the script body, followed by another one on the same line,
+     * where the line of the script block is split,
+     * as a function with an expression body takes the `;` as its part, like `fun a() = 1;`,
+     * so the parser of a block rejects the statement following it on the same line, unlike the parser of a script.
+     */
+    val lineSplits: List<Int>
+
     private val declaredNames = DeclaredNames()
 
     init {
@@ -1182,6 +1197,19 @@ private class ScriptStructure(
         localProperties = propertyNameSet - movedConstants.mapTo(HashSet()) { it.name!! }
         movedDeclarations = moved.map { it.toDeclaration(withNestedNames = true) }
         endsWithMovedDeclaration = moved.any { it.psi == statements.lastOrNull() }
+        val movedStatements = moved.mapTo(HashSet()) { it.psi }
+        lineSplits = statements.withIndex().mapNotNull { (index, statement) ->
+            // also followed by a comment, like `fun a() = 1; /* c */`, which the function takes as well
+            var last = PsiTreeUtil.getDeepestLast(statement)
+            while (last is PsiComment || last is PsiWhiteSpace) last = PsiTreeUtil.prevLeaf(last) ?: break
+            if (statement in movedStatements || last.node.elementType != KtTokens.SEMICOLON) return@mapNotNull null
+            val lineEnd = script.indexOf('\n', last.endOffset).let { if (it == -1) script.length else it }
+            last.endOffset.takeIf {
+                statements.subList(index + 1, statements.size).asSequence()
+                    .takeWhile { it.startOffset < lineEnd }
+                    .any { it !in movedStatements }
+            }
+        }
         // unlike an extension function, which cannot be called like the dependency
         val (local, movedOut) = declarations.filter { it.kind == DeclarationKind.FUNCTION && !it.isExtension }.partition { it !in moved }
         localFunctions = local.mapNotNullTo(HashSet()) { it.name }
