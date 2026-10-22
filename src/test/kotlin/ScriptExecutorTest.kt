@@ -1712,7 +1712,7 @@ class ScriptExecutorTest {
             message sameAs """
                 script.kts:1:17: error: Unresolved reference 'format'.
                   | val formatted = <error>format</error>("x")
-                  hint: 'format' is declared at line 3, while the functions of the script body are visible only after their declaration - move it before line 1.
+                  hint: 'format' is declared at line 3, and accesses 'prefix' declared after this call, while the declarations of the script body are visible only after their declaration - move them all before line 1, or pass 'prefix' as a parameter.
             """.trimIndent()
         }
     }
@@ -2019,6 +2019,89 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should not call function of inferred type accessing local declarations before its declaration when it calls function within lambda with receiver`() = runTest {
+        // given
+        val script = $$"""
+            val factor = 2
+            class Obj { fun b() = "member" }
+            fun b() = "local $factor"
+            fun a() = c()
+            fun c() = with(Obj()) { b() } + factor
+            val x = d()
+            fun d() = run { with(Obj()) { b() } } + factor
+            a() + x
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:11: error: Unresolved reference 'c'.
+                  | fun a() = <error>c</error>()
+                  hint: 'c' is declared at line 5, while the functions of the script body are visible only after their declaration - move it before line 4.
+
+                script.kts:6:9: error: Unresolved reference 'd'.
+                  | val x = <error>d</error>()
+                  hint: 'd' is declared at line 7, while the functions of the script body are visible only after their declaration - move it before line 6.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call function of declared type accessing local declarations before its declaration when it calls function within lambda with receiver`() = runTest {
+        // given
+        val script = $$"""
+            val factor = 2
+            class Obj { fun b() = "member" }
+            fun b() = "local $factor"
+            fun a() = c()
+            fun c(): String = with(Obj()) { b() } + factor
+            a()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "local 22")
+        }
+    }
+
+    @Test
+    fun `should not hint that function calls back the one calling it when it only binds a value of its name`() = runTest {
+        // given
+        val script = $$"""
+            val k = "!"
+            fun format(x: Int) = render(x)
+            fun render(x: Int) = listOf(x).joinToString { format -> "$format$k" }
+            format(1)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:22: error: Unresolved reference 'render'.
+                  | fun format(x: Int) = <error>render</error>(x)
+                  hint: 'render' is declared at line 3, while the functions of the script body are visible only after their declaration - move it before line 2.
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should not call function accessing local variable before its declaration`() = runTest {
         // given
         val script = """
@@ -2313,7 +2396,7 @@ class ScriptExecutorTest {
             message sameAs """
                 script.kts:1:9: error: Unresolved reference 'area'.
                   | println(<error>area</error>())
-                  hint: 'area' is declared at line 3, while the functions of the script body are visible only after their declaration - move it before line 1.
+                  hint: 'area' is declared at line 3, and accesses 'w', 'h' declared after this call, while the declarations of the script body are visible only after their declaration - move them all before line 1, or pass 'w', 'h' as parameters.
             """.trimIndent()
         }
     }

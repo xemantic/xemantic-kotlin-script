@@ -60,6 +60,7 @@ import org.jetbrains.kotlin.psi.KtForExpression
 import org.jetbrains.kotlin.psi.KtFunctionLiteral
 import org.jetbrains.kotlin.psi.KtLabelReferenceExpression
 import org.jetbrains.kotlin.psi.KtNamedDeclaration
+import org.jetbrains.kotlin.psi.KtNameReferenceExpression
 import org.jetbrains.kotlin.psi.KtNamedFunction
 import org.jetbrains.kotlin.psi.KtObjectDeclaration
 import org.jetbrains.kotlin.psi.KtOperationExpression
@@ -678,8 +679,8 @@ internal class ScriptSource private constructor(
 
     private val bodyDeclarations: List<Declaration>
 
-    /** See [ScriptStructure.localFunctionReferences]. */
-    private val localFunctionReferences: Map<String, Set<String>>
+    /** See [ScriptStructure.localReferences]. */
+    private val localReferences: Map<String, Set<String>>
 
     init {
         val lineBounds = lineBounds(script)
@@ -750,7 +751,7 @@ internal class ScriptSource private constructor(
             CoroutineScopeReference(reference.toScriptReference(), position(offset).line, isFunction, reference.isInLambda, assignment?.let { position(it) })
         }
         bodyDeclarations = structure.bodyDeclarations
-        localFunctionReferences = structure.localFunctionReferences
+        localReferences = structure.localReferences
         val deprecatedDependencies = if (confirming) {
             (laterDeclaredDependencyCandidates + laterDeclaredClassCandidates).mapTo(HashSet()) { it.reference.name }
         } else {
@@ -1094,7 +1095,25 @@ internal class ScriptSource private constructor(
         val caller = bodyDeclarations.find {
             it.kind == DeclarationKind.FUNCTION && offset >= it.start && offset < it.end
         }?.name ?: return null
-        return caller.takeIf { caller != name && caller in listOf(name).closure { localFunctionReferences[it].orEmpty().toList() } }
+        return caller.takeIf {
+            caller != name && caller in listOf(name).closure { function -> localReferences[function].orEmpty().filter { it in localReferences } }
+        }
+    }
+
+    /**
+     * The names of the local properties, which the local function of the [name] refers to, declared between the [position] and the function,
+     * which are not visible to it there, in the order of their declaration.
+     */
+    fun laterAccessedProperties(
+        name: String,
+        position: ScriptPosition
+    ): List<String> {
+        val offset = offset(position)
+        val function = bodyDeclarations.find { it.kind == DeclarationKind.FUNCTION && it.name == name } ?: return emptyList()
+        val references = localReferences[name].orEmpty()
+        return bodyDeclarations.filter { it.kind == DeclarationKind.PROPERTY && it.start > offset && it.start < function.start }
+            .flatMap { listOfNotNull(it.name) + it.destructuredNames }
+            .filter { it in references }
     }
 
     private fun position(
@@ -1262,6 +1281,33 @@ private val memberOnlyAnnotations = setOf("Volatile", "Transient", "JvmField", "
 
 private fun KtDeclaration.memberOnlyAnnotationEntries(): List<KtAnnotationEntry> = annotationEntries.filter {
     it.useSiteTarget != null || it.shortName?.asString() in memberOnlyAnnotations
+}
+
+/**
+ * Whether the function is of an inferred type, and might call a function within the scope of an implicit receiver,
+ * like its receiver, or the one of a lambda, where the script, calling it before its declaration,
+ * resolves all of its functions after the members of the receivers, unlike a local function, see [ScriptStructure.hoisting].
+ */
+private fun KtNamedFunction.mightResolveAfterImplicitReceivers(): Boolean =
+    !hasBlockBody() && !hasDeclaredReturnType() && (
+        receiverTypeReference != null || modifierList?.contextReceiverList != null
+            || bodyExpression?.anyDescendantOfType<KtElement> { it is KtLambdaExpression || it is KtNamedFunction || it is KtClassOrObject } == true
+            || valueParameters.any { parameter -> parameter.defaultValue?.anyDescendantOfType<KtElement> { it is KtLambdaExpression || it is KtNamedFunction || it is KtClassOrObject } == true }
+    )
+
+/**
+ * The names this function refers to unqualified, like `f` of `f(1)`, unlike `x.f()`, or a named argument,
+ * unless it declares a value, or a function, of the same name, which might be referred to instead, like the parameter of a lambda.
+ */
+private fun KtNamedFunction.unboundReferences(): Set<String> {
+    val bound = collectDescendantsOfType<KtNamedDeclaration> { it is KtParameter || it is KtProperty || it is KtDestructuringDeclarationEntry || it is KtNamedFunction }
+        .mapNotNullTo(HashSet()) { it.name }
+    return collectDescendantsOfType<KtNameReferenceExpression> { reference ->
+        val parent = reference.parent
+        parent !is KtValueArgumentName && parent !is KtUserType
+                && (parent as? KtQualifiedExpression)?.selectorExpression != reference
+                && !(parent is KtCallExpression && (parent.parent as? KtQualifiedExpression)?.selectorExpression == parent)
+    }.mapTo(HashSet()) { it.getReferencedName() } - bound
 }
 
 /**
@@ -1971,14 +2017,13 @@ private class DeclaredNames {
  * from its [start], without the comments preceding it, like of a declaration, to its [end].
  */
 private class BlockStatement(
+    private val psi: KtExpression,
     val start: Int,
     val end: Int,
     /** The name of the local function it declares, if any. */
     val function: String?,
     /** Whether it declares a local function, which might be hoisted, see [ScriptStructure.hoisting]. */
     val isHoistable: Boolean,
-    /** The names it refers to, or declares, by their offsets. */
-    val identifiers: Map<Int, String>,
     /**
      * The index of the first statement of the script block sharing its line, preceding which the hoisted functions are inserted,
      * so the inserted lines do not split another statement, like the copies, see [ScriptStructure.blockCopies].
@@ -1986,7 +2031,13 @@ private class BlockStatement(
     val insertion: Int,
     /** The offset where the functions hoisted preceding it are inserted, like the copies, preceding its line. */
     val insertionOffset: Int
-)
+) {
+    /** The names it refers to, or declares, by their offsets, recognized only when hoisting, see [ScriptStructure.hoisting]. */
+    val identifiers: Map<Int, String> by lazy {
+        psi.collectDescendantsOfType<LeafPsiElement> { it.elementType == KtTokens.IDENTIFIER }
+            .associate { it.startOffset to KtPsiUtil.unquoteIdentifier(it.text) }
+    }
+}
 
 /**
  * The local functions declared preceding the statements calling them, see [ScriptStructure.hoisting]:
@@ -2150,6 +2201,12 @@ private class ScriptStructure(
 
     /** The offsets of the operator functions of the script, see [hoisting]. */
     private val operatorStarts: List<Int>
+
+    /**
+     * The names of the local declarations of the script body, which each local function refers to, by its name,
+     * unless it declares a value or a function of the same name, see [ScriptSource.callsBack].
+     */
+    val localReferences: Map<String, Set<String>>
 
     /** The names of the local variables of the script body, the `var` ones, see [hoisting]. */
     private val localVariables: Set<String>
@@ -2770,25 +2827,19 @@ private class ScriptStructure(
         // the names declared once, as the overloads, or the declarations of other kinds, would be resolved together in the script
         val declarationCounts = declarations.flatMap { listOfNotNull(it.name) + it.destructuredNames }.groupingBy { it }.eachCount()
         val blockIndices = statements.indices.filter { declarationsByPsi[statements[it]] !in moved }
-        // like copyPlace, of each statement
-        val places = IntArray(statements.size)
-        statements.indices.forEach { index ->
-            val start = leadingStart(index)
-            places[index] = if (index > 0 && '\n' !in script.substring(statements[index - 1].endOffset, start)) places[index - 1] else start
-        }
-        val insertions = blockIndices.map { places[it] }
+        val insertions = blockIndices.map { copyPlace(it).first }
         var insertion = 0
         blockStatements = blockIndices.mapIndexed { index, statementIndex ->
             val statement = statements[statementIndex]
             val declaration = declarationsByPsi[statement]
             val function = declaration?.takeIf { it.kind == DeclarationKind.FUNCTION }?.name
             BlockStatement(
+                psi = statement,
                 start = declaration?.start ?: statement.startOffsetSkippingComments,
                 end = statement.endOffset,
                 function = function,
-                isHoistable = function != null && !declaration.isOperator && declarationCounts[function] == 1 && function !in dependencyNames,
-                identifiers = statement.collectDescendantsOfType<LeafPsiElement> { it.elementType == KtTokens.IDENTIFIER }
-                    .associate { it.startOffset to KtPsiUtil.unquoteIdentifier(it.text) },
+                isHoistable = function != null && !declaration.isOperator && declarationCounts[function] == 1 && function !in dependencyNames
+                        && !(declaration.psi as KtNamedFunction).mightResolveAfterImplicitReceivers(),
                 insertion = (if (index > 0 && insertions[index] == insertions[index - 1]) insertion else index).also { insertion = it },
                 insertionOffset = insertions[index]
             )
@@ -2805,6 +2856,11 @@ private class ScriptStructure(
             (listOfNotNull(declaration.name) + declaration.destructuredNames).map { it to declaration.start }
         }.groupBy({ it.first }) { it.second }
         operatorStarts = declarations.filter { it.isOperator }.map { it.start }
+        val bodyNames = declarations.filter { it !in moved }.flatMapTo(HashSet()) { listOfNotNull(it.name) + it.destructuredNames }
+        localReferences = blockStatements.zip(blockIndices).mapNotNull { (statement, index) ->
+            val function = statements[index] as? KtNamedFunction ?: return@mapNotNull null
+            statement.function?.let { it to function.unboundReferences().filterTo(HashSet()) { name -> name in bodyNames } }
+        }.toMap()
     }
 
     /**
@@ -2820,6 +2876,8 @@ private class ScriptStructure(
      * while the script resolves them after the implicit receivers, as declared later than the statement calling it, if its type is inferred,
      * nor to the local variables, whose smart casts it might affect,
      * and it is not an operator, nor any declaration in between, as the operators are referred to without their names, like `a + b`.
+     * A hoisted function of an inferred type, which the script resolves after the implicit receivers, as called before its declaration,
+     * has no scopes of implicit receivers, see [mightResolveAfterImplicitReceivers].
      */
     fun hoisting(
         unresolved: Map<Int, String>
@@ -2852,26 +2910,9 @@ private class ScriptStructure(
                 || hoisted.identifiers.values.any { it in localVariables }
             ) return null
         }
-        // the hoisted functions preceding each statement, each following the ones it calls, which are declared later
-        val functions = targets.entries.groupBy({ it.value }) { it.key }.mapValues { (_, indices) ->
-            val callers = indices.associateWith { index ->
-                blockStatements[index].identifiers.values.mapNotNullTo(HashSet()) { name -> hoistedFunctions[name]?.takeIf { it != index && it in indices } }
-            }
-            val ready = PriorityQueue(indices.filter { callers.getValue(it).isEmpty() })
-            val waiting = callers.filterValues { it.isNotEmpty() }.mapValuesTo(HashMap()) { it.value.size }
-            val callees = callers.entries.flatMap { (caller, called) -> called.map { it to caller } }.groupBy({ it.first }) { it.second }
-            buildList {
-                while (ready.isNotEmpty()) {
-                    val next = ready.remove()
-                    add(next)
-                    callees[next].orEmpty().forEach { caller ->
-                        if (waiting.merge(caller, -1, Int::plus) == 0) ready += caller
-                    }
-                }
-                // calling each other
-                if (size < indices.size) return null
-            }
-        }
+        // the hoisted functions preceding each statement, each following the ones it calls, which are declared later than it,
+        // as it does not refer to the ones declared in between
+        val functions = targets.entries.groupBy({ it.value }) { it.key }.mapValues { (_, indices) -> indices.sortedDescending() }
         val positions = IntArray(blockStatements.size)
         blockStatements.indices.flatMap { index ->
             functions[index].orEmpty() + listOf(index).filter { it !in targets }
@@ -2892,13 +2933,6 @@ private class ScriptStructure(
         )
     }
 
-    /** The names of the local functions, which each local function refers to, by its name, see [ScriptSource.callsBack]. */
-    val localFunctionReferences: Map<String, Set<String>>
-        get() = blockStatements.mapNotNull { it.function }.toSet().let { functions ->
-            blockStatements.filter { it.function != null }.associate { statement ->
-                statement.function!! to statement.identifiers.values.filterTo(HashSet()) { it in functions }
-            }
-        }
 
     /** The [propertyTypes] which are types indeed, which the copies of the [untypedProperties] are declared of, by their names, see [ScriptSource.propertyTypes]. */
     fun copiedPropertyTypes(

@@ -99,9 +99,12 @@ when (result) {
   The call stays reported as unresolved, with the hint to declare the function earlier, when the hoisting might change how any other name is resolved:
   when the function refers to a declaration declared between the statement calling it and itself, like another function it calls,
   or to a local `var`, or when it is an operator, or an operator is declared in between,
+  or when its type is inferred, while it is an extension, or contains a lambda, an anonymous function, or a class,
+  as a regular script calling it before its declaration resolves all of its functions after the members of the implicit receivers then, like `b()` in `with(obj) { b() }`,
   or when another declaration of the script has its name,
   or when a statement in between refers to its name otherwise, like a member of a receiver, `with(obj) { b() }`, or a parameter,
   or when a call in between, or within it, is checked as resolved to another declaration than in a regular script, like `print` declared by the script later.
+  When the function accesses a local property declared after the call, the hint tells to declare them both earlier, or to pass the property as a parameter.
   Functions calling each other, like `even` and `odd`, cannot be declared one preceding the other,
   which the hint tells, suggesting to pass the local declarations they access as parameters instead, so they are compiled outside of the script body.
 * Scripts executed repeatedly, like an agent harness defined as a script, can skip the recompilation
