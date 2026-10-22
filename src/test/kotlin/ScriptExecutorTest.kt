@@ -4028,6 +4028,95 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report unresolved infix or qualified call without hint at later function which is not an extension`() = runTest {
+        // given
+        val scripts = listOf(
+            """
+            val k = "a".length
+            val x = 1 bar 2
+            fun bar(o: Int) = k
+            x
+            """,
+            """
+            val k = "a".length
+            val x = 1.bar(2)
+            fun bar(o: Int) = k
+            x
+            """
+        ).map { it.trimIndent() }
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        results[0] should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                script.kts:2:11: error: Unresolved reference 'bar'.
+                  | val x = 1 <error>bar</error> 2
+            """.trimIndent()
+        }
+        results[1] should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                script.kts:2:11: error: Unresolved reference 'bar'.
+                  | val x = 1.<error>bar</error>(2)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report unresolved infix call before its declaration as extension function`() = runTest {
+        // given
+        val script = """
+            val k = "a".length
+            val x = 1 bar 2
+            infix fun Int.bar(o: Int) = k
+            x
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                script.kts:2:11: error: Unresolved reference 'bar'.
+                  | val x = 1 <error>bar</error> 2
+                  hint: 'bar' is declared at line 3, while the functions of the script body are visible only after their declaration - move it before line 2.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report unresolved qualified type without hint at later local class of its name`() = runTest {
+        // given
+        val script = """
+            val k = "a".length
+            class Config
+            val m: Config.Mode? = null
+            class Mode { val v = k }
+            m
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                script.kts:3:15: error: Unresolved reference 'Mode'.
+                  | val m: Config.<error>Mode</error>? = null
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should report unresolved type declared later as local class named like preceding local function`() = runTest {
         // given
         val scripts = listOf(
@@ -5002,10 +5091,9 @@ class ScriptExecutorTest {
         result should {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
-            // told by the names only, the inherited member is not known
             assert(message.lines().filter { "captures the script class instance" in it } == listOf(
-                "script.kts:2:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead.",
-                "script.kts:3:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead."
+                "script.kts:3:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead.",
+                "script.kts:4:11: error: Object 'Companion' captures the script class instance. Try to use class or anonymous object instead."
             ))
         }
     }
@@ -5034,6 +5122,32 @@ class ScriptExecutorTest {
                 script.kts:1:16: error: Enum entry 'X' captures the script class instance. Try to use class or anonymous object instead.
                   | enum class E { <error>X</error> { override fun f() = input }; abstract fun f(): String }
                   hint: 'X' is compiled outside of the script body, where an enum entry cannot access the dependencies, nor the functions of the script - pass them as parameters.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at nested class capturing the script class instance, not at the one with parameter named like script extension`() = runTest {
+        // given
+        val script = """
+            fun String.up() = this + input
+            class A { class N { fun f(up: Int) = up } }
+            class B { class N { fun g() = input } }
+            A.N().f(1).toString() + B.N().g()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("input", "abc")))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:17: error: Nested class 'N' captures the script class instance. Try to use the explicit 'inner' modifier for both the nested 'N' and outer 'B'.
+                  | class B { class <error>N</error> { fun g() = input } }
+                  hint: 'N' is compiled outside of the script body, where a nested class cannot access the dependencies, nor the functions of the script - pass them as parameters.
             """.trimIndent()
         }
     }
