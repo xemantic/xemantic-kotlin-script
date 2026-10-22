@@ -65,21 +65,47 @@ class ScriptErrorReporterTest {
         assert(lastLine == "    Suppressed: [FURTHER EXCEPTIONS OMITTED]")
     }
 
+    /** Standing for the classes declared in the script, nested in this one, standing for the script class. */
+    enum class Color { RED }
+
+    class Box { companion object }
+
     @Test
     fun `should report exception message naming only the classes declared in the script without the name of the script class`() {
         // given
-        val source = ScriptSource("enum class Color { RED }\nfun f() { class Dog; class Box { companion object } }")
+        val name = ScriptErrorReporterTest::class.java.name
         val throwable = RuntimeException(
-            "_\$\$\$result\$1\$1\$f\$Dog, _.Color.RED, _\$Box\$Companion@1f, _.x.Color, _\$x.Color, _.Cat, _\$_ScriptDependencies, x_.Color, _Color"
+            "$name.Color.RED, $name\$Box\$Companion@1f, $name.Cat, $name\$Cat, x$name.Color, ${name}x.Color"
         ).apply { stackTrace = emptyArray() }
-        val reporter = ScriptErrorReporter(source, scriptClassName = "_")
+        val reporter = ScriptErrorReporter(ScriptSource("throw x"), scriptClassName = name, classLoader = javaClass.classLoader)
 
         // when
         val message = reporter.toFailureMessage(throwable, warnings = emptyList())
 
         // then
         message sameAs
-                "java.lang.RuntimeException: Dog, Color.RED, Box.Companion@1f, _.x.Color, _\$x.Color, _.Cat, _\$_ScriptDependencies, x_.Color, _Color"
+                "java.lang.RuntimeException: Color.RED, Box.Companion@1f, $name.Cat, $name\$Cat, x$name.Color, ${name}x.Color"
+    }
+
+    @Test
+    fun `should report exception of the diagnostic without the name of the script class`() {
+        // given
+        val name = ScriptErrorReporterTest::class.java.name
+        val diagnostic = ScriptDiagnostic(
+            code = ScriptDiagnostic.unspecifiedError,
+            message = "Unable to instantiate class $name",
+            exception = NoClassDefFoundError("$name\$Box").apply { stackTrace = emptyArray() }
+        )
+        val reporter = ScriptErrorReporter(ScriptSource("foo"), scriptClassName = name, classLoader = javaClass.classLoader)
+
+        // when
+        val message = reporter.toFailureMessage(listOf(diagnostic))
+
+        // then
+        message sameAs """
+            error: Unable to instantiate class $name
+              Caused by: java.lang.NoClassDefFoundError: Box
+        """.trimIndent()
     }
 
     @Test

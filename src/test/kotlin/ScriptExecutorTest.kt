@@ -1371,6 +1371,116 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report default string representations of anonymous objects and lambdas without their synthetic names`() = runTest {
+        // given
+        val script = $$"""
+            class Box {
+                val o = object {}
+                val r = object : Runnable { override fun run() {} }
+                fun f() = { 1 }
+            }
+            val o = object {}
+            val f = { 1 }
+            throw IllegalStateException("$o $f ${Box().o} ${Box().r} ${Box().f()}")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.withoutHashCodes().lines().first() sameAs
+                    "java.lang.IllegalStateException: <anonymous object>@<hash> <lambda>@<hash> <anonymous object>@<hash> <anonymous java.lang.Runnable>@<hash> <lambda>@<hash>"
+        }
+    }
+
+    @Test
+    fun `should report enum constant not found without the name of the script class also written in a string literal`() = runTest {
+        // given
+        val script = """
+            enum class C { X }
+            val note = "_.C"
+            C.valueOf("Y")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first() sameAs "java.lang.IllegalArgumentException: No enum constant C.Y"
+        }
+    }
+
+    @Test
+    fun `should keep names in exception messages which the script wrote itself with escaped dollars or followed by other text`() = runTest {
+        // given
+        val script = listOf(
+            "class Box",
+            "throw IllegalStateException(\"\"\"_\${'\$'}Box\"\"\" + \" _\${\"\$\"}Box \" + \"_.Box\" + \"!\")"
+        ).joinToString("\n")
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first() sameAs $$"java.lang.IllegalStateException: _$Box _$Box _.Box!"
+        }
+    }
+
+    @Test
+    fun `should report default string representations of backticked classes without the name of the script class`() = runTest {
+        // given
+        val script = $$"""
+            class `My Box`
+            class `my-box`
+            throw IllegalStateException("${`My Box`()} ${`my-box`()}")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.withoutHashCodes().lines().first() sameAs
+                    "java.lang.IllegalStateException: My Box@<hash> my-box@<hash>"
+        }
+    }
+
+    @Test
+    fun `should report class cast of local class of function named like class enclosing object literal`() = runTest {
+        // given
+        val script = """
+            class Shape { val x = object {} }
+            fun Shape(n: Int): Any {
+                class Impl
+                return Impl()
+            }
+            Shape(1) as Shape
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first().substringBefore(" (") sameAs
+                    "java.lang.ClassCastException: class Impl cannot be cast to class Shape"
+        }
+    }
+
+    @Test
     fun `should report exception with a very long message resembling the name of the script class`() = runTest {
         // given
         val script = """

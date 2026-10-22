@@ -45,8 +45,15 @@ private val declarationCapturingScript = Regex(
  */
 private val backendCrash = Regex("Exception while generating code for (?:.* fun (\\S+) .*|.*) declared in (.+):")
 
-/** A part of a binary or canonical class name, like `$Lid` of `_$Box$Lid`, possibly empty, like in `_$$$result$1$1$Dog`. */
-private val classNamePart = Regex("([.$])([\\p{L}\\p{N}_]*)")
+/** The longest name of a class of the script looked up in a text resembling one, as the text might continue, like `_.Color is unknown`. */
+private const val MAX_CLASS_NAME_LENGTH = 256
+
+/** The superclasses of the classes of the Kotlin lambdas, not compiled with `invokedynamic`, like the suspend ones. */
+private val lambdaSuperclasses = setOf(
+    "kotlin.jvm.internal.Lambda",
+    "kotlin.coroutines.jvm.internal.SuspendLambda",
+    "kotlin.coroutines.jvm.internal.RestrictedSuspendLambda"
+)
 
 internal fun Iterable<ScriptDiagnostic>.filterNonIgnorable() = filterNot { diagnostic ->
     diagnostic.severity == ScriptDiagnostic.Severity.DEBUG && listOf(
@@ -62,29 +69,34 @@ internal fun Iterable<ScriptDiagnostic>.filterNonIgnorable() = filterNot { diagn
  *   to strip it from the names of the classes declared in the script.
  * @param blockClassName the binary name of the class of the script block,
  *   to tell the frames of the script body.
+ * @param classLoader the class loader of the script class,
+ *   resolving the names of the classes declared in the script, in the exception messages.
  */
 internal class ScriptErrorReporter(
     private val source: ScriptSource,
     private val scriptClassName: String? = null,
-    private val blockClassName: String? = null
+    private val blockClassName: String? = null,
+    private val classLoader: ClassLoader? = null
 ) {
 
     /**
      * The name of a class qualified by the script class, like `_.Color` of `Enum.valueOf`, or `_$Box$Lid` of `ClassCastException`,
-     * and of the default string representation, as long as the binary name continues, not preceded by a part of another name,
-     * matching the parts with a single character class, as a repeated group would overflow the stack on a long message.
+     * and of the default string representation, followed by the text, which might continue the name, like the spaces of a backticked name,
+     * not preceded by a part of another name, matching it with a single character class, as a repeated group would overflow the stack on a long message,
+     * and by the address of a lambda, like `/0x000071a8` of `_$$$result$1$1$$Lambda/0x000071a8`.
      */
     private val scriptQualifiedName = scriptClassName?.let {
         // also the element class of an array, like `[L_$Circle;`
-        Regex("(?:(?<=\\[L)|(?<![\\p{L}\\p{N}_.$]))${Regex.escape(it)}([.$][\\p{L}\\p{N}_.$]*)")
+        Regex("(?:(?<=\\[L)|(?<![\\p{L}\\p{N}_.$]))${Regex.escape(it)}([.$][\\p{L}\\p{N}_.$ -]*)(/0x\\p{XDigit}+)?")
     }
 
-    /** The names qualified by the script class written in the string literals of the script, like `_.Color`, which are kept. */
-    private val writtenQualifiedNames by lazy {
-        source.stringLiterals.flatMapTo(HashSet()) { literal ->
-            scriptQualifiedName?.findAll(literal)?.mapNotNull { it.toDeclaredClassName()?.first }.orEmpty()
-        }
+    /** The constant parts of the string literals of the script resembling the names qualified by the script class, like `_.Color`, which are kept. */
+    private val writtenNames by lazy {
+        source.stringLiterals.filter { literal -> scriptQualifiedName?.containsMatchIn(literal) == true }
     }
+
+    /** The classes of the script by their binary names, or `null`, if there is no such class. */
+    private val scriptClasses = HashMap<String, Class<*>?>()
 
     fun toFailureMessage(
         diagnostics: List<ScriptDiagnostic>
@@ -265,48 +277,91 @@ internal class ScriptErrorReporter(
     /**
      * The names of the classes declared in the script qualified by the script class, like `_.Color.BLUE`, as named in the script, like `Color.BLUE`,
      * also without the synthetic names of the classes enclosing a local class, like `_$$$result$1$1$Dog`,
-     * but not the names written in the string literals of the script.
-     * The text built at runtime to look like such a name, like `"_" + ".Color"`, cannot be told from it, and is rewritten as well.
+     * and the anonymous objects and the lambdas like the frames, as `<anonymous object>` and `<lambda>`,
+     * the classes told by the class loader of the script, unless a constant part of a string literal of the script contains the whole name there,
+     * so the text written by the script is kept, like `"_.Color"`, while the text built at runtime to look like such a name, like `"_" + ".Color"`,
+     * cannot be told from it, and is rewritten as well.
      */
-    private fun String.withoutScriptClassName(): String = scriptQualifiedName?.replace(this) { match ->
-        match.toDeclaredClassName()?.takeIf { (qualified) -> qualified !in writtenQualifiedNames }?.second ?: match.value
-    } ?: this
-
-    /**
-     * The name qualified by the script class up to the classes declared in the script, like `_.Color` of `_.Color.BLUE`,
-     * and the name as in the script, like `Color.BLUE`, or `null`, if it does not name a class declared in the script.
-     * A canonical name, separated by dots, starts with the declared class, while a binary name might start with the synthetic names,
-     * like `$$result$1$1$make`, which might be named like a class of the script as well, so the last sequence of the declared classes is taken.
-     */
-    private fun MatchResult.toDeclaredClassName(): Pair<String, String>? {
-        val parts = classNamePart.findAll(groupValues[1]).map { it.groupValues[1] to it.groupValues[2] }.toList()
-        val classNames = source.classNames
-        val enclosingClassNames = source.enclosingClassNames
-        val first = if (parts.first().first == ".") {
-            0.takeIf { parts.first().second in classNames } ?: return null
-        } else {
-            val last = parts.indexOfLast { (_, name) -> name in classNames }.takeIf { it != -1 } ?: return null
-            // unlike e.g. a function named like a class, enclosing a local class
-            generateSequence(last) { index -> (index - 1).takeIf { it >= 0 && parts[it].second in enclosingClassNames } }.last().takeIf { start ->
-                // the synthetic names are separated by dollars only
-                parts.subList(1, start + 1).none { (separator) -> separator == "." }
-            } ?: return null
+    private fun String.withoutScriptClassName(): String {
+        val regex = scriptQualifiedName ?: return this
+        // the ranges of this message, where the script wrote a name resembling the ones qualified by the script class
+        val written by lazy {
+            writtenNames.flatMap { name ->
+                generateSequence(indexOf(name).takeIf { it != -1 }) { previous ->
+                    indexOf(name, previous + 1).takeIf { it != -1 }
+                }.map { it until it + name.length }.toList()
+            }
         }
-        var last = first
-        while (parts[last].second in enclosingClassNames && parts.getOrNull(last + 1)?.second in classNames) last++
-        fun List<Pair<String, String>>.join() = joinToString("") { (separator, name) -> separator + name }
-        return scriptClassName + parts.take(last + 1).join() to
-                parts.subList(first, last + 1).joinToString(".") { it.second } + parts.drop(last + 1).join()
+        return buildString {
+            var index = 0
+            while (true) {
+                val match = regex.find(this@withoutScriptClassName, index) ?: break
+                +this@withoutScriptClassName.substring(index, match.range.first)
+                val start = match.range.first
+                val rest = match.groupValues[1]
+                // up to the end of the name, like `Y` of `_.C.Y`, which the script did not write, if it wrote only `_.C`
+                val nameEnd = start + scriptClassName!!.length + 1 + rest.drop(1).takeWhile { it.isLetterOrDigit() || it in "_.$" }.length
+                val (name, end) = if (rest.contains("$\$Lambda")) {
+                    // a lambda compiled with `invokedynamic`, as a hidden class, which cannot be looked up
+                    "<lambda>" to match.range.last + 1
+                } else {
+                    // the text following the class is matched again, as it might name other classes, like `_$Circle cannot be cast to class _$Square`
+                    rest.toScriptClass()?.let { (declared, length) -> declared.className() to start + scriptClassName.length + length }
+                        ?: (null to nameEnd)
+                }
+                index = end
+                +if (name == null || written.any { range -> range.first <= start && maxOf(nameEnd, end) - 1 <= range.last }) {
+                    this@withoutScriptClassName.substring(start, end)
+                } else {
+                    name
+                }
+            }
+            +this@withoutScriptClassName.substring(index)
+        }
     }
 
-    private fun Class<*>.className(): String = when {
-        // the synthetic name, like `Script$result$1$fail$1`, would not tell anything
-        isAnonymousClass -> "<anonymous ${superclass.className()}>"
-        // e.g. the classes declared in the script body
-        isLocalClass -> simpleName
-        scriptClassName != null && name.startsWith("$scriptClassName$") ->
-            name.removePrefix("$scriptClassName$").replace('$', '.')
-        else -> name
+    /**
+     * The class of the script of the longest binary or canonical name, like `_$Box` of `$Box$foo`, or `_$Color` of `.Color.RED`,
+     * starting with this text following the name of the script class, and the length of its part of this text,
+     * or `null`, if it does not start with the name of a class of the script.
+     */
+    private fun String.toScriptClass(): Pair<Class<*>, Int>? {
+        val loader = classLoader ?: return null
+        val ends = (1 until minOf(length, MAX_CLASS_NAME_LENGTH)).filter { this[it] in ".$ -" } + listOfNotNull(length.takeIf { it <= MAX_CLASS_NAME_LENGTH })
+        return ends.asReversed().firstNotNullOfOrNull { end ->
+            val name = scriptClassName + substring(0, end).replace('.', '$')
+            scriptClasses.getOrPut(name) {
+                try {
+                    Class.forName(name, false, loader)
+                } catch (e: Throwable) {
+                    if (e is VirtualMachineError) throw e
+                    null
+                }
+            }?.let { it to end }
+        }
+    }
+
+    /**
+     * The name of the class in terms of the script, like `Box.Lid` of `_$Box$Lid`, `Dog` of the local class `_$$$result$1$1$Dog`,
+     * `<anonymous java.lang.Runnable>` of an object literal, or `<lambda>`, while the name of a class of the script itself is qualified by the script class.
+     */
+    private fun Class<*>.className(): String = try {
+        when {
+            // the synthetic name, like `Script$result$1$fail$1`, would not tell anything
+            isAnonymousClass -> when {
+                superclass?.name in lambdaSuperclasses -> "<lambda>"
+                superclass == Any::class.java -> interfaces.firstOrNull()?.let { "<anonymous ${it.className()}>" } ?: "<anonymous object>"
+                else -> "<anonymous ${superclass.className()}>"
+            }
+            // e.g. the classes declared in the script body
+            isLocalClass -> simpleName
+            scriptClassName == null || !name.startsWith("$scriptClassName$") -> name
+            else -> declaringClass?.takeIf { it.name != scriptClassName }?.let { "${it.className()}.$simpleName" } ?: simpleName
+        }
+    } catch (e: Throwable) {
+        if (e is VirtualMachineError) throw e
+        // like a malformed name of a class not compiled by Kotlin
+        name
     }
 
     private class Frame(

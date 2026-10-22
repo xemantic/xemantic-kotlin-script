@@ -20,6 +20,7 @@ package com.xemantic.kotlin.script
 
 import com.xemantic.kotlin.core.text.unaryPlus
 import org.jetbrains.kotlin.CoreEnvironmentDeprecation
+import org.jetbrains.kotlin.KtNodeTypes
 import org.jetbrains.kotlin.cli.extensionsStorage
 import org.jetbrains.kotlin.cli.jvm.compiler.EnvironmentConfigFiles
 import org.jetbrains.kotlin.cli.jvm.compiler.KotlinCoreEnvironment
@@ -233,7 +234,7 @@ internal const val SCRIPT_BLOCK_END = "} }"
  * while each line of the [text] maps back to the line of the script.
  */
 internal class ScriptSource(
-    script: String,
+    private val script: String,
     dependencies: List<PreambleDependency> = emptyList(),
     /**
      * Whether it is the source of the compilation confirming the [laterDeclaredDependencyCandidates]
@@ -327,14 +328,24 @@ internal class ScriptSource(
     /** The package of the script, like `foo.bar`, or an empty string, if it has none. */
     val packageName: String
 
-    /** The names of the classes and the objects declared in the script, including `Companion` of an unnamed companion object, and the enum entries. */
-    val classNames: Set<String>
-
-    /** The names of the [classNames] enclosing other classes, objects or enum entries, which qualify their names. */
-    val enclosingClassNames: Set<String>
-
-    /** The contents of the string literals of the script, with the escapes resolved, and a NUL character in place of each template expression. */
-    val stringLiterals: List<String>
+    /**
+     * The constant parts of the string literals of the script, with the escapes resolved, like `_$Box` of `"_${'$'}Box"`,
+     * split at the other template expressions, parsed only when an exception message might name a class of the script.
+     */
+    val stringLiterals: List<String> by lazy {
+        psiFactory.createFile("script.kts", script).collectDescendantsOfType<KtStringTemplateExpression>().flatMap { literal ->
+            val parts = mutableListOf(StringBuilder())
+            literal.entries.forEach { entry ->
+                when (entry) {
+                    is KtEscapeStringTemplateEntry -> parts.last().append(entry.unescapedValue)
+                    // like `${'$'}`, the idiom of a dollar in a raw string
+                    is KtStringTemplateEntryWithExpression -> entry.expression?.constantText()?.let { parts.last().append(it) } ?: parts.add(StringBuilder())
+                    else -> parts.last().append(entry.text)
+                }
+            }
+            parts.map { it.toString() }
+        }
+    }
 
     /**
      * The references of the script body by their offsets and names, mapped only when an unresolved reference is hinted.
@@ -377,9 +388,6 @@ internal class ScriptSource(
         movedDeclarations = structure.movedDeclarations
         returnsUnit = structure.endsWithMovedDeclaration
         packageName = structure.packageName
-        classNames = structure.classNames
-        enclosingClassNames = structure.enclosingClassNames
-        stringLiterals = structure.stringLiterals
         bodyReferences = structure.bodyReferences.let { references ->
             lazy { references.sortedByDescending { it.isOperator }.associateBy { it.offset to it.name } }
         }
@@ -945,6 +953,23 @@ private fun KtProperty.functionType(
 }
 
 /** The text without the comments and the line breaks, as each declaration of the preamble is a single line. */
+/** The value of a character or a string literal without templates, like `'$'` or `"$"`, or `null`. */
+private fun KtExpression.constantText(): String? = when (this) {
+    is KtConstantExpression -> text.takeIf { node.elementType == KtNodeTypes.CHARACTER_CONSTANT }?.removeSurrounding("'")?.let { character ->
+        if (character.startsWith('\\')) characterEscapes[character] else character
+    }
+    is KtStringTemplateExpression -> if (hasInterpolation()) null else entries.joinToString("") { entry ->
+        (entry as? KtEscapeStringTemplateEntry)?.unescapedValue ?: entry.text
+    }
+    is KtParenthesizedExpression -> expression?.constantText()
+    else -> null
+}
+
+private val characterEscapes = mapOf(
+    "\\t" to "\t", "\\b" to "\b", "\\n" to "\n", "\\r" to "\r",
+    "\\'" to "'", "\\\"" to "\"", "\\\\" to "\\", "\\$" to "$"
+)
+
 private fun PsiElement.singleLineText(): String = buildString {
     collectDescendantsOfType<PsiElement> { it.firstChild == null }.forEach { leaf ->
         +(if (leaf is PsiComment || leaf is PsiWhiteSpace) " " else leaf.text)
@@ -1362,15 +1387,6 @@ private class ScriptStructure(
     /** See [ScriptSource.packageName]. */
     val packageName: String
 
-    /** See [ScriptSource.classNames]. */
-    val classNames: Set<String>
-
-    /** See [ScriptSource.enclosingClassNames]. */
-    val enclosingClassNames: Set<String>
-
-    /** See [ScriptSource.stringLiterals]. */
-    val stringLiterals: List<String>
-
     /** The references of the script body, see [ScriptSource.bodyReferences]. */
     val bodyReferences: List<Reference>
 
@@ -1408,20 +1424,6 @@ private class ScriptStructure(
         val file = psiFactory.createFile("script.kts", script)
         packageName = file.packageFqName.asString()
         val classes = file.collectDescendantsOfType<KtClassOrObject>()
-        fun KtClassOrObject.className() = name ?: "Companion".takeIf { this is KtObjectDeclaration && isCompanion() }
-        classNames = classes.mapNotNullTo(HashSet()) { it.className() }
-        enclosingClassNames = classes.filter { declaration ->
-            declaration.collectDescendantsOfType<KtClassOrObject> { it !== declaration }.isNotEmpty()
-        }.mapNotNullTo(HashSet()) { it.className() }
-        stringLiterals = file.collectDescendantsOfType<KtStringTemplateExpression>().map { literal ->
-            literal.entries.joinToString("") { entry ->
-                when (entry) {
-                    is KtEscapeStringTemplateEntry -> entry.unescapedValue
-                    is KtStringTemplateEntryWithExpression -> "\u0000"
-                    else -> entry.text
-                }
-            }
-        }
         val uniqueClassNames = file.collectDescendantsOfType<KtClassOrObject>().mapNotNull { it.pathName() }
             .groupingBy { it }.eachCount().filterValues { it == 1 }.keys
         propertyAccessors = file.collectDescendantsOfType<KtProperty>().flatMap { property ->
