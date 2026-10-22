@@ -66,6 +66,7 @@ import org.jetbrains.kotlin.psi.KtPropertyAccessor
 import org.jetbrains.kotlin.psi.KtPsiFactory
 import org.jetbrains.kotlin.psi.KtSimpleNameExpression
 import org.jetbrains.kotlin.psi.KtStringTemplateExpression
+import org.jetbrains.kotlin.psi.KtThisExpression
 import org.jetbrains.kotlin.psi.KtLambdaExpression
 import org.jetbrains.kotlin.psi.KtOperationReferenceExpression
 import org.jetbrains.kotlin.psi.KtTypeAlias
@@ -167,6 +168,9 @@ internal const val COROUTINE_SCOPE_FUNCTION = "xemantic-kotlin-script: coroutine
 /** The opt-in message of the moved functions, see [ScriptSource.shadowedFunctionCandidates]. */
 internal const val SHADOWED_ORIGINAL = "xemantic-kotlin-script: shadowed original"
 
+/** The opt-in message of the type of the coroutine scope receiver of the script body, see [ScriptSource.coroutineScopeThisCandidates]. */
+internal const val COROUTINE_SCOPE_RECEIVER = "xemantic-kotlin-script: coroutine scope receiver"
+
 /** The opt-in annotation marking the local copies of the declarations, reporting this [message] where they are used. */
 private fun optInMarker(
     message: String
@@ -198,6 +202,18 @@ internal const val SCRIPT_BLOCK_START = "_script($DEPENDENCIES_CLASS()) `_depend
 
 /** The line ending the script block in the [ScriptSource.text]. */
 internal const val SCRIPT_BLOCK_END = "} }"
+
+/** The type of the coroutine scope receiver of the script body in the confirming compilation, see [ScriptSource.coroutineScopeThisCandidates]. */
+private const val COROUTINE_SCOPE_TYPE = "`_CoroutineScope\$`"
+
+/** The function giving the coroutine scope receiver of the script body the [COROUTINE_SCOPE_TYPE] in the confirming compilation. */
+private const val COROUTINE_SCOPE_FUNCTION_NAME = "`_coroutineScope\$`"
+
+/** The [SCRIPT_BLOCK_START] of the confirming compilation, keeping the label of the coroutine scope receiver of the script body. */
+private const val CONFIRMING_SCRIPT_BLOCK_START = "_script($DEPENDENCIES_CLASS()) `_dependencies\$`@{ $COROUTINE_SCOPE_FUNCTION_NAME(_script@{"
+
+/** The [SCRIPT_BLOCK_END] of the confirming compilation. */
+private const val CONFIRMING_SCRIPT_BLOCK_END = "}) }"
 
 /**
  * The script turned into a block, which can be run in the coroutine of the caller:
@@ -312,6 +328,14 @@ internal class ScriptSource(
     val coroutineScopeCandidates: List<LaterDeclaredReference>
 
     /**
+     * The unlabeled `this` within the local functions of the script body, outside of the classes and the extension functions,
+     * which might refer to the coroutine scope receiver of the script body, while in the script it refers to the script instance.
+     * Confirmed by compiling the script with the type of this receiver marked with an opt-in, see [confirming],
+     * reporting the ones referring to it, unlike e.g. to the receiver of a lambda, like in `with(list) { this }`.
+     */
+    val coroutineScopeThisCandidates: List<ScriptReference>
+
+    /**
      * The references of the script body which might refer to the dependencies, preceding the declarations
      * of the local properties of the same names, like `x` in `fun show() = x` followed by `val x = 2`,
      * or of the local functions, when called, while in the script they refer to these declarations.
@@ -385,6 +409,9 @@ internal class ScriptSource(
             Triple(reference.toScriptReference(), position(property).line, position(function).line)
         }
         coroutineScopeCandidates = structure?.coroutineScopeCandidates.orEmpty().map { it.toLaterDeclaredReference() }
+        coroutineScopeThisCandidates = structure?.coroutineScopeThisCandidates.orEmpty().map {
+            ScriptReference("this", position(it.first), position(it.last + 1))
+        }
         bodyDeclarations = structure?.bodyDeclarations.orEmpty()
         if (structure == null) {
             text = scriptLines.joinToString(separator = "\n")
@@ -463,10 +490,19 @@ internal class ScriptSource(
                 mapping += null
             }
             // the deprecation of the local functions, like the copies in the script block, is not reported, unlike their opt-in
-            listOf(LATER_DECLARED_FUNCTION, SHADOWED_FUNCTION, SHADOWED_ORIGINAL, COROUTINE_SCOPE_ORIGINAL, COROUTINE_SCOPE_FUNCTION).forEach { message ->
+            listOf(
+                LATER_DECLARED_FUNCTION, SHADOWED_FUNCTION, SHADOWED_ORIGINAL, COROUTINE_SCOPE_ORIGINAL, COROUTINE_SCOPE_FUNCTION,
+                COROUTINE_SCOPE_RECEIVER
+            ).forEach { message ->
                 lines += "@kotlin.RequiresOptIn(\"$message\", level = RequiresOptIn.Level.WARNING) annotation class ${optInMarker(message)}"
                 mapping += null
             }
+            // the opt-in of the type is reported where `this` refers to the receiver of this type
+            val receiverMarker = optInMarker(COROUTINE_SCOPE_RECEIVER)
+            lines += "@$receiverMarker interface $COROUTINE_SCOPE_TYPE : kotlinx.coroutines.CoroutineScope"
+            lines += "@kotlin.OptIn($receiverMarker::class) fun $COROUTINE_SCOPE_FUNCTION_NAME(" +
+                    "block: suspend $COROUTINE_SCOPE_TYPE.() -> Any?): suspend kotlinx.coroutines.CoroutineScope.() -> Any? = kotlin.TODO()"
+            mapping += listOf(null, null)
         }
         val (shadowed, visible) = dependencies.partition {
             it.name in structure.localProperties || (it.isCallable && it.name in structure.localFunctions)
@@ -503,7 +539,7 @@ internal class ScriptSource(
                 it in declaration.start until declaration.end && !movedExcluded[it]
             }
         }
-        lines += SCRIPT_BLOCK_START
+        lines += if (confirming) CONFIRMING_SCRIPT_BLOCK_START else SCRIPT_BLOCK_START
         mapping += null
         // the copies preceding the statements, where the local classes declared before them are visible
         val blockCopies = structure.blockCopies.entries.groupBy({ lineOf(it.key) }) { it.value }
@@ -527,7 +563,7 @@ internal class ScriptSource(
             lines += "null"
             mapping += null
         }
-        lines += SCRIPT_BLOCK_END
+        lines += if (confirming) CONFIRMING_SCRIPT_BLOCK_END else SCRIPT_BLOCK_END
         mapping += null
         return lines to mapping
     }
@@ -1120,6 +1156,9 @@ private class ScriptStructure(
     /** See [ScriptSource.coroutineScopeCandidates], with the offsets of the declarations, and whether they are functions. */
     val coroutineScopeCandidates: List<Triple<Reference, Int, Boolean>>
 
+    /** The ranges of the [ScriptSource.coroutineScopeThisCandidates]. */
+    val coroutineScopeThisCandidates: List<IntRange>
+
 
     /**
      * The deprecated copies of the local functions, see [ScriptSource.laterDeclaredDependencyCandidates],
@@ -1350,6 +1389,9 @@ private class ScriptStructure(
             }
         }
         coroutineScopeCandidates = coroutineScopeCandidatesByStatement.values.flatten()
+        coroutineScopeThisCandidates = statements.filter { it !in movedStatements }.flatMap { statement ->
+            statement.collectDescendantsOfType<KtThisExpression> { it.getLabelName() == null && it.isInLocalFunction(statement) }
+        }.map { it.startOffset until it.endOffset }
         val laterDeclaredCandidatesByStatement = statements.indices.associateWith { index ->
             if (declarationsByPsi[statements[index]] in moved) return@associateWith emptyList()
             statementReferences[index].mapNotNull { reference ->
@@ -1567,6 +1609,25 @@ private class ScriptStructure(
             },
             references = declaration.references(scope = declaration.parent, declaredNames)
         )
+    }
+
+    /**
+     * Whether the unlabeled `this` is within a function of the [statement] of the script body,
+     * not within a class, nor an extension function, which `this` would refer to.
+     */
+    private fun KtThisExpression.isInLocalFunction(
+        statement: KtExpression
+    ): Boolean {
+        var inFunction = false
+        for (parent in parents) {
+            if (parent is KtClassOrObject) return false
+            if (parent is KtNamedFunction) {
+                if (parent.receiverTypeReference != null) return false
+                inFunction = true
+            }
+            if (parent === statement) break
+        }
+        return inFunction
     }
 
     /** Whether the [offset] is preceded only by whitespaces in its line. */

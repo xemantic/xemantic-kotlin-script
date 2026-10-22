@@ -145,6 +145,18 @@ internal class ScriptErrorReporter(
         }
     }.trimEnd()
 
+    /** The [references] of the local functions of the script body to its coroutine scope, see [ScriptSource.coroutineScopeThisCandidates]. */
+    fun toCoroutineScopeThisMessage(
+        references: List<ScriptReference>
+    ): String = references.joinToString(separator = "\n") { reference ->
+        buildString {
+            appendPosition(reference.start)
+            +"error: 'this' refers to the coroutine scope of the script body, while in a function of a regular script it refers to the script instance.\n"
+            appendSourceLines(reference.start, reference.end)
+            +"  hint: refer to the coroutine scope as 'this@_script' instead.\n"
+        }
+    }.trimEnd()
+
     /** The [references] of the script body to the local properties instead of the functions, see [ScriptSource.shadowedFunctionCandidates]. */
     fun toShadowedFunctionMessage(
         references: List<Triple<ScriptReference, Int, Int>>

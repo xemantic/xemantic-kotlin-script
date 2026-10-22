@@ -3429,6 +3429,61 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report this in local function referring to the coroutine scope of the script body`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            fun tag() = "${'$'}this".substringBefore("@") + "/" + log.size
+            fun hash() = run { this.hashCode() }
+            fun size() = with(log) { this.size }
+            "${'$'}{tag()} ${'$'}{hash()} ${'$'}{size()}"
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:15: error: 'this' refers to the coroutine scope of the script body, while in a function of a regular script it refers to the script instance.
+                  | fun tag() = "${'$'}<error>this</error>".substringBefore("@") + "/" + log.size
+                  hint: refer to the coroutine scope as 'this@_script' instead.
+
+                script.kts:3:20: error: 'this' refers to the coroutine scope of the script body, while in a function of a regular script it refers to the script instance.
+                  | fun hash() = run { <error>this</error>.hashCode() }
+                  hint: refer to the coroutine scope as 'this@_script' instead.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should execute this in local function referring to other receivers`() = runTest {
+        // given
+        val script = """
+            fun a() = with(5) { this + 1 }
+            fun Int.b() = this + 1
+            fun c() = object { val v = 1; fun d() = this.v }.d()
+            fun e(): Int { class F(val v: Int) { fun g() = this.v }; return F(2).g() }
+            fun h() = this@_script.isActive
+            val i = fun Int.() = this + 1
+            a() + 5.b() + c() + e() + (if (h()) 1 else 0) + 2.i() + "${'$'}this".length * 0
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 6 + 6 + 1 + 2 + 1 + 3)
+        }
+    }
+
+    @Test
     fun `should return from the script body by the script block label`() = runTest {
         // given
         val script = """

@@ -186,6 +186,8 @@ internal class DefaultScriptExecutor(
         val hiddenLocalFunctionReferences: List<LaterDeclaredReference> = emptyList(),
         /** The [ScriptSource.coroutineScopeCandidates] resolved to the coroutine scope indeed. */
         val coroutineScopeReferences: List<LaterDeclaredReference> = emptyList(),
+        /** The [ScriptSource.coroutineScopeThisCandidates] referring to the coroutine scope indeed. */
+        val coroutineScopeThisReferences: List<ScriptReference> = emptyList(),
         /** The [ScriptSource.shadowedFunctionCandidates] which would call the functions in the script. */
         val shadowedFunctionReferences: List<Triple<ScriptReference, Int, Int>> = emptyList()
     )
@@ -226,8 +228,12 @@ internal class DefaultScriptExecutor(
                 || compilation.hiddenLocalFunctionReferences.isNotEmpty()
                 || compilation.shadowedFunctionReferences.isNotEmpty()
                 || compilation.coroutineScopeReferences.isNotEmpty()
+                || compilation.coroutineScopeThisReferences.isNotEmpty()
             ) {
                 val failureMessage = listOfNotNull(
+                    compilation.coroutineScopeThisReferences.takeIf { it.isNotEmpty() }?.let {
+                        ScriptErrorReporter(source).toCoroutineScopeThisMessage(it)
+                    },
                     compilation.coroutineScopeReferences.takeIf { it.isNotEmpty() }?.let {
                         ScriptErrorReporter(source).toCoroutineScopeMessage(it)
                     },
@@ -319,6 +325,7 @@ internal class DefaultScriptExecutor(
                 && source.hiddenLocalFunctionCandidates.isEmpty()
                 && source.shadowedFunctionCandidates.isEmpty()
                 && source.coroutineScopeCandidates.isEmpty()
+                && source.coroutineScopeThisCandidates.isEmpty()
             ) {
                 return Compilation(source, result)
             }
@@ -367,6 +374,7 @@ internal class DefaultScriptExecutor(
                     }
                 }
             }
+            val toReceiver = deprecated(COROUTINE_SCOPE_RECEIVER)
             // the references not resolved to the moved declarations, unless already reported as errors
             val toDeclarations = deprecated(COROUTINE_SCOPE_ORIGINAL)
             val coroutineScopeReferences = source.coroutineScopeCandidates.filter { candidate ->
@@ -408,6 +416,9 @@ internal class DefaultScriptExecutor(
                 },
                 shadowedFunctionReferences = toProperties.filter { (reference) ->
                     shadowed.any { it in reference }
+                },
+                coroutineScopeThisReferences = source.coroutineScopeThisCandidates.filter { candidate ->
+                    toReceiver.any { it in candidate } && errors.none { it in candidate }
                 },
                 hiddenLocalFunctionReferences = hiddenCandidates.filter { it in hidden }
             )
