@@ -26,6 +26,8 @@ import com.xemantic.kotlin.test.should
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CompletableJob
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -42,14 +44,20 @@ import org.jetbrains.kotlin.config.JvmTarget
 import java.net.URL
 import java.util.Collections
 import java.util.Enumeration
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutionException
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.reflect.full.createType
 import kotlin.reflect.typeOf
 import kotlin.script.experimental.api.CompiledScript
+import kotlin.script.experimental.api.EvaluationResult
+import kotlin.script.experimental.api.ResultValue
 import kotlin.script.experimental.api.ResultWithDiagnostics
 import kotlin.script.experimental.api.ScriptCompilationConfiguration
 import kotlin.script.experimental.api.ScriptDiagnostic
+import kotlin.script.experimental.api.ScriptEvaluationConfiguration
+import kotlin.script.experimental.api.ScriptEvaluator
 import kotlin.script.experimental.api.SourceCode
 import kotlin.script.experimental.jvmhost.JvmScriptCompiler
 import kotlin.test.Test
@@ -96,17 +104,7 @@ private val ScriptResult.valueOrMessage: Any?
         is ScriptResult.Error -> message
     }
 
-/** Fails with whatever the [failure] throws, instead of compiling the script. */
-class FailingCompiler(
-    private val failure: suspend () -> Nothing
-) : JvmScriptCompiler() {
-    override suspend fun invoke(
-        script: SourceCode,
-        scriptCompilationConfiguration: ScriptCompilationConfiguration
-    ): ResultWithDiagnostics<CompiledScript> = failure()
-}
-
-/** Returns whatever the [compile] returns, instead of compiling the script. */
+/** Returns whatever the [compile] returns, or fails with whatever it throws, instead of compiling the script. */
 class FakeCompiler(
     private val compile: suspend () -> ResultWithDiagnostics<CompiledScript>
 ) : JvmScriptCompiler() {
@@ -116,28 +114,74 @@ class FakeCompiler(
     ): ResultWithDiagnostics<CompiledScript> = compile()
 }
 
+/** Returns whatever the [evaluate] returns, instead of evaluating the script. */
+class FakeEvaluator(
+    private val evaluate: suspend () -> ResultWithDiagnostics<EvaluationResult>
+) : ScriptEvaluator {
+    override suspend fun invoke(
+        compiledScript: CompiledScript,
+        scriptEvaluationConfiguration: ScriptEvaluationConfiguration
+    ): ResultWithDiagnostics<EvaluationResult> = evaluate()
+}
+
 /**
  * Records the threads resolving the classpath through it, like the scripting host does with `getResources`,
- * failing the first [failures] times.
+ * failing the first [failures] times with the [failure],
+ * and counting down the [resolving] latch, before waiting for the [released] one.
  */
 class ClasspathRecordingClassLoader(
     parent: ClassLoader,
-    private var failures: Int = 0
+    private var failures: Int = 0,
+    private val resolving: CountDownLatch = CountDownLatch(0),
+    private val released: CountDownLatch = CountDownLatch(0),
+    private val failure: () -> Throwable = { IllegalStateException("classpath unavailable") }
 ) : ClassLoader(parent) {
 
     val threads: MutableList<Thread> = Collections.synchronizedList(mutableListOf())
 
     override fun getResources(name: String): Enumeration<URL> {
         threads += Thread.currentThread()
+        resolving.countDown()
+        released.await()
         synchronized(this) {
             if (failures > 0) {
                 failures--
-                throw IllegalStateException("classpath unavailable")
+                throw failure()
             }
         }
         return super.getResources(name)
     }
 
+}
+
+/** Runs the [block] creating the executor with the [classLoader] as the context class loader. */
+private fun <T> withContextClassLoader(
+    classLoader: ClassLoader,
+    block: () -> T
+): T {
+    val thread = Thread.currentThread()
+    val contextClassLoader = thread.contextClassLoader
+    thread.contextClassLoader = classLoader
+    return try {
+        block()
+    } finally {
+        thread.contextClassLoader = contextClassLoader
+    }
+}
+
+/**
+ * Runs the [block] on a thread of this executor, which is the other one, if the first one is busy,
+ * awaiting it cancellably, unlike `withContext`, which would wait for the queued block to run.
+ */
+private suspend fun ExecutorService.onOtherThread(
+    block: () -> Unit
+) {
+    val done = CompletableDeferred<Unit>()
+    execute {
+        block()
+        done.complete(Unit)
+    }
+    done.await()
 }
 
 class ScriptExecutorTest {
@@ -2455,7 +2499,7 @@ class ScriptExecutorTest {
     fun `should report internal failure of the compiler as compilation error`() = runTest {
         // given
         val executor = DefaultScriptExecutor(
-            compiler = FailingCompiler { throw IllegalStateException("compiler crashed") }
+            compiler = FakeCompiler { throw IllegalStateException("compiler crashed") }
         )
 
         // when
@@ -2475,7 +2519,7 @@ class ScriptExecutorTest {
     fun `should report the root cause of the doubly wrapped internal failure of the compiler`() = runTest {
         // given
         val executor = DefaultScriptExecutor(
-            compiler = FailingCompiler {
+            compiler = FakeCompiler {
                 throw IllegalStateException("Could not compile", RuntimeException(IllegalArgumentException("root cause")))
             }
         )
@@ -2499,7 +2543,7 @@ class ScriptExecutorTest {
         // given
         val executor = DefaultScriptExecutor(
             // like a dump of the bytecode
-            compiler = FailingCompiler { throw IllegalStateException("x".repeat(100_000)) }
+            compiler = FakeCompiler { throw IllegalStateException("x".repeat(100_000)) }
         )
 
         // when
@@ -2519,7 +2563,7 @@ class ScriptExecutorTest {
     fun `should report StackOverflowError of the compiler as internal failure, not as the script nested too deeply`() = runTest {
         // given
         val executor = DefaultScriptExecutor(
-            compiler = FailingCompiler { throw StackOverflowError() }
+            compiler = FakeCompiler { throw StackOverflowError() }
         )
 
         // when
@@ -2570,7 +2614,7 @@ class ScriptExecutorTest {
         val executor = DefaultScriptExecutor(
             // compiling on the thread of the test, read before the test loop would fail on its interrupt status
             dispatcher = Dispatchers.Unconfined,
-            compiler = FailingCompiler { throw InterruptedException("compiler interrupted") }
+            compiler = FakeCompiler { throw InterruptedException("compiler interrupted") }
         )
 
         // when
@@ -2612,7 +2656,7 @@ class ScriptExecutorTest {
         // given
         val executor = DefaultScriptExecutor(
             dispatcher = Dispatchers.Unconfined,
-            compiler = FailingCompiler {
+            compiler = FakeCompiler {
                 throw IllegalStateException("failed", ExecutionException(InterruptedException("worker thread interrupted")))
             }
         )
@@ -2670,7 +2714,7 @@ class ScriptExecutorTest {
     fun `should not report VirtualMachineError causing the exception thrown by the compiler as compilation error`() = runTest {
         // given
         val executor = DefaultScriptExecutor(
-            compiler = FailingCompiler { throw RuntimeException(OutOfMemoryError("compiler out of memory")) }
+            compiler = FakeCompiler { throw RuntimeException(OutOfMemoryError("compiler out of memory")) }
         )
 
         // when
@@ -2718,7 +2762,7 @@ class ScriptExecutorTest {
     fun `should report compilation cancelled by the compiler while the caller is active as compilation error`() = runTest {
         // given
         val executor = DefaultScriptExecutor(
-            compiler = FailingCompiler { throw CancellationException("compiler cancelled") }
+            compiler = FakeCompiler { throw CancellationException("compiler cancelled") }
         )
 
         // when
@@ -2744,7 +2788,7 @@ class ScriptExecutorTest {
             // so the waiter is waiting in the cache before the compiler fails
             dispatcher = StandardTestDispatcher(testScheduler),
             compilationCacheSize = 10,
-            compiler = FailingCompiler {
+            compiler = FakeCompiler {
                 failing.await()
                 throw IllegalStateException("compiler crashed")
             }
@@ -2771,7 +2815,7 @@ class ScriptExecutorTest {
     fun `should not report VirtualMachineError of the compiler as compilation error`() = runTest {
         // given
         val executor = DefaultScriptExecutor(
-            compiler = FailingCompiler { throw OutOfMemoryError("compiler out of memory") }
+            compiler = FakeCompiler { throw OutOfMemoryError("compiler out of memory") }
         )
 
         // when
@@ -2989,6 +3033,187 @@ class ScriptExecutorTest {
         assert(compilingResult is ScriptResult.Error && compilingResult.phase == ExecutionPhase.COMPILATION)
         assert(waiterResult is ScriptResult.Error && waiterResult.phase == ExecutionPhase.COMPILATION)
         assert(executor.compilationCount == 2)
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun `should not invoke the compiler again for the caller cancelled during the compilation`() = runTest {
+        // given
+        // probing the type of the property, before confirming the references
+        val script = """
+            fun printer(): (Any?) -> Unit = { }
+            val print = printer()
+            sealed class Shape { fun show() = print("shape") }
+            fun show() = x
+            val x = 2
+            show()
+        """.trimIndent()
+        lateinit var caller: Job
+        val executor = DefaultScriptExecutor(
+            dispatcher = StandardTestDispatcher(testScheduler),
+            compiler = FakeCompiler {
+                // like while the compiler is running, which does not check the cancellation
+                caller.cancel()
+                ResultWithDiagnostics.Failure(ScriptDiagnostic(ScriptDiagnostic.unspecifiedError, "not compiled"))
+            }
+        )
+
+        // when
+        caller = launch { executor.execute(script, listOf(dependency("x", 1))) }
+        caller.join()
+
+        // then
+        assert(caller.isCancelled)
+        assert(executor.compilationCount == 1)
+    }
+
+    @Test
+    fun `should report internal failure of the confirming compilation at the position in the script, without caching it`() = runTest {
+        // given
+        val script = """
+            fun show() = x
+            val x = 2
+            cancel()
+            fun cancel() {}
+            show()
+        """.trimIndent()
+        val dependencies = listOf(dependency("x", 1))
+        val executor = DefaultScriptExecutor(
+            compilationCacheSize = 10,
+            compiler = object : JvmScriptCompiler() {
+                override suspend fun invoke(
+                    script: SourceCode,
+                    scriptCompilationConfiguration: ScriptCompilationConfiguration
+                ): ResultWithDiagnostics<CompiledScript> = if (LATER_DECLARED_DEPENDENCY in script.text) {
+                    // like the compiler crashing on the confirming sources only, at `x` of `show`
+                    val line = script.text.lines().indexOfFirst { it.startsWith("fun show() = x") } + 1
+                    ResultWithDiagnostics.Failure(
+                        ScriptDiagnostic(
+                            code = ScriptDiagnostic.unspecifiedError,
+                            message = "Exception in expression checkers",
+                            location = SourceCode.Location(SourceCode.Position(line, 14), SourceCode.Position(line, 15)),
+                            exception = IllegalStateException("Exception in expression checkers")
+                        )
+                    )
+                } else {
+                    super.invoke(script, scriptCompilationConfiguration)
+                }
+            }
+        )
+
+        // when
+        val results = List(2) { executor.execute(script, dependencies) }
+
+        // then
+        results.forEach { result ->
+            result should {
+                be<ScriptResult.Error>()
+                have(phase == ExecutionPhase.COMPILATION)
+                message sameAs """
+                    script.kts:1:14: error: The compiler failed internally: Exception in expression checkers
+                      | fun show() = <error>x</error>
+                      hint: it is a failure of the compiler itself - express this code differently.
+                """.trimIndent()
+            }
+        }
+        // the compilation and the first confirming one, without the confirming copies of the scope functions, for each execution
+        assert(executor.compilationCount == 4)
+    }
+
+    @Test
+    fun `should not report VirtualMachineError causing the exception thrown by the script as evaluation error`() = runTest {
+        // given
+        val script = """
+            throw IllegalStateException("failed", OutOfMemoryError("script out of memory"))
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val failure = runCatching { executor.execute(script) }.exceptionOrNull()
+
+        // then
+        assert(failure is OutOfMemoryError && failure.message == "script out of memory")
+    }
+
+    @Test
+    fun `should not report VirtualMachineError reported by the evaluator as evaluation error`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            // like the evaluator reporting the exception it caught, e.g. while loading the script class
+            evaluator = FakeEvaluator {
+                ResultWithDiagnostics.Failure(
+                    ScriptDiagnostic(
+                        code = ScriptDiagnostic.unspecifiedError,
+                        message = "Java heap space",
+                        exception = OutOfMemoryError("Java heap space")
+                    )
+                )
+            }
+        )
+
+        // when
+        val failure = runCatching { executor.execute("42") }.exceptionOrNull()
+
+        // then
+        assert(failure is OutOfMemoryError && failure.message == "Java heap space")
+    }
+
+    @Test
+    fun `should not report VirtualMachineError causing the error of the script value as evaluation error`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            evaluator = FakeEvaluator {
+                ResultWithDiagnostics.Success(
+                    EvaluationResult(
+                        ResultValue.Error(ExceptionInInitializerError(OutOfMemoryError("Java heap space"))),
+                        ScriptEvaluationConfiguration()
+                    )
+                )
+            }
+        )
+
+        // when
+        val failure = runCatching { executor.execute("42") }.exceptionOrNull()
+
+        // then
+        assert(failure is OutOfMemoryError && failure.message == "Java heap space")
+    }
+
+    @Test
+    fun `should create executors with the factory functions visible to Java`() = runTest {
+        // given
+        val executors = listOf(
+            JavaClient.executor(),
+            JavaClient.executor(Dispatchers.IO),
+            JavaClient.executor(Dispatchers.IO, 10),
+            JavaClient.executor(Dispatchers.IO, 10, 2)
+        )
+
+        // when
+        val results = executors.map { it.execute("1 + 1") }
+
+        // then
+        assert(results.map { it.valueOrMessage } == listOf(2, 2, 2, 2))
+    }
+
+    @Test
+    fun `should create executor with the default arguments of the factory function of 0_1_0`() = runTest {
+        // given
+        // called by the Kotlin clients compiled against 0.1.0 omitting the arguments, like `ScriptExecutor()`
+        val defaults = Class.forName("com.xemantic.kotlin.script.ScriptExecutorKt").getMethod(
+            $$"ScriptExecutor$default",
+            CoroutineDispatcher::class.java,
+            Int::class.javaPrimitiveType,
+            Int::class.javaPrimitiveType,
+            Any::class.java
+        )
+        val executor = defaults.invoke(null, null, 0, 0b11, null) as ScriptExecutor
+
+        // when
+        val result = executor.execute("1 + 1")
+
+        // then
+        assert(result.valueOrMessage == 2)
     }
 
     @Test
@@ -3372,6 +3597,149 @@ class ScriptExecutorTest {
             be<ScriptResult.Value>()
             have(value == 2)
         }
+    }
+
+    @Test
+    fun `should not block the dispatcher thread while waiting for the classpath resolved by another caller`() = runTest {
+        // given
+        val resolving = CountDownLatch(1)
+        val released = CountDownLatch(1)
+        val executorService = Executors.newFixedThreadPool(2)
+        val dispatcher = executorService.asCoroutineDispatcher()
+        val executor = withContextClassLoader(
+            ClasspathRecordingClassLoader(Thread.currentThread().contextClassLoader, resolving = resolving, released = released)
+        ) {
+            ScriptExecutor(dispatcher = dispatcher)
+        }
+
+        // when
+        val results = try {
+            val first = async(start = CoroutineStart.UNDISPATCHED) { executor.execute("1 + 1") }
+            resolving.await()
+            val second = async(start = CoroutineStart.UNDISPATCHED) { executor.execute("2 + 2") }
+            // on the other thread, unless the second caller blocks it, failing the test on its timeout
+            executorService.onOtherThread { released.countDown() }
+            listOf(first.await(), second.await())
+        } finally {
+            released.countDown()
+            dispatcher.close()
+        }
+
+        // then
+        assert(results.map { it.valueOrMessage } == listOf(2, 4))
+    }
+
+    @Test
+    fun `should not compile for the caller cancelled while waiting for the classpath resolved by another caller`() = runTest {
+        // given
+        val resolving = CountDownLatch(1)
+        val released = CountDownLatch(1)
+        val executorService = Executors.newFixedThreadPool(2)
+        val dispatcher = executorService.asCoroutineDispatcher()
+        val executor = withContextClassLoader(
+            ClasspathRecordingClassLoader(Thread.currentThread().contextClassLoader, resolving = resolving, released = released)
+        ) {
+            DefaultScriptExecutor(dispatcher = dispatcher)
+        }
+
+        // when
+        val (result, cancelled) = try {
+            val first = async(start = CoroutineStart.UNDISPATCHED) { executor.execute("1 + 1") }
+            resolving.await()
+            val second = launch(start = CoroutineStart.UNDISPATCHED) { executor.execute("2 + 2") }
+            executorService.onOtherThread {
+                second.cancel()
+                released.countDown()
+            }
+            second.join()
+            first.await() to second.isCancelled
+        } finally {
+            released.countDown()
+            dispatcher.close()
+        }
+
+        // then
+        assert(result.valueOrMessage == 2)
+        assert(cancelled)
+        assert(executor.compilationCount == 1)
+    }
+
+    @Test
+    fun `should report failure of resolving the classpath to all the callers waiting for it`() = runTest {
+        // given
+        val resolving = CountDownLatch(1)
+        val released = CountDownLatch(1)
+        val executorService = Executors.newFixedThreadPool(2)
+        val dispatcher = executorService.asCoroutineDispatcher()
+        val recording = ClasspathRecordingClassLoader(
+            Thread.currentThread().contextClassLoader, failures = 1, resolving = resolving, released = released
+        )
+        val executor = withContextClassLoader(recording) {
+            DefaultScriptExecutor(dispatcher = dispatcher)
+        }
+
+        // when
+        val results = try {
+            val first = async(start = CoroutineStart.UNDISPATCHED) { executor.execute("1 + 1") }
+            resolving.await()
+            val second = async(start = CoroutineStart.UNDISPATCHED) { executor.execute("2 + 2") }
+            executorService.onOtherThread { released.countDown() }
+            listOf(first.await(), second.await())
+        } finally {
+            released.countDown()
+            dispatcher.close()
+        }
+
+        // then
+        results.forEach { result ->
+            result should {
+                be<ScriptResult.Error>()
+                have(phase == ExecutionPhase.COMPILATION)
+                message sameAs """
+                    error: The script could not be compiled because of an internal failure: java.lang.IllegalStateException: classpath unavailable
+                """.trimIndent()
+            }
+        }
+        // resolved once, failing on the first resource
+        assert(recording.threads.size == 1)
+        assert(executor.compilationCount == 0)
+    }
+
+    @Test
+    fun `should resolve the classpath again for the waiting caller when the resolution fails because of a fatal error`() = runTest {
+        // given
+        val resolving = CountDownLatch(1)
+        val released = CountDownLatch(1)
+        val executorService = Executors.newFixedThreadPool(2)
+        val dispatcher = executorService.asCoroutineDispatcher()
+        val executor = withContextClassLoader(
+            ClasspathRecordingClassLoader(
+                Thread.currentThread().contextClassLoader,
+                failures = 1,
+                resolving = resolving,
+                released = released,
+                failure = { IllegalStateException("classpath unavailable", OutOfMemoryError("classpath out of memory")) }
+            )
+        ) {
+            ScriptExecutor(dispatcher = dispatcher)
+        }
+
+        // when
+        val (firstFailure, second) = try {
+            // not failing the test process, if the error is shared
+            val first = async(start = CoroutineStart.UNDISPATCHED) { runCatching { executor.execute("1 + 1") } }
+            resolving.await()
+            val second = async(start = CoroutineStart.UNDISPATCHED) { runCatching { executor.execute("2 + 2") } }
+            executorService.onOtherThread { released.countDown() }
+            first.await().exceptionOrNull() to second.await().getOrNull()
+        } finally {
+            released.countDown()
+            dispatcher.close()
+        }
+
+        // then
+        assert(firstFailure is OutOfMemoryError && firstFailure.message == "classpath out of memory")
+        assert(second?.valueOrMessage == 4)
     }
 
     @Test

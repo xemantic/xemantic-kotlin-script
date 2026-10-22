@@ -30,8 +30,14 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import java.lang.management.ManagementFactory
+import java.lang.management.MonitorInfo
+import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import kotlin.concurrent.thread
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
 import kotlin.time.Duration.Companion.milliseconds
@@ -506,9 +512,6 @@ class ScriptCompilationCacheTest {
         // given
         val cache = ScriptCompilationCache<String>(maxSize = 10) { true }
         val key = ScriptCompilationCache.Key(script = "foo", dependencies = emptyList())
-        val entries = ScriptCompilationCache::class.java.getDeclaredField("entries").apply {
-            isAccessible = true
-        }.get(cache)
         val compiled = CompletableDeferred<Unit>()
         val owner = async {
             cache.getOrCompile(key) {
@@ -517,11 +520,13 @@ class ScriptCompilationCacheTest {
             }
         }
         runCurrent()
-        var lockHeldByWaiter: Boolean? = null
+        var monitorsHeldByWaiter: List<MonitorInfo>? = null
         // resumed inline by the completion of the compilation, as no dispatch is needed
         launch(Dispatchers.Unconfined) {
             cache.getOrCompile(key) { "bar" }
-            lockHeldByWaiter = Thread.holdsLock(entries)
+            monitorsHeldByWaiter = ManagementFactory.getThreadMXBean().getThreadInfo(
+                longArrayOf(Thread.currentThread().id), true, false
+            ).single().lockedMonitors.toList()
         }
 
         // when
@@ -529,7 +534,122 @@ class ScriptCompilationCacheTest {
         owner.await()
 
         // then
-        assert(lockHeldByWaiter == false)
+        assert(monitorsHeldByWaiter == emptyList<MonitorInfo>())
+    }
+
+    @Test
+    fun `should evict the compiled script before resuming the callers waiting for it`() = runTest {
+        // given
+        val resuming = CountDownLatch(1)
+        val resumed = CountDownLatch(1)
+        val cache = ScriptCompilationCache<String>(
+            maxSize = 1,
+            resume = { entry, result ->
+                if (result == "foo") {
+                    resuming.countDown()
+                    resumed.await()
+                }
+                entry.complete(result)
+            }
+        ) { true }
+        val key1 = ScriptCompilationCache.Key(script = "foo", dependencies = emptyList())
+        val key2 = ScriptCompilationCache.Key(script = "bar", dependencies = emptyList())
+        val compilations = Collections.synchronizedList(mutableListOf<String>())
+        val owner = thread {
+            runBlocking { cache.getOrCompile(key1) { compilations += "foo"; "foo" } }
+        }
+        resuming.await()
+
+        // when
+        cache.getOrCompile(key2) { compilations += "bar"; "bar" }
+        resumed.countDown()
+        owner.join()
+        val results = listOf(
+            cache.getOrCompile(key2) { compilations += "bar"; "bar" },
+            cache.getOrCompile(key1) { compilations += "foo"; "foo" }
+        )
+
+        // then
+        assert(results == listOf("bar", "foo"))
+        // the first one evicted, as the cache keeps one script
+        assert(compilations == listOf("foo", "bar", "foo"))
+    }
+
+    @Test
+    fun `should keep the compiled script cached when resuming the waiting callers fails`() = runTest {
+        // given
+        val cache = ScriptCompilationCache<String>(
+            maxSize = 10,
+            // like a fatal error of a waiting caller resumed inline
+            resume = { entry, result ->
+                entry.complete(result)
+                if (result == "foo") throw OutOfMemoryError("waiter out of memory")
+            }
+        ) { true }
+        val key = ScriptCompilationCache.Key(script = "foo", dependencies = emptyList())
+        var compilations = 0
+
+        // when
+        val failure = runCatching {
+            cache.getOrCompile(key) { compilations++; "foo" }
+        }.exceptionOrNull()
+        val result = cache.getOrCompile(key) { compilations++; "bar" }
+
+        // then
+        assert(failure is OutOfMemoryError && failure.message == "waiter out of memory")
+        assert(result == "foo")
+        assert(compilations == 1)
+    }
+
+    @Test
+    fun `should compile again when storing the compilation fails`() = runTest {
+        // given
+        var failing = true
+        val cache = ScriptCompilationCache<String>(maxSize = 10) {
+            if (failing) throw IllegalStateException("not stored") else true
+        }
+        val key = ScriptCompilationCache.Key(script = "foo", dependencies = emptyList())
+        var compilations = 0
+        val failure = runCatching {
+            cache.getOrCompile(key) { compilations++; "foo" }
+        }.exceptionOrNull()
+        failing = false
+
+        // when
+        val result = cache.getOrCompile(key) { compilations++; "bar" }
+
+        // then
+        assert(failure is IllegalStateException && failure.message == "not stored")
+        assert(result == "bar")
+        assert(compilations == 2)
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun `should compile again for the waiting caller when the compilation fails fatally`() = runTest {
+        // given
+        val cache = ScriptCompilationCache<String>(maxSize = 10) { true }
+        val key = ScriptCompilationCache.Key(script = "foo", dependencies = emptyList())
+        var compilations = 0
+        val compile: suspend () -> String = {
+            compilations++
+            delay(1.milliseconds)
+            if (compilations == 1) throw OutOfMemoryError("owner out of memory")
+            "foo"
+        }
+        val owner = async { runCatching { cache.getOrCompile(key, compile) } }
+        // not failing the test process, if the error is shared
+        val waiter = async { runCatching { cache.getOrCompile(key, compile) } }
+        runCurrent()
+
+        // when
+        val ownerFailure = owner.await().exceptionOrNull()
+        val result = waiter.await().getOrNull()
+
+        // then
+        assert(ownerFailure is OutOfMemoryError && ownerFailure.message == "owner out of memory")
+        assert(result == "foo")
+        assert(compilations == 2)
     }
 
     @Test
