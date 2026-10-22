@@ -30,6 +30,8 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import org.jetbrains.kotlin.config.JvmTarget
+import org.jetbrains.kotlin.lexer.KotlinLexer
+import org.jetbrains.kotlin.lexer.KtTokens
 import kotlin.concurrent.atomics.AtomicInt
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.concurrent.atomics.fetchAndIncrement
@@ -38,6 +40,7 @@ import kotlin.coroutines.CoroutineContext
 import kotlin.reflect.KClass
 import java.lang.reflect.Modifier
 import kotlin.reflect.KFunction
+import kotlin.reflect.KType
 import kotlin.reflect.KVisibility
 import kotlin.reflect.full.extensionReceiverParameter
 import kotlin.reflect.typeOf
@@ -426,9 +429,7 @@ internal class DefaultScriptExecutor(
 
         /** Inspected once, as recognizing a callable dependency might inspect its members by reflection. */
         private val preambleDependencies by lazy {
-            allDependencies.filter { it.isHidden }.map { dependency ->
-                PreambleDependency(dependency.name, dependency.accessor, dependency.isCallable)
-            }
+            allDependencies.filter { it.isHidden }.map { it.preambleDependency }
         }
 
         private fun source(
@@ -648,12 +649,84 @@ private val ScriptExecutor.Dependency<*>.providedName: String
 private val ScriptExecutor.Dependency<*>.providedType: KotlinType
     get() = if (isHidden) KotlinType(typeOf<Any?>()) else KotlinType(type)
 
-// with an initializer, unlike a getter, the dependency can be smart cast,
-// while the getter is renamed, as a function moved out of the script body might be named like it, e.g. `getFoo` or `isFoo`,
-// to a name with `$`, which no function of the script can have, unless quoted in backticks
-// its warnings, like of the unchecked cast, are not reported, see [filterNonIgnorable]
-private val ScriptExecutor.Dependency<*>.accessor: String
-    get() = "@get:kotlin.jvm.JvmName(\"$name\\\$dependency\") val `$name`: $type = `$providedName` as $type"
+/** The dependency, as declared in the preamble of the script. */
+private val ScriptExecutor.Dependency<*>.preambleDependency: PreambleDependency
+    get() {
+        val rootPackageClasses = type.rootPackageClasses()
+        val renderedType = type.toString()
+        return PreambleDependency(
+            name = name,
+            // with an initializer, unlike a getter, the dependency can be smart cast,
+            // while the getter is renamed, as a function moved out of the script body might be named like it, e.g. `getFoo` or `isFoo`,
+            // to a name with `$`, which no function of the script can have, unless quoted in backticks
+            // its warnings, like of the unchecked cast, are not reported, see [filterNonIgnorable]
+            accessor = { aliases, lazy ->
+                val type = renderedType.withRootPackageAliases(rootPackageClasses, aliases)
+                "@get:kotlin.jvm.JvmName(\"$name\\\$dependency\") val `$name`: $type ${if (lazy) "get() =" else "="} `$providedName` as $type"
+            },
+            isCallable = isCallable,
+            rootPackageClasses = rootPackageClasses.values.toSet()
+        )
+    }
+
+/**
+ * The names of the top-level classes of the root package, which this type refers to,
+ * by the qualified names of the classes they are, or they nest, like `Outer.Nested`.
+ */
+private fun KType.rootPackageClasses(): Map<String, String> = buildMap {
+    fun KType.collect() {
+        (classifier as? KClass<*>)?.let { kClass ->
+            val qualifiedName = kClass.qualifiedName
+            // an array class, like of `Array<T>`, is of the package of its component type
+            if (qualifiedName != null && !kClass.java.isArray && kClass.java.packageName.isEmpty()) {
+                // a name cannot contain `.`, even if quoted in backticks
+                put(qualifiedName, qualifiedName.substringBefore('.'))
+            }
+        }
+        arguments.forEach { it.type?.collect() }
+    }
+    collect()
+}
+
+/**
+ * This [KType.toString] rendering, referring to the [classes] of the root package, see [rootPackageClasses],
+ * by the [aliases] of the top-level classes, by their names, like `_root_Outer.Nested` instead of `Outer.Nested`.
+ */
+private fun String.withRootPackageAliases(
+    classes: Map<String, String>,
+    aliases: Map<String, String>
+): String {
+    if (classes.isEmpty()) return this
+    val lexer = KotlinLexer()
+    lexer.start(this)
+    val tokens = buildList {
+        while (lexer.tokenType != null) {
+            add(Triple(lexer.tokenType!!, lexer.tokenStart, lexer.tokenEnd))
+            lexer.advance()
+        }
+    }
+    val rendered = this
+    return buildString {
+        var copied = 0
+        tokens.forEachIndexed { index, (type, start, end) ->
+            if (type != KtTokens.IDENTIFIER || tokens.getOrNull(index - 1)?.first == KtTokens.DOT) return@forEachIndexed
+            // the segments of the qualified name, like `kotlin.collections.List`, quoted in backticks if needed, like `in`
+            val segments = generateSequence(index) { it + 2 }.takeWhile {
+                it == index || (tokens.getOrNull(it - 1)?.first == KtTokens.DOT && tokens.getOrNull(it)?.first == KtTokens.IDENTIFIER)
+            }.map { rendered.substring(tokens[it].second, tokens[it].third) }.toList()
+            // a soft keyword, like the variance `out` in `List<out T>`, which is lexed as an identifier, is followed by a space,
+            // unlike a name, which is quoted in backticks if it is a keyword
+            val isModifier = segments.size == 1 && !segments[0].startsWith('`') && tokens.getOrNull(index + 1)?.first == KtTokens.WHITE_SPACE
+            val alias = classes[segments.joinToString(".") { it.removeSurrounding("`") }]?.let { aliases[it] }
+            if (!isModifier && alias != null) {
+                append(rendered, copied, start)
+                append(alias)
+                copied = end
+            }
+        }
+        append(rendered, copied, rendered.length)
+    }
+}
 
 /** Whether it is of a function type, or of a type with the public `invoke` operator, so the script can call it. */
 private val ScriptExecutor.Dependency<*>.isCallable: Boolean

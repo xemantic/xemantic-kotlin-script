@@ -198,10 +198,16 @@ private fun optInMarker(
 /** A dependency, as declared in the preamble of the [ScriptSource]. */
 internal class PreambleDependency(
     val name: String,
-    /** The declaration of the property of the dependency, like `@get:JvmName("x\$dependency") val x: T = _dependency_x as T`. */
-    val accessor: String,
+    /**
+     * The declaration of the property of the dependency, like `@get:JvmName("x\$dependency") val x: T = _dependency_x as T`,
+     * referring to the [rootPackageClasses] by the given aliases, by their names,
+     * and casting the value in the getter, if `lazy`, see [ScriptSource].
+     */
+    val accessor: (aliases: Map<String, String>, lazy: Boolean) -> String,
     /** Whether it can be called like a function, so a local function of the same name shadows it. */
-    val isCallable: Boolean = false
+    val isCallable: Boolean = false,
+    /** The names of the top-level classes of the root package, which the type of the dependency refers to. */
+    val rootPackageClasses: Set<String> = emptySet()
 )
 
 /** The class of the outer receiver of the script body, declaring the shadowed dependencies, see [ScriptSource]. */
@@ -239,6 +245,7 @@ private const val CONFIRMING_SCRIPT_BLOCK_END = "}) }"
  *
  * ```
  * <file annotations, package and imports>
+ * <the imports of the root package classes of the dependency types under their aliases>
  * <the dependency accessors, unless shadowed by the local declarations of the script body>
  * class _ScriptDependencies {
  * <the accessors of the shadowed dependencies>
@@ -256,6 +263,13 @@ private const val CONFIRMING_SCRIPT_BLOCK_END = "}) }"
  * as in the script they refer to the local declaration,
  * while the script body refers to it as the member of the outer receiver of the script block,
  * the inner one being the coroutine scope of the caller.
+ *
+ * The accessors refer to the classes of the root package by aliases, chosen not to occur in the script,
+ * where they cannot refer to them by their names: if the script has a `package` directive,
+ * or imports another class under the same name, or the class under another name.
+ * A script without a `package` directive, declaring a classifier moved out of the script body named like such a class,
+ * shadows it also in the alias, like in a regular script, where it shadows the type of the property of the base class,
+ * so the accessor casts the value only when the script refers to it.
  *
  * Declarations are moved by blanking them out with spaces in one copy of their lines,
  * and everything else in the other, so the columns of the script are retained,
@@ -492,14 +506,39 @@ internal class ScriptSource(
         if (headerEnd > 0) {
             addLines(0..lineOf(headerEnd - 1)) { it < headerEnd && it < (structure.unterminatedComment ?: script.length) }
         }
+        val usedAliases = mutableSetOf<String>()
+        val rootPackageAliases = dependencies.flatMapTo(sortedSetOf()) { it.rootPackageClasses }.filter { name ->
+            // as an alias hides the name of the class also from the script, like the alias of the script, e.g. `import A as B`
+            structure.isPackaged || structure.imports.any { (fqName, importedName) -> (fqName == name) != (importedName == name) }
+        }.associateWith { name ->
+            generateSequence("_root_${name.filter { it.isLetterOrDigit() || it == '_' }}") { "${it}_" }.first {
+                // an alias quoted in backticks is not resolved, so the script might refer to it
+                it !in script && usedAliases.add(it)
+            }
+        }
+        rootPackageAliases.forEach { (name, alias) ->
+            // reported as the error of the first dependency referring to it, e.g. of a class deprecated as hidden
+            preambleDependencies[lines.size] = dependencies.first { name in it.rootPackageClasses }.name
+            // quoted, as it might be a keyword, like `is`
+            lines += "import `$name` as $alias"
+            mapping += null
+        }
+        val shadowedRootPackageClasses = if (structure.isPackaged) {
+            emptySet()
+        } else {
+            movedDeclarations.filter {
+                it.kind != DeclarationKind.FUNCTION && it.kind != DeclarationKind.PROPERTY
+            }.mapNotNullTo(HashSet()) { it.name }
+        }
         fun addAccessor(
             dependency: PreambleDependency
         ) {
             preambleDependencies[lines.size] = dependency.name
+            val accessor = dependency.accessor(rootPackageAliases, dependency.rootPackageClasses.any { it in shadowedRootPackageClasses })
             lines += if (dependency.name in deprecatedDependencies) {
-                "@kotlin.Deprecated(\"$LATER_DECLARED_DEPENDENCY\") ${dependency.accessor}"
+                "@kotlin.Deprecated(\"$LATER_DECLARED_DEPENDENCY\") $accessor"
             } else {
-                dependency.accessor
+                accessor
             }
             mapping += null
         }
@@ -1147,6 +1186,12 @@ private class ScriptStructure(
 
     val headerEnd: Int
 
+    /** Whether the script starts with a `package` directive. */
+    val isPackaged: Boolean
+
+    /** The qualified names the script imports, except the ones imported with `*`, with the names they are imported under. */
+    val imports: List<Pair<String, String>>
+
     val movedDeclarations: List<Declaration>
 
     val bodyDeclarations: List<Declaration>
@@ -1222,6 +1267,10 @@ private class ScriptStructure(
             file.packageDirective,
             file.importList
         ).filter { it.textLength > 0 }.maxOfOrNull { it.endOffset } ?: 0
+        isPackaged = file.packageDirective?.isRoot == false
+        imports = file.importDirectives.filter { !it.isAllUnder }.mapNotNull { directive ->
+            directive.importedFqName?.let { it.asString() to (directive.aliasName ?: it.shortName().asString()) }
+        }
         val block = file.script?.blockExpression
         val statements = block?.statements.orEmpty()
         val declarations = statements.mapNotNull { parseDeclaration(it) }
