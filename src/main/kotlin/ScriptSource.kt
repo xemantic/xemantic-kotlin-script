@@ -184,7 +184,12 @@ internal class CoroutineScopeReference(
     val line: Int,
     override val isFunction: Boolean,
     /** Whether it is within a lambda, which might have a receiver. */
-    val isInLambda: Boolean
+    val isInLambda: Boolean,
+    /**
+     * The position of the operator of the assignment to the moved `var`, like `=` of `isActive = "b"`, if it is assigned,
+     * where the compiler reports the errors of the assignment to the property of the coroutine scope instead, like `Assignment type mismatch`.
+     */
+    val assignment: ScriptPosition? = null
 ) : LocalDeclarationReference, CandidateReference
 
 /** The [reference] of the script body preceding the local declaration of this [kind], and of its name, declared at the 0-based [line]. */
@@ -697,8 +702,8 @@ internal class ScriptSource private constructor(
                 candidate.isInInferredType
             )
         }
-        coroutineScopeCandidates = structure.coroutineScopeCandidates.map { (reference, offset, isFunction) ->
-            CoroutineScopeReference(reference.toScriptReference(), position(offset).line, isFunction, reference.isInLambda)
+        coroutineScopeCandidates = structure.coroutineScopeCandidates.map { (reference, offset, isFunction, assignment) ->
+            CoroutineScopeReference(reference.toScriptReference(), position(offset).line, isFunction, reference.isInLambda, assignment?.let { position(it) })
         }
         bodyDeclarations = structure.bodyDeclarations
         val deprecatedDependencies = if (confirming) {
@@ -1066,6 +1071,17 @@ private fun lineBounds(
     add(start until script.length)
 }
 
+/**
+ * See [ScriptSource.coroutineScopeCandidates], with the [offset] of the declaration, whether it is a function,
+ * and the offset of the operator of the assignment to the moved `var`, if the [reference] is assigned, see [CoroutineScopeReference.assignment].
+ */
+private data class CoroutineScopeCandidate(
+    val reference: Reference,
+    val offset: Int,
+    val isFunction: Boolean,
+    val assignment: Int?
+)
+
 /** See [ScriptSource.shadowedFunctionCandidates], with the offsets of the local declarations and of the first moved function. */
 private class ShadowedCandidate(
     val reference: Reference,
@@ -1274,14 +1290,19 @@ private const val LATER_DECLARED_CLASS_PREFIX = "_LaterDeclaredClass_"
 
 /**
  * The overriding declaration of the member of `Any` of the same signature as this function, like `override fun toString(): kotlin.String`,
- * which a declaration of this signature in a class would hide, or `null`, if it has another signature, like `fun equals(other: String)`.
+ * which a declaration of this signature in a class would hide, or `null`, if it has another signature, like `fun equals(other: String)`,
+ * or declares another return type, like `fun toString(): Int`, the calls of which are of this type.
  */
 private fun KtNamedFunction.anyMemberOverride(): String? = if (receiverTypeReference != null || typeParameters.isNotEmpty()) null else {
     val parameterTypes = valueParameters.map { it.typeReference?.singleLineText()?.trim()?.removePrefix("kotlin.") }
+    // `Unit` of a block body, while an inferred one is not known, assumed to be the one of the member
+    val returnType = typeReference?.singleLineText()?.trim()?.removePrefix("kotlin.") ?: "Unit".takeIf { bodyBlockExpression != null }
+    fun returning(type: String) = returnType == null || returnType == type
     when {
-        name == "toString" && parameterTypes.isEmpty() -> "override fun toString(): kotlin.String = kotlin.TODO()"
-        name == "hashCode" && parameterTypes.isEmpty() -> "override fun hashCode(): kotlin.Int = kotlin.TODO()"
-        name == "equals" && parameterTypes == listOf("Any?") -> "override fun equals(other: kotlin.Any?): kotlin.Boolean = kotlin.TODO()"
+        name == "toString" && parameterTypes.isEmpty() && returning("String") -> "override fun toString(): kotlin.String = kotlin.TODO()"
+        name == "hashCode" && parameterTypes.isEmpty() && returning("Int") -> "override fun hashCode(): kotlin.Int = kotlin.TODO()"
+        name == "equals" && parameterTypes == listOf("Any?") && returning("Boolean") ->
+            "override fun equals(other: kotlin.Any?): kotlin.Boolean = kotlin.TODO()"
         else -> null
     }
 }
@@ -1591,11 +1612,16 @@ private fun KtExpression.reportedCallee(): KtExpression? = when (val expression 
     else -> expression
 }
 
-/** Whether the [expression] is within a lambda, which might have a receiver, within the [scope], exclusive. */
+/**
+ * Whether the [expression] is within a lambda, which might have a receiver, within the [scope], exclusive,
+ * or within an anonymous function with a receiver, like `fun Job.() = isActive`.
+ */
 private fun isInLambda(
     expression: PsiElement,
     scope: PsiElement
-): Boolean = expression.parents.takeWhile { it !== scope }.any { it is KtLambdaExpression }
+): Boolean = expression.parents.takeWhile { it !== scope }.any {
+    it is KtLambdaExpression || (it is KtNamedFunction && it.isAnonymous && it.receiverTypeReference != null)
+}
 
 /** See [Reference.mightResolveOnReceiver]. */
 private fun mightResolveOnReceiver(
@@ -1633,6 +1659,36 @@ private fun scopeCalls(
     val call = (argument.parent as? KtValueArgument)?.parent.let { (it as? KtValueArgumentList)?.parent ?: it } as? KtCallExpression
     (call?.calleeExpression as? KtSimpleNameExpression)?.takeIf { it.getReferencedName() in scopeFunctions }?.let { it.startOffset until it.endOffset }
 }.toList()
+
+/** The functions of `kotlinx.coroutines`, the block of which has a coroutine scope receiver, nested in the coroutine scope of the script body. */
+private val coroutineScopeBuilders = setOf("coroutineScope", "supervisorScope", "withContext", "withTimeout", "withTimeoutOrNull", "launch", "async")
+
+/**
+ * Whether the [element] is within the block of a [coroutineScopeBuilders], like `isActive` of `coroutineScope { run { isActive } }`,
+ * the outermost lambda within the [scope], exclusive, which is called by its name, unless one of the [scriptNames],
+ * not within a receiver of its own, so it is the one of `kotlinx.coroutines`,
+ * the coroutine scope of which has the same members, and extensions, as the coroutine scope of the script body, while taking precedence over them,
+ * also over the members of the script in a regular script.
+ */
+private fun isInNestedCoroutineScope(
+    element: PsiElement,
+    scope: PsiElement,
+    scriptNames: Set<String>
+): Boolean {
+    val lambda = element.parents.takeWhile { it !== scope }.lastOrNull {
+        it is KtLambdaExpression || (it is KtNamedFunction && it.isAnonymous && it.receiverTypeReference != null)
+    } as? KtLambdaExpression ?: return false
+    var argument: PsiElement = lambda
+    while (argument.parent.let { it is KtLabeledExpression || it is KtParenthesizedExpression || it is KtAnnotatedExpression }) argument = argument.parent
+    val valueArgument = argument.parent as? KtValueArgument ?: return false
+    // the block, which is the last argument, also a trailing lambda
+    val call = valueArgument.parent.let { (it as? KtValueArgumentList)?.parent ?: it } as? KtCallExpression ?: return false
+    if (call.valueArguments.lastOrNull() !== valueArgument) return false
+    val callee = call.calleeExpression as? KtSimpleNameExpression ?: return false
+    return callee.getReferencedName().let { it in coroutineScopeBuilders && it !in scriptNames }
+            && call.parent.let { it !is KtQualifiedExpression || it.selectorExpression !== call }
+            && !mightResolveOnReceiver(call, scope)
+}
 
 /** Whether the return type of the function is inferred from its expression body, unlike a declared one, or `Unit` of a block body. */
 private fun KtNamedFunction.isOfInferredType(): Boolean = typeReference == null && bodyBlockExpression == null && bodyExpression != null
@@ -1867,8 +1923,8 @@ private class ScriptStructure(
     /** The names of the local functions overloading the [overloadedFunctions], renamed with these letters, see [ScriptSource.overloadingFunctionCopies]. */
     val renamedRanges: List<Pair<IntRange, Char>>
 
-    /** See [ScriptSource.coroutineScopeCandidates], with the offsets of the declarations, and whether they are functions. */
-    val coroutineScopeCandidates: List<Triple<Reference, Int, Boolean>>
+    /** See [ScriptSource.coroutineScopeCandidates]. */
+    val coroutineScopeCandidates: List<CoroutineScopeCandidate>
 
     /** The copies of the moved declarations, the members of the coroutine scope of the script body, see [ScriptSource.coroutineScopeCopies]. */
     val coroutineScopeMembers: List<String>
@@ -2194,6 +2250,8 @@ private class ScriptStructure(
             (it.kind == DeclarationKind.FUNCTION || (it.kind == DeclarationKind.PROPERTY && (it.psi as? KtProperty)?.receiverTypeReference == null))
                     && it.name != null && (it.name in coroutineScopeProperties || it.name in coroutineScopeFunctions)
         }.groupBy { it.name!! }
+        // the names of the declarations of the script, and of the dependencies, which the calls by these names might refer to
+        val scriptNames = file.collectDescendantsOfType<KtNamedDeclaration>().mapNotNullTo(HashSet()) { it.name } + dependencyNames
         val coroutineScopeCandidatesByStatement = bodyCandidates { index, reference ->
             coroutineScopeDeclarations[reference.name]?.takeIf {
                 !reference.isQualified && !reference.isBound
@@ -2201,7 +2259,17 @@ private class ScriptStructure(
                         && shadowingProperties[reference.name]?.let { (propertyIndex) -> propertyIndex < index } != true
             }?.let { declarations ->
                 val declaration = declarations.first()
-                Triple(reference, declaration.line(), declaration.kind == DeclarationKind.FUNCTION)
+                val element = file.findElementAt(reference.offset)
+                // resolved to the nested coroutine scope, also in a regular script, without compiling
+                if (reference.isInLambda && element != null && isInNestedCoroutineScope(element, statements[index].parent, scriptNames)) {
+                    return@bodyCandidates null
+                }
+                val assignment = (declaration.psi as? KtProperty)?.takeIf { it.isVar }?.let {
+                    (element?.parent?.parent as? KtBinaryExpression)?.takeIf { assignment ->
+                        assignment.left === element?.parent && assignment.operationToken in KtTokens.ALL_ASSIGNMENTS
+                    }?.operationReference?.startOffset
+                }
+                CoroutineScopeCandidate(reference, declaration.line(), declaration.kind == DeclarationKind.FUNCTION, assignment)
             }
         }
         coroutineScopeCandidates = coroutineScopeCandidatesByStatement.values.flatten()
@@ -2372,7 +2440,7 @@ private class ScriptStructure(
         coroutineScopeMembers = run {
             // the properties, which always apply, only within the lambdas, see ScriptSource.coroutineScopeCandidates
             val names = coroutineScopeCandidates.filter { (reference, _, isFunction) -> isFunction || reference.isInLambda }
-                .mapTo(HashSet()) { it.first.name }
+                .mapTo(HashSet()) { it.reference.name }
             // also the extension functions, which might not apply, like `fun Robot.launch()` to `launch { }`
             moved.filter { it.name in names }.mapNotNull { declaration ->
                 val property = declaration.psi as? KtProperty

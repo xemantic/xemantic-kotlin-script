@@ -5810,6 +5810,99 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should execute references within anonymous functions with receivers next to moved declarations of their names`() = runTest {
+        // given
+        val scripts = listOf(
+            "val r = with(Job(), fun Job.(): Any = isActive)\nval isActive get() = \"mine\"\nr",
+            "val r = (fun CoroutineScope.(): Any = isActive)(CoroutineScope(Job()))\nval isActive get() = \"mine\"\nr",
+            "val r = Job().run(fun Job.(): Any { cancel(); return isCancelled })\nfun cancel(): String = \"mine\"\nr"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(true, true, true))
+    }
+
+    @Test
+    fun `should report references within anonymous functions resolved to the coroutine scope of the script body instead of moved declarations`() = runTest {
+        // given
+        val scripts = listOf(
+            "val r = with(\"a\", fun String.(): Any = isActive)\nval isActive get() = \"mine\"\nr",
+            "val r = (fun(): Any = isActive)()\nval isActive get() = \"mine\"\nr"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.first()?.substringAfter("error: ") } == List(scripts.size) {
+            "'isActive' refers to the coroutine scope of the script body, instead of the property declared at line 2, which is compiled outside of the script body."
+        })
+    }
+
+    @Test
+    fun `should report assignments resolved to the coroutine scope of the script body instead of moved properties`() = runTest {
+        // given
+        val scripts = listOf(
+            "isActive = \"b\"\nvar isActive: String get() = \"a\"; set(v) {}\n1",
+            "val r = listOf(1).map { isActive = \"b\"; 1 }\nvar isActive: String get() = \"a\"; set(v) {}\nr",
+            "val r = listOf(1).map { isActive += \"b\"; 1 }\nvar isActive: String get() = \"a\"; set(v) {}\nr"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // without the errors of the assignments to the property of the coroutine scope, like `'val' cannot be reassigned`
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.filter { line -> "error: " in line } } == List(scripts.size) { index ->
+            listOf(
+                "script.kts:1:${if (index == 0) 1 else 25}: error: 'isActive' refers to the coroutine scope of the script body, " +
+                        "instead of the property declared at line 2, which is compiled outside of the script body."
+            )
+        })
+    }
+
+    @Test
+    fun `should execute assignments within lambdas to properties of their receivers next to moved properties of their names`() = runTest {
+        // given
+        val script = "val r = with(object { var isActive = 1 }) { isActive = 2; isActive }\nvar isActive: String get() = \"a\"; set(v) {}\nr"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert((result as? ScriptResult.Value)?.value == 2)
+    }
+
+    @Test
+    fun `should report call within lambda resolved to the coroutine scope of the script body given the moved member of any of other return type`() = runTest {
+        // given
+        val script = """
+            val r = listOf(1).map { cancel(toString()) }
+            fun toString(): Int = 1
+            fun cancel(x: Int): String = "mine"
+            r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        // `cancel(toString())` resolves to `cancel(message: String)` of the coroutine scope, while a regular script calls `cancel(x: Int)`
+        assert((result as? ScriptResult.Error)?.message?.lines()?.filter { "error: " in it }?.map { it.substringBefore(" refers") } == listOf(
+            "script.kts:1:25: error: 'cancel'",
+            "script.kts:1:32: error: 'toString'"
+        ))
+    }
+
+    @Test
     fun `should report calls resolved to the coroutine scope after comments and shadowed functions in the order of the script`() = runTest {
         // given
         val scripts = listOf(
