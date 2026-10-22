@@ -5004,6 +5004,76 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report unresolved value called by declaration moved out of the script body once`() = runTest {
+        // given
+        val script = """
+            val p = listOf("!").first()
+            operator fun Int.invoke(x: Any?): String = "int:${'$'}x${'$'}p"
+            val q = listOf(1).first()
+            sealed class S { fun g() = q(2) }
+            class T : S()
+            T().g()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert(result is ScriptResult.Error && result.message == """
+            script.kts:4:28: error: Unresolved reference 'q'.
+              | sealed class S { fun g() = <error>q</error>(2) }
+              hint: 'S' is compiled outside of the script body, where 'q' (line 3) is not visible - pass it as a parameter, or declare it within 'S'.
+        """.trimIndent())
+    }
+
+    @Test
+    fun `should not move local invoke operator overloading one accessing local properties`() = runTest {
+        // given
+        val script = """
+            val p = listOf("!").first()
+            operator fun Any.invoke(x: Any?): String = "any:${'$'}x${'$'}p"
+            operator fun Int.invoke(x: Any?): String = "int:${'$'}x"
+            sealed class S { fun g() = listOf(1).size }
+            class T : S()
+            T().g().toString() + 3("x")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "1int:x")
+        }
+    }
+
+    @Test
+    fun `should report calls of moved declarations to local overloads not moved with the overloads accessing local properties`() = runTest {
+        // given
+        val overloads = "val p = listOf(\"!\").first()\n"
+        val scripts = listOf(
+            "${overloads}fun Any.f(x: Any?): String = \"any:${'$'}x${'$'}p\"\nfun Int.f(x: Any?): String = \"int:${'$'}x\"\n" +
+                    "sealed class S { fun g() = 1.f(2) }\nclass T : S()\nT().g() + 3.f(\"x\")" to "where 'f' (line ",
+            "${overloads}operator fun Any.invoke(x: Any?): String = \"any:${'$'}x${'$'}p\"\noperator fun Int.invoke(x: Any?): String = \"int:${'$'}x\"\n" +
+                    "sealed class S { fun g(n: Int) = n(2) }\nclass T : S()\nT().g(1) + 3(\"x\")" to
+                    // the overload called in the script
+                    "'invoke' does not refer to the function of the script body declared at line 3"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { (script) -> executor.execute(script) }
+
+        // then
+        assert(results.zip(scripts).all { (result, script) ->
+            result is ScriptResult.Error && script.second in result.message
+        })
+    }
+
+    @Test
     fun `should report calls of declarations moved out of the script body on values made callable by hidden local invoke operator`() = runTest {
         // given
         val invoke = "val p = \"!\"\noperator fun Int.invoke(x: Any?): String = \"int:${'$'}x${'$'}p\"\n"
@@ -5542,14 +5612,16 @@ class ScriptExecutorTest {
             // starting with the local of the same name, where the compiler reports the delegate convention as well
             "getValue[0]"
         )
+        // the local named like the convention, only where the delegate expression starts with it
+        fun locals(delegate: String) = if (delegate.startsWith("getValue")) "val getValue = listOf(cfg); " else ""
         val scripts = operators.flatMap { (name, operator) ->
             delegates.map { delegate ->
-                "$declarations${operator}enum class E { A; fun getValue() = 0; fun f(): Int { val cfg = Cfg(); val getValue = listOf(cfg); val v: Int by $delegate; return v } }\nE.A.f()" to name
+                "$declarations${operator}enum class E { A; fun getValue() = 0; fun f(): Int { val cfg = Cfg(); ${locals(delegate)}val v: Int by $delegate; return v } }\nE.A.f()" to name
             }
         } + delegates.map { delegate ->
             val variable = "class Cfg { $members; operator fun getValue(t: Any?, p: KProperty<*>) = 1 }\n" +
                     "operator fun Cfg.setValue(t: Any?, p: KProperty<*>, v: Int) { println(scale) }\n"
-            "${declarations.replace("class Cfg { $members }\n", variable)}enum class E { A; fun getValue() = 0; fun f(): Int { val cfg = Cfg(); val getValue = listOf(cfg); var v: Int by $delegate; v = 2; return v } }\nE.A.f()" to "setValue"
+            "${declarations.replace("class Cfg { $members }\n", variable)}enum class E { A; fun getValue() = 0; fun f(): Int { val cfg = Cfg(); ${locals(delegate)}var v: Int by $delegate; v = 2; return v } }\nE.A.f()" to "setValue"
         }
         val executor = ScriptExecutor()
 

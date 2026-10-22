@@ -492,7 +492,9 @@ internal class DefaultScriptExecutor(
             // each assigned to the candidate of its name containing it, the one of the same end, if nested, like `a[0][1]`
             val hiddenWarnings = reports.markedRanges(probe, HIDDEN_LOCAL_FUNCTION)
             val hiddenCandidates = source.hiddenLocalFunctionCandidates
-            val hidden = hiddenWarnings.mapNotNullTo(HashSet()) { (start, end, message) ->
+            // with the lines of the declarations they are resolved to, if known, like of one of the overloads
+            val hidden = mutableMapOf<HiddenLocalFunctionReference, Int?>()
+            hiddenWarnings.forEach { (start, end, message) ->
                 hiddenCandidates.filter { candidate ->
                     start in candidate.reference && hiddenLocalFunctionMessage(candidate.reference.name) in message
                             // like a delegate convention, not of a call of the same name within it, unless reported on the whole expression,
@@ -503,7 +505,7 @@ internal class DefaultScriptExecutor(
                     // like `getValue` of `by getValue(cfg)`,
                     // otherwise the innermost one, nested ones start later, or at the same position, ending earlier
                     matching.firstOrNull { candidate ->
-                        candidate.callee?.let { start in it && end == it.end } == true
+                        candidate.delegateCallee?.let { start in it && end == it.end } == true
                                 && hiddenLocalFunctionMessage(candidate.reference.name, isOperator = true) in message
                     } ?: matching.firstOrNull { it.reference.end == end } ?: matching.maxWithOrNull(
                         compareBy<HiddenLocalFunctionReference> { it.reference.start }.thenByDescending { it.reference.end }
@@ -512,9 +514,10 @@ internal class DefaultScriptExecutor(
                     // chosen first, so that the warning of a plain call, like `get(1)` in `m[get(1)]`, is not assigned to the enclosing operator,
                     // the compiler reports the operators as unresolved, misleading, so they are hinted at as well,
                     // like the calls failing as resolved to other functions, like `print("")` returning `Unit` of `kotlin.io.print`,
-                    // or to the dependency of the same name, see ScriptSource.calledInsteadDependencies
-                    candidate.isOperator || (start to candidate.reference.name) !in unresolved
-                }
+                    // or to the dependency of the same name, see ScriptSource.calledInsteadDependencies,
+                    // unlike the invoke operators of the unresolved values, like `q(2)`, hinted at as not visible already
+                    (candidate.isOperator && candidate.invokedValue == null) || (start to (candidate.invokedValue ?: candidate.reference.name)) !in unresolved
+                }?.let { candidate -> hidden.putIfAbsent(candidate, hiddenLocalFunctionLine(message)) }
             }
             // the references not resolved to the moved declarations, unless already reported as errors
             val toDeclarations = deprecated(COROUTINE_SCOPE_ORIGINAL)
@@ -576,6 +579,9 @@ internal class DefaultScriptExecutor(
             }).sortedBy { it.reference.start }
             val hiddenLocalFunctionReferences = hiddenCandidates.filter {
                 it in hidden && (it !in source.untypedPropertyCalls || it.reference.name in confirmedTypes)
+            }.map { candidate ->
+                // naming the overload called in the script
+                hidden[candidate]?.let { candidate.copy(line = it) } ?: candidate
             }
             val reporter = ScriptErrorReporter(source)
             /** The failure message of these confirmed [references] of one kind, unless there are none. */
