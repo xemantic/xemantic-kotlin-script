@@ -40,6 +40,7 @@ import kotlin.concurrent.atomics.incrementAndFetch
 import kotlin.coroutines.CoroutineContext
 import kotlin.reflect.KClass
 import java.lang.reflect.Modifier
+import java.util.Collections
 import kotlin.reflect.KFunction
 import kotlin.reflect.KVisibility
 import kotlin.reflect.full.extensionReceiverParameter
@@ -323,14 +324,26 @@ internal class DefaultScriptExecutor(
          * or the interruption of the thread, all of which are thrown.
          */
         private suspend fun compileOrFail(): CompilationOutcome = try {
-            doCompile()
+            doCompile().also { outcome ->
+                // the crashes of the compiler, reported without the stack traces
+                (outcome as? Compilation)?.result?.reports?.forEach { diagnostic ->
+                    if (diagnostic.severity == ScriptDiagnostic.Severity.ERROR) diagnostic.exception?.let {
+                        logger.warn(it) { "Script[$scriptId]: Compilation (1/2) failed internally: ${diagnostic.message}" }
+                    }
+                }
+            }
         } catch (e: Throwable) {
             e.rethrowIfCancelledOrFatal()
+            // like the compiler reporting it as a diagnostic
+            e.fatalCause()?.let { throw it }
             // with the interrupt status restored where it was caught, see compile(source)
             if (e is InterruptedException) throw e
             logger.warn(e) { "Script[$scriptId]: Compilation (1/2) failed internally" }
-            FailedCompilation(internalFailureMessage(e))
+            FailedCompilation(internalFailureMessage(e, compiledSources))
         }
+
+        /** The sources compiled for the script, which the messages of the internal failures might refer to. */
+        private val compiledSources: MutableList<ScriptSource> = Collections.synchronizedList(mutableListOf())
 
         private suspend fun doCompile(): CompilationOutcome {
             // the sources of all the compilations are derived from the script parsed once
@@ -541,6 +554,7 @@ internal class DefaultScriptExecutor(
         private suspend fun compile(
             source: ScriptSource
         ): ResultWithDiagnostics<CompiledScript> {
+            compiledSources += source
             val result = try {
                 compilationPermits.withPermit {
                     // resolving the classpath on the first compilation, which is not counted if it fails
@@ -558,13 +572,13 @@ internal class DefaultScriptExecutor(
                 // otherwise it would silently cancel the active caller, and the ones waiting in the cache, instead of failing them
                 currentCoroutineContext().ensureActive()
                 throw IllegalStateException("The compilation of the script was cancelled", e)
-            } catch (e: Throwable) {
-                e.interruption()?.let { throwRestoringInterruptStatus(it) }
-                throw e
+            } catch (e: InterruptedException) {
+                // only the one of this thread, not the one causing a failure of another thread
+                throwRestoringInterruptStatus(e)
             }
             // the compiler reports what it throws as a diagnostic, like `error: Java heap space`, not an error of the script
             result.reports.firstNotNullOfOrNull { it.exception?.fatalCause() }?.let { throw it }
-            result.reports.firstNotNullOfOrNull { it.exception?.interruption() }?.let { throwRestoringInterruptStatus(it) }
+            result.reports.firstNotNullOfOrNull { it.exception as? InterruptedException }?.let { throwRestoringInterruptStatus(it) }
             return result
         }
 
@@ -728,11 +742,6 @@ private suspend fun Throwable.rethrowIfCancelledOrFatal() {
 private fun Throwable.fatalCause(): Throwable? = firstCause {
     it is VirtualMachineError && it !is StackOverflowError
 }
-
-/** This exception, or its first cause, which is the [InterruptedException] of the interrupted thread, if any. */
-private fun Throwable.interruption(): InterruptedException? = firstCause {
-    it is InterruptedException
-} as InterruptedException?
 
 /**
  * Throws the [interruption] caught by this thread, restoring its interrupt status,

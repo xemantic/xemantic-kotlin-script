@@ -99,6 +99,8 @@ public interface ScriptExecutor {
      * A failure of the compilation, even an internal one of the compiler, is reported as a [ExecutionPhase.COMPILATION] error,
      * unless it is the cancellation of the caller, a [VirtualMachineError] other than [StackOverflowError],
      * or the [InterruptedException] of the interrupted thread compiling the script, with its interrupt status restored, which are thrown.
+     * So a [LinkageError] while compiling, like a [NoClassDefFoundError] of a broken classpath, is a [ExecutionPhase.COMPILATION] error,
+     * while the one thrown by the script, like the [ExceptionInInitializerError] of its object, is a [ExecutionPhase.EVALUATION] error.
      *
      * @throws IllegalArgumentException if the [dependencies] have duplicate, or reserved, names.
      */
