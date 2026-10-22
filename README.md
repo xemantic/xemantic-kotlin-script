@@ -91,6 +91,19 @@ when (result) {
   which calls another function instead, like `print` of the standard library, or fails, like an operator resolved to the `CoroutineScope`,
   is reported as an error, if the local function applies, as in a regular script it calls the local function,
   unless the call is resolved to a member of a receiver, like `append` in `buildString { append("x") }`, as in a regular script.
+* A function accessing the local declarations of the script body stays local to the script block, where it is visible only after its declaration,
+  so a call preceding it, like `b(x)` in `fun a(x: Int) = b(x) + 1` followed by `fun b(x: Int) = x * factor`, is unresolved there.
+  Then the script is compiled again with such functions declared preceding the statements calling them, each preceding the ones calling it,
+  if they are the only unresolved references, and the script compiles then
+  ([#4](https://github.com/xemantic/xemantic-kotlin-script/issues/4)).
+  The call stays reported as unresolved, with the hint to declare the function earlier, when the hoisting might change how any other name is resolved:
+  when the function refers to a declaration declared between the statement calling it and itself, like another function it calls,
+  or to a local `var`, or when it is an operator, or an operator is declared in between,
+  or when another declaration of the script has its name,
+  or when a statement in between refers to its name otherwise, like a member of a receiver, `with(obj) { b() }`, or a parameter,
+  or when a call in between, or within it, is checked as resolved to another declaration than in a regular script, like `print` declared by the script later.
+  Functions calling each other, like `even` and `odd`, cannot be declared one preceding the other,
+  which the hint tells, suggesting to pass the local declarations they access as parameters instead, so they are compiled outside of the script body.
 * Scripts executed repeatedly, like an agent harness defined as a script, can skip the recompilation
   with `ScriptExecutor(compilationCacheSize = ...)`, keeping that many compiled scripts, the least recently used evicted first.
   A compiled script is reused when the script text, and the names and types of the dependencies are the same,

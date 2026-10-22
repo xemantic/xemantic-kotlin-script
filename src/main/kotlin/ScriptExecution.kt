@@ -387,6 +387,15 @@ internal class DefaultScriptExecutor(
             if (source.unmatchedClosingBrace != null || source.conflictingDependencyDeclarations.isNotEmpty()) {
                 return Compilation(source, result = null)
             }
+            val compilation = compile(parsed, source)
+            return hoistedCompilation(parsed, compilation) ?: compilation
+        }
+
+        /** The compilation of the [source] of the [parsed] script, with its [ScriptSource.candidates] confirmed, see [confirm]. */
+        private suspend fun compile(
+            parsed: ScriptSource.Parsed,
+            source: ScriptSource
+        ): CompilationOutcome {
             if (source.candidates.isEmpty()) return Compilation(source, compile(source))
             // the confirming compilations do not depend on this one
             return coroutineScope {
@@ -407,6 +416,27 @@ internal class DefaultScriptExecutor(
                         is Failure -> Compilation(source, result)
                     }
                 }
+            }
+        }
+
+        /**
+         * The compilation of the [parsed] script with the local functions declared preceding the statements calling them,
+         * which are not visible there, unlike in the script, see [ScriptSource.Parsed.hoisted],
+         * if they are the only unresolved references of the failed [compilation], and the hoisted script compiles,
+         * otherwise `null`, as the errors of the script are reported for the script as it is.
+         */
+        private suspend fun hoistedCompilation(
+            parsed: ScriptSource.Parsed,
+            compilation: CompilationOutcome
+        ): CompilationOutcome? {
+            if (compilation !is Compilation || compilation.confirmedFailures.isNotEmpty()) return null
+            val result = compilation.result as? Failure ?: return null
+            val hoisted = parsed.hoisted(compilation.source, result.reports.unresolvedReferences(compilation.source)) ?: return null
+            logger.debug { "Script[$scriptId]: Compiling (1/2) with the local functions declared preceding their calls" }
+            return when (val outcome = compile(hoisted, hoisted.source())) {
+                is Compilation -> outcome.takeIf { it.result is Success }
+                // the internal failure of the confirming compilation, otherwise silently resolving the references to the wrong declarations
+                is FailedCompilation -> outcome
             }
         }
 

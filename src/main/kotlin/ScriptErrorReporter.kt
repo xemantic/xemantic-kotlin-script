@@ -527,8 +527,14 @@ internal class ScriptErrorReporter(
         val (line, kind) = (if (preferFunction) source.bodyDeclarationLine(name, DeclarationKind.FUNCTION) else null)
             ?: source.bodyDeclarationLine(name) ?: return
         val declaration = source.movedDeclarationAt(position)
+        // which cannot be declared preceding the calling one, see ScriptSource.Parsed.hoisted
+        val calledBack = if (kind == FUNCTION && line > position.line) source.callsBack(name, position) else null
         if (declaration != null) {
             appendNotVisibleHint(declaration, name, line)
+        } else if (calledBack != null) {
+            +"  hint: '$name' is declared at line ${line + 1}, and calls '$calledBack' back,"
+            +" while the functions of the script body accessing its local declarations are visible only after their declaration, so they cannot call each other"
+            +" - pass the local declarations they access as parameters instead.\n"
         } else if (line > position.line) {
             val declarations = when (kind) {
                 CLASS -> "classes"
