@@ -300,14 +300,16 @@ internal class DefaultScriptExecutor(
 
         private suspend fun doCompile(): Compilation {
             val source = source()
-            if (source.unmatchedClosingBrace != null || source.conflictingDependencyDeclarations.isNotEmpty()) {
+            if (!source.isWrapped) {
+                // the script alone, failing with the syntax errors of a regular script, without any candidates,
+                // unless it compiles, contrary to the lexer, while it cannot run without the script block
+                val result = compile(source).takeIf { it is Failure }
+                return Compilation(source, result)
+            }
+            if (source.conflictingDependencyDeclarations.isNotEmpty()) {
                 return Compilation(source, result = null)
             }
             val result = compile(source)
-            if (source.endsUnclosed) {
-                // the script alone, failing with the syntax errors only, so the candidates are never reported
-                return Compilation(source, result)
-            }
             // unless already reported as unresolved
             val errors = result.reports.filter { it.severity == ScriptDiagnostic.Severity.ERROR }.mapNotNull { diagnostic ->
                 diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }

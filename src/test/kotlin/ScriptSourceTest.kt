@@ -149,6 +149,26 @@ class ScriptSourceTest {
         // then
         assert(topLevelSources.none { "abc" in it.text })
         assert(nestedSources.all { "abc" in it.text })
+        assert((topLevel + nested).zip(topLevelSources + nestedSources).all { (script, source) ->
+            script.substringBefore("/*").lines().map { it.trim() }.filter { it.isNotEmpty() }.all { it in source.text }
+        })
+    }
+
+    @Test
+    fun `should not analyze structure of script which is not wrapped`() {
+        // given
+        val scripts = listOf(
+            "x\nA().y\nclass A {\n  val y = 1\n",
+            "x\nA().y\nclass A {\n  val y = 1\n}\n}\nval x = 2"
+        )
+        val dependencies = listOf(PreambleDependency("x", "val x: Int = 42"))
+
+        // when
+        val sources = scripts.map { ScriptSource(it, dependencies) }
+
+        // then
+        assert(sources.none { it.isWrapped })
+        assert(sources.all { it.movedDeclarationName("A") == null && it.laterDeclaredDependencyCandidates.isEmpty() })
     }
 
     @Test

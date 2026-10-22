@@ -1929,6 +1929,9 @@ class ScriptExecutorTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
+                script.kts:1:10: error: Syntax error: Expecting ')'.
+                  | println(1<error></error>
+
                 script.kts:2:1: error: Syntax error: Unexpected '}' without matching '{'.
                   | <error>}</error>
             """.trimIndent()
@@ -2270,12 +2273,57 @@ class ScriptExecutorTest {
 
         // then
         assert(results.map { (it as? ScriptResult.Error)?.message } == listOf(
-            "script.kts:3:12: error: Syntax error: Missing '}.\n  |   val x = 1<error></error>",
-            "script.kts:2:15: error: Syntax error: Expecting '}'.\n  | fun f(): Int {<error></error>",
+            "script.kts:3:12: error: Syntax error: Missing '}.\n  |   val x = 1<error></error>\n\nscript.kts:4:3: info: Unterminated block comment, running to the end of the script.\n  |   <error>/*</error> abc\n  hint: close the comment with '*/' - the tokens reported as missing might be within it.",
+            "script.kts:2:15: error: Syntax error: Expecting '}'.\n  | fun f(): Int {<error></error>\n\nscript.kts:3:3: info: Unterminated block comment, running to the end of the script.\n  |   <error>/*</error> abc\n  hint: close the comment with '*/' - the tokens reported as missing might be within it.",
             "script.kts:3:12: error: Syntax error: Missing '}.\n  |   val x = 1<error></error>",
             "script.kts:2:5: error: Syntax error: Expecting '}'.\n  | \"\${a<error></error>",
             "script.kts:2:17: error: Syntax error: Expecting an element.\n  | fun f() = \"\${1 +<error></error>"
         ))
+    }
+
+    @Test
+    fun `should report syntax errors of script with unmatched closing brace like regular script`() = runTest {
+        // given
+        val scripts = listOf(
+            "val a = (1\n}",
+            "foo(1 }"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message } == listOf(
+            "script.kts:1:11: error: Syntax error: Expecting ')'.\n  | val a = (1<error></error>\n\n" +
+                    "script.kts:2:1: error: Syntax error: Unexpected '}' without matching '{'.\n  | <error>}</error>",
+            "script.kts:1:6: error: Syntax error: Expecting ')'.\n  | foo(1<error></error> }\n\n" +
+                    "script.kts:1:7: error: Syntax error: Unexpected '}' without matching '{'.\n  | foo(1 <error>}</error>"
+        ))
+    }
+
+    @Test
+    fun `should hint at unterminated block comment swallowing closing brace`() = runTest {
+        // given
+        val script = "class A {\n  val x = 1\n  /* abc\n}\nA().x"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:12: error: Syntax error: Missing '}.
+                  |   val x = 1<error></error>
+
+                script.kts:3:3: info: Unterminated block comment, running to the end of the script.
+                  |   <error>/*</error> abc
+                  hint: close the comment with '*/' - the tokens reported as missing might be within it.
+            """.trimIndent()
+        }
     }
 
     @Test
@@ -2696,6 +2744,9 @@ class ScriptExecutorTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
+                script.kts:1:13: error: Syntax error: Expecting '"'.
+                  | val s = "abc<error></error>
+
                 script.kts:2:12: error: Syntax error: Unexpected '}' without matching '{'.
                   | println(s) <error>}</error>
             """.trimIndent()
