@@ -3510,6 +3510,72 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report this in local function outside of the body of local class referring to the coroutine scope`() = runTest {
+        // given
+        val script = """
+            open class B(val v: Any)
+            fun f(): Any { class C(val s: Any = this); return C().s }
+            fun g() = object : B(this) { }.v
+            "${'$'}{f()} ${'$'}{g()}"
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:37: error: 'this' refers to the coroutine scope of the script body, while in a function of a regular script it refers to the script instance.
+                  | fun f(): Any { class C(val s: Any = <error>this</error>); return C().s }
+                  hint: refer to the coroutine scope as 'this@_script' instead.
+
+                script.kts:3:22: error: 'this' refers to the coroutine scope of the script body, while in a function of a regular script it refers to the script instance.
+                  | fun g() = object : B(<error>this</error>) { }.v
+                  hint: refer to the coroutine scope as 'this@_script' instead.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report members of Any called in local function without receiver on the coroutine scope`() = runTest {
+        // given
+        val script = """
+            fun name() = toString()
+            fun copy() = apply { }
+            fun self() = with(this) { this }
+            fun length() = with("abc") { toString().length }
+            fun active() = isActive && launch { }.isActive
+            "${'$'}{name()} ${'$'}{copy()} ${'$'}{self()} ${'$'}{length()} ${'$'}{active()}"
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:14: error: 'toString' is resolved on the coroutine scope of the script body, while in a function of a regular script it is resolved on the script instance.
+                  | fun name() = <error>toString</error>()
+                  hint: refer to the coroutine scope as 'this@_script' instead.
+
+                script.kts:2:14: error: 'apply' is resolved on the coroutine scope of the script body, while in a function of a regular script it is resolved on the script instance.
+                  | fun copy() = <error>apply</error> { }
+                  hint: refer to the coroutine scope as 'this@_script' instead.
+
+                script.kts:3:19: error: 'this' refers to the coroutine scope of the script body, while in a function of a regular script it refers to the script instance.
+                  | fun self() = with(<error>this</error>) { this }
+                  hint: refer to the coroutine scope as 'this@_script' instead.
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should execute this in local function referring to other receivers`() = runTest {
         // given
         val script = """

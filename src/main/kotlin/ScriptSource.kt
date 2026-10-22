@@ -67,11 +67,13 @@ import org.jetbrains.kotlin.psi.KtPsiFactory
 import org.jetbrains.kotlin.psi.KtSimpleNameExpression
 import org.jetbrains.kotlin.psi.KtStringTemplateExpression
 import org.jetbrains.kotlin.psi.KtThisExpression
+import org.jetbrains.kotlin.psi.KtLambdaArgument
 import org.jetbrains.kotlin.psi.KtLambdaExpression
 import org.jetbrains.kotlin.psi.KtOperationReferenceExpression
 import org.jetbrains.kotlin.psi.KtTypeAlias
 import org.jetbrains.kotlin.psi.KtUnaryExpression
 import org.jetbrains.kotlin.psi.KtUserType
+import org.jetbrains.kotlin.psi.KtValueArgument
 import org.jetbrains.kotlin.psi.KtValueArgumentName
 import org.jetbrains.kotlin.psi.KtWhenExpression
 import org.jetbrains.kotlin.psi.psiUtil.allChildren
@@ -79,6 +81,7 @@ import org.jetbrains.kotlin.psi.psiUtil.collectDescendantsOfType
 import org.jetbrains.kotlin.psi.psiUtil.endOffset
 import org.jetbrains.kotlin.psi.psiUtil.getReceiverExpression
 import org.jetbrains.kotlin.psi.psiUtil.forEachDescendantOfType
+import org.jetbrains.kotlin.psi.psiUtil.getQualifiedExpressionForSelector
 import org.jetbrains.kotlin.psi.psiUtil.parents
 import org.jetbrains.kotlin.psi.psiUtil.startOffset
 import org.jetbrains.kotlin.psi.psiUtil.startOffsetSkippingComments
@@ -168,8 +171,24 @@ internal const val COROUTINE_SCOPE_FUNCTION = "xemantic-kotlin-script: coroutine
 /** The opt-in message of the moved functions, see [ScriptSource.shadowedFunctionCandidates]. */
 internal const val SHADOWED_ORIGINAL = "xemantic-kotlin-script: shadowed original"
 
-/** The opt-in message of the type of the coroutine scope receiver of the script body, see [ScriptSource.coroutineScopeThisCandidates]. */
+/** The opt-in message of the type of the coroutine scope receiver of the script body, see [ScriptSource.coroutineScopeReceiverCandidates]. */
 internal const val COROUTINE_SCOPE_RECEIVER = "xemantic-kotlin-script: coroutine scope receiver"
+
+/**
+ * The names of the members of `Any` and of its extensions, which a local function might call on the coroutine scope without a receiver,
+ * while in the script they would be called on the script instance, see [ScriptSource.coroutineScopeReceiverCandidates],
+ * except `run` and `runCatching`, which behave the same, unless their lambdas refer to `this`, which is a candidate itself,
+ * and the API of the coroutine scope, like `launch` or `isActive`, which the local functions use as in the script body.
+ */
+private val implicitReceiverNames = setOf("toString", "hashCode", "equals", "javaClass", "let", "also", "apply", "takeIf", "takeUnless", "to")
+
+/**
+ * The functions taking a lambda with a receiver, which `this` within the lambda refers to,
+ * so it is not a candidate, see [ScriptSource.coroutineScopeReceiverCandidates], like `this` in `with(list) { this }`,
+ * while the receiver of the call is a candidate itself, like `apply`, or `this` in `with(this) { this }`, reported only once,
+ * except `run`, which has an overload without a receiver.
+ */
+private val receiverLambdaFunctions = setOf("with", "apply", "buildString", "buildList", "buildSet", "buildMap")
 
 /** The opt-in annotation marking the local copies of the declarations, reporting this [message] where they are used. */
 private fun optInMarker(
@@ -203,7 +222,7 @@ internal const val SCRIPT_BLOCK_START = "_script($DEPENDENCIES_CLASS()) `_depend
 /** The line ending the script block in the [ScriptSource.text]. */
 internal const val SCRIPT_BLOCK_END = "} }"
 
-/** The type of the coroutine scope receiver of the script body in the confirming compilation, see [ScriptSource.coroutineScopeThisCandidates]. */
+/** The type of the coroutine scope receiver of the script body in the confirming compilation, see [ScriptSource.coroutineScopeReceiverCandidates]. */
 private const val COROUTINE_SCOPE_TYPE = "`_CoroutineScope\$`"
 
 /** The function giving the coroutine scope receiver of the script body the [COROUTINE_SCOPE_TYPE] in the confirming compilation. */
@@ -328,12 +347,13 @@ internal class ScriptSource(
     val coroutineScopeCandidates: List<LaterDeclaredReference>
 
     /**
-     * The unlabeled `this` within the local functions of the script body, outside of the classes and the extension functions,
-     * which might refer to the coroutine scope receiver of the script body, while in the script it refers to the script instance.
+     * The unlabeled `this` within the local functions of the script body, outside of the bodies of the classes and of the extension functions,
+     * and the calls without a receiver of the members of `Any` and of its extensions there, like `toString()` or `apply { }`,
+     * which might refer to the coroutine scope receiver of the script body, while in the script they refer to the script instance.
      * Confirmed by compiling the script with the type of this receiver marked with an opt-in, see [confirming],
      * reporting the ones referring to it, unlike e.g. to the receiver of a lambda, like in `with(list) { this }`.
      */
-    val coroutineScopeThisCandidates: List<ScriptReference>
+    val coroutineScopeReceiverCandidates: List<ScriptReference>
 
     /**
      * The references of the script body which might refer to the dependencies, preceding the declarations
@@ -409,8 +429,8 @@ internal class ScriptSource(
             Triple(reference.toScriptReference(), position(property).line, position(function).line)
         }
         coroutineScopeCandidates = structure?.coroutineScopeCandidates.orEmpty().map { it.toLaterDeclaredReference() }
-        coroutineScopeThisCandidates = structure?.coroutineScopeThisCandidates.orEmpty().map {
-            ScriptReference("this", position(it.first), position(it.last + 1))
+        coroutineScopeReceiverCandidates = structure?.coroutineScopeReceiverCandidates.orEmpty().map { (name, range) ->
+            ScriptReference(name, position(range.first), position(range.last + 1))
         }
         bodyDeclarations = structure?.bodyDeclarations.orEmpty()
         if (structure == null) {
@@ -483,6 +503,9 @@ internal class ScriptSource(
             }
             mapping += null
         }
+        val markedOriginals = confirming && !shadowedFunctionCopies && !coroutineScopeCopies
+        // only where needed, keeping the other compilations like the compilation of the script
+        val markedReceiver = markedOriginals && coroutineScopeReceiverCandidates.isNotEmpty()
         if (confirming) {
             // named in the message, as the operators of the same position refer to different functions, like `get` and `set`
             structure.hiddenLocalFunctionCopies.forEach { (name, declaration) ->
@@ -490,19 +513,19 @@ internal class ScriptSource(
                 mapping += null
             }
             // the deprecation of the local functions, like the copies in the script block, is not reported, unlike their opt-in
-            listOf(
-                LATER_DECLARED_FUNCTION, SHADOWED_FUNCTION, SHADOWED_ORIGINAL, COROUTINE_SCOPE_ORIGINAL, COROUTINE_SCOPE_FUNCTION,
-                COROUTINE_SCOPE_RECEIVER
-            ).forEach { message ->
+            listOf(LATER_DECLARED_FUNCTION, SHADOWED_FUNCTION, SHADOWED_ORIGINAL, COROUTINE_SCOPE_ORIGINAL, COROUTINE_SCOPE_FUNCTION).forEach { message ->
                 lines += "@kotlin.RequiresOptIn(\"$message\", level = RequiresOptIn.Level.WARNING) annotation class ${optInMarker(message)}"
                 mapping += null
             }
-            // the opt-in of the type is reported where `this` refers to the receiver of this type
+        }
+        if (markedReceiver) {
+            // the opt-in of the type is reported where `this`, or a call without a receiver, refers to the receiver of this type
             val receiverMarker = optInMarker(COROUTINE_SCOPE_RECEIVER)
+            lines += "@kotlin.RequiresOptIn(\"$COROUTINE_SCOPE_RECEIVER\", level = RequiresOptIn.Level.WARNING) annotation class $receiverMarker"
             lines += "@$receiverMarker interface $COROUTINE_SCOPE_TYPE : kotlinx.coroutines.CoroutineScope"
             lines += "@kotlin.OptIn($receiverMarker::class) fun $COROUTINE_SCOPE_FUNCTION_NAME(" +
                     "block: suspend $COROUTINE_SCOPE_TYPE.() -> Any?): suspend kotlinx.coroutines.CoroutineScope.() -> Any? = kotlin.TODO()"
-            mapping += listOf(null, null)
+            mapping += listOf(null, null, null)
         }
         val (shadowed, visible) = dependencies.partition {
             it.name in structure.localProperties || (it.isCallable && it.name in structure.localFunctions)
@@ -514,7 +537,6 @@ internal class ScriptSource(
         shadowed.filterNot { it.isCallable && it.name in structure.movedFunctions }.forEach { addAccessor(it) }
         lines += "}"
         mapping += null
-        val markedOriginals = confirming && !shadowedFunctionCopies && !coroutineScopeCopies
         val deprecatedFunctions = if (markedOriginals) {
             shadowedFunctionCandidates.mapTo(HashSet()) { it.first.name }
         } else {
@@ -539,7 +561,7 @@ internal class ScriptSource(
                 it in declaration.start until declaration.end && !movedExcluded[it]
             }
         }
-        lines += if (confirming) CONFIRMING_SCRIPT_BLOCK_START else SCRIPT_BLOCK_START
+        lines += if (markedReceiver) CONFIRMING_SCRIPT_BLOCK_START else SCRIPT_BLOCK_START
         mapping += null
         // the copies preceding the statements, where the local classes declared before them are visible
         val blockCopies = structure.blockCopies.entries.groupBy({ lineOf(it.key) }) { it.value }
@@ -563,7 +585,7 @@ internal class ScriptSource(
             lines += "null"
             mapping += null
         }
-        lines += if (confirming) CONFIRMING_SCRIPT_BLOCK_END else SCRIPT_BLOCK_END
+        lines += if (markedReceiver) CONFIRMING_SCRIPT_BLOCK_END else SCRIPT_BLOCK_END
         mapping += null
         return lines to mapping
     }
@@ -1156,8 +1178,8 @@ private class ScriptStructure(
     /** See [ScriptSource.coroutineScopeCandidates], with the offsets of the declarations, and whether they are functions. */
     val coroutineScopeCandidates: List<Triple<Reference, Int, Boolean>>
 
-    /** The ranges of the [ScriptSource.coroutineScopeThisCandidates]. */
-    val coroutineScopeThisCandidates: List<IntRange>
+    /** The names and the ranges of the [ScriptSource.coroutineScopeReceiverCandidates]. */
+    val coroutineScopeReceiverCandidates: List<Pair<String, IntRange>>
 
 
     /**
@@ -1389,9 +1411,20 @@ private class ScriptStructure(
             }
         }
         coroutineScopeCandidates = coroutineScopeCandidatesByStatement.values.flatten()
-        coroutineScopeThisCandidates = statements.filter { it !in movedStatements }.flatMap { statement ->
-            statement.collectDescendantsOfType<KtThisExpression> { it.getLabelName() == null && it.isInLocalFunction(statement) }
-        }.map { it.startOffset until it.endOffset }
+        coroutineScopeReceiverCandidates = statements.filter { it !in movedStatements }.flatMap { statement ->
+            statement.collectDescendantsOfType<KtExpression> { expression ->
+                when (expression) {
+                    is KtThisExpression -> expression.getLabelName() == null
+                    is KtLabelReferenceExpression, is KtOperationReferenceExpression -> false
+                    is KtSimpleNameExpression -> expression.getReferencedName() in implicitReceiverNames
+                            && expression.getReceiverExpression() == null
+                            && expression.parent !is KtValueArgumentName && expression.parent !is KtCallableReferenceExpression
+                    else -> false
+                } && expression.isInLocalFunction(statement) && !expression.isInReceiverLambda(statement)
+            }.map { expression ->
+                ((expression as? KtSimpleNameExpression)?.getReferencedName() ?: "this") to (expression.startOffset until expression.endOffset)
+            }
+        }
         val laterDeclaredCandidatesByStatement = statements.indices.associateWith { index ->
             if (declarationsByPsi[statements[index]] in moved) return@associateWith emptyList()
             statementReferences[index].mapNotNull { reference ->
@@ -1612,15 +1645,16 @@ private class ScriptStructure(
     }
 
     /**
-     * Whether the unlabeled `this` is within a function of the [statement] of the script body,
-     * not within a class, nor an extension function, which `this` would refer to.
+     * Whether the expression is within a function of the [statement] of the script body,
+     * not within the body of a class, nor within an extension function, which `this` would refer to,
+     * unlike e.g. the default values of the parameters of a class, or its supertypes, referring to the receiver outside of the class.
      */
-    private fun KtThisExpression.isInLocalFunction(
+    private fun KtExpression.isInLocalFunction(
         statement: KtExpression
     ): Boolean {
         var inFunction = false
         for (parent in parents) {
-            if (parent is KtClassOrObject) return false
+            if (parent is KtClassBody) return false
             if (parent is KtNamedFunction) {
                 if (parent.receiverTypeReference != null) return false
                 inFunction = true
@@ -1628,6 +1662,26 @@ private class ScriptStructure(
             if (parent === statement) break
         }
         return inFunction
+    }
+
+    /**
+     * Whether the nearest lambda within the [statement] containing the expression is passed to a function of the [receiverLambdaFunctions],
+     * or to `run` with a receiver, like `list.run { this }`, so it refers to the receiver of the lambda.
+     */
+    private fun KtExpression.isInReceiverLambda(
+        statement: KtExpression
+    ): Boolean {
+        val lambda = parents.takeWhile { it !== statement }.firstOrNull { it is KtLambdaExpression } as? KtLambdaExpression ?: return false
+        val call = lambda.call() ?: return false
+        val name = (call.calleeExpression as? KtSimpleNameExpression)?.getReferencedName()
+        return name in receiverLambdaFunctions || (name == "run" && call.getQualifiedExpressionForSelector() != null)
+    }
+
+    /** The call taking this lambda as an argument, like `with(x) { }`. */
+    private fun KtLambdaExpression.call(): KtCallExpression? = when (val argument = parent) {
+        is KtLambdaArgument -> argument.parent as? KtCallExpression
+        is KtValueArgument -> argument.parent?.parent as? KtCallExpression
+        else -> null
     }
 
     /** Whether the [offset] is preceded only by whitespaces in its line. */
