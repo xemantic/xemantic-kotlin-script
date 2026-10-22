@@ -4767,6 +4767,23 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should call callable dependency from declaration moved out of the script body like a regular script when local function of its name refers to type alias declared later`() = runTest {
+        // given
+        // the copy of the local function precedes the type alias, so it does not apply, like the local function in a regular script
+        val script = "val k = 1\nfun log(n: N) = \"local:\$n\$k\"\nsealed interface S\nclass T : S { fun f() = log(\"x\") }\ntypealias N = String\nT().f()"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<(Any?) -> String>("log") { "dep:$it" }))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "dep:x")
+        }
+    }
+
+    @Test
     fun `should report error at declaration moved out of the script body calling local function with dollar in name named like imported function`() = runTest {
         // given
         // the name is pasted into the string literal of the deprecation message of its copy
@@ -5973,6 +5990,21 @@ class ScriptExecutorTest {
             "script.kts:7:11: error: 'show' refers to the function of the script body declared at line 4, instead of its overload declared at line 3, which a regular script calls.",
             "any!int"
         ))
+    }
+
+    @Test
+    fun `should report calls of local overloads referring to type aliases declared later within declarations of inferred types`() = runTest {
+        // given
+        // the local overload, which the type alias declared after it is visible to only in the script block, does not apply in a regular script
+        val script = "val p = \"!\".trim()\nfun show(x: Any) = \"any\"\nfun show(x: N): String = \"int\$p\"\ntypealias N = Int\nsealed interface S\nclass T : S { fun f() = show(\"a\") }\nfun h() = show(1)\nh() + T().f()"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert((result as? ScriptResult.Error)?.message?.lines()?.firstOrNull() ==
+                "script.kts:7:11: error: 'show' refers to the function of the script body declared at line 3, instead of its overload declared at line 2, which a regular script calls.")
     }
 
     @Test
