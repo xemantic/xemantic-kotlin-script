@@ -2499,6 +2499,46 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should execute script with property accessors on the lines after it without indentation`() = runTest {
+        // given
+        val scripts = listOf(
+            "val size: Int\nget() = 3\nvar count = 0\nprivate set\ncount += size\ncount",
+            "val size: Int\nget() { return 3 }\nsize",
+            "var size = 2\nset\nget() = field + 1\nsize"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == List(scripts.size) { 3 })
+    }
+
+    @Test
+    fun `should execute calls of get and set on the lines after properties without indentation`() = runTest {
+        // given
+        val scripts = listOf(
+            "fun get(i: Int) = i * 2\nval x = 1\nget(3)",
+            "fun set(v: Int) = v + 1\nvar y = 1\nset(5)",
+            "val get = { 6 }\nval x = 1\nget()",
+            "fun get() = 5\nval x = 1\nget() + 1",
+            "val get = 6\nval x = 1\n// note\nget",
+            "fun get(p: String, b: () -> Int) = b()\nval x = 1\nget(\"/\") { 6 }",
+            "fun get(b: () -> Int) = b()\nval x = 1\nget { 6 }",
+            "fun set(b: () -> Int) = b()\nvar y = 1\nset { 6 }",
+            "fun get(i: Int) = i\nval x = 1\n@Suppress(\"UNUSED\") get(6)"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == List(scripts.size) { 6 })
+    }
+
+    @Test
     fun `should report unmatched closing brace following unterminated string`() = runTest {
         // given
         val script = """
