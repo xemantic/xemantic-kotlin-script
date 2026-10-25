@@ -98,7 +98,7 @@ internal class ScriptErrorReporter(
 
     /** The [references] of the script body to its coroutine scope, see [ScriptSource.coroutineScopeCandidates]. */
     fun toCoroutineScopeMessage(
-        references: List<LaterDeclaredReference>
+        references: List<CoroutineScopeReference>
     ): String = references.joinToString(separator = "\n") { scope ->
         val reference = scope.reference
         buildString {
@@ -136,7 +136,7 @@ internal class ScriptErrorReporter(
 
     /** The [references] of the declarations moved out of the script body to other functions, see [ScriptSource.hiddenLocalFunctionCandidates]. */
     fun toHiddenLocalFunctionMessage(
-        references: List<LaterDeclaredReference>
+        references: List<HiddenLocalFunctionReference>
     ): String = references.joinToString(separator = "\n") { hidden ->
         val reference = hidden.reference
         val declaration = source.movedDeclarationAt(reference.start)
