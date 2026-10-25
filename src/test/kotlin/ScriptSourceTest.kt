@@ -123,6 +123,35 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should blank out unterminated block comment ending script only at top level of script body`() {
+        // given
+        val topLevel = listOf(
+            "val a = 1\n/* abc\na",
+            "1 + 1\n/** abc",
+            "1 + 1\n/* a /* b */ abc",
+            "fun f() = 3\nf() /* abc",
+            "fun f() = 3 /* abc",
+            "import kotlin.math.PI\n/* abc",
+            "import kotlin.math.PI /* abc",
+            "/* abc"
+        )
+        val nested = listOf(
+            "class A {\n  /* abc\n  val x = 1\n}\nA().x",
+            "fun f(): Int {\n  /* abc\n  return 1\n}\nf()",
+            "listOf(1,\n/* abc",
+            "val a = 5\n\"\${a /* abc }\""
+        )
+
+        // when
+        val topLevelSources = topLevel.map { ScriptSource(it) }
+        val nestedSources = nested.map { ScriptSource(it) }
+
+        // then
+        assert(topLevelSources.none { "abc" in it.text })
+        assert(nestedSources.all { "abc" in it.text })
+    }
+
+    @Test
     fun `should give distinct location ids to scripts of the same hash code`() {
         // given
         val scripts = listOf("\"Aa\"", "\"BB\"")
