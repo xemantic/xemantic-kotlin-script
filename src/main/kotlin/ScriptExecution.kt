@@ -141,20 +141,28 @@ internal class DefaultScriptExecutor(
     private val classLoader: ClassLoader = Thread.currentThread().contextClassLoader
         ?: DefaultScriptExecutor::class.java.classLoader
 
-
-    private val compilationConfigurationTemplate = ScriptCompilationConfiguration {
-        jvm {
-            dependenciesFromClassloader(
-                classLoader = classLoader,
-                wholeClasspath = true
+    /**
+     * Built on the first compilation, on the [dispatcher], as resolving the whole classpath
+     * would otherwise block the caller creating the executor, even if it never executes a script.
+     * The concurrent first compilations wait for it, holding their permits,
+     * while its failure, reported as the internal failure of the compiler, is not kept,
+     * so the next compilation resolves the classpath again, as the failure might be transient.
+     */
+    private val compilationConfigurationTemplate by lazy {
+        ScriptCompilationConfiguration {
+            jvm {
+                dependenciesFromClassloader(
+                    classLoader = classLoader,
+                    wholeClasspath = true
+                )
+                // the default 1.8 target cannot inline functions of the classpath, e.g. `dependency(...)`
+                jvmTarget(scriptJvmTarget(System.getProperty("java.specification.version")))
+            }
+            // the script body has a CoroutineScope receiver, so it can launch coroutines without imports
+            defaultImports(
+                "kotlinx.coroutines.*"
             )
-            // the default 1.8 target cannot inline functions of the classpath, e.g. `dependency(...)`
-            jvmTarget(scriptJvmTarget(System.getProperty("java.specification.version")))
         }
-        // the script body has a CoroutineScope receiver, so it can launch coroutines without imports
-        defaultImports(
-            "kotlinx.coroutines.*"
-        )
     }
 
     override suspend fun execute(
@@ -453,12 +461,14 @@ internal class DefaultScriptExecutor(
         ): ResultWithDiagnostics<CompiledScript> {
             val result = try {
                 compilationPermits.withPermit {
+                    // resolving the classpath on the first compilation, which is not counted if it fails
+                    val configuration = compilationConfig()
                     // not counting the callers cancelled while waiting for the permit
                     @OptIn(ExperimentalAtomicApi::class)
                     compilations.incrementAndFetch()
                     scriptingHost.compiler(
                         script = source,
-                        scriptCompilationConfiguration = compilationConfig()
+                        scriptCompilationConfiguration = configuration
                     )
                 }
             } catch (e: CancellationException) {

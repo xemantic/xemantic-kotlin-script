@@ -111,7 +111,7 @@ public interface ScriptExecutor {
 /**
  * Creates the default [ScriptExecutor].
  *
- * @param dispatcher the dispatcher of the compilation and of the script body,
+ * @param dispatcher the dispatcher of the compilation, including resolving the classpath on the first one, and of the script body,
  *   [Dispatchers.IO] by default, as both might block.
  *   The coroutines launched by the script inherit it.
  * @param compilationCacheSize the maximal number of compiled scripts kept for reuse,

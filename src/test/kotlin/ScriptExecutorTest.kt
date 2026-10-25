@@ -38,6 +38,9 @@ import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.jetbrains.kotlin.config.JvmTarget
+import java.net.URL
+import java.util.Collections
+import java.util.Enumeration
 import java.util.concurrent.Executors
 import kotlin.reflect.full.createType
 import kotlin.reflect.typeOf
@@ -102,6 +105,30 @@ class FakeCompiler(
         script: SourceCode,
         scriptCompilationConfiguration: ScriptCompilationConfiguration
     ): ResultWithDiagnostics<CompiledScript> = compile()
+}
+
+/**
+ * Records the threads resolving the classpath through it, like the scripting host does with `getResources`,
+ * failing the first [failures] times.
+ */
+class ClasspathRecordingClassLoader(
+    parent: ClassLoader,
+    private var failures: Int = 0
+) : ClassLoader(parent) {
+
+    val threads: MutableList<Thread> = Collections.synchronizedList(mutableListOf())
+
+    override fun getResources(name: String): Enumeration<URL> {
+        threads += Thread.currentThread()
+        synchronized(this) {
+            if (failures > 0) {
+                failures--
+                throw IllegalStateException("classpath unavailable")
+            }
+        }
+        return super.getResources(name)
+    }
+
 }
 
 class ScriptExecutorTest {
@@ -3027,6 +3054,69 @@ class ScriptExecutorTest {
                   | class Below : Check { fun ok() = <error>log</error>("hi") }
                   hint: 'Below' is compiled outside of the script body, where 'log' (line 2) is not visible - pass it as a parameter, or declare it within 'Below'.
             """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not resolve the classpath when creating the executor, but when compiling on the dispatcher thread`() = runTest {
+        // given
+        val thread = Thread.currentThread()
+        val contextClassLoader = thread.contextClassLoader
+        val recording = ClasspathRecordingClassLoader(contextClassLoader)
+        val executorService = Executors.newSingleThreadExecutor()
+        val dispatcherThread = executorService.submit<Thread> { Thread.currentThread() }.get()
+        val dispatcher = executorService.asCoroutineDispatcher()
+        thread.contextClassLoader = recording
+        val executor = try {
+            ScriptExecutor(dispatcher = dispatcher)
+        } finally {
+            thread.contextClassLoader = contextClassLoader
+        }
+        val threadsAfterCreation = recording.threads.toList()
+
+        // when
+        val result = try {
+            executor.execute("1 + 1")
+        } finally {
+            dispatcher.close()
+        }
+
+        // then
+        assert(threadsAfterCreation.isEmpty())
+        assert(recording.threads.isNotEmpty() && recording.threads.all { it == dispatcherThread })
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should report failure of resolving the classpath as compilation error, and resolve it again on the next execution`() = runTest {
+        // given
+        val thread = Thread.currentThread()
+        val contextClassLoader = thread.contextClassLoader
+        thread.contextClassLoader = ClasspathRecordingClassLoader(contextClassLoader, failures = 1)
+        val executor = try {
+            ScriptExecutor()
+        } finally {
+            thread.contextClassLoader = contextClassLoader
+        }
+
+        // when
+        val failed = executor.execute("1 + 1")
+        val retried = executor.execute("1 + 1")
+
+        // then
+        failed should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                error: The script could not be compiled because of an internal failure of the compiler: java.lang.IllegalStateException: classpath unavailable
+            """.trimIndent()
+        }
+        retried should {
+            be<ScriptResult.Value>()
+            have(value == 2)
         }
     }
 
