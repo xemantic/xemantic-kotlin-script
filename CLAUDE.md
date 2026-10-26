@@ -65,6 +65,10 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 - The script compilation does not resolve a backticked import alias, not even a plain one like ``import kotlin.check as `verify` `` (`Unresolved reference`), while the same alias without backticks works —
   so a test needing a library function of a name with special characters, like `` `say$hi` ``, declares it in the test sources, see `StringLiteralNames.kt`, and star-imports its package.
 
+- When probing a regular `.kts` with `BasicJvmScriptingHost` to compare the behaviour, a provided property declared as `KotlinType(typeOf<(String) -> String>())` loses its type arguments, and as `KotlinType("(String) -> String")` is unresolved —
+  provide an instance of a class implementing the function type, declared as `KotlinType(ThatClass::class)`.
+- In a regular `.kts`, a callable reference to a function of the script from a class of the script, like `::log`, crashes the compiler backend ("No mapping for symbol"), so there is no reference behaviour to match.
+
 ## Anti-patterns to avoid
 
 - Inside a lambda walking a chain of exceptions in a `Throwable` extension, like `generateSequence(this) { read(null) { cause } }`,
