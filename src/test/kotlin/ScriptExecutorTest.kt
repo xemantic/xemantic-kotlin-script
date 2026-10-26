@@ -23,19 +23,28 @@ import com.xemantic.kotlin.test.be
 import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CompletableJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.currentTime
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.jetbrains.kotlin.config.JvmTarget
 import java.util.concurrent.Executors
 import kotlin.reflect.full.createType
 import kotlin.reflect.typeOf
+import kotlin.script.experimental.api.CompiledScript
+import kotlin.script.experimental.api.ResultWithDiagnostics
+import kotlin.script.experimental.api.ScriptCompilationConfiguration
+import kotlin.script.experimental.api.SourceCode
+import kotlin.script.experimental.jvmhost.JvmScriptCompiler
 import kotlin.test.Test
 import kotlin.time.Clock
 import kotlin.time.Duration.Companion.hours
@@ -70,6 +79,16 @@ class OptionalUser {
 
 class DurationLogger {
     operator fun invoke(duration: kotlin.time.Duration) = "dep:$duration"
+}
+
+/** Fails with whatever the [failure] throws, instead of compiling the script. */
+class FailingCompiler(
+    private val failure: suspend () -> Nothing
+) : JvmScriptCompiler() {
+    override suspend fun invoke(
+        script: SourceCode,
+        scriptCompilationConfiguration: ScriptCompilationConfiguration
+    ): ResultWithDiagnostics<CompiledScript> = failure()
 }
 
 class ScriptExecutorTest {
@@ -3036,6 +3055,91 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report internal failure of the compiler as compilation error`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            compiler = FailingCompiler { throw IllegalStateException("compiler crashed") }
+        )
+
+        // when
+        val result = executor.execute("42")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                error: The script could not be compiled because of an internal failure of the compiler: java.lang.IllegalStateException: compiler crashed
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report compilation cancelled by the compiler while the caller is active as compilation error`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            compiler = FailingCompiler { throw CancellationException("compiler cancelled") }
+        )
+
+        // when
+        val result = executor.execute("42")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                error: The script could not be compiled because of an internal failure of the compiler: java.lang.IllegalStateException: The compilation of the script was cancelled, caused by: java.util.concurrent.CancellationException: compiler cancelled
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun `should report internal failure of the compiler as compilation error to all the callers waiting for the cached compilation`() = runTest {
+        // given
+        val failing = CompletableDeferred<Unit>()
+        val executor = DefaultScriptExecutor(
+            // so the waiter is waiting in the cache before the compiler fails
+            dispatcher = StandardTestDispatcher(testScheduler),
+            compilationCacheSize = 10,
+            compiler = FailingCompiler {
+                failing.await()
+                throw IllegalStateException("compiler crashed")
+            }
+        )
+        val owner = async { executor.execute("42") }
+        runCurrent()
+        val waiter = async { executor.execute("42") }
+        runCurrent()
+
+        // when
+        failing.complete(Unit)
+        val results = listOf(owner.await(), waiter.await())
+
+        // then
+        val (ownerResult, waiterResult) = results
+        assert(ownerResult is ScriptResult.Error && ownerResult.phase == ExecutionPhase.COMPILATION)
+        assert(waiterResult is ScriptResult.Error && waiterResult.phase == ExecutionPhase.COMPILATION)
+        assert(waiterResult.message == ownerResult.message)
+        assert(executor.compilationCount == 1)
+    }
+
+    @Test
+    fun `should not report VirtualMachineError of the compiler as compilation error`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            compiler = FailingCompiler { throw OutOfMemoryError("compiler out of memory") }
+        )
+
+        // when
+        val failure = runCatching { executor.execute("42") }.exceptionOrNull()
+
+        // then
+        assert(failure is OutOfMemoryError && failure.message == "compiler out of memory")
+    }
+
+    @Test
     fun `should run script body with the class loader of the script as the context class loader`() = runTest {
         // given
         val script = """
@@ -3324,6 +3428,46 @@ class ScriptExecutorTest {
             be<ScriptResult.Value>()
             have(value == "[a, b] 1")
         }
+    }
+
+    @Test
+    fun `should execute script with property accessors on the lines after it without indentation`() = runTest {
+        // given
+        val scripts = listOf(
+            "val size: Int\nget() = 3\nvar count = 0\nprivate set\ncount += size\ncount",
+            "val size: Int\nget() { return 3 }\nsize",
+            "var size = 2\nset\nget() = field + 1\nsize"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == List(scripts.size) { 3 })
+    }
+
+    @Test
+    fun `should execute calls of get and set on the lines after properties without indentation`() = runTest {
+        // given
+        val scripts = listOf(
+            "fun get(i: Int) = i * 2\nval x = 1\nget(3)",
+            "fun set(v: Int) = v + 1\nvar y = 1\nset(5)",
+            "val get = { 6 }\nval x = 1\nget()",
+            "fun get() = 5\nval x = 1\nget() + 1",
+            "val get = 6\nval x = 1\n// note\nget",
+            "fun get(p: String, b: () -> Int) = b()\nval x = 1\nget(\"/\") { 6 }",
+            "fun get(b: () -> Int) = b()\nval x = 1\nget { 6 }",
+            "fun set(b: () -> Int) = b()\nvar y = 1\nset { 6 }",
+            "fun get(i: Int) = i\nval x = 1\n@Suppress(\"UNUSED\") get(6)"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == List(scripts.size) { 6 })
     }
 
     @Test
