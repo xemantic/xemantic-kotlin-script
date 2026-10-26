@@ -155,9 +155,12 @@ internal class ScriptErrorReporter(
         }
     }.trimEnd()
 
-    /** The [references] of the script body to the dependencies, preceding the local properties of their names, see [ScriptSource.laterDeclaredDependencyCandidates]. */
+    /**
+     * The [references] of the script body to the dependencies, preceding the local declarations of their names,
+     * see [ScriptSource.laterDeclaredDependencyCandidates] and [ScriptSource.laterDeclaredClassCandidates].
+     */
     fun toLaterDeclaredDependencyMessage(
-        references: List<LaterDeclaredReference>
+        references: List<PrecedingReference>
     ): String = references.joinToString(separator = "\n") { later ->
         val reference = later.reference
         val kind = later.kind

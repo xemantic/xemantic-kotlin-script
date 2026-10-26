@@ -208,8 +208,8 @@ internal class DefaultScriptExecutor(
     private class Compilation(
         val source: ScriptSource,
         val result: ResultWithDiagnostics<CompiledScript>?,
-        /** The [ScriptSource.laterDeclaredDependencyCandidates] referring to the dependencies indeed. */
-        val laterDeclaredDependencyReferences: List<LaterDeclaredReference> = emptyList(),
+        /** The [ScriptSource.laterDeclaredDependencyCandidates], and the [ScriptSource.laterDeclaredClassCandidates], referring to the dependencies indeed. */
+        val laterDeclaredDependencyReferences: List<PrecedingReference> = emptyList(),
         /** The [ScriptSource.hiddenLocalFunctionCandidates] referring to other functions indeed. */
         val hiddenLocalFunctionReferences: List<LaterDeclaredReference> = emptyList(),
         /** The [ScriptSource.coroutineScopeCandidates] resolved to the coroutine scope indeed. */
@@ -360,6 +360,7 @@ internal class DefaultScriptExecutor(
             }
             if (
                 source.laterDeclaredDependencyCandidates.isEmpty()
+                && source.laterDeclaredClassCandidates.isEmpty()
                 && source.hiddenLocalFunctionCandidates.isEmpty()
                 && source.shadowedFunctionCandidates.isEmpty()
                 && source.coroutineScopeCandidates.isEmpty()
@@ -430,7 +431,7 @@ internal class DefaultScriptExecutor(
             fun LaterDeclaredReference.isConfirmedByCopies() = isFunction || isInLambda
             val confirmedCandidates = coroutineScopeReferences.filter { it.isConfirmedByCopies() }
             // independent of each other
-            val (shadowed, toCoroutineScope) = coroutineScope {
+            val (shadowed, scopeCopies) = coroutineScope {
                 // the calls within the declarations of inferred types are resolved differently, see ScriptSource.overloadingFunctionCopies
                 val (inInferredTypes, inDeclaredTypes) = toLocals.partition { it.isInInferredType }
                 fun copies(
@@ -450,23 +451,34 @@ internal class DefaultScriptExecutor(
                 val inferred = copies(inInferredTypes) { source(confirming = true, overloadingFunctionCopies = true) }
                 val declared = copies(inDeclaredTypes) { source(confirming = true, shadowedFunctionCopies = true) }
                 val shadowed = async { (inferred.await() + declared.await()).distinctBy { it.reference } }
-                val toCoroutineScope = async {
-                    if (confirmedCandidates.isEmpty()) emptyList() else {
+                // also declaring the copies of the constructors of the local classes, see ScriptSource.laterDeclaredClassCandidates
+                val scopeCopies = async {
+                    if (confirmedCandidates.isEmpty() && source.laterDeclaredClassCandidates.isEmpty()) null else {
                         val copies = source(confirming = true, coroutineScopeCopies = true)
-                        compile(copies).reports.marked(copies, COROUTINE_SCOPE_FUNCTION)
+                        copies to compile(copies).reports
                     }
                 }
-                shadowed.await() to toCoroutineScope.await()
+                shadowed.await() to scopeCopies.await()
             }
+            val toCoroutineScope = scopeCopies?.let { (copies, reports) -> reports.marked(copies, COROUTINE_SCOPE_FUNCTION) }.orEmpty()
+            // only the ones, which the constructors apply to, unlike the dependency called anyway
+            val constructors = scopeCopies?.let { (copies, reports) -> reports.marked(copies, LATER_DECLARED_CLASS) }.orEmpty()
+            // the calls of the scope functions of the coroutine scope of the script body, the script instance in the script
+            val toScriptReceiver = scopeCopies?.let { (copies, reports) -> reports.marked(copies, SCRIPT_RECEIVER) }.orEmpty()
             return Compilation(
                 source,
                 result,
-                laterDeclaredDependencyReferences = source.laterDeclaredDependencyCandidates.filter { candidate ->
+                laterDeclaredDependencyReferences = (source.laterDeclaredDependencyCandidates.filter { candidate ->
                     (functions.takeIf { candidate.isFunction }.orEmpty()
                             // like `::x`, resolved to the property of the dependency instead of the local function
                             + dependencies.takeIf { !candidate.isFunction || candidate.isCallableReference }.orEmpty())
                         .any { it in candidate.reference }
-                },
+                } + source.laterDeclaredClassCandidates.filter { candidate ->
+                    // calling the dependency without the copies, rather than e.g. the member of a receiver, which takes precedence in the script,
+                    // like the script instance, the receiver of the lambdas of its scope functions, like `run { }`, declaring the dependency
+                    constructors.any { it in candidate.reference } && dependencies.any { it in candidate.reference }
+                            && candidate.scopeCalls.none { call -> toScriptReceiver.any { it in call } }
+                }).sortedBy { it.reference.start },
                 // in the order of the script
                 coroutineScopeReferences = coroutineScopeReferences.filter { candidate ->
                     !candidate.isConfirmedByCopies() || toCoroutineScope.any { it in candidate.reference }

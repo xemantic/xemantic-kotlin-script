@@ -4052,6 +4052,117 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report error at call of dependency before local class of the same name declared later`() = runTest {
+        // given
+        val script = """
+            val p = 1
+            val r = Foo(2)
+            class Foo(val v: Int) { fun g() = v + p }
+            r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<(Int) -> Int>("Foo") { it * 100 }))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:9: error: 'Foo' refers to the dependency, as the class 'Foo' of the script body is declared later, at line 3.
+                  | val r = <error>Foo</error>(2)
+                  hint: declare the class before line 2, or rename it.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report calls of dependency before constructors of local class of the same name declared later`() = runTest {
+        // given
+        val scripts = listOf(
+            "val p = 1\nval r = Foo(2)\nclass Foo(val s: String) { constructor(i: Int) : this(\"i\$i\"); fun g() = s + p }\nr",
+            "val p = 1\nval r = Foo(2)\nclass Foo { val v: Int; constructor(i: Int) { v = i }; fun g() = v + p }\nr",
+            "val p = 1\nval r = Foo()\nclass Foo { fun g() = p }\nr",
+            "val p = 1\nval r = Foo<Int>(2)\nclass Foo<T>(val v: T) { fun g() = p }\nr",
+            "val p = 1\nval r = Foo(2)\ndata class Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = 1\nval r = Foo(2)\nclass Foo(val v: Int, val w: Int = 3) { fun g() = v + p }\nr",
+            "val p = 1\nval r = Foo(2)\nclass Foo(vararg val v: Int) { fun g() = p }\nr",
+            "val p = 1\nval r = Foo(2)\nabstract class Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = 1\nval r: Any = Foo(v = 2)\nclass Foo(val v: Int) { constructor(o: Foo) : this(o.v); fun g() = v + p }\nr",
+            "val p = 1\nval f = { Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nf()",
+            "val p = 1\nfun h() = listOf(1).map { Foo(it) }\nclass Foo(val v: Int) { fun g() = v + p }\nh()",
+            "val p = 1\nval r = \"a\".run { Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = 1\nclass Bar { fun make() = Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nBar().make()",
+            // within the lambdas of the scope functions, the receivers of which are not the script instance in a regular script
+            "val p = 1\nclass Bar { fun m() = run { Foo(2) } }\nclass Foo(val v: Int) { fun g() = v + p }\nBar().m()",
+            "val p = 1\nclass Bar { val x = run { Foo(2) } }\nclass Foo(val v: Int) { fun g() = v + p }\nBar().x",
+            "val p = 1\nclass Bar { fun m() = apply { Foo(2) }.let { with(this) { Foo(3) } } }\nclass Foo(val v: Int) { fun g() = v + p }\nBar().m()",
+            "val p = 1\nclass Bar { fun m() = this@Bar.run { Foo(2) } }\nclass Foo(val v: Int) { fun g() = v + p }\nBar().m()",
+            "val p = 1\nfun Int.h() = run { Foo(this) }\nclass Foo(val v: Int) { fun g() = v + p }\n2.h()",
+            "val p = 1\nval r = buildString { append(run { Foo(2) }) }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = 1\nval r = with(\"a\") { run { Foo(2) } }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = 1\nval r = \"a\".run { this.run { Foo(2) } }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = 1\nval r = object { val x = run { Foo(2) } }.x\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = 1\nval r = kotlinx.coroutines.coroutineScope { run { Foo(2) } }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            // with the parameters of the type of the class itself
+            "val p = 1\nval r = Foo(2)\nclass Foo(val v: Int, val next: Foo? = null) { fun g() = v + p }\nr",
+            "val p = 1\nval r = Foo(2)\nclass Foo(val v: Int, val children: List<Foo> = emptyList()) { fun g() = v + p }\nr",
+            "val p = 1\nval r = Foo(2)\nclass Foo<T>(val v: T, val next: Foo<T>? = null) { fun g() = p }\nr",
+            "val p = 1\nval r = Foo<Nothing?>(2)\nclass Foo<T : Foo<T>?>(val v: Int) { fun g() = v + p }\nr",
+            // within the lambdas of the scope functions, of other receivers than the script instance, or without receivers
+            "val p = 1\nval r = run<Any> { Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = 1\nval r = runCatching<Any> { Foo(2) }.getOrThrow()\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = 1\nval r = run<Any, Any> { Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = 1\nval r = with<Any, Any>(this) { Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nr"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, listOf(dependency<(Int) -> Int>("Foo") { it * 100 })) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.first()?.substringAfter("error: ") } == List(scripts.size) {
+            "'Foo' refers to the dependency, as the class 'Foo' of the script body is declared later, at line 3."
+        })
+    }
+
+    @Test
+    fun `should call dependency before local class of the same name whose constructors do not apply`() = runTest {
+        // given
+        val scripts = listOf(
+            // the arguments of other types, or of the bounds of the type parameters
+            "val p = 1\nval r = Foo(\"x\")\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = 1\nval r = Foo(2)\nclass Foo<T : CharSequence>(val v: T) { fun g() = p }\nr",
+            // not visible to the script body
+            "val p = 1\nval r = Foo(2)\nclass Foo private constructor(val v: Int) { fun g() = v + p }\nr",
+            // within the lambda of the receiver, which is the script instance declaring the dependency in a regular script
+            "val p = 1\nval r = run { Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = 1\nval r = with(this) { Foo(2) } + this.run { Foo(1) }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = 1\nval r = listOf(1).map { run { Foo(it) } }.single() + run { \"a\".run { Foo(1) } }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            // the members of the receivers, which take precedence over the constructors
+            "val p = 1\nclass M { fun Foo(i: Int) = i + 198 }\nval r = with(M()) { Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = 1\nopen class B { fun Foo(i: Int) = i + 198 }\nclass C : B() { fun make() = Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nC().make()",
+            // a value of the local class declared later cannot precede it
+            "val p = 1\nval r = Foo(2)\nclass Foo(val next: Foo?) { fun g() = p }\nr",
+            // within the lambdas of the scope functions of the script instance
+            "val p = 1\nvar y = 0\napply { y = Foo(1) }\nval r = runCatching { Foo(2) }.getOrThrow() + y\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = 1\nval r = Foo(2)\nclass Bar(val q: Int) { fun g() = q + p }\nclass Foo(val b: Bar) { fun g() = p }\nr",
+            // followed by a call of the constructor
+            "val p = 1\nval r = Foo(\"x\")\nclass Foo(val v: Int) { fun g() = v + p }\nclass Foo2(val v: Int) { fun g() = Foo(v).g() }\nr + Foo2(1).g()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { script ->
+            executor.execute(script, listOf(if ("\"x\"" in script) dependency<(String) -> Int>("Foo") { 100 } else dependency<(Int) -> Int>("Foo") { it * 100 }))
+        }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(100, 200, 200, 200, 300, 200, 200, 200, 200, 300, 200, 102))
+    }
+
+    @Test
     fun `should provide dependency of nullable function type named like function of the coroutine scope`() = runTest {
         // given
         val script = """
