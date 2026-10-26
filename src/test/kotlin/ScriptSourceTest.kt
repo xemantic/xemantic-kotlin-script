@@ -66,6 +66,44 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should recognize calls preceding local functions of their names as candidates`() {
+        // given
+        val script = """
+            val p = "1".toInt()
+            fun early(x: Int) = early(x - 1) + p
+            early(1)
+            print("a")
+            "a".shout()
+            log("a")
+            ::later
+            data class V(val x: Int)
+            val r = run { V(1) + V(2) }
+            fun print(x: Any) = kotlin.io.print(x.toString() + p)
+            fun String.shout() = uppercase() + p
+            fun log(x: Any) = print(x)
+            fun later() = p
+            operator fun V.plus(o: V) = V(x + o.x + p)
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script, dependencies = listOf(PreambleDependency("log", "val log: Any = 1", isCallable = true)))
+
+        // then
+        // unlike the calls following them, the ones named like the dependencies, and the callable references
+        assert(source.laterDeclaredFunctionCandidates.map { "${it.reference.name}:${it.reference.start.line}:${it.line}:${it.isConfirmedOnlyWhenFailing}" } == listOf(
+            // the operators recognized by their names only, like `+` of `Int`, which the confirming compilation tells apart
+            "plus:1:13:false",
+            "print:3:9:false",
+            "shout:4:10:false",
+            // within a lambda, referring to a local class
+            "plus:8:13:true",
+            "plus:9:13:false",
+            // within an extension function
+            "plus:10:13:true"
+        ))
+    }
+
+    @Test
     fun `should probe the types of local properties called by moved declarations on the lines following them`() {
         // given
         val script = """

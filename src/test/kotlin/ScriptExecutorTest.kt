@@ -4245,7 +4245,7 @@ class ScriptExecutorTest {
             local + "class T : S { fun f(log: Int) = log(\"x\") }\nT().f(1)",
             local + "class T : S { fun f(): String { val log = 1; return log(\"x\") } }\nT().f()",
             local + "class T : S { fun f() = listOf(1).map { log -> log(\"x\") } }\nT().f()",
-            // the copies of the local functions referring to the type aliases are not compiled
+            // the copies of the local functions referring to the type aliases follow them
             "val k = 1\ntypealias N = String\nfun log(n: N) = \"local:\$n\$k\"\nsealed interface S\nclass T : S { fun f() = log(\"x\") }\nT().f()",
             "val k = 1\ntypealias L<X> = List<X>\nfun log(l: L<String>) = \"local:\$l\$k\"\nsealed interface S\nclass T : S { fun f() = log(listOf(\"x\")) }\nT().f()",
             "val k = 1\ntypealias Fn = () -> String\nfun log(f: Fn) = \"local:\${f()}\$k\"\nsealed interface S\nclass T : S { fun f() = log { \"x\" } }\nT().f()"
@@ -4264,11 +4264,10 @@ class ScriptExecutorTest {
             "script.kts:4:33: error: Cannot infer type for type parameter 'T'. Specify it explicitly.",
             "script.kts:4:53: error: Cannot infer type for type parameter 'T'. Specify it explicitly.",
             "script.kts:4:35: error: Cannot infer type for type parameter 'R'. Specify it explicitly.",
-            "script.kts:5:25: error: Unresolved reference 'log'.",
-            "script.kts:5:25: error: Unresolved reference 'log'.",
-            "script.kts:5:25: error: Unresolved reference 'log'."
+            "script.kts:5:25: error: 'log' does not refer to the function of the script body declared at line 3, which is not visible in 'T'.",
+            "script.kts:5:25: error: 'log' does not refer to the function of the script body declared at line 3, which is not visible in 'T'.",
+            "script.kts:5:25: error: 'log' does not refer to the function of the script body declared at line 3, which is not visible in 'T'."
         ))
-        // as the dependency is not visible in 'T', like the local function
         assert(results.takeLast(3).all { "hint: 'T' is compiled outside of the script body, where 'log' (line 3) is not visible" in it.valueOrMessage.toString() })
     }
 
@@ -4599,6 +4598,254 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report error at call preceding local function named like library function`() = runTest {
+        // given
+        val script = """
+            val prefix = ">".trim()
+            print("raw\n")
+            fun print(x: Any) = kotlin.io.print("${'$'}prefix${'$'}x")
+            print("1\n")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:1: error: 'print' does not refer to the function of the script body declared at line 3, which is not visible before its declaration.
+                  | <error>print</error>("raw\n")
+                  hint: 'print' is declared at line 3, while the functions of the script body are visible only after their declaration - move it before line 2.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at operator preceding local operator function instead of resolving it to coroutine scope`() = runTest {
+        // given
+        val script = """
+            val p = "0".toInt()
+            data class V(val x: Int)
+            val r = V(1) + V(2)
+            operator fun V.plus(o: V) = V(x + o.x + p)
+            r.x
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:14: error: 'plus' does not refer to the function of the script body declared at line 4, which is not visible before its declaration.
+                  | val r = V(1) <error>+</error> V(2)
+                  hint: 'plus' is declared at line 4, while the functions of the script body are visible only after their declaration - move it before line 3.
+
+                script.kts:5:3: error: Unresolved reference 'x' on receiver of type 'CoroutineScope'.
+                  | r.<error>x</error>
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at call preceding local function referring to local class declared after preceding call of its name`() = runTest {
+        // given
+        val script = """
+            val p = "0".toInt()
+            val a = maxOf(1, 2)
+            class W(val x: Int)
+            val r = maxOf(W(1), W(2))
+            fun maxOf(a: W, b: W) = W(a.x + b.x + p)
+            r.x + a
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        // without the errors of the library function the call is resolved to instead, like the argument type mismatches
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:9: error: 'maxOf' does not refer to the function of the script body declared at line 5, which is not visible before its declaration.
+                  | val r = <error>maxOf</error>(W(1), W(2))
+                  hint: 'maxOf' is declared at line 5, while the functions of the script body are visible only after their declaration - move it before line 4.
+
+                script.kts:6:3: error: Unresolved reference 'x'.
+                  | r.<error>x</error> + a
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at call preceding local function with arguments of wrong types only once`() = runTest {
+        // given
+        val script = """
+            val p = "0".toInt()
+            fun show(x: Int) = "int" + p
+            val r = show(listOf("a").first())
+            fun show(x: String) = "string" + p
+            r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:9: error: 'show' does not refer to the function of the script body declared at line 4, which is not visible before its declaration.
+                  | val r = <error>show</error>(listOf("a").first())
+                  hint: 'show' is declared at line 4, while the functions of the script body are visible only after their declaration - move it before line 3.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should keep errors of arguments of call preceding local function independent of function called`() = runTest {
+        // given
+        val scripts = listOf(
+            "val p = \"0\".toInt()\nabstract class A\nprint(A())\nfun print(x: Any) = kotlin.io.print(\"${'$'}p${'$'}x\")",
+            "val p = \"0\".toInt()\nval u: Int\nprint(u)\nfun print(x: Any) = kotlin.io.print(\"${'$'}p${'$'}x\")",
+            "val p = \"0\".toInt()\nabstract class A\ndata class V(val x: Int)\nval r = V(1) + A()\noperator fun V.plus(o: Any) = V(x + p)\nr",
+            // the errors of the calls as arguments, which do not apply themselves
+            "val p = \"0\".toInt()\nprint(maxOf(\"a\", 2))\nfun print(x: Any) = kotlin.io.print(\"${'$'}p${'$'}x\")",
+            "val p = \"0\".toInt()\nprint(Pair(1))\nfun print(x: Any) = kotlin.io.print(\"${'$'}p${'$'}x\")"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { result -> (result as? ScriptResult.Error)?.message?.lines()?.filter { it.startsWith("script.kts:") } } == listOf(
+            listOf(
+                "script.kts:3:1: error: 'print' does not refer to the function of the script body declared at line 4, which is not visible before its declaration.",
+                "script.kts:3:7: error: Cannot create an instance of an abstract class."
+            ),
+            listOf(
+                "script.kts:3:1: error: 'print' does not refer to the function of the script body declared at line 4, which is not visible before its declaration.",
+                "script.kts:3:7: error: Variable 'u' must be initialized."
+            ),
+            listOf(
+                "script.kts:4:14: error: 'plus' does not refer to the function of the script body declared at line 5, which is not visible before its declaration.",
+                "script.kts:4:16: error: Cannot create an instance of an abstract class."
+            ),
+            listOf(
+                "script.kts:2:1: error: 'print' does not refer to the function of the script body declared at line 3, which is not visible before its declaration.",
+                "script.kts:2:7: error: None of the following candidates is applicable:"
+            ),
+            listOf(
+                "script.kts:2:1: error: 'print' does not refer to the function of the script body declared at line 3, which is not visible before its declaration.",
+                "script.kts:2:7: error: Cannot infer type for type parameter 'B'. Specify it explicitly.",
+                "script.kts:2:7: error: No value passed for parameter 'second'."
+            )
+        ))
+    }
+
+    @Test
+    fun `should report error at nested array access preceding local operator function only at the innermost one`() = runTest {
+        // given
+        val script = """
+            val p = "0".toInt()
+            data class V(val x: Int)
+            val l = listOf(10, 20)
+            val r = l[V(1)[0]]
+            operator fun V.get(i: Int) = x + i + p
+            r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:11: error: 'get' does not refer to the function of the script body declared at line 5, which is not visible before its declaration.
+                  | val r = l[<error>V(1)[0]</error>]
+                  hint: 'get' is declared at line 5, while the functions of the script body are visible only after their declaration - move it before line 4.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at calls preceding local functions named like library functions`() = runTest {
+        // given
+        val scripts = listOf(
+            // returning another value
+            "val p = \"9\".toInt()\nval r = listOf(1)\nfun listOf(x: Int) = kotlin.collections.listOf(x, p)\nr",
+            // an extension function, called on a receiver
+            "val p = \"0\".toInt()\nval r = listOf(1, 2).sum()\nfun List<Int>.sum() = 100 + p\nr",
+            // within a lambda without a receiver
+            "val p = \"0\".toInt()\nval r = listOf(1, 2).map { maxOf(it, 5) }\nfun maxOf(a: Int, b: Int) = a + b + p\nr",
+            // within a lambda with a receiver, which does not declare it
+            "val p = \"9\".toInt()\nval r = run { listOf(3) }\nfun listOf(x: Int) = kotlin.collections.listOf(x, p)\nr",
+            // within a local class
+            "val p = \"0\".toInt()\nclass Foo { fun bar() = maxOf(1, 2) }\nval r = Foo().bar()\nfun maxOf(a: Int, b: Int) = a + b + p\nr",
+            // within a local function
+            "val p = \"9\".toInt()\nfun f() = listOf(1)\nval r = f()\nfun listOf(x: Int) = kotlin.collections.listOf(x, p)\nr",
+            // an operator of a local class, failing within a lambda
+            "val p = \"0\".toInt()\ndata class V(val x: Int)\nval r = run { V(1) + V(2) }\noperator fun V.plus(o: V) = V(x + o.x + p)\nr.x",
+            // an operator of a local class, preceded by another operator of its name, where the class is not visible yet
+            "val p = \"0\".toInt()\nval s = 1 + 2\ndata class V(val x: Int)\nval r = V(1) + V(2)\noperator fun V.plus(o: V) = V(x + o.x + p)\nr.x"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.first() } == listOf(
+            "script.kts:2:9: error: 'listOf' does not refer to the function of the script body declared at line 3, which is not visible before its declaration.",
+            "script.kts:2:22: error: 'sum' does not refer to the function of the script body declared at line 3, which is not visible before its declaration.",
+            "script.kts:2:28: error: 'maxOf' does not refer to the function of the script body declared at line 3, which is not visible before its declaration.",
+            "script.kts:2:15: error: 'listOf' does not refer to the function of the script body declared at line 3, which is not visible before its declaration.",
+            "script.kts:2:25: error: 'maxOf' does not refer to the function of the script body declared at line 4, which is not visible before its declaration.",
+            "script.kts:2:11: error: 'listOf' does not refer to the function of the script body declared at line 4, which is not visible before its declaration.",
+            "script.kts:3:20: error: 'plus' does not refer to the function of the script body declared at line 4, which is not visible before its declaration.",
+            "script.kts:4:14: error: 'plus' does not refer to the function of the script body declared at line 5, which is not visible before its declaration."
+        ))
+    }
+
+    @Test
+    fun `should execute calls preceding local functions like regular script when they do not apply or receivers resolve them`() = runTest {
+        // given
+        val scripts = listOf(
+            // the member of the receiver of the lambda takes precedence
+            "val p = \"1\".toInt()\nval r = buildString { append(\"x\") }\nfun append(s: String): StringBuilder = throw Exception(\"local ${'$'}p\")\nr",
+            // the local function does not apply
+            "val p = \"1\".toInt()\nval r = listOf(\"a\")\nfun listOf(x: Int) = kotlin.collections.listOf(x, p)\nr",
+            // the member of a local class takes precedence over the extension operator
+            "val p = \"0\".toInt()\ndata class V(val x: Int) { operator fun plus(o: V) = V(x * o.x) }\nval r = V(2) + V(3)\noperator fun V.plus(o: V) = V(x + o.x + p)\nr.x",
+            // the members of the receivers take precedence over the local functions of inferred types as well
+            "val p = \"1\".toInt()\nclass S { fun pick(x: Int) = x * 2 }\nval r = with(S()) { pick(1) }\nfun pick(x: Int) = \"s\" + p\nr",
+            "val p = \"1\".toInt()\nval r = buildList { add(1) }\nfun add(x: Int) = p\nr",
+            "val p = \"1\".toInt()\nclass S { fun pick(x: Int) = x * 2 }\nfun S.go() = pick(1)\nval r = S().go()\nfun pick(x: Int) = \"s\" + p\nr"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("x", listOf("a"), 6, 2, listOf(1), 2))
+    }
+
+    @Test
     fun `should report error at reference to dependency before local property of the same name despite suppressed deprecation error`() = runTest {
         // given
         val scripts = listOf(
@@ -4915,6 +5162,88 @@ class ScriptExecutorTest {
                   | class T : S { fun f() = <error>check</error>(false) }
                   hint: 'T' is compiled outside of the script body, where 'check' (line 2) is not visible - pass it as a parameter, or declare it within 'T'.
             """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at declaration moved out of the script body calling local function referring to type alias named like library function`() = runTest {
+        // given
+        // the type alias is moved out of the script body, and visible only to the declarations following it there
+        val script = """
+            typealias N = Boolean
+            val k = 1
+            fun check(n: N) = "local:${'$'}n${'$'}k"
+            sealed interface S
+            class T : S { fun f() = check(true) }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:5:25: error: 'check' does not refer to the function of the script body declared at line 3, which is not visible in 'T'.
+                  | class T : S { fun f() = <error>check</error>(true) }
+                  hint: 'T' is compiled outside of the script body, where 'check' (line 3) is not visible - pass it as a parameter, or declare it within 'T'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at declaration moved out of the script body calling local function referring to type aliases of type arguments or function types`() = runTest {
+        // given
+        val scripts = listOf(
+            "val k = 1\ntypealias L<X> = List<X>\ntypealias N = Boolean\nfun check(l: L<N>) = \"local:\$l\$k\"\nsealed interface S\nclass T : S { fun f() = check(listOf(true)) }\nT().f()",
+            "val k = 1\ntypealias Fn = () -> Boolean\nfun check(f: Fn): String = \"local:\${f()}\$k\"\nsealed interface S\nclass T : S { fun f() = check { true } }\nT().f()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.firstOrNull() } == listOf(
+            "script.kts:6:25: error: 'check' does not refer to the function of the script body declared at line 4, which is not visible in 'T'.",
+            "script.kts:5:25: error: 'check' does not refer to the function of the script body declared at line 3, which is not visible in 'T'."
+        ))
+    }
+
+    @Test
+    fun `should call library function from declaration moved out of the script body like a regular script when local function refers to type alias declared later`() = runTest {
+        // given
+        // the type alias is not visible to the local function preceding it in a regular script, which calls the library function then
+        val script = "val k = 1\nfun check(n: N) = \"local:\$n\$k\"\nsealed interface S\nclass T : S { fun f() = check(true) }\ntypealias N = Boolean\nT().f()"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == Unit)
+        }
+    }
+
+    @Test
+    fun `should call callable dependency from declaration moved out of the script body like a regular script when local function of its name refers to type alias declared later`() = runTest {
+        // given
+        // the copy of the local function precedes the type alias, so it does not apply, like the local function in a regular script
+        val script = "val k = 1\nfun log(n: N) = \"local:\$n\$k\"\nsealed interface S\nclass T : S { fun f() = log(\"x\") }\ntypealias N = String\nT().f()"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<(Any?) -> String>("log") { "dep:$it" }))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "dep:x")
         }
     }
 
@@ -6104,6 +6433,42 @@ class ScriptExecutorTest {
         assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.firstOrNull()?.substringBefore(": error") } == listOf(
             "script.kts:6:17", "script.kts:6:19", "script.kts:6:11", "script.kts:6:21"
         ))
+    }
+
+    @Test
+    fun `should confirm calls of local overloads referring to type aliases within declarations of inferred types`() = runTest {
+        // given
+        val scripts = listOf(
+            // the moved overload of an inferred type, which a regular script prefers
+            "val p = \"!\".trim()\ntypealias N = Int\nfun show(x: Any) = \"any\"\nfun show(x: N): String = \"int\$p\"\nsealed interface S\nclass T : S { fun f() = show(\"a\") }\nfun h() = show(1)\nh() + T().f()",
+            // the local overload of an inferred type, which a regular script prefers
+            "val p = \"!\".trim()\ntypealias N = Int\nfun show(x: N): String = \"int\"\nfun show(x: Any) = \"any\$p\"\nsealed interface S\nclass T : S { fun f(): String = show(1) }\nfun h() = show(1)\nh() + T().f()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { it.valueOrMessage.toString().lines().first() } == listOf(
+            "script.kts:7:11: error: 'show' refers to the function of the script body declared at line 4, instead of its overload declared at line 3, which a regular script calls.",
+            "any!int"
+        ))
+    }
+
+    @Test
+    fun `should report calls of local overloads referring to type aliases declared later within declarations of inferred types`() = runTest {
+        // given
+        // the local overload, which the type alias declared after it is visible to only in the script block, does not apply in a regular script
+        val script = "val p = \"!\".trim()\nfun show(x: Any) = \"any\"\nfun show(x: N): String = \"int\$p\"\ntypealias N = Int\nsealed interface S\nclass T : S { fun f() = show(\"a\") }\nfun h() = show(1)\nh() + T().f()"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert((result as? ScriptResult.Error)?.message?.lines()?.firstOrNull() ==
+                "script.kts:7:11: error: 'show' refers to the function of the script body declared at line 3, instead of its overload declared at line 2, which a regular script calls.")
     }
 
     @Test

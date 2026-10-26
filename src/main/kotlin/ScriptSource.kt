@@ -54,6 +54,7 @@ import org.jetbrains.kotlin.psi.KtDestructuringDeclaration
 import org.jetbrains.kotlin.psi.KtDestructuringDeclarationEntry
 import org.jetbrains.kotlin.psi.KtElement
 import org.jetbrains.kotlin.psi.KtExpression
+import org.jetbrains.kotlin.psi.KtFile
 import org.jetbrains.kotlin.psi.KtForExpression
 import org.jetbrains.kotlin.psi.KtFunctionLiteral
 import org.jetbrains.kotlin.psi.KtLabelReferenceExpression
@@ -161,7 +162,7 @@ internal class LaterDeclaredDependencyReference(
  */
 internal data class HiddenLocalFunctionReference(
     override val reference: ScriptReference,
-    /** Of the first local declaration of the name, or of the one the confirming compilation resolves the reference to, see [hiddenLocalFunctionLine]. */
+    /** Of the first local declaration of the name, or of the one the confirming compilation resolves the reference to, see [localFunctionLine]. */
     val line: Int,
     override val isFunction: Boolean,
     /** Whether it is an operator, or a convention, like `[]` of `get`, sharing its position with other ones, like `set`. */
@@ -206,6 +207,29 @@ internal class LaterDeclaredClassReference(
 
 }
 
+/**
+ * The [reference] of the script body calling a function, preceding the declaration of the local function of its name at the 0-based [line],
+ * which is not visible there, so it might call another function, like `print` of the standard library, see [ScriptSource.laterDeclaredFunctionCandidates].
+ */
+internal data class LaterDeclaredFunctionReference(
+    override val reference: ScriptReference,
+    /** Of the first local function of the name declared later, or of the one the confirming compilation resolves the call to. */
+    val line: Int,
+    /**
+     * Whether it is within a lambda, a class, or an extension function, and confirmed by the copies of the local functions declared as the local functions preceding it,
+     * which take precedence over the members of the receivers, unlike the functions of the script in a regular script,
+     * so it is confirmed only if it fails to compile otherwise, as then no member of the receivers applies.
+     */
+    val isConfirmedOnlyWhenFailing: Boolean,
+    /**
+     * The positions of its arguments, or of the indices of the array access, or of the right operand of the binary operator,
+     * where the compiler reports the errors of the function called instead, like `Argument type mismatch`, explained by it.
+     */
+    val arguments: List<ScriptPosition>,
+    /** The position of the indices of the array access, like `[0]` of `a[0]`, where the compiler reports the missing operator, like `No 'get' operator method`. */
+    val indices: ScriptPosition?
+) : CandidateReference
+
 /** A reference to a local declaration of the script body, a function, if [isFunction], or a property. */
 internal interface LocalDeclarationReference {
     val isFunction: Boolean
@@ -236,6 +260,18 @@ internal const val LATER_DECLARED_DEPENDENCY = "xemantic-kotlin-script: later de
 /** The deprecation message of the copies of the local functions, see [ScriptSource.laterDeclaredDependencyCandidates]. */
 internal const val LATER_DECLARED_FUNCTION = "xemantic-kotlin-script: later declared function"
 
+/** The opt-in message of the copies of the local functions, see [ScriptSource.laterDeclaredFunctionCandidates]. */
+internal const val LATER_DECLARED_LOCAL_FUNCTION = "xemantic-kotlin-script: later declared local function"
+
+/**
+ * The opt-in message of the copy of the local function of this [name], see [ScriptSource.laterDeclaredFunctionCandidates],
+ * with its 0-based [line], if known, telling the overloads apart, while containing the message of any function of the name.
+ */
+internal fun laterDeclaredFunctionMessage(
+    name: String,
+    line: Int? = null
+): String = localFunctionMessage(LATER_DECLARED_LOCAL_FUNCTION, name, isOperator = false, line)
+
 /** The opt-in message of the copies of the constructors of the local classes, see [ScriptSource.laterDeclaredClassCandidates]. */
 internal const val LATER_DECLARED_CLASS = "xemantic-kotlin-script: later declared class"
 
@@ -254,14 +290,27 @@ internal fun hiddenLocalFunctionMessage(
     name: String,
     isOperator: Boolean = false,
     line: Int? = null
-): String = "$HIDDEN_LOCAL_FUNCTION: $name;" + (if (isOperator) " operator;" else "") + (line?.let { " line $it;" } ?: "")
+): String = localFunctionMessage(HIDDEN_LOCAL_FUNCTION, name, isOperator, line)
 
-private val hiddenLocalFunctionLineRegex = Regex("${Regex.escape(HIDDEN_LOCAL_FUNCTION)}: .*?;(?: operator;)? line (\\d+);")
+/** The message of the copy of the local declaration of this [name], starting with this [prefix], see [hiddenLocalFunctionMessage]. */
+private fun localFunctionMessage(
+    prefix: String,
+    name: String,
+    isOperator: Boolean,
+    line: Int?
+): String = "$prefix: $name;" + (if (isOperator) " operator;" else "") + (line?.let { " line $it;" } ?: "")
 
-/** The 0-based line of the local declaration of the deprecation [message] of its copy, if known, see [hiddenLocalFunctionMessage]. */
-internal fun hiddenLocalFunctionLine(
+private val localFunctionLineRegex = Regex(
+    "(?:${Regex.escape(HIDDEN_LOCAL_FUNCTION)}|${Regex.escape(LATER_DECLARED_LOCAL_FUNCTION)}): .*?;(?: operator;)? line (\\d+);"
+)
+
+/**
+ * The 0-based line of the local declaration of the deprecation, or opt-in, [message] of its copy, if known,
+ * see [hiddenLocalFunctionMessage] and [laterDeclaredFunctionMessage].
+ */
+internal fun localFunctionLine(
     message: String
-): Int? = hiddenLocalFunctionLineRegex.find(message)?.groupValues?.get(1)?.toInt()
+): Int? = localFunctionLineRegex.find(message)?.groupValues?.get(1)?.toInt()
 
 /**
  * The string literal of this [value], escaping the characters ending it, or starting an escape, or a template,
@@ -531,6 +580,18 @@ internal class ScriptSource private constructor(
     val laterDeclaredClassCandidates: List<LaterDeclaredClassReference>
 
     /**
+     * The calls of the script body preceding the declarations of the local functions of their names, unlike of the dependencies,
+     * like `print("x")` followed by `fun print(x: Any)`, which call other functions, like `print` of the standard library,
+     * or fail, like `V(1) + V(2)` resolved to `plus` of the coroutine scope of the script body,
+     * while in the script they call the local functions, if they apply.
+     * They are confirmed by compiling the script with the copies of the local functions, marked with an opt-in, see [confirming],
+     * declared as the members of the script, like the functions of a regular script, the members of the receivers taking precedence over them,
+     * or, if they refer to the local classes, which the members would not see, as the local functions preceding the calls,
+     * which take precedence over the members of the receivers, unlike in the script, see [LaterDeclaredFunctionReference.isConfirmedOnlyWhenFailing].
+     */
+    val laterDeclaredFunctionCandidates: List<LaterDeclaredFunctionReference>
+
+    /**
      * The calls of the declarations moved out of the script body named like the local functions of the script body,
      * by the 0-based lines of the first ones, which are not visible there, so they might be resolved to other functions,
      * like `check` of the standard library, while in the script they refer to the local functions.
@@ -559,7 +620,7 @@ internal class ScriptSource private constructor(
 
     /** All the candidates, which the confirming compilations confirm, see [confirming]. */
     val candidates: List<CandidateReference>
-        get() = laterDeclaredDependencyCandidates + laterDeclaredClassCandidates + hiddenLocalFunctionCandidates +
+        get() = laterDeclaredDependencyCandidates + laterDeclaredClassCandidates + laterDeclaredFunctionCandidates + hiddenLocalFunctionCandidates +
                 shadowedFunctionCandidates + coroutineScopeCandidates
 
     /** The names of the [untypedProperties], by the 0-based lines of the [text] probing, or checking, their types, see [propertyTypeProbes]. */
@@ -614,6 +675,15 @@ internal class ScriptSource private constructor(
                 candidate.reference.toScriptReference(),
                 position(candidate.classOffset).line,
                 candidate.scopeCalls.map { it.toScriptReference() }
+            )
+        }
+        laterDeclaredFunctionCandidates = structure.laterDeclaredFunctionCandidates.map { candidate ->
+            LaterDeclaredFunctionReference(
+                candidate.reference.toScriptReference(),
+                position(candidate.offset).line,
+                candidate.isConfirmedOnlyWhenFailing,
+                candidate.arguments.map { position(it) },
+                candidate.indices?.let { position(it) }
             )
         }
         hiddenLocalFunctionCandidates = structure.hiddenLocalFunctionCandidates.map { (reference, offset, isFunction) ->
@@ -694,21 +764,37 @@ internal class ScriptSource private constructor(
             }
             mapping += null
         }
-        val blockCopies = if (confirming) structure.blockCopies(shadowedFunctionCopies, coroutineScopeCopies) else emptyMap()
+        // only the first confirming compilation confirms the laterDeclaredFunctionCandidates,
+        // while their copies would take precedence over the copies of the other ones, like the members of the coroutine scope of the script body
+        val confirmsLaterDeclaredFunctions = confirming && !shadowedFunctionCopies && !overloadingFunctionCopies && !coroutineScopeCopies
+        val blockCopies = if (confirming) {
+            structure.blockCopies(shadowedFunctionCopies, coroutineScopeCopies, withLaterDeclaredFunctions = confirmsLaterDeclaredFunctions)
+        } else {
+            emptyMap()
+        }
+        // the members of the script copying the local declarations, see MemberCopy
+        val memberCopies = mutableListOf<MemberCopy>()
         if (confirming) {
             // named in the message, as the operators of the same position refer to different functions, like `get` and `set`,
             // unlike the copies of the local functions overloading the moved ones, see overloadingFunctionCopies
             if (!overloadingFunctionCopies) structure.hiddenLocalFunctionCopies(copiedPropertyTypes).forEach { copy ->
-                // the type of the copy of the property might be an invalid one, see confirmedPropertyTypes
-                if (copy.name in copiedProperties) propertyTypeLines[lines.size] = copy.name
                 val message = hiddenLocalFunctionMessage(copy.name, copy.isOperator, copy.offset?.let { position(it).line })
-                lines += "@kotlin.Deprecated(${stringLiteral(message)}) ${copy.declaration}"
+                memberCopies += MemberCopy(
+                    copy.offset ?: Int.MAX_VALUE,
+                    "@kotlin.Deprecated(${stringLiteral(message)}) ${copy.declaration}",
+                    // the type of the copy of the property might be an invalid one, see confirmedPropertyTypes
+                    copy.name.takeIf { it in copiedProperties }
+                )
+            }
+            // the members of the script, as in a regular script, see laterDeclaredFunctionCandidates
+            if (confirmsLaterDeclaredFunctions) structure.laterDeclaredFunctionMemberCopies.forEach { (offset, message, declaration) ->
+                lines += "@kotlin.RequiresOptIn(${stringLiteral(message)}, level = RequiresOptIn.Level.WARNING) annotation class ${optInMarker(message)}"
                 mapping += null
+                memberCopies += MemberCopy(offset, "@${optInMarker(message)} $declaration")
             }
             // resolved together with the moved functions they overload, as in the script, see shadowedFunctionCopies
-            if (overloadingFunctionCopies) structure.overloadingCopies.forEach {
-                lines += it
-                mapping += null
+            if (overloadingFunctionCopies) structure.overloadingCopies.forEach { (offset, copy) ->
+                memberCopies += MemberCopy(offset, copy)
             }
             // the deprecation of the local functions, like the copies in the script block, is not reported, unlike their opt-in
             val blockCopyMessages = blockCopies.values.flatten().flatMap { it.first }
@@ -724,9 +810,20 @@ internal class ScriptSource private constructor(
         // the types probed, or checked, whether the ones of the copies are the same, see propertyTypeProbes
         val checkedPropertyTypes = if (confirming && !overloadingFunctionCopies && !propertyTypeProbes) copiedPropertyTypes else emptyMap()
         structure.propertyTypeCheckFunctions(checkedPropertyTypes).forEach { (name, declaration) ->
-            propertyTypeLines[lines.size] = name
-            lines += declaration
-            mapping += null
+            memberCopies += MemberCopy(Int.MAX_VALUE, declaration, name)
+        }
+        memberCopies.sortBy { it.offset }
+        var memberCopyIndex = 0
+        /** Adds the [memberCopies] of the originals preceding this [offset]. */
+        fun addMemberCopies(
+            offset: Int
+        ) {
+            while (memberCopyIndex < memberCopies.size && memberCopies[memberCopyIndex].offset <= offset) {
+                val copy = memberCopies[memberCopyIndex++]
+                if (copy.propertyTypeName != null) propertyTypeLines[lines.size] = copy.propertyTypeName
+                lines += copy.declaration
+                mapping += null
+            }
         }
         // a callable one is visible to the moved declarations referring to it as a value, like `map(log)`, as in the script,
         // while their calls, which in the script call the local function, if it applies, are confirmed, see hiddenLocalFunctionCandidates
@@ -753,6 +850,7 @@ internal class ScriptSource private constructor(
             emptySet()
         }
         movedDeclarations.forEach { declaration ->
+            addMemberCopies(declaration.start)
             // opt-in markers, which can mark the same declaration, unlike the deprecations
             if (declaration.kind == DeclarationKind.FUNCTION && declaration.name in deprecatedFunctions) {
                 lines += "@${optInMarker(SHADOWED_ORIGINAL)}"
@@ -774,6 +872,7 @@ internal class ScriptSource private constructor(
                 it in declaration.start until declaration.end && !movedExcluded[it]
             }
         }
+        addMemberCopies(Int.MAX_VALUE)
         // following the moved type aliases, which are not visible before their declarations
         if (coroutineScopeCopies) {
             lines += "abstract class $BODY_SCOPE_CLASS : kotlinx.coroutines.CoroutineScope {"
@@ -965,7 +1064,8 @@ private fun scriptStructure(
 ) = ScriptStructure(
     // the parser recognizes only `\n` as a line terminator, replacing each character keeps the offsets
     script.replace('\r', '\n'),
-    dependencies.mapTo(HashSet()) { it.name }
+    dependencies.mapTo(HashSet()) { it.name },
+    lineBounds(script).map { it.first }
 )
 
 /** The index of the line containing the [offset], given the sorted [lineStarts]. */
@@ -1006,6 +1106,39 @@ private class ShadowedCandidate(
     /** See [ShadowedFunctionReference.isInInferredType]. */
     val isInInferredType: Boolean = false
 )
+
+/**
+ * See [ScriptSource.laterDeclaredFunctionCandidates], with the [offset] of the name of the first local function declared later,
+ * and the offsets of the [arguments] and the [indices], see [LaterDeclaredFunctionReference].
+ */
+private class LaterFunctionCandidate(
+    val reference: Reference,
+    val offset: Int,
+    val isConfirmedOnlyWhenFailing: Boolean,
+    val arguments: List<Int>,
+    val indices: Int?
+)
+
+/**
+ * The starts of the arguments of the call of this [reference], or of the indices of the array access, or of the right operand of the binary operator,
+ * where the compiler reports the errors of the function called instead, like `Argument type mismatch`, see [LaterDeclaredFunctionReference.arguments],
+ * and the start of the indices of the array access, see [LaterDeclaredFunctionReference.indices].
+ */
+private fun KtFile.argumentStarts(
+    reference: Reference
+): Pair<List<Int>, Int?> {
+    generateSequence(findElementAt(reference.offset)) { it.parent }.forEach { element ->
+        when {
+            element is KtCallExpression && element.calleeExpression?.let { it.startOffset == reference.offset && it.textLength == reference.length } == true ->
+                return element.valueArguments.mapNotNull { it.getArgumentExpression()?.startOffset } to null
+            element is KtArrayAccessExpression && element.startOffset == reference.offset && element.textLength == reference.length ->
+                return element.indexExpressions.map { it.startOffset } to element.indicesNode.startOffset
+            element is KtBinaryExpression && element.operationReference.startOffset == reference.offset ->
+                return listOfNotNull(element.right?.startOffset) to null
+        }
+    }
+    return emptyList<Int>() to null
+}
 
 /** See [ScriptSource.laterDeclaredClassCandidates], with the offset of the class, and the ranges of the [LaterDeclaredClassReference.scopeCalls]. */
 private class ClassCandidate(
@@ -1071,9 +1204,13 @@ private fun KtDeclaration.memberOnlyAnnotationEntries(): List<KtAnnotationEntry>
 
 /**
  * The declaration of a function of the same signature, which is never called, like `fun f(s: String): Nothing = kotlin.TODO()`,
- * without the default values of the parameters, which might refer to the local declarations.
+ * without the default values of the parameters, which might refer to the local declarations,
+ * of the return type inferred, if it is inferred in the script, and if it [keepsInferredType],
+ * otherwise declared as `Nothing`, like the return type of a block body.
  */
-private fun KtNamedFunction.signature(): String? = if (
+private fun KtNamedFunction.signature(
+    keepsInferredType: Boolean = true
+): String? = if (
     typeParameters.any { it.nameIdentifier == null } || valueParameters.any { it.typeReference == null || it.name == null }
 ) {
     // e.g. of a script with a syntax error
@@ -1098,7 +1235,7 @@ private fun KtNamedFunction.signature(): String? = if (
     // so the confirming compilation reports that the inferred `Nothing` should be declared, an error ignored there
     when {
         typeReference != null -> +": ${typeReference!!.singleLineText()}"
-        !isOfInferredType() -> +": Nothing"
+        !isOfInferredType() || !keepsInferredType -> +": Nothing"
     }
     typeConstraintList?.let {
         +" where "
@@ -1314,6 +1451,11 @@ private class Reference(
     /** Whether it is within a lambda, which might have a receiver, so its resolution is not known without compiling. */
     val isInLambda: Boolean = false,
     /**
+     * Whether it is within a lambda, a class, an object, or an extension function,
+     * so it might resolve to a member of their receivers, like `append` in `buildString { append("x") }`.
+     */
+    val mightResolveOnReceiver: Boolean = false,
+    /**
      * The ranges of the references of its [name] within it, unless the compiler reports it at one of them,
      * like `getValue` of `by lazy { "a".getValue(null, p) }`, the warnings at which are of them,
      * even if not candidates themselves, like when bound by name to a member, which does not apply.
@@ -1371,7 +1513,8 @@ private fun PsiElement.references(
         isCallableReference = callableReference?.callableReference == expression,
         expressionOffset = callableReference?.takeIf { it.callableReference == expression }?.startOffset ?: expression.startOffset,
         canAccessScriptMembers = canAccessScriptMembers(expression, scope),
-        isInLambda = isInLambda(expression, scope)
+        isInLambda = isInLambda(expression, scope),
+        mightResolveOnReceiver = mightResolveOnReceiver(expression, scope)
     )
 } + operatorReferences(scope)
 
@@ -1414,6 +1557,7 @@ private fun PsiElement.operatorReferences(
         inner: (String) -> List<IntRange> = { emptyList() }
     ) {
         val canAccessScriptMembers = canAccessScriptMembers(element, scope)
+        val mightResolveOnReceiver = mightResolveOnReceiver(element, scope)
         names.forEach { name ->
             add(
                 Reference(
@@ -1427,6 +1571,7 @@ private fun PsiElement.operatorReferences(
                     expressionOffset = offset,
                     canAccessScriptMembers = canAccessScriptMembers,
                     isOperator = true,
+                    mightResolveOnReceiver = mightResolveOnReceiver,
                     inner = inner(name),
                     delegateCallee = delegateCallee,
                     invokedValue = invokedValue
@@ -1498,6 +1643,14 @@ private fun isInLambda(
     expression: PsiElement,
     scope: PsiElement
 ): Boolean = expression.parents.takeWhile { it !== scope }.any { it is KtLambdaExpression }
+
+/** See [Reference.mightResolveOnReceiver]. */
+private fun mightResolveOnReceiver(
+    expression: PsiElement,
+    scope: PsiElement
+): Boolean = expression.parents.takeWhile { it !== scope }.any {
+    it is KtLambdaExpression || it is KtClassOrObject || (it is KtNamedFunction && it.receiverTypeReference != null)
+}
 
 /**
  * The scope functions, the lambdas of which have the receivers of their calls as their receivers, like `run` of `run { }`, by their names,
@@ -1683,9 +1836,23 @@ private class HiddenLocalCopy(
     val offset: Int?
 )
 
+/**
+ * The [declaration] of a member of the script, copying a local declaration in a confirming compilation, see [ScriptSource.confirming],
+ * following the moved declarations preceding the [offset] of the name of its original, like the type aliases, which are not visible before their declarations,
+ * as in a regular script, or all of them, if [Int.MAX_VALUE], like the copies of the properties,
+ * and the name of the property, whose type it refers to, see [ScriptSource.propertyTypes].
+ */
+private class MemberCopy(
+    val offset: Int,
+    val declaration: String,
+    val propertyTypeName: String? = null
+)
+
 private class ScriptStructure(
     private val script: String,
-    dependencyNames: Set<String>
+    dependencyNames: Set<String>,
+    /** The starts of the lines of the original script, unlike of the [script], where `\r\n` ends two lines. */
+    lineStarts: List<Int>
 ) {
 
     val headerEnd: Int
@@ -1710,7 +1877,7 @@ private class ScriptStructure(
 
     /**
      * The names of the [localFunctions], which the references of the moved declarations cannot be confirmed to refer to,
-     * see [ScriptSource.hiddenLocalFunctionCandidates], as they cannot be copied, like the ones referring to the local classes or the type aliases,
+     * see [ScriptSource.hiddenLocalFunctionCandidates], as they cannot be copied, like the ones referring to the local classes, or to the type aliases declared after them,
      * or as they are referred to as functions, like `::log`, which would be resolved to the dependency of the same name instead,
      * or as their names are bound within the moved declarations, which are not candidates.
      * Only the ones named like the dependencies are checked for the copies.
@@ -1741,8 +1908,8 @@ private class ScriptStructure(
     /** The names of the moved functions overloaded by the local ones, which the [shadowedFunctionCandidates] call, see [ScriptSource.overloadingFunctionCopies]. */
     val overloadedFunctions: Set<String>
 
-    /** The copies of the local functions overloading the [overloadedFunctions], see [ScriptSource.overloadingFunctionCopies]. */
-    val overloadingCopies: List<String>
+    /** The copies of the local functions overloading the [overloadedFunctions], by the offsets of their names, see [ScriptSource.overloadingFunctionCopies]. */
+    val overloadingCopies: List<Pair<Int, String>>
 
     /** The names of the local functions overloading the [overloadedFunctions], renamed with these letters, see [ScriptSource.overloadingFunctionCopies]. */
     val renamedRanges: List<Pair<IntRange, Char>>
@@ -1773,6 +1940,19 @@ private class ScriptStructure(
 
     /** See [ScriptSource.laterDeclaredClassCandidates]. */
     val laterDeclaredClassCandidates: List<ClassCandidate>
+
+    /** See [ScriptSource.laterDeclaredFunctionCandidates]. */
+    val laterDeclaredFunctionCandidates: List<LaterFunctionCandidate>
+
+    /** The copies of the local functions, see [ScriptSource.laterDeclaredFunctionCandidates], with their messages, by the offsets of the statements they precede. */
+    private val laterDeclaredLocalFunctionCopies: Map<Int, List<Pair<String, String>>>
+
+    /**
+     * The copies of the local functions, see [ScriptSource.laterDeclaredFunctionCandidates], the members of the script, as the functions of a regular script,
+     * which the members of the receivers take precedence over, with their messages, by the offsets of the names of their originals,
+     * unless the [hiddenLocalFunctionCopies] declare them already.
+     */
+    val laterDeclaredFunctionMemberCopies: List<Triple<Int, String, String>>
 
     /** The copies of the scope functions of the script instance, see [ScriptSource.laterDeclaredClassCandidates]. */
     val scopeFunctionCopies: List<String>
@@ -1882,7 +2062,9 @@ private class ScriptStructure(
             }
         }
         fun ParsedDeclaration.line() = nameRange?.first ?: start
-        fun ParsedDeclaration.signature() = (psi as KtNamedFunction).signature()
+        fun ParsedDeclaration.signature(
+            keepsInferredType: Boolean = true
+        ) = (psi as KtNamedFunction).signature(keepsInferredType)
         val localClasses = declarations.filter { it.kind == DeclarationKind.CLASS && it !in moved && it.name != null }
         /** Whether the function refers to the types of these [names], like the local classes, which might not be visible to its copy. */
         fun ParsedDeclaration.refersToTypes(
@@ -1965,10 +2147,14 @@ private class ScriptStructure(
                 }?.let { (local, isFunction) -> Triple(reference, local.line(), isFunction) }
             }
         }
-        // the copies precede the type aliases, which are not visible before their declarations
-        val uncopiedTypes = localClassNames + declarations.mapNotNull { (it.psi as? KtTypeAlias)?.name }
+        /**
+         * Whether the function cannot be copied, as it refers to the local classes, unlike to the type aliases,
+         * as its copy follows the moved declarations preceding it, so it sees the same type aliases as the function in a regular script,
+         * and does not apply either, if it refers to the ones declared after it, see [ScriptSource.confirming].
+         */
+        fun ParsedDeclaration.isUncopied() = signature() == null || refersToTypes(localClassNames)
         unconfirmedLocalFunctions = localFunctionsByName.filter { (name, functions) ->
-            name in dependencyNames && functions.any { it.refersToTypes(uncopiedTypes) || it.signature() == null }
+            name in dependencyNames && functions.any { it.isUncopied() }
         }.keys + hiddenLocalFunctionCandidates.filter { (reference) ->
             reference.isCallableReference && reference.refersToLocal(localFunctions)
         }.map { it.first.name } + moved.flatMap { declaration ->
@@ -2025,9 +2211,9 @@ private class ScriptStructure(
         val mixedOverloads = overloadingFunctions.filter { (name, functions) ->
             (functions.map { it.second } + movedFunctionsByName.getValue(name)).map { (it.psi as KtNamedFunction).isOfInferredType() }.distinct().size > 1
         }.keys
-        // unless they cannot be copied preceding the moved declarations, see ScriptSource.overloadingFunctionCopies
+        // unless they cannot be copied, see ScriptSource.overloadingFunctionCopies
         val uncopiedOverloads = overloadingFunctions.filter { (_, functions) ->
-            functions.any { (_, function) -> function.refersToTypes(uncopiedTypes) || function.signature() == null }
+            functions.any { (_, function) -> function.isUncopied() }
         }.keys
         /** The candidates among the references of each statement of the script body, unless moved, by its index. */
         fun <T : Any> bodyCandidates(
@@ -2059,7 +2245,7 @@ private class ScriptStructure(
         val overloadedNames = shadowedFunctionCandidates.filter { it.isInInferredType }.mapTo(HashSet()) { it.reference.name }
         overloadedFunctions = overloadedNames
         val overloading = overloadingFunctions.filterKeys { it in overloadedNames }
-        overloadingCopies = overloading.values.flatten().mapNotNull { it.second.signature() }
+        overloadingCopies = overloading.values.flatten().mapNotNull { (_, function) -> function.signature()?.let { function.line() to it } }
         // a distinct letter for each name, so the renamed functions of different names do not overload each other
         renamedRanges = overloading.values.flatMapIndexed { index, functions ->
             functions.mapNotNull { (_, function) ->
@@ -2122,6 +2308,38 @@ private class ScriptStructure(
             scopeFunctions.filterKeys { name -> moved.none { it.name == name } }.values.toList()
         }
         val statementIndices = statements.withIndex().associate { (index, statement) -> statement to index }
+        /** The start of the statement, including the comments preceding it, which the copies should not be inserted into. */
+        fun leadingStart(
+            statementIndex: Int
+        ): Int {
+            var start = statements[statementIndex].startOffset
+            var element = statements[statementIndex].prevSibling
+            while (element is PsiWhiteSpace || element is PsiComment) {
+                if (element is PsiComment) start = element.startOffset
+                element = element.prevSibling
+            }
+            return start
+        }
+        /**
+         * The offset where the copies preceding the statement of this [index] are inserted,
+         * and the names of the local classes declared from there on, which are not visible there.
+         */
+        fun copyPlace(
+            index: Int
+        ): Pair<Int, Set<String>> {
+            // preceding the first statement sharing the line, so the inserted line does not split another statement
+            var first = index
+            while (first > 0 && '\n' !in script.substring(statements[first - 1].endOffset, leadingStart(first))) first--
+            return leadingStart(first) to localClasses.filter { statementIndices.getValue(it.psi) >= first }.mapTo(HashSet()) { it.name!! }
+        }
+        /** The indices of the statements of the candidates of each name, in the order of the script. */
+        fun candidateIndices(
+            candidatesByStatement: Map<Int, List<Reference>>
+        ) = buildMap<String, MutableList<Int>> {
+            candidatesByStatement.entries.sortedBy { it.key }.forEach { (index, candidates) ->
+                candidates.mapTo(LinkedHashSet()) { it.name }.forEach { getOrPut(it) { mutableListOf() } += index }
+            }
+        }
         /**
          * The copies of the declarations of each name, with their messages, preceding the first statement of the candidates of this name,
          * given the names of the local classes declared from this statement on, which are not visible there.
@@ -2130,26 +2348,9 @@ private class ScriptStructure(
             candidatesByStatement: Map<Int, List<Reference>>,
             declarations: (name: String, invisibleClasses: Set<String>) -> List<Pair<String, String>>
         ) = buildMap<Int, MutableList<Pair<String, String>>> {
-            candidatesByStatement.entries.sortedBy { it.key }.flatMap { (index, candidates) ->
-                candidates.map { it.name to index }
-            }.distinctBy { it.first }.forEach { (name, index) ->
-                /** The start of the statement, including the comments preceding it, which the copies should not be inserted into. */
-                fun leadingStart(
-                    statementIndex: Int
-                ): Int {
-                    var start = statements[statementIndex].startOffset
-                    var element = statements[statementIndex].prevSibling
-                    while (element is PsiWhiteSpace || element is PsiComment) {
-                        if (element is PsiComment) start = element.startOffset
-                        element = element.prevSibling
-                    }
-                    return start
-                }
-                // preceding the first statement sharing the line, so the inserted line does not split another statement
-                var first = index
-                while (first > 0 && '\n' !in script.substring(statements[first - 1].endOffset, leadingStart(first))) first--
-                val invisibleClasses = localClasses.filter { statementIndices.getValue(it.psi) >= first }.mapTo(HashSet()) { it.name!! }
-                getOrPut(leadingStart(first)) { mutableListOf() } += declarations(name, invisibleClasses)
+            candidateIndices(candidatesByStatement).forEach { (name, indices) ->
+                val (offset, invisibleClasses) = copyPlace(indices.first())
+                getOrPut(offset) { mutableListOf() } += declarations(name, invisibleClasses)
             }
         }
         /** The copies of these [functions] of each name, see [signature]. */
@@ -2165,6 +2366,67 @@ private class ScriptStructure(
             laterDeclaredCandidatesByStatement.mapValues { (_, candidates) -> candidates.filter { it.third }.map { it.first } },
             functionCopies(localFunctionsByName) { LATER_DECLARED_FUNCTION }
         )
+        // the local functions, also the extension ones, by the indices of their statements, unless named like the dependencies, see laterDeclaredDependencyCandidates
+        val namedFunctions = buildMap<String, MutableList<Pair<Int, ParsedDeclaration>>> {
+            statements.forEachIndexed { index, statement ->
+                declarationsByPsi[statement]?.takeIf {
+                    it.kind == DeclarationKind.FUNCTION && it !in moved && it.name != null && it.name !in dependencyNames
+                }?.let { getOrPut(it.name!!) { mutableListOf() } += index to it }
+            }
+        }
+        val laterFunctionCandidatesByStatement = bodyCandidates { index, reference ->
+            if (!reference.isCall || reference.isBound || reference.isCallableReference || !reference.mightCallOperator(valueNames)) {
+                return@bodyCandidates null
+            }
+            namedFunctions[reference.name]?.firstOrNull { (functionIndex, function) ->
+                functionIndex > index && when {
+                    reference.isOperator -> function.isExtension && function.isOperator
+                    // like `listOf(1, 2).sum()`
+                    reference.isQualified -> function.isExtension
+                    else -> true
+                }
+            }?.let { (_, function) -> reference to function.line() }
+        }
+        val laterCandidateIndices = candidateIndices(laterFunctionCandidatesByStatement.mapValues { (_, candidates) -> candidates.map { it.first } })
+        // the functions of each name declared after its first candidate, which the copies would conflict with otherwise
+        val laterFunctions = laterCandidateIndices.mapValues { (name, indices) ->
+            namedFunctions.getValue(name).filter { (functionIndex) -> functionIndex > indices.first() }
+        }
+        // the local copies of the ones referring to the local classes, which the members of the script would not see,
+        // and of the names of the functions of the coroutine scope of the script body, which its members would take precedence over
+        val locallyCopied = laterFunctions.filter { (name, functions) ->
+            name in coroutineScopeFunctions || functions.any { it.second.refersToTypes(localClassNames) }
+        }.keys
+        laterDeclaredFunctionCandidates = laterFunctionCandidatesByStatement.values.flatten().map { (reference, offset) ->
+            val (arguments, indices) = file.argumentStarts(reference)
+            LaterFunctionCandidate(
+                reference, offset,
+                isConfirmedOnlyWhenFailing = reference.name in locallyCopied && reference.mightResolveOnReceiver,
+                arguments = arguments,
+                indices = indices
+            )
+        }
+        /** The copy of the local function, of the return type declared, as an inferred one would take precedence over the members of the receivers. */
+        fun ParsedDeclaration.laterDeclaredFunctionCopy() = signature(keepsInferredType = false)?.let { signature ->
+            laterDeclaredFunctionMessage(name!!, lineOf(lineStarts, line())) to signature
+        }
+        laterDeclaredLocalFunctionCopies = buildMap<Int, MutableList<Pair<String, String>>> {
+            // each function once, as declaring it twice would make the calls ambiguous, preceding the first of its candidates seeing the local classes it refers to,
+            // as the preceding ones cannot call it, unlike the following ones, like `V(1) + V(2)` preceded by `1 + 2` and `data class V(val x: Int)`
+            laterFunctions.filterKeys { it in locallyCopied }.forEach { (name, functions) ->
+                functions.forEach { (functionIndex, function) ->
+                    val copy = function.laterDeclaredFunctionCopy() ?: return@forEach
+                    laterCandidateIndices.getValue(name).asSequence().takeWhile { it < functionIndex }.map { copyPlace(it) }
+                        .firstOrNull { (_, invisibleClasses) -> !function.refersToTypes(invisibleClasses) }
+                        ?.let { (offset) -> getOrPut(offset) { mutableListOf() } += copy }
+                }
+            }
+        }
+        // the hidden local functions are copied as the members of the script already, see hiddenLocalFunctionCopies
+        val hiddenNames = hiddenLocalDeclarations.mapTo(HashSet()) { it.name }
+        laterDeclaredFunctionMemberCopies = laterFunctions.filterKeys { it !in locallyCopied && it !in hiddenNames }.values.flatten().mapNotNull { (_, function) ->
+            function.laterDeclaredFunctionCopy()?.let { (message, signature) -> Triple(function.line(), message, signature) }
+        }
         // resolved among the local functions, like among the members of the script class in the declarations of declared types
         shadowedFunctionCopies = copies(
             shadowedFunctionCandidatesByStatement.mapValues { (_, candidates) ->
@@ -2273,14 +2535,17 @@ private class ScriptStructure(
      * The deprecated copies of the local functions, see [ScriptSource.laterDeclaredDependencyCandidates],
      * and of the moved functions, if [withShadowedFunctions], see [ScriptSource.shadowedFunctionCopies],
      * and of the constructors of the local classes, if [withConstructors], see [ScriptSource.coroutineScopeCopies],
+     * and of the local functions, if [withLaterDeclaredFunctions], see [ScriptSource.laterDeclaredFunctionCandidates],
      * with the messages of their opt-in markers, by the offsets of the statements they precede.
      */
     fun blockCopies(
         withShadowedFunctions: Boolean,
-        withConstructors: Boolean
+        withConstructors: Boolean,
+        withLaterDeclaredFunctions: Boolean
     ): Map<Int, List<Pair<List<String>, String>>> = buildMap<Int, MutableList<Pair<String, String>>> {
         listOfNotNull(
             laterDeclaredFunctionCopies,
+            laterDeclaredLocalFunctionCopies.takeIf { withLaterDeclaredFunctions },
             shadowedFunctionCopies.takeIf { withShadowedFunctions },
             constructorCopies.takeIf { withConstructors }
         ).forEach { copies ->

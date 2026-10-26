@@ -227,6 +227,19 @@ internal class ScriptErrorReporter(
         }
     }.trimEnd()
 
+    /** The [references] of the script body calling other functions than the local functions declared later, see [ScriptSource.laterDeclaredFunctionCandidates]. */
+    fun toLaterDeclaredFunctionMessage(
+        references: List<LaterDeclaredFunctionReference>
+    ): String = references.joinToString(separator = "\n") { later ->
+        val reference = later.reference
+        buildString {
+            appendPosition(reference.start)
+            +"error: '${reference.name}' does not refer to the function of the script body declared at line ${later.line + 1}, which is not visible before its declaration.\n"
+            appendSourceLines(reference.start, reference.end)
+            appendNotDeclaredYetHint(reference.name, later.line, "functions", reference.start)
+        }
+    }.trimEnd()
+
     /**
      * The [references] of the script body to the dependencies, preceding the local declarations of their names,
      * see [ScriptSource.laterDeclaredDependencyCandidates] and [ScriptSource.laterDeclaredClassCandidates].
@@ -588,9 +601,19 @@ internal class ScriptErrorReporter(
                 FUNCTION -> "functions"
                 else -> "properties"
             }
-            +"  hint: '$name' is declared at line ${line + 1}, while the $declarations of the script body are visible only after their declaration"
-            +" - move it before line ${position.line + 1}.\n"
+            appendNotDeclaredYetHint(name, line, declarations, position)
         }
+    }
+
+    /** The hint of the reference at the [position] to the [name] declared later, at the 0-based [line], among these [declarations], like `functions`. */
+    private fun StringBuilder.appendNotDeclaredYetHint(
+        name: String,
+        line: Int,
+        declarations: String,
+        position: ScriptPosition
+    ) {
+        +"  hint: '$name' is declared at line ${line + 1}, while the $declarations of the script body are visible only after their declaration"
+        +" - move it before line ${position.line + 1}.\n"
     }
 
 }
