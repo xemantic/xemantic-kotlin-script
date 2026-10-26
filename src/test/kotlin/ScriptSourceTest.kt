@@ -340,6 +340,8 @@ class ScriptSourceTest {
             "val items = listOf(1)\nvar total\n    get() = items.sum()\n    set(v) { }\ntotal",
             // not applicable to a local variable
             "val items = listOf(1)\n@Deprecated(\"x\")\nval total get() = items.size\ntotal",
+            "@Target(AnnotationTarget.PROPERTY)\nannotation class Tag\nval items = listOf(1)\n@Tag\nval total get() = items.size\ntotal",
+            "val items = listOf(1)\n@get:Suppress(\"x\")\nval total get() = items.size\ntotal",
             "fun Any.describe() = this::class.simpleName\nval items = listOf(1)\nval d get() = items.size.toString() + describe()\nd",
             "val total get() = 42\ntotal",
             "class User(val name: String)\nval name = \"script\"\nval greeting get() = User(\"user\").run { name }\ngreeting",
@@ -365,6 +367,9 @@ class ScriptSourceTest {
             // resolved on the receiver of a lambda before the local property, unlike the script
             "class User(val name: String)\nval name = \"local\"\nval items = listOf(1)\nval t get() = items.size.toString() + with(User(\"u\")) { name }\nt",
             "class User(val name: String)\nfun name() = \"local\"\nval items = listOf(1)\nval t get() = items.size.toString() + listOf(1).map { User(\"u\").run { name } }\nt",
+            "class Box { val factor = 10; fun count(block: Box.() -> Int) = block() }\nval factor = listOf(2).first()\nval items = listOf(1)\nval t get() = items.size + Box().count { factor }\nt",
+            "fun <T> T.twice(block: T.() -> Int) = block()\nclass Box { val factor = 10 }\nval factor = listOf(2).first()\nval items = listOf(1)\nval t get() = items.size + Box().twice { factor }\nt",
+            "class Box { fun g() = \"box\" }\nfun g() = \"script\"\nval items = listOf(1)\nval t get() = items.size.toString() + with(Box()) { g() }\nt",
             // not visible in the accessors, if declared after them, unlike in the script
             "val items = listOf(1)\nval t get() = items.size.toString() + isActive\nval isActive = \"mine\"\nt",
             "val items = listOf(1)\nval t get() = items.size.toString() + javaClass\nval javaClass = \"mine\"\nt",
@@ -387,19 +392,53 @@ class ScriptSourceTest {
     @Test
     fun `should keep property with accessor reading local properties within lambdas without receiver as delegated property`() {
         // given
-        val script = """
-            val threshold = listOf(1).first()
-            val items = listOf(1, 2, 3)
-            val n get() = items.count { it > threshold }.toString() + items.map { x -> listOf(x).sumOf { it * threshold } }.sum()
-            n
-        """.trimIndent()
+        val locals = "val factor = listOf(2).first()\nval items = listOf(1, 2)\n"
+        val scripts = listOf(
+            locals + "val t get() = items.count { it > factor }.toString() + items.map { x -> listOf(x).sumOf { it * factor } }.sum()\nt",
+            locals + "val t get() = items.zip(items) { a, b -> a + b * factor }.sum()\nt",
+            locals + "val t get() = items.mapTo(HashSet()) { it * factor }.size\nt",
+            locals + "val t get() = items.maxOfOrNull { it * factor }\nt",
+            locals + "val t get() = items.associateWith { it }.mapValues { it.value * factor }.values.sum()\nt",
+            locals + "val t get() = items.chunked(2) { it.sum() * factor }.sum()\nt",
+            // labeled, or annotated
+            locals + "val t get() = items.map label@{ it * factor }.sum()\nt",
+            locals + "val t get() = items.map(@Suppress(\"x\") { it * factor }).sum()\nt",
+            // declared by the script without a receiver of the lambda
+            "fun <T> twice(block: () -> T) = listOf(block(), block())\n" + locals + "val t get() = items.size + twice { factor }.sum()\nt",
+            // not a function
+            "class Page(val count: Int)\n" + locals + "val t get() = items.count { it > factor }\nt",
+            "fun process(map: String) = map\n" + locals + "val t get() = items.map { it * factor }.sum()\nt",
+            // a moved function is resolved like in the script
+            "class Box { fun g() = \"box\" }\n@JvmName(\"gg\") fun g() = \"script\"\nval items = listOf(1)\nval t get() = items.size.toString() + with(Box()) { g() }\nt"
+        )
 
         // when
-        val source = ScriptSource(script)
+        val sources = scripts.map { ScriptSource(it) }
 
         // then
-        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
-        assert("get()" !in moved && " by object " in body)
+        sources.forEach { source ->
+            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            assert("get()" !in moved && " by object " in body)
+        }
+    }
+
+    @Test
+    fun `should keep property with accessor reading local property and annotations applicable to local variable as delegated property`() {
+        // given
+        val scripts = listOf(
+            "val items = listOf(1)\n@OptIn(ExperimentalStdlibApi::class)\nval t get() = items.size\nt",
+            "@Target(AnnotationTarget.PROPERTY, AnnotationTarget.LOCAL_VARIABLE)\nannotation class Tag\nval items = listOf(1)\n@Tag\nval t get() = items.size\nt",
+            "annotation class Tag\nval items = listOf(1)\n@Tag @Suppress(\"unused\")\nval t get() = items.size\nt"
+        )
+
+        // when
+        val sources = scripts.map { ScriptSource(it) }
+
+        // then
+        sources.forEach { source ->
+            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            assert("get()" !in moved && " by object " in body)
+        }
     }
 
     @Test

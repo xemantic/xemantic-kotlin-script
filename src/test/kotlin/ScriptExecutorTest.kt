@@ -2019,7 +2019,12 @@ class ScriptExecutorTest {
             // named like a member of the receivers, though declared before
             "val items = listOf(1)\nval isActive get() = items.isEmpty()\nval t get() = items.size.toString() + isActive\nt",
             // within the lambdas without a receiver
-            "val threshold = listOf(1).first()\nval items = listOf(1, 2, 3)\nval n get() = items.count { it > threshold }.toString() + items.map { it * threshold }.sum()\nn"
+            "val threshold = listOf(1).first()\nval items = listOf(1, 2, 3)\nval n get() = items.count { it > threshold }.toString() + items.map { it * threshold }.sum()\nn",
+            "val factor = listOf(2).first()\nval items = listOf(1, 2)\nval t get() = items.zip(items) { a, b -> a + b * factor }.sum()\nt",
+            "fun <T> twice(block: () -> T) = listOf(block(), block())\nval factor = listOf(2).first()\nval items = listOf(1, 2)\nval t get() = items.map label@{ it * factor }.sum() + twice { factor }.sum()\nt",
+            "class Box { fun g() = \"box\" }\n@JvmName(\"gg\") fun g() = \"script\"\nval items = listOf(1)\nval t get() = items.size.toString() + with(Box()) { g() }\nt",
+            // with the annotations applicable to a local variable
+            "val items = listOf(1)\n@OptIn(ExperimentalStdlibApi::class)\nval t get() = items.size\nt"
         )
         val executor = ScriptExecutor()
 
@@ -2027,7 +2032,7 @@ class ScriptExecutorTest {
         val results = scripts.map { executor.execute(it) }
 
         // then
-        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("[20, 2]20", "[10, 2]10", 12, "total: 6", 6, 6, 9, "local!1", "1false", "26"))
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("[20, 2]20", "[10, 2]10", 12, "total: 6", 6, 6, 9, "local!1", "1false", "26", 9, 10, "1script", 1))
     }
 
     @Test
@@ -2055,7 +2060,11 @@ class ScriptExecutorTest {
         val result = executor.execute(script)
 
         // then
-        assert((result as? ScriptResult.Error)?.phase == ExecutionPhase.COMPILATION)
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            have("'t' is compiled outside of the script body, where 'items' (line 3) is not visible" in message)
+        }
     }
 
     @Test
@@ -4080,7 +4089,10 @@ class ScriptExecutorTest {
             "val log = mutableListOf<String>()\ninline fun <T> logged(name: String, crossinline block: () -> T, noinline after: () -> Unit = { }): T {\n    log += name\n    return block().also { after() }\n}\n" +
                     "val r = logged(\"a\", { for (i in 1..5) { if (i == 2) break }; if (log.size > 5) return@logged 0; 7 }) { log += \"after\" }\nr.toString() + log",
             "val items = mutableListOf(1, 2)\n@Suppress(\"NOTHING_TO_INLINE\") private inline fun total() = items.sum()\nitems += 3\ntotal()",
-            "val log = mutableListOf<String>()\nsuspend inline fun step(block: suspend () -> Unit) { log += \"s\"; block() }\nstep { kotlinx.coroutines.delay(1) }\nlog"
+            "val log = mutableListOf<String>()\nsuspend inline fun step(block: suspend () -> Unit) { log += \"s\"; block() }\nstep { kotlinx.coroutines.delay(1) }\nlog",
+            // called within the lambdas without a receiver
+            "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"a\"; block() }\nlistOf(1).forEach { logged { } }\nlog",
+            "val log = mutableListOf<Int>()\nvar x = 1\ninline fun i(block: () -> Unit) { block(); log += x }\nfun h() { log += x }\ninline fun j(block: () -> Unit) { block(); h() }\ni { j { } }\nx = 2\ni { j { } }\nlog"
         )
         val executor = ScriptExecutor()
 
@@ -4088,7 +4100,7 @@ class ScriptExecutorTest {
         val results = scripts.map { executor.execute(it) }
 
         // then
-        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(listOf("h"), "7[a, after]", 6, listOf("s")))
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(listOf("h"), "7[a, after]", 6, listOf("s"), listOf("a"), listOf(1, 1, 2, 2)))
     }
 
     @Test
