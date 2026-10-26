@@ -34,6 +34,12 @@ private val unresolvedReference = Regex("Unresolved reference '(.+)'\\.")
 /** Reported without a location, e.g. for an object accessing the dependencies, which are the members of the script class. */
 private val declarationCapturingScript = Regex("(Object|Enum class|Interface|Nested class) '(.+)' captures the script class instance\\..*")
 
+/**
+ * The first line of the failure of the compiler backend, reported without a location, followed by the intermediate representation of the code,
+ * with the name of the generated function, if it is one, and the path of the declaration containing it within the script class, if any, like `T.I`.
+ */
+private val backendCrash = Regex("Exception while generating code for (?:.* fun (\\S+) .*|.*) declared in (.+):")
+
 internal fun Iterable<ScriptDiagnostic>.filterNonIgnorable() = filterNot { diagnostic ->
     diagnostic.severity == ScriptDiagnostic.Severity.DEBUG && listOf(
         "Using JDK home inferred from java.home",
@@ -353,6 +359,18 @@ internal class ScriptErrorReporter(
             appendSeverityAndMessage(diagnostic)
             return
         }
+        if (location == null) {
+            val firstLine = diagnostic.message.lineSequence().first()
+            backendCrash.matchEntire(firstLine)?.let { match ->
+                // qualified by the package of the script, or by `<root>`, followed by the script class
+                val qualifiedPath = match.groupValues[2]
+                val path = listOf("<root>.", "${source.packageName}.").firstOrNull { qualifiedPath.startsWith(it) }?.let {
+                    qualifiedPath.removePrefix(it).split('.').drop(1)
+                }.orEmpty()
+                appendBackendCrash(diagnostic, firstLine.removeSuffix(":"), match.groupValues[1], path)
+                return
+            }
+        }
         val capturing = declarationCapturingScript.matchEntire(diagnostic.message)?.groupValues
         val capturingDeclaration = capturing?.get(2)
         val range = if (location != null) {
@@ -388,6 +406,50 @@ internal class ScriptErrorReporter(
             +"  hint: '$capturingDeclaration' is compiled outside of the script body, where $article $kind cannot access the dependencies,"
             +" nor the functions of the script - ${alternative}pass them as parameters.\n"
         }
+    }
+
+    /**
+     * The crash of the compiler backend while generating the [function] within the declaration of this [path], if any,
+     * explained by the callable references of all the classes moved out of the script body to the members of the script class,
+     * if the declaration moved out of the script body containing the code has any,
+     * as the compiler stops at the first crash, otherwise by the first line of the [message] and of its root cause,
+     * without the intermediate representation of the code, at the innermost declaration of the [path] found in the script.
+     */
+    private fun StringBuilder.appendBackendCrash(
+        diagnostic: ScriptDiagnostic,
+        message: String,
+        function: String,
+        path: List<String>
+    ) {
+        val references = source.scriptMemberCallableReferences
+        if (references.any { (reference) -> source.movedDeclarationAt(reference.start) == path.firstOrNull() }) {
+            references.forEachIndexed { index, (reference, text) ->
+                val start = reference.start
+                val end = reference.end
+                val name = reference.name
+                if (index > 0) +'\n'
+                appendPosition(start)
+                appendSeverityAndMessage(
+                    diagnostic.copy(message = "The compiler crashed generating the callable reference '$text'.", exception = null)
+                )
+                appendSourceLines(start, end)
+                +"  hint: '${source.movedDeclarationAt(start)}' is compiled outside of the script body, where a callable reference to '$name' of the script crashes the compiler"
+                +" - replace it with a lambda using '$name'.\n"
+            }
+            return
+        }
+        val range = source.movedDeclarationPath(path.ifEmpty { listOf(function) })
+        val rootCause = generateSequence(diagnostic.exception) { cause ->
+            cause.read(null) { this.cause }?.takeIf { it !== cause }
+        }.take(MAX_REPORTED_EXCEPTIONS).lastOrNull()
+        val causeLine = rootCause?.let { cause ->
+            listOfNotNull(cause.javaClass.name, cause.read(null) { this.message }?.lineSequence()?.first()).joinToString(": ")
+        }
+        range?.let { appendPosition(it.first) }
+        appendSeverityAndMessage(
+            diagnostic.copy(message = listOfNotNull(message, causeLine?.let { "Caused by: $it" }).joinToString("\n"), exception = null)
+        )
+        range?.let { appendSourceLines(it.first, it.second) }
     }
 
     /** The hint of the declaration moved out of the script body referring to the [name] declared at the 0-based [line] of the script body. */
