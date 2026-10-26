@@ -29,6 +29,12 @@ private const val MAX_REPEATED_FRAMES = 16
 /** The most exceptions reported, including causes and suppressed ones, as the script might chain them endlessly. */
 private const val MAX_REPORTED_EXCEPTIONS = 32
 
+/** The most causes of an internal failure reported, as they tell little about the script. */
+private const val MAX_INTERNAL_FAILURE_CAUSES = 8
+
+/** The longest message of an internal failure reported, as it might carry a dump of the bytecode, or of the source. */
+private const val MAX_INTERNAL_FAILURE_MESSAGE_LENGTH = 500
+
 private val unresolvedReference = Regex("Unresolved reference '(.+)'\\.")
 
 /** Reported without a location, e.g. for an object accessing the dependencies, which are the members of the script class. */
@@ -63,7 +69,19 @@ internal class ScriptErrorReporter(
 
     fun toFailureMessage(
         diagnostics: List<ScriptDiagnostic>
-    ): String = diagnostics.describe().joinToString(separator = "\n").trimEnd().ifEmpty {
+    ): String = diagnostics.toFailureMessage(compilation = false)
+
+    /**
+     * Like [toFailureMessage], while the errors carrying an exception are the internal failures of the compiler,
+     * reported without its stack traces, and generated names.
+     */
+    fun toCompilationFailureMessage(
+        diagnostics: List<ScriptDiagnostic>
+    ): String = diagnostics.toFailureMessage(compilation = true)
+
+    private fun List<ScriptDiagnostic>.toFailureMessage(
+        compilation: Boolean
+    ): String = describe(compilation).joinToString(separator = "\n").trimEnd().ifEmpty {
         // e.g. when all the diagnostics of the failure were ignorable
         "error: Failed without any diagnostic message."
     }
@@ -85,9 +103,62 @@ internal class ScriptErrorReporter(
     }.trimEnd()
 
     /** The descriptions of the diagnostics, without the repeated ones, e.g. of the same type used twice in an accessor. */
-    private fun List<ScriptDiagnostic>.describe(): List<String> = map { diagnostic ->
-        buildString { appendDiagnostic(diagnostic) }
+    private fun List<ScriptDiagnostic>.describe(
+        compilation: Boolean = false
+    ): List<String> = map { diagnostic ->
+        buildString {
+            val exception = diagnostic.exception
+            if (
+                compilation && exception != null && diagnostic.severity == ScriptDiagnostic.Severity.ERROR
+                // reported at the declarations of the script instead, see appendBackendCrash
+                && !(diagnostic.location == null && backendCrash.matches(diagnostic.message.lineSequence().first()))
+            ) {
+                appendCompilerFailure(diagnostic, exception)
+            } else {
+                appendDiagnostic(diagnostic)
+            }
+        }
     }.distinct()
+
+    /**
+     * The [exception] the compiler failed with internally, reported as the [diagnostic],
+     * like `While analysing $1.kts:6:15: ...: Exception in expression checkers`,
+     * at the position in the script, if its location, or its message, refers to one.
+     */
+    private fun StringBuilder.appendCompilerFailure(
+        diagnostic: ScriptDiagnostic,
+        exception: Throwable
+    ) {
+        val location = diagnostic.location
+        location?.let { source.preambleDependencyAt(it.start.line) }?.let { dependency ->
+            +"dependency '$dependency': "
+        }
+        // only the lines of the script, not the generated ones
+        val range = if (location != null) {
+            source.toScriptLine(location.start.line)?.let { line ->
+                val start = ScriptPosition(line, (location.start.col - 1).coerceAtLeast(0))
+                val end = location.end?.let {
+                    source.toScriptPosition(it.line, it.col)
+                }?.takeIf {
+                    (it.line > start.line) || (it.line == start.line && it.column >= start.column)
+                } ?: start
+                start to end
+            }
+        } else {
+            source.generatedLocations().find(diagnostic.message)?.let { source.scriptLineAndColumn(it) }?.let { (line, column) ->
+                column?.let { ScriptPosition(line, (it - 1).coerceAtLeast(0)) }
+            }?.let { it to it }
+        }
+        range?.let { appendPosition(it.first) }
+        +"error: The compiler failed internally: "
+        appendInternalFailure(exception, diagnostic.message) { it.toScriptLocations(listOf(source)) }
+        if (range != null) {
+            appendSourceLines(range.first, range.second)
+            +"  hint: it is a failure of the compiler itself - express this code differently.\n"
+        } else {
+            +"  hint: it is a failure of the compiler itself - express the script differently.\n"
+        }
+    }
 
     /** The failure recognized in the [source] before compiling it. */
     fun toSourceFailureMessage(): String = source.unmatchedClosingBrace?.let {
@@ -222,8 +293,7 @@ internal class ScriptErrorReporter(
         val message = try {
             throwable.message
         } catch (e: Throwable) {
-            val description = listOfNotNull(e.javaClass.name, e.read(null) { message }).joinToString(": ")
-            "[message unavailable: $description]"
+            "[message unavailable: ${e.description()}]"
         }
         message?.let {
             +": "
@@ -523,6 +593,130 @@ internal class ScriptErrorReporter(
     }
 
 }
+
+/**
+ * The failure message of the [throwable] failing the compilation internally, rather than the error of the script,
+ * e.g. of the compiler, or of this library preparing the compilation,
+ * referring to the script instead of the compiled [sources], see [toScriptLocations].
+ */
+internal fun internalFailureMessage(
+    throwable: Throwable,
+    sources: Collection<ScriptSource> = emptyList()
+): String = buildString {
+    +"error: The script could not be compiled because of an internal failure: "
+    appendInternalFailure(throwable) { it.toScriptLocations(sources) }
+}.trimEnd()
+
+/**
+ * This message, with the locations in the compiled [sources], like `$1.kts:6:15`, `$1.kts:6`, or `(6,15) in /$1.kts`,
+ * replaced by the ones in the script, like `script.kts:2:15`, or just `script.kts`, if not in a line of the script.
+ */
+internal fun String.toScriptLocations(
+    sources: Collection<ScriptSource>
+): String = sources.fold(this) { message, source ->
+    source.generatedLocations().replace(message) { match ->
+        source.scriptLineAndColumn(match)?.let { (line, column) ->
+            "script.kts:${line + 1}" + (column?.let { ":${it.coerceAtLeast(1)}" } ?: "")
+        } ?: "script.kts"
+    }
+}
+
+/** The locations in the [ScriptSource.text], see [toScriptLocations]. */
+private fun ScriptSource.generatedLocations(): Regex {
+    val name = Regex.escape(locationId)
+    return Regex("\\((\\d+),(\\d+)\\) in /?$name|$name(?::(\\d+)(?::(\\d+))?)?")
+}
+
+/**
+ * The 0-based line of the script, and the 1-based column, if any, of the location matched by the [generatedLocations],
+ * or `null`, if it is not in a line of the script.
+ */
+private fun ScriptSource.scriptLineAndColumn(
+    match: MatchResult
+): Pair<Int, Int?>? {
+    val line = (match.groups[1] ?: match.groups[3])?.value?.toIntOrNull()?.let { toScriptLine(it) } ?: return null
+    return line to (match.groups[2] ?: match.groups[4])?.value?.toIntOrNull()
+}
+
+/**
+ * The [throwable] and its causes, following the [header], if any, without their stack traces, which are internal,
+ * and without the ones just wrapping their causes, like the copies made by the coroutine stack trace recovery,
+ * or described by the [header] already, with their messages bounded, and rewritten by the [rewrite], e.g. to replace the generated names.
+ */
+private fun StringBuilder.appendInternalFailure(
+    throwable: Throwable,
+    header: String? = null,
+    rewrite: (String) -> String
+) {
+    var reported = 0
+    fun appendMessage(message: String) {
+        val rewritten = rewrite(message).trimEnd()
+        val bounded = if (rewritten.length > MAX_INTERNAL_FAILURE_MESSAGE_LENGTH) {
+            rewritten.take(MAX_INTERNAL_FAILURE_MESSAGE_LENGTH) + "... [TRUNCATED]"
+        } else {
+            rewritten
+        }
+        bounded.lines().joinTo(this, "\n  ")
+        +'\n'
+        reported++
+    }
+    header?.let { appendMessage(it) }
+    val visited = Collections.newSetFromMap<Throwable>(IdentityHashMap())
+    var current: Throwable? = throwable
+    while (current != null && visited.add(current)) {
+        val cause = current.read(null) { cause }
+        val isWrapper = cause != null && cause !in visited && current.wraps(cause)
+        if (!isWrapper && (header == null || !current.isDescribedBy(header))) {
+            if (reported == MAX_INTERNAL_FAILURE_CAUSES) {
+                +"  [FURTHER CAUSES OMITTED]\n"
+                return
+            }
+            if (reported > 0) +"  Caused by: "
+            +current.javaClass.name
+            val message = current.read(null) { message }
+            if (message != null) {
+                +": "
+                appendMessage(message)
+            } else {
+                +'\n'
+                reported++
+            }
+        }
+        current = cause
+    }
+}
+
+/**
+ * Whether this exception just wraps the [cause], like `RuntimeException(cause)`,
+ * or its copy made by the coroutine stack trace recovery,
+ * or `While analysing $1.kts:6:15: ` followed by the description of the cause.
+ */
+private fun Throwable.wraps(
+    cause: Throwable
+): Boolean {
+    val message = read(null) { message }
+    if (javaClass == cause.javaClass && message == cause.read(null) { this.message }) return true
+    return message != null && cause.isDescribedBy(message)
+}
+
+/** Whether the [message] is this exception's own, or its description, or ends with the description including its message. */
+private fun Throwable.isDescribedBy(
+    message: String
+): Boolean {
+    val ownMessage = read(null) { this.message }
+    val description = description()
+    return message == ownMessage
+            || message == description
+            || message == read(null) { toString() }
+            // the description of an exception without a message is just its class name, which the message might only mention
+            || (ownMessage != null && message.endsWith(": $description"))
+}
+
+/** The class name and the message, unless it cannot be read, as the exception might override it. */
+private fun Throwable.description(): String = listOfNotNull(
+    javaClass.name,
+    read(null) { message }
+).joinToString(": ")
 
 /** Like in [StackTraceElement.toString], e.g. `Native Method`, instead of the negative line number. */
 private val StackTraceElement.source: String get() = when {

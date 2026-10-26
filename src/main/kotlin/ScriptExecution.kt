@@ -22,6 +22,7 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ThreadContextElement
 import kotlinx.coroutines.async
@@ -39,6 +40,7 @@ import kotlin.concurrent.atomics.incrementAndFetch
 import kotlin.coroutines.CoroutineContext
 import kotlin.reflect.KClass
 import java.lang.reflect.Modifier
+import java.util.Collections
 import kotlin.reflect.KFunction
 import kotlin.reflect.KVisibility
 import kotlin.reflect.full.extensionReceiverParameter
@@ -121,8 +123,8 @@ internal class DefaultScriptExecutor(
     }
 
     private val compilationCache = if (compilationCacheSize > 0) {
-        ScriptCompilationCache<Compilation>(compilationCacheSize) {
-            it.result is ResultWithDiagnostics.Success
+        ScriptCompilationCache<CompilationOutcome>(compilationCacheSize) {
+            it is Compilation && it.result is ResultWithDiagnostics.Success
         }
     } else {
         null
@@ -147,7 +149,7 @@ internal class DefaultScriptExecutor(
      * Built on the first compilation, on the [dispatcher], as resolving the whole classpath
      * would otherwise block the caller creating the executor, even if it never executes a script.
      * The concurrent first compilations wait for it, holding their permits,
-     * while its failure, reported as the internal failure of the compiler, is not kept,
+     * while its failure, reported as an internal failure, is not kept,
      * so the next compilation resolves the classpath again, as the failure might be transient.
      */
     private val compilationConfigurationTemplate by lazy {
@@ -201,6 +203,9 @@ internal class DefaultScriptExecutor(
         return result
     }
 
+    /** What compiling the script gives, shared with the callers waiting for it in the cache. */
+    private sealed interface CompilationOutcome
+
     /**
      * The [source] of the script, together with the [result] of its compilation,
      * or `null`, if the script was not compiled because of the failure recognized in its source.
@@ -212,7 +217,12 @@ internal class DefaultScriptExecutor(
         val confirmedFailures: List<String> = emptyList(),
         /** The positions of the errors of the compilation explained by the [confirmedFailures], which are omitted. */
         val explainedErrors: Set<ScriptPosition> = emptySet()
-    )
+    ) : CompilationOutcome
+
+    /** The compilation failed without giving a result, e.g. internally, reported with the failure [message]. */
+    private class FailedCompilation(
+        val message: String
+    ) : CompilationOutcome
 
     private inner class ScriptHandler(
         private val scriptId: Int,
@@ -234,24 +244,9 @@ internal class DefaultScriptExecutor(
         private val reporter by lazy { ScriptErrorReporter(source) }
 
         suspend fun handle(): ScriptResult {
-            val compilation = try {
-                compile()
-            } catch (_: StackOverflowError) {
-                // thrown by parsing the script, while the compiler reports it as a diagnostic
-                return ScriptResult.Error(
-                    "error: The script is nested too deeply to be parsed.",
-                    ExecutionPhase.COMPILATION
-                )
-            } catch (e: Throwable) {
-                e.rethrowIfCancelledOrFatal()
-                // the internal failure of the parser, or of the compiler, shared by the callers waiting in the cache
-                logger.warn(e) { "Script[$scriptId]: Compilation (1/2) failed internally" }
-                return ScriptResult.Error(
-                    "error: The script could not be compiled because of an internal failure of the compiler: "
-                            // the callers waiting in the cache receive the copy recovered by kotlinx.coroutines
-                            + e.unwrapRecoveredCopy().let { listOfNotNull(it, it.cause) }.joinToString(", caused by: "),
-                    ExecutionPhase.COMPILATION
-                )
+            val compilation = when (val outcome = compile()) {
+                is Compilation -> outcome
+                is FailedCompilation -> return compilationFailure(outcome.message)
             }
             source = compilation.source
             val compilationResult = compilation.result ?: return compilationFailure(
@@ -265,7 +260,7 @@ internal class DefaultScriptExecutor(
                             source.toScriptPosition(start.line, start.col) in compilation.explainedErrors
                         } == true
                     }?.takeIf { reports -> reports.any { it.severity == ScriptDiagnostic.Severity.ERROR } }?.let {
-                        reporter.toFailureMessage(it)
+                        reporter.toCompilationFailureMessage(it)
                     }
                 )).joinToString(separator = "\n\n")
                 return compilationFailure(failureMessage)
@@ -280,7 +275,7 @@ internal class DefaultScriptExecutor(
                     )
                 }
                 is Failure -> compilationFailure(
-                    reporter.toFailureMessage(compilationResult.reports.filterNonIgnorable())
+                    reporter.toCompilationFailureMessage(compilationResult.reports.filterNonIgnorable())
                 )
             }
 
@@ -296,7 +291,7 @@ internal class DefaultScriptExecutor(
             return ScriptResult.Error(failureMessage, ExecutionPhase.COMPILATION)
         }
 
-        private suspend fun compile(): Compilation {
+        private suspend fun compile(): CompilationOutcome {
 
             logger.debug { "Script[$scriptId]: Compiling (1/2)" }
 
@@ -307,11 +302,11 @@ internal class DefaultScriptExecutor(
                         script = script,
                         dependencies = allDependencies.map { it.name to it.type }
                     ),
-                    ::doCompile
-                ) ?: doCompile()
+                    ::compileOrFail
+                ) ?: compileOrFail()
             }
 
-            when (compilation.result) {
+            when ((compilation as? Compilation)?.result) {
                 is Success -> logger.debug {
                     "Script[$scriptId]: Compilation (1/2) succeeded after $duration"
                 }
@@ -323,21 +318,67 @@ internal class DefaultScriptExecutor(
             return compilation
         }
 
-        private suspend fun doCompile(): Compilation {
-            val source = source()
+        /**
+         * The [doCompile], or its internal failure, logged once, as it is shared with the callers waiting for it in the cache,
+         * unless it is the cancellation of the caller, or fatal, see [rethrowIfCancelledOrFatal],
+         * or the interruption of the thread, all of which are thrown.
+         */
+        private suspend fun compileOrFail(): CompilationOutcome = try {
+            doCompile().also { outcome ->
+                // the crashes of the compiler, reported without the stack traces
+                (outcome as? Compilation)?.result?.reports?.forEach { diagnostic ->
+                    if (diagnostic.severity == ScriptDiagnostic.Severity.ERROR) diagnostic.exception?.let {
+                        logger.warn(it) { "Script[$scriptId]: Compilation (1/2) failed internally: ${diagnostic.message}" }
+                    }
+                }
+            }
+        } catch (e: Throwable) {
+            e.rethrowIfCancelledOrFatal()
+            // like the compiler reporting it as a diagnostic
+            e.fatalCause()?.let { throw it }
+            // with the interrupt status restored where it was caught, see compile(source)
+            if (e is InterruptedException) throw e
+            logger.warn(e) { "Script[$scriptId]: Compilation (1/2) failed internally" }
+            FailedCompilation(internalFailureMessage(e, compiledSources))
+        }
+
+        /** The sources compiled for the script, which the messages of the internal failures might refer to. */
+        private val compiledSources: MutableList<ScriptSource> = Collections.synchronizedList(mutableListOf())
+
+        private suspend fun doCompile(): CompilationOutcome {
+            // the sources of all the compilations are derived from the script parsed once
+            val parsed: ScriptSource.Parsed
+            val source: ScriptSource
+            try {
+                parsed = ScriptSource.Parsed(script, preambleDependencies)
+                source = parsed.source()
+            } catch (_: StackOverflowError) {
+                // while the compiler reports it as a diagnostic, and its other failures are internal
+                return FailedCompilation("error: The script is nested too deeply to be parsed.")
+            }
             if (source.unmatchedClosingBrace != null || source.conflictingDependencyDeclarations.isNotEmpty()) {
                 return Compilation(source, result = null)
             }
-            val result = compile(source)
-            // unless already reported as unresolved
-            val errors = result.reports.filter { it.severity == ScriptDiagnostic.Severity.ERROR }.mapNotNull { diagnostic ->
-                diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }
+            if (source.candidates.isEmpty()) return Compilation(source, compile(source))
+            // the confirming compilations do not depend on this one
+            return coroutineScope {
+                confirm(parsed, source, async { compile(source) })
             }
+        }
+
+        /**
+         * The compilation of the [source], with its [ScriptSource.candidates] confirmed by the confirming compilations,
+         * while it is being [compiled].
+         */
+        private suspend fun confirm(
+            parsed: ScriptSource.Parsed,
+            source: ScriptSource,
+            compiled: Deferred<ResultWithDiagnostics<CompiledScript>>
+        ): Compilation {
             val candidates = source.candidates
-            if (candidates.isEmpty()) return Compilation(source, result)
             // the types of the local properties, which are known only to the compiler, see ScriptSource.untypedPropertyCalls
             val propertyTypes = if (source.untypedProperties.isEmpty()) emptyMap() else {
-                val typeProbes = source(propertyTypeProbes = true)
+                val typeProbes = parsed.source(propertyTypeProbes = true)
                 val unexpected = mutableListOf<String>()
                 val types = typeProbes.propertyTypes(compile(typeProbes).reports) { unexpected += it.message }
                 val (mismatches, others) = unexpected.partition { it.startsWith("Initializer type mismatch") }
@@ -348,10 +389,10 @@ internal class DefaultScriptExecutor(
                 types
             }
             // recognizing the candidates referring to the wrong declarations indeed
-            val probe = source(confirming = true, propertyTypes = propertyTypes)
+            val probe = parsed.source(confirming = true, propertyTypes = propertyTypes)
             // only the calls of the properties of unknown types, which cannot be confirmed without their copies
             if (probe.copiedProperties.isEmpty() && candidates.all { it in source.untypedPropertyCalls }) {
-                return Compilation(source, result)
+                return Compilation(source, compiled.await())
             }
             /**
              * The positions, from the start to the end, if known, of the warnings of the deprecated,
@@ -376,6 +417,11 @@ internal class DefaultScriptExecutor(
                 message: String
             ) = markedRanges(source, message).map { it.first }
             val reports = compile(probe).reports
+            val result = compiled.await()
+            // unless already reported as unresolved
+            val errors = result.reports.filter { it.severity == ScriptDiagnostic.Severity.ERROR }.mapNotNull { diagnostic ->
+                diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }
+            }
             // unlike the other ones, the calls of which cannot be confirmed
             val confirmedTypes = probe.confirmedPropertyTypes(reports)
             fun deprecated(
@@ -434,13 +480,13 @@ internal class DefaultScriptExecutor(
                         }
                     }
                 }
-                val inferred = copies(inInferredTypes) { source(confirming = true, overloadingFunctionCopies = true) }
-                val declared = copies(inDeclaredTypes) { source(confirming = true, shadowedFunctionCopies = true) }
+                val inferred = copies(inInferredTypes) { parsed.source(confirming = true, overloadingFunctionCopies = true) }
+                val declared = copies(inDeclaredTypes) { parsed.source(confirming = true, shadowedFunctionCopies = true) }
                 val shadowed = async { (inferred.await() + declared.await()).distinctBy { it.reference } }
                 // also declaring the copies of the constructors of the local classes, see ScriptSource.laterDeclaredClassCandidates
                 val scopeCopies = async {
                     if (confirmedCandidates.isEmpty() && source.laterDeclaredClassCandidates.isEmpty()) null else {
-                        val copies = source(confirming = true, coroutineScopeCopies = true)
+                        val copies = parsed.source(confirming = true, coroutineScopeCopies = true)
                         copies to compile(copies).reports
                     }
                 }
@@ -505,27 +551,10 @@ internal class DefaultScriptExecutor(
             }
         }
 
-        private fun source(
-            confirming: Boolean = false,
-            shadowedFunctionCopies: Boolean = false,
-            overloadingFunctionCopies: Boolean = false,
-            coroutineScopeCopies: Boolean = false,
-            propertyTypeProbes: Boolean = false,
-            propertyTypes: Map<String, String> = emptyMap()
-        ) = ScriptSource(
-            script = script,
-            dependencies = preambleDependencies,
-            confirming = confirming,
-            shadowedFunctionCopies = shadowedFunctionCopies,
-            overloadingFunctionCopies = overloadingFunctionCopies,
-            coroutineScopeCopies = coroutineScopeCopies,
-            propertyTypeProbes = propertyTypeProbes,
-            propertyTypes = propertyTypes
-        )
-
         private suspend fun compile(
             source: ScriptSource
         ): ResultWithDiagnostics<CompiledScript> {
+            compiledSources += source
             val result = try {
                 compilationPermits.withPermit {
                     // resolving the classpath on the first compilation, which is not counted if it fails
@@ -543,9 +572,13 @@ internal class DefaultScriptExecutor(
                 // otherwise it would silently cancel the active caller, and the ones waiting in the cache, instead of failing them
                 currentCoroutineContext().ensureActive()
                 throw IllegalStateException("The compilation of the script was cancelled", e)
+            } catch (e: InterruptedException) {
+                // only the one of this thread, not the one causing a failure of another thread
+                throwRestoringInterruptStatus(e)
             }
             // the compiler reports what it throws as a diagnostic, like `error: Java heap space`, not an error of the script
             result.reports.firstNotNullOfOrNull { it.exception?.fatalCause() }?.let { throw it }
+            result.reports.firstNotNullOfOrNull { it.exception as? InterruptedException }?.let { throwRestoringInterruptStatus(it) }
             return result
         }
 
@@ -706,14 +739,30 @@ private suspend fun Throwable.rethrowIfCancelledOrFatal() {
  * This exception, or its first cause, which is a [VirtualMachineError] other than [StackOverflowError],
  * see [rethrowIfCancelledOrFatal], if any.
  */
-private fun Throwable.fatalCause(): Throwable? = generateSequence(this) { exception ->
-    exception.read(null) { cause }?.takeUnless { it === exception }
-}.take(MAX_FATAL_CAUSE_DEPTH).firstOrNull {
+private fun Throwable.fatalCause(): Throwable? = firstCause {
     it is VirtualMachineError && it !is StackOverflowError
 }
 
+/**
+ * Throws the [interruption] caught by this thread, restoring its interrupt status,
+ * as the interruption, like on shutdown, is not a failure of the compilation.
+ */
+private fun throwRestoringInterruptStatus(
+    interruption: InterruptedException
+): Nothing {
+    Thread.currentThread().interrupt()
+    throw interruption
+}
+
+/** This exception, or its first cause, matching the [predicate], if any. */
+private fun Throwable.firstCause(
+    predicate: (Throwable) -> Boolean
+): Throwable? = generateSequence(this) { exception ->
+    exception.read(null) { cause }?.takeUnless { it === exception }
+}.take(MAX_CAUSE_DEPTH).firstOrNull(predicate)
+
 /** Bounds the chain of causes, which might be cyclic. */
-private const val MAX_FATAL_CAUSE_DEPTH = 100
+private const val MAX_CAUSE_DEPTH = 100
 
 /**
  * The original exception, if this one is its copy made by the coroutine stack trace recovery,

@@ -46,7 +46,7 @@ internal class ScriptCompilationCache<T : Any>(
     )
 
     /**
-     * The compilations, completed with `null` when the compiling caller was cancelled,
+     * The compilations, completed with `null` when the compiling caller was cancelled, or interrupted,
      * in the order of access, while the ones in progress are never evicted,
      * so there might be more of them than the [maxSize].
      */
@@ -54,7 +54,9 @@ internal class ScriptCompilationCache<T : Any>(
 
     /**
      * @param compile throws [CancellationException] only when its caller is cancelled,
-     *   as the waiting callers would be cancelled by it as well.
+     *   as the waiting callers would be cancelled by it as well,
+     *   and [InterruptedException] only when the thread of its caller is interrupted,
+     *   after both of which the waiting callers compile again.
      */
     suspend fun getOrCompile(
         key: Key,
@@ -70,7 +72,7 @@ internal class ScriptCompilationCache<T : Any>(
                 }
             }
             if (!owner) {
-                // the compiling caller was cancelled, compile again
+                // the compiling caller was cancelled, or interrupted, compile again
                 return entry.await() ?: continue
             }
             try {
@@ -83,8 +85,8 @@ internal class ScriptCompilationCache<T : Any>(
                 return result
             } catch (e: Throwable) {
                 remove(key, entry)
-                // unlike the cancellation of the caller, the failure of the compilation is shared
-                if (e is CancellationException) entry.complete(null) else entry.completeExceptionally(e)
+                // unlike the cancellation, or the interruption, of the caller, the failure of the compilation is shared
+                if (e is CancellationException || e is InterruptedException) entry.complete(null) else entry.completeExceptionally(e)
                 throw e
             }
         }
