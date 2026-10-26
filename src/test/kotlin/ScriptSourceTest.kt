@@ -66,6 +66,39 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should probe the types of local properties called by moved declarations on the lines following them`() {
+        // given
+        val script = """
+            val print = printer() // trailing
+            val trim = trimmer(); val x = 1
+            val sum = (10L * 2) + 1
+            val (log, n) = logger() to 1
+            sealed class S { fun f() = print(1) + " a ".trim() + log(n) + listOf(1, 2).sum() }
+        """.trimIndent()
+
+        // when
+        val sources = listOf(script, script.replace("\n", "\r\n")).map { ScriptSource(it, propertyTypeProbes = true) }
+
+        // then
+        // unless another statement follows on the same line, or initialized with a literal, which cannot be called
+        assert(sources.all { it.untypedProperties == setOf("print", "log") })
+        // also following the lines terminated by `\r\n`
+        assert(sources.all { source ->
+            source.text.substringAfter(SCRIPT_BLOCK_START).lines().filter { it.isNotBlank() } == listOf(
+                "val print = printer() // trailing",
+                "val `_typeProbe_0`: _ScriptTypeProbe = `print`",
+                "val trim = trimmer(); val x = 1",
+                "val sum = (10L * 2) + 1",
+                "val (log, n) = logger() to 1",
+                "val `_typeProbe_1`: _ScriptTypeProbe = `log`",
+                // returned instead of the value of the last statement preceding the moved declaration
+                "null",
+                "} }"
+            )
+        })
+    }
+
+    @Test
     fun `should declare the copies of the local functions with the return types inferred only if inferred in the script`() {
         // given
         val script = """

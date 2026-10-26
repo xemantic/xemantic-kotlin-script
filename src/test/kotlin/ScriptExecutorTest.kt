@@ -4524,6 +4524,125 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report calls of declarations moved out of the script body to local properties of function types inferred by the compiler`() = runTest {
+        // given
+        val scripts = listOf(
+            "val log = mutableListOf<String>()\nfun printer(): (Any?) -> Unit = { log += it.toString() }\nval print = printer()\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()\nlog",
+            "val log = mutableListOf<String>()\nfun printer(): (Any?) -> Unit = { log += it.toString() }\nval (print, n) = printer() to 1\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()\nlog",
+            "val suffix = \"!\"\nfun trimmer(): String.() -> String = { \"local\" + suffix }\nval trim = trimmer()\nsealed class Shape { fun t() = \" a \".trim() }\nclass Circle : Shape()\nCircle().t()",
+            // of a class moved out of the script body, with the invoke operator
+            "val log = mutableListOf<String>()\nsealed class Base { operator fun invoke(m: Any?) { (this as Printer).log += m.toString() } }\nval print = Printer(log)\nclass Printer(val log: MutableList<String>) : Base()\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()\nlog"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+        assert(results.all { "does not refer to the property of the script body declared at line 3" in (it as ScriptResult.Error).message })
+    }
+
+    @Test
+    fun `should report calls of declarations moved out of the script body to local properties of literals made callable by imports`() = runTest {
+        // given
+        val scripts = listOf(
+            "import com.xemantic.kotlin.script.literal.invoke\nval print = 1 + 2\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()",
+            "import com.xemantic.kotlin.script.literal.*\nval print = 1 + 2\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+        assert(results.all { "does not refer to the property of the script body declared at line 2" in (it as ScriptResult.Error).message })
+    }
+
+    @Test
+    fun `should report calls of declarations moved out of the script body to local properties of inferred types on receivers named like packages`() = runTest {
+        // given
+        val scripts = listOf(
+            // inherited from a library class
+            "fun trimmer(): String.() -> String = { \"local\" }\nval trim = trimmer()\nsealed class S : Thread(\" a \") { fun f() = name.trim() }\nclass T : S()\nT().f()",
+            // the member of the receiver of a scope function
+            "fun trimmer(): String.() -> String = { \"local\" }\nval trim = trimmer()\nsealed class S { fun f() = with(\" a \" to 1) { first.trim() } }\nclass T : S()\nT().f()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+    }
+
+    @Test
+    fun `should report call of dependency before local class of the same name together with calls of local properties of inferred types named as invalid types`() = runTest {
+        // given
+        val script = "val p = 1\nval delay = java.util.Collections.emptyList<String>()\nsealed class Task { suspend fun go(): String { delay(1); return \"done\" } }\nclass Job1 : Task()\nval r = Foo(2)\nclass Foo(val v: Int) { fun g() = v + p }\nJob1().go() + r"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<(Int) -> Int>("Foo") { it * 100 }))
+
+        // then
+        assert(result is ScriptResult.Error && "'Foo' refers to the dependency, as the class 'Foo' of the script body is declared later" in result.message)
+    }
+
+    @Test
+    fun `should report calls of declarations moved out of the script body to local properties of inferred types despite suppressions of the probes`() = runTest {
+        // given
+        val script = "@file:Suppress(\"INITIALIZER_TYPE_MISMATCH\")\nval log = mutableListOf<String>()\nfun printer(): (Any?) -> Unit = { log += it.toString() }\nval print = printer()\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()\nlog"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert(result is ScriptResult.Error && "does not refer to the property of the script body declared at line 4" in result.message)
+    }
+
+    @Test
+    fun `should resolve calls of declarations moved out of the script body to local properties of inferred types the same with CRLF line terminators`() = runTest {
+        // given
+        val scripts = listOf(
+            "val log = mutableListOf<String>()\nfun printer(): (Any?) -> Unit = { log += it.toString() }\nval print = printer()\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()\nlog",
+            "val log = mutableListOf<String>()\nfun printer(): (Int) -> Unit = { }\nval print = printer()\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()\nlog"
+        )
+        val dependencies = listOf(dependency<(Any?) -> Unit>("print") { })
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, dependencies) }
+        val crlfResults = scripts.map { executor.execute(it.replace("\n", "\r\n"), dependencies) }
+
+        // then
+        assert(results.map { it::class } == listOf(ScriptResult.Error::class, ScriptResult.Value::class))
+        assert(crlfResults.map { it::class } == results.map { it::class })
+        assert((crlfResults[1] as ScriptResult.Value).value == (results[1] as ScriptResult.Value).value)
+    }
+
+    @Test
+    fun `should call library functions from declarations moved out of the script body when local properties of inferred types do not apply`() = runTest {
+        // given
+        val scripts = listOf(
+            "val log = mutableListOf<String>()\nfun printer(): (Int) -> Unit = { log += it.toString() }\nval print = printer()\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()\nlog",
+            "val log = mutableListOf<String>()\nfun printer(): ((Any?) -> Unit)? = { log += it.toString() }\nval print = printer()\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()\nlog",
+            // of the type the compiler names as an invalid one, `(Mutable)List<String!>!`
+            "val delay = java.util.Collections.emptyList<String>()\nsealed class Task { suspend fun go(): String { delay(1); return \"done\" } }\nclass Job1 : Task()\nJob1().go() + delay"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf<Any>(emptyList<String>(), emptyList<String>(), "done[]"))
+    }
+
+    @Test
     fun `should report wrongly resolved references after comments, of aliased function types and destructured names`() = runTest {
         // given
         val scripts = listOf(

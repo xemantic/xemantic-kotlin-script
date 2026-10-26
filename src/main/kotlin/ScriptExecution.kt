@@ -208,14 +208,10 @@ internal class DefaultScriptExecutor(
     private class Compilation(
         val source: ScriptSource,
         val result: ResultWithDiagnostics<CompiledScript>?,
-        /** The [ScriptSource.laterDeclaredDependencyCandidates], and the [ScriptSource.laterDeclaredClassCandidates], referring to the dependencies indeed. */
-        val laterDeclaredDependencyReferences: List<PrecedingReference> = emptyList(),
-        /** The [ScriptSource.hiddenLocalFunctionCandidates] referring to other functions indeed. */
-        val hiddenLocalFunctionReferences: List<LaterDeclaredReference> = emptyList(),
-        /** The [ScriptSource.coroutineScopeCandidates] resolved to the coroutine scope indeed. */
-        val coroutineScopeReferences: List<LaterDeclaredReference> = emptyList(),
-        /** The [ScriptSource.shadowedFunctionCandidates] which would call the functions in the script. */
-        val shadowedFunctionReferences: List<ShadowedFunctionReference> = emptyList()
+        /** The failure messages of the [ScriptSource.candidates] confirmed by the confirming compilations, one for each kind of them. */
+        val confirmedFailures: List<String> = emptyList(),
+        /** The positions of the errors of the compilation explained by the [confirmedFailures], which are omitted. */
+        val explainedErrors: Set<ScriptPosition> = emptySet()
     )
 
     private inner class ScriptHandler(
@@ -261,38 +257,17 @@ internal class DefaultScriptExecutor(
             val compilationResult = compilation.result ?: return compilationFailure(
                 reporter.toSourceFailureMessage()
             )
-            if (
-                compilation.laterDeclaredDependencyReferences.isNotEmpty()
-                || compilation.hiddenLocalFunctionReferences.isNotEmpty()
-                || compilation.shadowedFunctionReferences.isNotEmpty()
-                || compilation.coroutineScopeReferences.isNotEmpty()
-            ) {
-                // like `No value passed for parameter 'p1'` of `log()`, see ScriptSource.calledInsteadDependencies
-                val calledInstead = compilation.hiddenLocalFunctionReferences.filter {
-                    it.reference.name in source.calledInsteadDependencies
-                }.mapTo(HashSet()) { it.reference.start }
-                val failureMessage = listOfNotNull(
-                    compilation.coroutineScopeReferences.takeIf { it.isNotEmpty() }?.let {
-                        reporter.toCoroutineScopeMessage(it)
-                    },
-                    compilation.shadowedFunctionReferences.takeIf { it.isNotEmpty() }?.let {
-                        reporter.toShadowedFunctionMessage(it)
-                    },
-                    compilation.hiddenLocalFunctionReferences.takeIf { it.isNotEmpty() }?.let {
-                        reporter.toHiddenLocalFunctionMessage(it)
-                    },
-                    compilation.laterDeclaredDependencyReferences.takeIf { it.isNotEmpty() }?.let {
-                        reporter.toLaterDeclaredDependencyMessage(it)
-                    },
-                    // explained by the reference to the dependency, like the errors of the calls resolved to the dependency instead, omitted
+            if (compilation.confirmedFailures.isNotEmpty()) {
+                val failureMessage = (compilation.confirmedFailures + listOfNotNull(
+                    // without the errors explained by the confirmed references
                     (compilationResult as? Failure)?.reports?.filterNonIgnorable()?.filterNot { diagnostic ->
                         diagnostic.severity == ScriptDiagnostic.Severity.ERROR && diagnostic.location?.start?.let { start ->
-                            source.toScriptPosition(start.line, start.col) in calledInstead
+                            source.toScriptPosition(start.line, start.col) in compilation.explainedErrors
                         } == true
                     }?.takeIf { reports -> reports.any { it.severity == ScriptDiagnostic.Severity.ERROR } }?.let {
                         reporter.toFailureMessage(it)
                     }
-                ).joinToString(separator = "\n\n")
+                )).joinToString(separator = "\n\n")
                 return compilationFailure(failureMessage)
             }
             val result = when (compilationResult) {
@@ -358,17 +333,26 @@ internal class DefaultScriptExecutor(
             val errors = result.reports.filter { it.severity == ScriptDiagnostic.Severity.ERROR }.mapNotNull { diagnostic ->
                 diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }
             }
-            if (
-                source.laterDeclaredDependencyCandidates.isEmpty()
-                && source.laterDeclaredClassCandidates.isEmpty()
-                && source.hiddenLocalFunctionCandidates.isEmpty()
-                && source.shadowedFunctionCandidates.isEmpty()
-                && source.coroutineScopeCandidates.isEmpty()
-            ) {
-                return Compilation(source, result)
+            val candidates = source.candidates
+            if (candidates.isEmpty()) return Compilation(source, result)
+            // the types of the local properties, which are known only to the compiler, see ScriptSource.untypedPropertyCalls
+            val propertyTypes = if (source.untypedProperties.isEmpty()) emptyMap() else {
+                val typeProbes = source(propertyTypeProbes = true)
+                val unexpected = mutableListOf<String>()
+                val types = typeProbes.propertyTypes(compile(typeProbes).reports) { unexpected += it.message }
+                val (mismatches, others) = unexpected.partition { it.startsWith("Initializer type mismatch") }
+                // like after the upgrade of the compiler, changing the message naming the type
+                if (mismatches.isNotEmpty()) logger.warn { "Script[$scriptId]: Unexpected messages of the type probes: ${mismatches.joinToString(separator = "; ")}" }
+                // like `Variable must be initialized` of a property assigned later, or the errors of the script
+                if (others.isNotEmpty()) logger.debug { "Script[$scriptId]: Other errors of the type probes: ${others.joinToString(separator = "; ")}" }
+                types
             }
             // recognizing the candidates referring to the wrong declarations indeed
-            val probe = source(confirming = true)
+            val probe = source(confirming = true, propertyTypes = propertyTypes)
+            // only the calls of the properties of unknown types, which cannot be confirmed without their copies
+            if (probe.copiedProperties.isEmpty() && candidates.all { it in source.untypedPropertyCalls }) {
+                return Compilation(source, result)
+            }
             /**
              * The positions, from the start to the end, if known, of the warnings of the deprecated,
              * or opted in, declarations of this [message] in the [source], with their messages, see [ScriptSource.confirming].
@@ -392,6 +376,8 @@ internal class DefaultScriptExecutor(
                 message: String
             ) = markedRanges(source, message).map { it.first }
             val reports = compile(probe).reports
+            // unlike the other ones, the calls of which cannot be confirmed
+            val confirmedTypes = probe.confirmedPropertyTypes(reports)
             fun deprecated(
                 message: String
             ) = reports.marked(probe, message)
@@ -409,7 +395,7 @@ internal class DefaultScriptExecutor(
                 }.let { matching ->
                     // the innermost one, nested ones start later, or at the same position, ending earlier
                     matching.firstOrNull { it.reference.end == end } ?: matching.maxWithOrNull(
-                        compareBy<LaterDeclaredReference> { it.reference.start }.thenByDescending { it.reference.end }
+                        compareBy<HiddenLocalFunctionReference> { it.reference.start }.thenByDescending { it.reference.end }
                     )
                 }?.takeIf { candidate ->
                     // chosen first, so that the warning of a plain call, like `get(1)` in `m[get(1)]`, is not assigned to the enclosing operator,
@@ -428,7 +414,7 @@ internal class DefaultScriptExecutor(
             val toLocals = source.shadowedFunctionCandidates.filter { (reference) -> toFunctions.none { it in reference } }
             // the remaining calls of the functions, which would refer to them in the script, if they apply, like the properties,
             // and the references within the lambdas, unless resolved to their receivers, also in the script, see ScriptSource.coroutineScopeCopies
-            fun LaterDeclaredReference.isConfirmedByCopies() = isFunction || isInLambda
+            fun CoroutineScopeReference.isConfirmedByCopies() = isFunction || isInLambda
             val confirmedCandidates = coroutineScopeReferences.filter { it.isConfirmedByCopies() }
             // independent of each other
             val (shadowed, scopeCopies) = coroutineScope {
@@ -465,27 +451,50 @@ internal class DefaultScriptExecutor(
             val constructors = scopeCopies?.let { (copies, reports) -> reports.marked(copies, LATER_DECLARED_CLASS) }.orEmpty()
             // the calls of the scope functions of the coroutine scope of the script body, the script instance in the script
             val toScriptReceiver = scopeCopies?.let { (copies, reports) -> reports.marked(copies, SCRIPT_RECEIVER) }.orEmpty()
+            val laterDeclaredDependencyReferences = (source.laterDeclaredDependencyCandidates.filter { candidate ->
+                (functions.takeIf { candidate.isFunction }.orEmpty()
+                        // like `::x`, resolved to the property of the dependency instead of the local function
+                        + dependencies.takeIf { !candidate.isFunction || candidate.isCallableReference }.orEmpty())
+                    .any { it in candidate.reference }
+            } + source.laterDeclaredClassCandidates.filter { candidate ->
+                // calling the dependency without the copies, rather than e.g. the member of a receiver, which takes precedence in the script,
+                // like the script instance, the receiver of the lambdas of its scope functions, like `run { }`, declaring the dependency
+                constructors.any { it in candidate.reference } && dependencies.any { it in candidate.reference }
+                        && candidate.scopeCalls.none { call -> toScriptReceiver.any { it in call } }
+            }).sortedBy { it.reference.start }
+            val hiddenLocalFunctionReferences = hiddenCandidates.filter {
+                it in hidden && (it !in source.untypedPropertyCalls || it.reference.name in confirmedTypes)
+            }
+            val reporter = ScriptErrorReporter(source)
+            /** The failure message of these confirmed [references] of one kind, unless there are none. */
+            fun <T : CandidateReference> message(
+                references: List<T>,
+                toMessage: ScriptErrorReporter.(List<T>) -> String
+            ) = references.takeIf { it.isNotEmpty() }?.let { reporter.toMessage(it) }
             return Compilation(
                 source,
                 result,
-                laterDeclaredDependencyReferences = (source.laterDeclaredDependencyCandidates.filter { candidate ->
-                    (functions.takeIf { candidate.isFunction }.orEmpty()
-                            // like `::x`, resolved to the property of the dependency instead of the local function
-                            + dependencies.takeIf { !candidate.isFunction || candidate.isCallableReference }.orEmpty())
-                        .any { it in candidate.reference }
-                } + source.laterDeclaredClassCandidates.filter { candidate ->
-                    // calling the dependency without the copies, rather than e.g. the member of a receiver, which takes precedence in the script,
-                    // like the script instance, the receiver of the lambdas of its scope functions, like `run { }`, declaring the dependency
-                    constructors.any { it in candidate.reference } && dependencies.any { it in candidate.reference }
-                            && candidate.scopeCalls.none { call -> toScriptReceiver.any { it in call } }
-                }).sortedBy { it.reference.start },
-                // in the order of the script
-                coroutineScopeReferences = coroutineScopeReferences.filter { candidate ->
-                    !candidate.isConfirmedByCopies() || toCoroutineScope.any { it in candidate.reference }
-                },
-                // in the order of the script
-                shadowedFunctionReferences = toLocals.mapNotNull { candidate -> shadowed.find { it.reference === candidate.reference } },
-                hiddenLocalFunctionReferences = hiddenCandidates.filter { it in hidden }
+                confirmedFailures = listOfNotNull(
+                    // in the order of the script
+                    message(
+                        coroutineScopeReferences.filter { candidate ->
+                            !candidate.isConfirmedByCopies() || toCoroutineScope.any { it in candidate.reference }
+                        },
+                        ScriptErrorReporter::toCoroutineScopeMessage
+                    ),
+                    // in the order of the script
+                    message(
+                        toLocals.mapNotNull { candidate -> shadowed.find { it.reference === candidate.reference } },
+                        ScriptErrorReporter::toShadowedFunctionMessage
+                    ),
+                    message(hiddenLocalFunctionReferences, ScriptErrorReporter::toHiddenLocalFunctionMessage),
+                    message(laterDeclaredDependencyReferences, ScriptErrorReporter::toLaterDeclaredDependencyMessage)
+                ),
+                // the errors of the calls resolved to the dependency instead, like `No value passed for parameter 'p1'` of `log()`,
+                // see ScriptSource.calledInsteadDependencies
+                explainedErrors = hiddenLocalFunctionReferences.filter {
+                    it.reference.name in source.calledInsteadDependencies
+                }.mapTo(HashSet()) { it.reference.start }
             )
         }
 
@@ -500,8 +509,19 @@ internal class DefaultScriptExecutor(
             confirming: Boolean = false,
             shadowedFunctionCopies: Boolean = false,
             overloadingFunctionCopies: Boolean = false,
-            coroutineScopeCopies: Boolean = false
-        ) = ScriptSource(script, preambleDependencies, confirming, shadowedFunctionCopies, overloadingFunctionCopies, coroutineScopeCopies)
+            coroutineScopeCopies: Boolean = false,
+            propertyTypeProbes: Boolean = false,
+            propertyTypes: Map<String, String> = emptyMap()
+        ) = ScriptSource(
+            script = script,
+            dependencies = preambleDependencies,
+            confirming = confirming,
+            shadowedFunctionCopies = shadowedFunctionCopies,
+            overloadingFunctionCopies = overloadingFunctionCopies,
+            coroutineScopeCopies = coroutineScopeCopies,
+            propertyTypeProbes = propertyTypeProbes,
+            propertyTypes = propertyTypes
+        )
 
         private suspend fun compile(
             source: ScriptSource
