@@ -2197,6 +2197,54 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should not treat locally bound name as reference to function declared later`() = runTest {
+        // given
+        val script = """
+            import kotlinx.coroutines.launch
+            val sizes = listOf("ab").map { work -> work.length }
+            var total = 0
+            for (work in sizes) total += work
+            fun work() = launch { }
+            work()
+            sizes + total
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == listOf(2, 2))
+        }
+    }
+
+    @Test
+    fun `should refer to class declared later by name of local function or member extension property before it`() = runTest {
+        // given
+        val check = "Regex::class.java.declaredMethods.any { it.name == \"mine\" }"
+        val bindings = listOf(
+            "val found = run {\n    fun Regex() = 1\n    $check\n}",
+            "class Box {\n    fun Regex() = 2\n    val found = $check\n}\nval found = Box().found",
+            "class Box {\n    val Int.Regex get() = 3\n    val found = $check\n}\nval found = Box().found"
+        )
+        val scripts = bindings.map { "$it\nclass Regex { fun mine() = 4 }\nfound" }
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        results.forEach { result ->
+            result should {
+                be<ScriptResult.Value>()
+                have(value == true)
+            }
+        }
+    }
+
+    @Test
     fun `should call extension function declared later in the script`() = runTest {
         // given
         val script = """
