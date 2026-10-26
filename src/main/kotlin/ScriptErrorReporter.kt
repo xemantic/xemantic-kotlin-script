@@ -35,7 +35,8 @@ private const val MAX_INTERNAL_FAILURE_CAUSES = 8
 /** The longest message of an internal failure reported, as it might carry a dump of the bytecode, or of the source. */
 private const val MAX_INTERNAL_FAILURE_MESSAGE_LENGTH = 500
 
-private val unresolvedReference = Regex("Unresolved reference '(.+)'\\.")
+/** The error of the unresolved reference, with its name. */
+internal val unresolvedReference = Regex("Unresolved reference '(.+)'\\.")
 
 /** Reported without a location, e.g. for an object accessing the dependencies, which are the members of the script class. */
 private val declarationCapturingScript = Regex("(Object|Enum class|Interface|Nested class) '(.+)' captures the script class instance\\..*")

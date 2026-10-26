@@ -26,6 +26,8 @@ import com.xemantic.kotlin.test.should
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CompletableJob
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -42,14 +44,20 @@ import org.jetbrains.kotlin.config.JvmTarget
 import java.net.URL
 import java.util.Collections
 import java.util.Enumeration
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutionException
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.reflect.full.createType
 import kotlin.reflect.typeOf
 import kotlin.script.experimental.api.CompiledScript
+import kotlin.script.experimental.api.EvaluationResult
+import kotlin.script.experimental.api.ResultValue
 import kotlin.script.experimental.api.ResultWithDiagnostics
 import kotlin.script.experimental.api.ScriptCompilationConfiguration
 import kotlin.script.experimental.api.ScriptDiagnostic
+import kotlin.script.experimental.api.ScriptEvaluationConfiguration
+import kotlin.script.experimental.api.ScriptEvaluator
 import kotlin.script.experimental.api.SourceCode
 import kotlin.script.experimental.jvmhost.JvmScriptCompiler
 import kotlin.test.Test
@@ -96,17 +104,7 @@ private val ScriptResult.valueOrMessage: Any?
         is ScriptResult.Error -> message
     }
 
-/** Fails with whatever the [failure] throws, instead of compiling the script. */
-class FailingCompiler(
-    private val failure: suspend () -> Nothing
-) : JvmScriptCompiler() {
-    override suspend fun invoke(
-        script: SourceCode,
-        scriptCompilationConfiguration: ScriptCompilationConfiguration
-    ): ResultWithDiagnostics<CompiledScript> = failure()
-}
-
-/** Returns whatever the [compile] returns, instead of compiling the script. */
+/** Returns whatever the [compile] returns, or fails with whatever it throws, instead of compiling the script. */
 class FakeCompiler(
     private val compile: suspend () -> ResultWithDiagnostics<CompiledScript>
 ) : JvmScriptCompiler() {
@@ -116,28 +114,74 @@ class FakeCompiler(
     ): ResultWithDiagnostics<CompiledScript> = compile()
 }
 
+/** Returns whatever the [evaluate] returns, instead of evaluating the script. */
+class FakeEvaluator(
+    private val evaluate: suspend () -> ResultWithDiagnostics<EvaluationResult>
+) : ScriptEvaluator {
+    override suspend fun invoke(
+        compiledScript: CompiledScript,
+        scriptEvaluationConfiguration: ScriptEvaluationConfiguration
+    ): ResultWithDiagnostics<EvaluationResult> = evaluate()
+}
+
 /**
  * Records the threads resolving the classpath through it, like the scripting host does with `getResources`,
- * failing the first [failures] times.
+ * failing the first [failures] times with the [failure],
+ * and counting down the [resolving] latch, before waiting for the [released] one.
  */
 class ClasspathRecordingClassLoader(
     parent: ClassLoader,
-    private var failures: Int = 0
+    private var failures: Int = 0,
+    private val resolving: CountDownLatch = CountDownLatch(0),
+    private val released: CountDownLatch = CountDownLatch(0),
+    private val failure: () -> Throwable = { IllegalStateException("classpath unavailable") }
 ) : ClassLoader(parent) {
 
     val threads: MutableList<Thread> = Collections.synchronizedList(mutableListOf())
 
     override fun getResources(name: String): Enumeration<URL> {
         threads += Thread.currentThread()
+        resolving.countDown()
+        released.await()
         synchronized(this) {
             if (failures > 0) {
                 failures--
-                throw IllegalStateException("classpath unavailable")
+                throw failure()
             }
         }
         return super.getResources(name)
     }
 
+}
+
+/** Runs the [block] creating the executor with the [classLoader] as the context class loader. */
+private fun <T> withContextClassLoader(
+    classLoader: ClassLoader,
+    block: () -> T
+): T {
+    val thread = Thread.currentThread()
+    val contextClassLoader = thread.contextClassLoader
+    thread.contextClassLoader = classLoader
+    return try {
+        block()
+    } finally {
+        thread.contextClassLoader = contextClassLoader
+    }
+}
+
+/**
+ * Runs the [block] on a thread of this executor, which is the other one, if the first one is busy,
+ * awaiting it cancellably, unlike `withContext`, which would wait for the queued block to run.
+ */
+private suspend fun ExecutorService.onOtherThread(
+    block: () -> Unit
+) {
+    val done = CompletableDeferred<Unit>()
+    execute {
+        block()
+        done.complete(Unit)
+    }
+    done.await()
 }
 
 class ScriptExecutorTest {
@@ -2455,7 +2499,7 @@ class ScriptExecutorTest {
     fun `should report internal failure of the compiler as compilation error`() = runTest {
         // given
         val executor = DefaultScriptExecutor(
-            compiler = FailingCompiler { throw IllegalStateException("compiler crashed") }
+            compiler = FakeCompiler { throw IllegalStateException("compiler crashed") }
         )
 
         // when
@@ -2475,7 +2519,7 @@ class ScriptExecutorTest {
     fun `should report the root cause of the doubly wrapped internal failure of the compiler`() = runTest {
         // given
         val executor = DefaultScriptExecutor(
-            compiler = FailingCompiler {
+            compiler = FakeCompiler {
                 throw IllegalStateException("Could not compile", RuntimeException(IllegalArgumentException("root cause")))
             }
         )
@@ -2499,7 +2543,7 @@ class ScriptExecutorTest {
         // given
         val executor = DefaultScriptExecutor(
             // like a dump of the bytecode
-            compiler = FailingCompiler { throw IllegalStateException("x".repeat(100_000)) }
+            compiler = FakeCompiler { throw IllegalStateException("x".repeat(100_000)) }
         )
 
         // when
@@ -2519,7 +2563,7 @@ class ScriptExecutorTest {
     fun `should report StackOverflowError of the compiler as internal failure, not as the script nested too deeply`() = runTest {
         // given
         val executor = DefaultScriptExecutor(
-            compiler = FailingCompiler { throw StackOverflowError() }
+            compiler = FakeCompiler { throw StackOverflowError() }
         )
 
         // when
@@ -2570,7 +2614,7 @@ class ScriptExecutorTest {
         val executor = DefaultScriptExecutor(
             // compiling on the thread of the test, read before the test loop would fail on its interrupt status
             dispatcher = Dispatchers.Unconfined,
-            compiler = FailingCompiler { throw InterruptedException("compiler interrupted") }
+            compiler = FakeCompiler { throw InterruptedException("compiler interrupted") }
         )
 
         // when
@@ -2612,7 +2656,7 @@ class ScriptExecutorTest {
         // given
         val executor = DefaultScriptExecutor(
             dispatcher = Dispatchers.Unconfined,
-            compiler = FailingCompiler {
+            compiler = FakeCompiler {
                 throw IllegalStateException("failed", ExecutionException(InterruptedException("worker thread interrupted")))
             }
         )
@@ -2670,7 +2714,7 @@ class ScriptExecutorTest {
     fun `should not report VirtualMachineError causing the exception thrown by the compiler as compilation error`() = runTest {
         // given
         val executor = DefaultScriptExecutor(
-            compiler = FailingCompiler { throw RuntimeException(OutOfMemoryError("compiler out of memory")) }
+            compiler = FakeCompiler { throw RuntimeException(OutOfMemoryError("compiler out of memory")) }
         )
 
         // when
@@ -2718,7 +2762,7 @@ class ScriptExecutorTest {
     fun `should report compilation cancelled by the compiler while the caller is active as compilation error`() = runTest {
         // given
         val executor = DefaultScriptExecutor(
-            compiler = FailingCompiler { throw CancellationException("compiler cancelled") }
+            compiler = FakeCompiler { throw CancellationException("compiler cancelled") }
         )
 
         // when
@@ -2744,7 +2788,7 @@ class ScriptExecutorTest {
             // so the waiter is waiting in the cache before the compiler fails
             dispatcher = StandardTestDispatcher(testScheduler),
             compilationCacheSize = 10,
-            compiler = FailingCompiler {
+            compiler = FakeCompiler {
                 failing.await()
                 throw IllegalStateException("compiler crashed")
             }
@@ -2771,7 +2815,7 @@ class ScriptExecutorTest {
     fun `should not report VirtualMachineError of the compiler as compilation error`() = runTest {
         // given
         val executor = DefaultScriptExecutor(
-            compiler = FailingCompiler { throw OutOfMemoryError("compiler out of memory") }
+            compiler = FakeCompiler { throw OutOfMemoryError("compiler out of memory") }
         )
 
         // when
@@ -2989,6 +3033,187 @@ class ScriptExecutorTest {
         assert(compilingResult is ScriptResult.Error && compilingResult.phase == ExecutionPhase.COMPILATION)
         assert(waiterResult is ScriptResult.Error && waiterResult.phase == ExecutionPhase.COMPILATION)
         assert(executor.compilationCount == 2)
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun `should not invoke the compiler again for the caller cancelled during the compilation`() = runTest {
+        // given
+        // probing the type of the property, before confirming the references
+        val script = """
+            fun printer(): (Any?) -> Unit = { }
+            val print = printer()
+            sealed class Shape { fun show() = print("shape") }
+            fun show() = x
+            val x = 2
+            show()
+        """.trimIndent()
+        lateinit var caller: Job
+        val executor = DefaultScriptExecutor(
+            dispatcher = StandardTestDispatcher(testScheduler),
+            compiler = FakeCompiler {
+                // like while the compiler is running, which does not check the cancellation
+                caller.cancel()
+                ResultWithDiagnostics.Failure(ScriptDiagnostic(ScriptDiagnostic.unspecifiedError, "not compiled"))
+            }
+        )
+
+        // when
+        caller = launch { executor.execute(script, listOf(dependency("x", 1))) }
+        caller.join()
+
+        // then
+        assert(caller.isCancelled)
+        assert(executor.compilationCount == 1)
+    }
+
+    @Test
+    fun `should report internal failure of the confirming compilation at the position in the script, without caching it`() = runTest {
+        // given
+        val script = """
+            fun show() = x
+            val x = 2
+            cancel()
+            fun cancel() {}
+            show()
+        """.trimIndent()
+        val dependencies = listOf(dependency("x", 1))
+        val executor = DefaultScriptExecutor(
+            compilationCacheSize = 10,
+            compiler = object : JvmScriptCompiler() {
+                override suspend fun invoke(
+                    script: SourceCode,
+                    scriptCompilationConfiguration: ScriptCompilationConfiguration
+                ): ResultWithDiagnostics<CompiledScript> = if (LATER_DECLARED_DEPENDENCY in script.text) {
+                    // like the compiler crashing on the confirming sources only, at `x` of `show`
+                    val line = script.text.lines().indexOfFirst { it.startsWith("fun show() = x") } + 1
+                    ResultWithDiagnostics.Failure(
+                        ScriptDiagnostic(
+                            code = ScriptDiagnostic.unspecifiedError,
+                            message = "Exception in expression checkers",
+                            location = SourceCode.Location(SourceCode.Position(line, 14), SourceCode.Position(line, 15)),
+                            exception = IllegalStateException("Exception in expression checkers")
+                        )
+                    )
+                } else {
+                    super.invoke(script, scriptCompilationConfiguration)
+                }
+            }
+        )
+
+        // when
+        val results = List(2) { executor.execute(script, dependencies) }
+
+        // then
+        results.forEach { result ->
+            result should {
+                be<ScriptResult.Error>()
+                have(phase == ExecutionPhase.COMPILATION)
+                message sameAs """
+                    script.kts:1:14: error: The compiler failed internally: Exception in expression checkers
+                      | fun show() = <error>x</error>
+                      hint: it is a failure of the compiler itself - express this code differently.
+                """.trimIndent()
+            }
+        }
+        // the compilation and the first confirming one, without the confirming copies of the scope functions, for each execution
+        assert(executor.compilationCount == 4)
+    }
+
+    @Test
+    fun `should not report VirtualMachineError causing the exception thrown by the script as evaluation error`() = runTest {
+        // given
+        val script = """
+            throw IllegalStateException("failed", OutOfMemoryError("script out of memory"))
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val failure = runCatching { executor.execute(script) }.exceptionOrNull()
+
+        // then
+        assert(failure is OutOfMemoryError && failure.message == "script out of memory")
+    }
+
+    @Test
+    fun `should not report VirtualMachineError reported by the evaluator as evaluation error`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            // like the evaluator reporting the exception it caught, e.g. while loading the script class
+            evaluator = FakeEvaluator {
+                ResultWithDiagnostics.Failure(
+                    ScriptDiagnostic(
+                        code = ScriptDiagnostic.unspecifiedError,
+                        message = "Java heap space",
+                        exception = OutOfMemoryError("Java heap space")
+                    )
+                )
+            }
+        )
+
+        // when
+        val failure = runCatching { executor.execute("42") }.exceptionOrNull()
+
+        // then
+        assert(failure is OutOfMemoryError && failure.message == "Java heap space")
+    }
+
+    @Test
+    fun `should not report VirtualMachineError causing the error of the script value as evaluation error`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            evaluator = FakeEvaluator {
+                ResultWithDiagnostics.Success(
+                    EvaluationResult(
+                        ResultValue.Error(ExceptionInInitializerError(OutOfMemoryError("Java heap space"))),
+                        ScriptEvaluationConfiguration()
+                    )
+                )
+            }
+        )
+
+        // when
+        val failure = runCatching { executor.execute("42") }.exceptionOrNull()
+
+        // then
+        assert(failure is OutOfMemoryError && failure.message == "Java heap space")
+    }
+
+    @Test
+    fun `should create executors with the factory functions visible to Java`() = runTest {
+        // given
+        val executors = listOf(
+            JavaClient.executor(),
+            JavaClient.executor(Dispatchers.IO),
+            JavaClient.executor(Dispatchers.IO, 10),
+            JavaClient.executor(Dispatchers.IO, 10, 2)
+        )
+
+        // when
+        val results = executors.map { it.execute("1 + 1") }
+
+        // then
+        assert(results.map { it.valueOrMessage } == listOf(2, 2, 2, 2))
+    }
+
+    @Test
+    fun `should create executor with the default arguments of the factory function of 0_1_0`() = runTest {
+        // given
+        // called by the Kotlin clients compiled against 0.1.0 omitting the arguments, like `ScriptExecutor()`
+        val defaults = Class.forName("com.xemantic.kotlin.script.ScriptExecutorKt").getMethod(
+            $$"ScriptExecutor$default",
+            CoroutineDispatcher::class.java,
+            Int::class.javaPrimitiveType,
+            Int::class.javaPrimitiveType,
+            Any::class.java
+        )
+        val executor = defaults.invoke(null, null, 0, 0b11, null) as ScriptExecutor
+
+        // when
+        val result = executor.execute("1 + 1")
+
+        // then
+        assert(result.valueOrMessage == 2)
     }
 
     @Test
@@ -3588,6 +3813,149 @@ class ScriptExecutorTest {
             be<ScriptResult.Value>()
             have(value == 2)
         }
+    }
+
+    @Test
+    fun `should not block the dispatcher thread while waiting for the classpath resolved by another caller`() = runTest {
+        // given
+        val resolving = CountDownLatch(1)
+        val released = CountDownLatch(1)
+        val executorService = Executors.newFixedThreadPool(2)
+        val dispatcher = executorService.asCoroutineDispatcher()
+        val executor = withContextClassLoader(
+            ClasspathRecordingClassLoader(Thread.currentThread().contextClassLoader, resolving = resolving, released = released)
+        ) {
+            ScriptExecutor(dispatcher = dispatcher)
+        }
+
+        // when
+        val results = try {
+            val first = async(start = CoroutineStart.UNDISPATCHED) { executor.execute("1 + 1") }
+            resolving.await()
+            val second = async(start = CoroutineStart.UNDISPATCHED) { executor.execute("2 + 2") }
+            // on the other thread, unless the second caller blocks it, failing the test on its timeout
+            executorService.onOtherThread { released.countDown() }
+            listOf(first.await(), second.await())
+        } finally {
+            released.countDown()
+            dispatcher.close()
+        }
+
+        // then
+        assert(results.map { it.valueOrMessage } == listOf(2, 4))
+    }
+
+    @Test
+    fun `should not compile for the caller cancelled while waiting for the classpath resolved by another caller`() = runTest {
+        // given
+        val resolving = CountDownLatch(1)
+        val released = CountDownLatch(1)
+        val executorService = Executors.newFixedThreadPool(2)
+        val dispatcher = executorService.asCoroutineDispatcher()
+        val executor = withContextClassLoader(
+            ClasspathRecordingClassLoader(Thread.currentThread().contextClassLoader, resolving = resolving, released = released)
+        ) {
+            DefaultScriptExecutor(dispatcher = dispatcher)
+        }
+
+        // when
+        val (result, cancelled) = try {
+            val first = async(start = CoroutineStart.UNDISPATCHED) { executor.execute("1 + 1") }
+            resolving.await()
+            val second = launch(start = CoroutineStart.UNDISPATCHED) { executor.execute("2 + 2") }
+            executorService.onOtherThread {
+                second.cancel()
+                released.countDown()
+            }
+            second.join()
+            first.await() to second.isCancelled
+        } finally {
+            released.countDown()
+            dispatcher.close()
+        }
+
+        // then
+        assert(result.valueOrMessage == 2)
+        assert(cancelled)
+        assert(executor.compilationCount == 1)
+    }
+
+    @Test
+    fun `should report failure of resolving the classpath to all the callers waiting for it`() = runTest {
+        // given
+        val resolving = CountDownLatch(1)
+        val released = CountDownLatch(1)
+        val executorService = Executors.newFixedThreadPool(2)
+        val dispatcher = executorService.asCoroutineDispatcher()
+        val recording = ClasspathRecordingClassLoader(
+            Thread.currentThread().contextClassLoader, failures = 1, resolving = resolving, released = released
+        )
+        val executor = withContextClassLoader(recording) {
+            DefaultScriptExecutor(dispatcher = dispatcher)
+        }
+
+        // when
+        val results = try {
+            val first = async(start = CoroutineStart.UNDISPATCHED) { executor.execute("1 + 1") }
+            resolving.await()
+            val second = async(start = CoroutineStart.UNDISPATCHED) { executor.execute("2 + 2") }
+            executorService.onOtherThread { released.countDown() }
+            listOf(first.await(), second.await())
+        } finally {
+            released.countDown()
+            dispatcher.close()
+        }
+
+        // then
+        results.forEach { result ->
+            result should {
+                be<ScriptResult.Error>()
+                have(phase == ExecutionPhase.COMPILATION)
+                message sameAs """
+                    error: The script could not be compiled because of an internal failure: java.lang.IllegalStateException: classpath unavailable
+                """.trimIndent()
+            }
+        }
+        // resolved once, failing on the first resource
+        assert(recording.threads.size == 1)
+        assert(executor.compilationCount == 0)
+    }
+
+    @Test
+    fun `should resolve the classpath again for the waiting caller when the resolution fails because of a fatal error`() = runTest {
+        // given
+        val resolving = CountDownLatch(1)
+        val released = CountDownLatch(1)
+        val executorService = Executors.newFixedThreadPool(2)
+        val dispatcher = executorService.asCoroutineDispatcher()
+        val executor = withContextClassLoader(
+            ClasspathRecordingClassLoader(
+                Thread.currentThread().contextClassLoader,
+                failures = 1,
+                resolving = resolving,
+                released = released,
+                failure = { IllegalStateException("classpath unavailable", OutOfMemoryError("classpath out of memory")) }
+            )
+        ) {
+            ScriptExecutor(dispatcher = dispatcher)
+        }
+
+        // when
+        val (firstFailure, second) = try {
+            // not failing the test process, if the error is shared
+            val first = async(start = CoroutineStart.UNDISPATCHED) { runCatching { executor.execute("1 + 1") } }
+            resolving.await()
+            val second = async(start = CoroutineStart.UNDISPATCHED) { runCatching { executor.execute("2 + 2") } }
+            executorService.onOtherThread { released.countDown() }
+            first.await().exceptionOrNull() to second.await().getOrNull()
+        } finally {
+            released.countDown()
+            dispatcher.close()
+        }
+
+        // then
+        assert(firstFailure is OutOfMemoryError && firstFailure.message == "classpath out of memory")
+        assert(second?.valueOrMessage == 4)
     }
 
     @Test
@@ -4808,6 +5176,205 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report calls of declarations moved out of the script body to local properties made callable by local invoke operators`() = runTest {
+        // given
+        val invoke = "operator fun Int.invoke(x: Any?): String = \"int:${'$'}x\"\n"
+        val scripts = listOf(
+            // failing as resolved to `kotlin.io.print` instead
+            "${invoke}val print = 1 + 2\nsealed class S { fun show(): String = print(\"\") }\nclass T : S()\nT().show()",
+            "${invoke}val print = three()\nfun three() = 3\nsealed class S { fun show(): String = print(\"\") }\nclass T : S()\nT().show()",
+            "${invoke}val print: Int = listOf(3).first()\nsealed class S { fun show(): String = print(\"\") }\nclass T : S()\nT().show()",
+            // returning `Unit` of `kotlin.io.print` instead
+            "${invoke}val print = 1 + 2\nsealed class S { fun show(): Any = print(\"\") }\nclass T : S()\nT().show()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+        assert(results.all { "'print' does not refer to the property of the script body declared at line 2" in (it as ScriptResult.Error).message })
+    }
+
+    @Test
+    fun `should move local invoke operator called on value by declaration moved out of the script body`() = runTest {
+        // given
+        val script = """
+            operator fun Int.invoke(x: Any?): String = "int:${'$'}x"
+            val print: Int = 3
+            sealed class S { fun show(): String = print("") }
+            class T : S()
+            T().show()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "int:")
+        }
+    }
+
+    @Test
+    fun `should report unresolved value called by declaration moved out of the script body once`() = runTest {
+        // given
+        val script = """
+            val p = listOf("!").first()
+            operator fun Int.invoke(x: Any?): String = "int:${'$'}x${'$'}p"
+            val q = listOf(1).first()
+            sealed class S { fun g() = q(2) }
+            class T : S()
+            T().g()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert(result is ScriptResult.Error && result.message == """
+            script.kts:4:28: error: Unresolved reference 'q'.
+              | sealed class S { fun g() = <error>q</error>(2) }
+              hint: 'S' is compiled outside of the script body, where 'q' (line 3) is not visible - pass it as a parameter, or declare it within 'S'.
+        """.trimIndent())
+    }
+
+    @Test
+    fun `should move extension overloads not referred to by the script body despite overloads accessing local properties`() = runTest {
+        // given
+        val scripts = listOf(
+            "val p = listOf(\"!\").first()\nfun String.f(): String = \"s\" + p\nfun Int.f(): String = \"int\"\nsealed class S { fun g() = 1.f() }\nclass T : S()\nT().g()",
+            "class V(val n: Int)\nval p = listOf(1).first()\noperator fun String.plus(v: V): String = this + v.n + p\noperator fun V.plus(v: V): V = V(n + v.n)\n" +
+                    "sealed class S { fun g() = (V(1) + V(2)).n }\nclass T : S()\nT().g()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("int", 3))
+    }
+
+    @Test
+    fun `should move local invoke operator called on implicit lambda parameter by declaration moved out of the script body`() = runTest {
+        // given
+        val script = """
+            operator fun Int.invoke(x: Any?): String = "int:${'$'}x"
+            sealed class S { fun g() = listOf(3).map { it("x") } }
+            class T : S()
+            T().g()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == listOf("int:x"))
+        }
+    }
+
+    @Test
+    fun `should not move local invoke operator overloading one accessing local properties`() = runTest {
+        // given
+        val script = """
+            val p = listOf("!").first()
+            operator fun Any.invoke(x: Any?): String = "any:${'$'}x${'$'}p"
+            operator fun Int.invoke(x: Any?): String = "int:${'$'}x"
+            sealed class S { fun g() = listOf(1).size }
+            class T : S()
+            T().g().toString() + 3("x")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "1int:x")
+        }
+    }
+
+    @Test
+    fun `should report calls of moved declarations to local overloads not moved with the overloads accessing local properties`() = runTest {
+        // given
+        val overloads = "val p = listOf(\"!\").first()\n"
+        val scripts = listOf(
+            "${overloads}fun Any.f(x: Any?): String = \"any:${'$'}x${'$'}p\"\nfun Int.f(x: Any?): String = \"int:${'$'}x\"\n" +
+                    "sealed class S { fun g() = 1.f(2) }\nclass T : S()\nT().g() + 3.f(\"x\")" to "where 'f' (line ",
+            "${overloads}operator fun Any.invoke(x: Any?): String = \"any:${'$'}x${'$'}p\"\noperator fun Int.invoke(x: Any?): String = \"int:${'$'}x\"\n" +
+                    "sealed class S { fun g(n: Int) = n(2) }\nclass T : S()\nT().g(1) + 3(\"x\")" to
+                    // the overload called in the script
+                    "'invoke' does not refer to the function of the script body declared at line 3"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { (script) -> executor.execute(script) }
+
+        // then
+        assert(results.zip(scripts).all { (result, script) ->
+            result is ScriptResult.Error && script.second in result.message
+        })
+    }
+
+    @Test
+    fun `should report calls of declarations moved out of the script body on values made callable by hidden local invoke operator`() = runTest {
+        // given
+        val invoke = "val p = \"!\"\noperator fun Int.invoke(x: Any?): String = \"int:${'$'}x${'$'}p\"\n"
+        val scripts = listOf(
+            // failing as resolved to `kotlin.io.print` instead, of the constant moved with the class
+            "${invoke}val print: Int = 3\nsealed class S { fun show(): String = print(\"\") }\nclass T : S()\nT().show()",
+            // returning `Unit` of `kotlin.io.print` instead
+            "${invoke}val print: Int = 3\nsealed class S { fun show(): Any = print(\"\") }\nclass T : S()\nT().show()",
+            "${invoke}sealed class S { fun show(n: Int): Any = n(\"\") }\nclass T : S()\nT().show(4)"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+        assert(results.all { "'invoke' does not refer to the function of the script body declared at line 2" in (it as ScriptResult.Error).message })
+    }
+
+    @Test
+    fun `should report call of declaration moved out of the script body failing as resolved to another function than the local one`() = runTest {
+        // given
+        val script = """
+            val p = "!"
+            fun print(x: Int): String = "n${'$'}x${'$'}p"
+            sealed class S { fun f(): String = print(1) }
+            class T : S()
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert(result is ScriptResult.Error && result.message == """
+            script.kts:3:36: error: 'print' does not refer to the function of the script body declared at line 2, which is not visible in 'S'.
+              | sealed class S { fun f(): String = <error>print</error>(1) }
+              hint: 'S' is compiled outside of the script body, where 'print' (line 2) is not visible - pass it as a parameter, or declare it within 'S'.
+
+            script.kts:3:36: error: Return type mismatch: expected 'String', actual 'Unit'.
+              | sealed class S { fun f(): String = <error>print(1)</error> }
+        """.trimIndent())
+    }
+
+    @Test
     fun `should report calls of declarations moved out of the script body to local properties of inferred types on receivers named like packages`() = runTest {
         // given
         val scripts = listOf(
@@ -5295,16 +5862,20 @@ class ScriptExecutorTest {
             "Cfg()!!", "cfg as Cfg", "null ?: cfg", "when { cfg is Cfg -> cfg else -> Cfg() }", "@Deprecated(\"x\") cfg", "l@ cfg", "mkf(cfg)()",
             "cfg + cfg", "-cfg", "!cfg", "cfg with cfg", "cfg..cfg", "(cfg)()", "(mkf(cfg))()", "@Suppress(\"x\") Cfg()",
             // the call of the same name, bound by name to the member of the enum class
-            "mapOf(1 to cfg).getValue(1)", "l@ (mapOf(1 to cfg)).getValue(1)"
+            "mapOf(1 to cfg).getValue(1)", "l@ (mapOf(1 to cfg)).getValue(1)",
+            // starting with the local of the same name, where the compiler reports the delegate convention as well
+            "getValue[0]"
         )
+        // the local named like the convention, only where the delegate expression starts with it
+        fun locals(delegate: String) = if (delegate.startsWith("getValue")) "val getValue = listOf(cfg); " else ""
         val scripts = operators.flatMap { (name, operator) ->
             delegates.map { delegate ->
-                "$declarations${operator}enum class E { A; fun getValue() = 0; fun f(): Int { val cfg = Cfg(); val v: Int by $delegate; return v } }\nE.A.f()" to name
+                "$declarations${operator}enum class E { A; fun getValue() = 0; fun f(): Int { val cfg = Cfg(); ${locals(delegate)}val v: Int by $delegate; return v } }\nE.A.f()" to name
             }
         } + delegates.map { delegate ->
             val variable = "class Cfg { $members; operator fun getValue(t: Any?, p: KProperty<*>) = 1 }\n" +
                     "operator fun Cfg.setValue(t: Any?, p: KProperty<*>, v: Int) { println(scale) }\n"
-            "${declarations.replace("class Cfg { $members }\n", variable)}enum class E { A; fun getValue() = 0; fun f(): Int { val cfg = Cfg(); var v: Int by $delegate; v = 2; return v } }\nE.A.f()" to "setValue"
+            "${declarations.replace("class Cfg { $members }\n", variable)}enum class E { A; fun getValue() = 0; fun f(): Int { val cfg = Cfg(); ${locals(delegate)}var v: Int by $delegate; v = 2; return v } }\nE.A.f()" to "setValue"
         }
         val executor = ScriptExecutor()
 
@@ -5345,6 +5916,31 @@ class ScriptExecutorTest {
 
         // then
         assert(results.all { it is ScriptResult.Error && "does not refer to the function" !in it.message })
+    }
+
+    @Test
+    fun `should report invisible delegate convention reported at callee of the same name`() = runTest {
+        // given
+        val script = """
+            import kotlin.reflect.KProperty
+            val scale = listOf(10).first()
+            class Cfg
+            operator fun Cfg.getValue(t: Any?, p: KProperty<*>): Int = scale
+            fun getValue(c: Cfg): Cfg = c
+            sealed class E { fun f(): Int { val cfg = Cfg(); val v: Int by getValue(cfg); return v } }
+            class F : E()
+            F().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert(result is ScriptResult.Error && result.message.startsWith(
+            "script.kts:6:61: error: 'getValue' does not refer to the function of the script body declared at line 4, which is not visible in 'E'.\n" +
+                    "  | sealed class E { fun f(): Int { val cfg = Cfg(); val v: Int <error>by getValue(cfg)</error>; return v } }\n"
+        ))
     }
 
     @Test

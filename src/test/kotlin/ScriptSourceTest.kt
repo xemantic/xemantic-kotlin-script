@@ -256,6 +256,25 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should refer to hidden local invoke operator only the calls of values`() {
+        // given
+        val script = """
+            val p = listOf("!").first()
+            operator fun Int.invoke(x: Any?): String = "int:${'$'}x${'$'}p"
+            val q: Int = listOf(1).first()
+            sealed class S { fun g(n: Int) = listOf(1).joinToString { "a" } + println("x") + n(1) + q(2) + this.toString() }
+            class T : S()
+            T().g(1)
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        assert(source.hiddenLocalFunctionCandidates.filter { it.reference.name == "invoke" }.map { it.reference.start.column } == listOf(81, 88))
+    }
+
+    @Test
     fun `should override the members of Any by the copies of the moved functions of their signatures`() {
         // given
         val script = """
