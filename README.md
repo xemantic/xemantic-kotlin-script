@@ -79,6 +79,11 @@ when (result) {
   a name which the script body would resolve on its `CoroutineScope` receiver instead, like `coroutineContext` or `javaClass`,
   or such a function name, like `launch` or `let`, for a dependency which can be called,
   or a type which the script cannot refer to, like a private or a local class.
+  Where this document compares the script with a regular `.kts` file,
+  the dependencies are the members of an abstract base class of that script (`baseClass` of the scripting host), not provided properties (`providedProperties`),
+  so a function of the script shadows a callable dependency of its name:
+  `x()` calls `fun x(): Int = 10` of the script, also when the call precedes the function, while a regular script would prefer a provided property `x`
+  ([#101](https://github.com/xemantic/xemantic-kotlin-script/issues/101)).
 * A reference to a dependency preceding the declaration of a local property of the same name, like `x` in `fun show() = x` followed by `val x = 2`,
   or a call preceding the declaration of a local function of the same name,
   or of a local class, like `Foo(2)` followed by `class Foo(val v: Int)`, which constructs it, if a constructor applies
@@ -145,6 +150,11 @@ Most of these cases are reported as errors, while the following ones still resol
   like `name` in `user.run { name }` with `val name = "script"`, as it is a local variable of the block ([#36](https://github.com/xemantic/xemantic-kotlin-script/issues/36)),
 * a call of a function, of which only some overloads are compiled outside of the script body, when it precedes a local overload,
   or has a receiver, like `"a".fmt(1)` of the extension functions, or when a local overload refers to a local class, while the overloads are of both inferred and declared return types ([#30](https://github.com/xemantic/xemantic-kotlin-script/issues/30)),
+* a call of local overloads, like `show(1)` with `fun show(x: Int): String = "int"` and `fun show(x: Any) = "any"`, which calls the most specific one, `show(x: Int)`,
+  while a regular script prefers the one with the return type inferred from its expression body within a top-level statement, or a declaration of an inferred type, like `fun h() = show(1)`,
+  which seems to be a quirk of the compiler rather than a rule of the language ([#100](https://github.com/xemantic/xemantic-kotlin-script/issues/100)),
+* a call of a function, of which only some overloads are compiled outside of the script body, within a default value of a parameter of a function of an inferred return type,
+  like `show(1)` in `fun h(x: String = show(1)) = x`, which calls the local overload of an inferred type, while a regular script calls the most specific one ([#102](https://github.com/xemantic/xemantic-kotlin-script/issues/102)),
 * a call from the script body to a local function referring to a type alias declared after it, which is not visible to the function in a regular script, so the function does not apply there,
   like `check(true)` calling `fun check(n: N)` followed by `typealias N = Boolean`, instead of `check` of the standard library, unless the call is within a declaration of an inferred type, and the function overloads one compiled outside of the script body ([#102](https://github.com/xemantic/xemantic-kotlin-script/issues/102)),
 * a call preceding a local class named like a callable dependency, when only a constructor with a parameter of a local class declared after the call applies, like `Foo(null)` followed by `class Bar` and `class Foo(val b: Bar?)` ([#31](https://github.com/xemantic/xemantic-kotlin-script/issues/31)),
