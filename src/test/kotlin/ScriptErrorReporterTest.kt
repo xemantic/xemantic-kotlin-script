@@ -21,6 +21,7 @@ package com.xemantic.kotlin.script
 import com.xemantic.kotlin.test.assert
 import com.xemantic.kotlin.test.sameAs
 import kotlin.script.experimental.api.ScriptDiagnostic
+import kotlin.script.experimental.api.SourceCode
 import kotlin.test.Test
 
 class ScriptErrorReporterTest {
@@ -116,9 +117,6 @@ class ScriptErrorReporterTest {
         """.trimIndent()
     }
 
-    /**
-     * Tested directly, as the crashes of the compiler backend, which the callable references do not explain, are not known.
-     */
     @Test
     fun `should report compiler backend crash at nested class without intermediate representation`() {
         // given
@@ -236,6 +234,212 @@ class ScriptErrorReporterTest {
         message sameAs """
             java.lang.RuntimeException: b
               at Boom.<clinit>(script.kts)
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report crash of the compiler in generated code without position and generated names`() {
+        // given
+        val source = ScriptSource("foo")
+        val location = "${source.locationId}:1:1"
+        val diagnostic = ScriptDiagnostic(
+            code = ScriptDiagnostic.unspecifiedError,
+            message = "While analysing $location: java.lang.IllegalStateException: Exception in expression checkers",
+            exception = RuntimeException(
+                "While analysing $location: java.lang.IllegalStateException: Exception in expression checkers",
+                IllegalStateException("Exception in expression checkers", IllegalArgumentException("Unexpected element at $location"))
+            )
+        )
+        val reporter = ScriptErrorReporter(source)
+
+        // when
+        val message = reporter.toCompilationFailureMessage(listOf(diagnostic))
+
+        // then
+        message sameAs """
+            error: The compiler failed internally: While analysing script.kts: java.lang.IllegalStateException: Exception in expression checkers
+              Caused by: java.lang.IllegalArgumentException: Unexpected element at script.kts
+              hint: it is a failure of the compiler itself - express the script differently.
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report limited number of causes of internal failure`() {
+        // given
+        val throwable = (1..20).fold(null as Throwable?) { cause, index ->
+            RuntimeException("failure ${21 - index}", cause)
+        }!!
+
+        // when
+        val message = internalFailureMessage(throwable)
+
+        // then
+        message sameAs """
+            error: The script could not be compiled because of an internal failure: java.lang.RuntimeException: failure 1
+              Caused by: java.lang.RuntimeException: failure 2
+              Caused by: java.lang.RuntimeException: failure 3
+              Caused by: java.lang.RuntimeException: failure 4
+              Caused by: java.lang.RuntimeException: failure 5
+              Caused by: java.lang.RuntimeException: failure 6
+              Caused by: java.lang.RuntimeException: failure 7
+              Caused by: java.lang.RuntimeException: failure 8
+              [FURTHER CAUSES OMITTED]
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report circular causes of internal failure once`() {
+        // given
+        val first = RuntimeException("first")
+        val second = IllegalStateException("second", first)
+        first.initCause(second)
+
+        // when
+        val message = internalFailureMessage(first)
+
+        // then
+        message sameAs """
+            error: The script could not be compiled because of an internal failure: java.lang.RuntimeException: first
+              Caused by: java.lang.IllegalStateException: second
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report internal failure with multiline message indented`() {
+        // given
+        val throwable = IllegalStateException("Back-end failed\nFile being compiled: (1,1)")
+
+        // when
+        val message = internalFailureMessage(throwable)
+
+        // then
+        message sameAs """
+            error: The script could not be compiled because of an internal failure: java.lang.IllegalStateException: Back-end failed
+              File being compiled: (1,1)
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report crash of the compiler with the message of its diagnostic`() {
+        // given
+        val diagnostic = ScriptDiagnostic(
+            code = ScriptDiagnostic.unspecifiedError,
+            message = "Could not read classpath entry /x.jar",
+            exception = java.io.IOException()
+        )
+        val reporter = ScriptErrorReporter(ScriptSource("foo"))
+
+        // when
+        val message = reporter.toCompilationFailureMessage(listOf(diagnostic))
+
+        // then
+        message sameAs """
+            error: The compiler failed internally: Could not read classpath entry /x.jar
+              Caused by: java.io.IOException
+              hint: it is a failure of the compiler itself - express the script differently.
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report crash of the compiler in the accessor of the dependency`() {
+        // given
+        val source = ScriptSource("x", listOf(PreambleDependency("x", { _, _ -> "val `x`: Int = TODO()" })))
+        val line = source.text.lines().indexOfFirst { it.startsWith("val `x`") } + 1
+        val diagnostic = ScriptDiagnostic(
+            code = ScriptDiagnostic.unspecifiedError,
+            message = "Exception in expression checkers",
+            location = SourceCode.Location(SourceCode.Position(line, 1)),
+            exception = IllegalStateException("Exception in expression checkers")
+        )
+        val reporter = ScriptErrorReporter(source)
+
+        // when
+        val message = reporter.toCompilationFailureMessage(listOf(diagnostic))
+
+        // then
+        message sameAs """
+            dependency 'x': error: The compiler failed internally: Exception in expression checkers
+              hint: it is a failure of the compiler itself - express the script differently.
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report crash of the compiler marking the range of its location`() {
+        // given
+        val source = ScriptSource("val a = 1\nval b = a + 1\nb")
+        val line = (1..source.text.lines().size).first { source.toScriptLine(it) == 1 }
+        val diagnostic = ScriptDiagnostic(
+            code = ScriptDiagnostic.unspecifiedError,
+            message = "Exception in expression checkers",
+            location = SourceCode.Location(SourceCode.Position(line, 9), SourceCode.Position(line, 14)),
+            exception = IllegalStateException("Exception in expression checkers")
+        )
+        val reporter = ScriptErrorReporter(source)
+
+        // when
+        val message = reporter.toCompilationFailureMessage(listOf(diagnostic))
+
+        // then
+        message sameAs """
+            script.kts:2:9: error: The compiler failed internally: Exception in expression checkers
+              | val b = <error>a + 1</error>
+              hint: it is a failure of the compiler itself - express this code differently.
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report crash of the compiler at oversized line without position`() {
+        // given
+        val source = ScriptSource("foo")
+        val diagnostic = ScriptDiagnostic(
+            code = ScriptDiagnostic.unspecifiedError,
+            message = "While analysing ${source.locationId}:99999999999:1: boom",
+            exception = IllegalStateException("boom")
+        )
+        val reporter = ScriptErrorReporter(source)
+
+        // when
+        val message = reporter.toCompilationFailureMessage(listOf(diagnostic))
+
+        // then
+        message sameAs """
+            error: The compiler failed internally: While analysing script.kts: boom
+              Caused by: java.lang.IllegalStateException: boom
+              hint: it is a failure of the compiler itself - express the script differently.
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should rewrite generated locations of the script`() {
+        // given
+        val source = ScriptSource("val a = 1\nval b = a + 1\nb")
+        val line = (1..source.text.lines().size).first { source.toScriptLine(it) == 1 }
+        val generated = (1..source.text.lines().size).first { source.toScriptLine(it) == null }
+        val message = "at ${source.locationId}:$line, ($line,9) in /${source.locationId}, " +
+                "${source.locationId}:$generated:1, ($generated,1) in /${source.locationId}, ${source.locationId}"
+
+        // when
+        val rewritten = message.toScriptLocations(listOf(source))
+
+        // then
+        assert(rewritten == "at script.kts:2, script.kts:2:9, script.kts, script.kts, script.kts")
+    }
+
+    @Test
+    fun `should report wrapper of internal failure mentioning class of the cause without message`() {
+        // given
+        val throwable = IllegalStateException(
+            "Couldn't inline method call at line 3 of script: java.lang.NullPointerException",
+            NullPointerException()
+        )
+
+        // when
+        val message = internalFailureMessage(throwable)
+
+        // then
+        message sameAs """
+            error: The script could not be compiled because of an internal failure: java.lang.IllegalStateException: Couldn't inline method call at line 3 of script: java.lang.NullPointerException
+              Caused by: java.lang.NullPointerException
         """.trimIndent()
     }
 

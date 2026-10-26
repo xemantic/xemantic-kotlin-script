@@ -20,14 +20,18 @@ package com.xemantic.kotlin.script
 
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ThreadContextElement
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import org.jetbrains.kotlin.builtins.PrimitiveType
 import org.jetbrains.kotlin.builtins.StandardNames
@@ -43,6 +47,8 @@ import kotlin.concurrent.atomics.incrementAndFetch
 import kotlin.coroutines.CoroutineContext
 import kotlin.reflect.KClass
 import java.lang.reflect.Modifier
+import java.util.Collections
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.reflect.KFunction
 import kotlin.reflect.KType
 import kotlin.reflect.KVisibility
@@ -55,8 +61,10 @@ import kotlin.script.experimental.api.ResultWithDiagnostics
 import kotlin.script.experimental.api.ScriptCompilationConfiguration
 import kotlin.script.experimental.api.ScriptDiagnostic
 import kotlin.script.experimental.api.ScriptEvaluationConfiguration
+import kotlin.script.experimental.api.ScriptEvaluator
 import kotlin.script.experimental.api.defaultImports
 import kotlin.script.experimental.api.providedProperties
+import kotlin.script.experimental.jvm.BasicJvmScriptEvaluator
 import kotlin.script.experimental.jvm.baseClassLoader
 import kotlin.script.experimental.jvm.dependenciesFromClassloader
 import kotlin.script.experimental.jvm.jvm
@@ -85,14 +93,20 @@ public class ScriptBody internal constructor(
     internal val block: suspend CoroutineScope.() -> Any?
 )
 
+/** The default of the `maxConcurrentCompilations` of the `ScriptExecutor(...)` factory function. */
+internal fun defaultMaxConcurrentCompilations(): Int = Runtime.getRuntime().availableProcessors()
+
 /**
  * The default [ScriptExecutor], see the `ScriptExecutor(...)` factory function for the parameters.
  */
 internal class DefaultScriptExecutor(
     private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
     compilationCacheSize: Int = 0,
+    maxConcurrentCompilations: Int = defaultMaxConcurrentCompilations(),
     /** Replaced only by the tests of the internal failures of the compiler. */
-    compiler: JvmScriptCompiler = JvmScriptCompiler()
+    compiler: JvmScriptCompiler = JvmScriptCompiler(),
+    /** Replaced only by the tests of the failures of the evaluator. */
+    evaluator: ScriptEvaluator = BasicJvmScriptEvaluator()
 ) : ScriptExecutor {
 
     private val logger = KotlinLogging.logger {}
@@ -104,8 +118,10 @@ internal class DefaultScriptExecutor(
     private val compilations = AtomicInt(0)
 
     /**
-     * The number of the actual compilations, not served by the cache,
-     * including the ones confirming the [ScriptSource.laterDeclaredDependencyCandidates].
+     * The number of the invocations of the compiler, the ones bounded by the `maxConcurrentCompilations`,
+     * so not counting the compilations served by the cache,
+     * while counting each confirming one, see [ScriptSource.confirming],
+     * even when the compilation of the script failed.
      */
     @OptIn(ExperimentalAtomicApi::class)
     internal val compilationCount: Int get() = compilations.load()
@@ -114,17 +130,26 @@ internal class DefaultScriptExecutor(
         require(compilationCacheSize >= 0) {
             "compilationCacheSize must not be negative, but was: $compilationCacheSize"
         }
+        require(maxConcurrentCompilations > 0) {
+            "maxConcurrentCompilations must be positive, but was: $maxConcurrentCompilations"
+        }
     }
 
     private val compilationCache = if (compilationCacheSize > 0) {
-        ScriptCompilationCache<Compilation>(compilationCacheSize) {
-            it.result is ResultWithDiagnostics.Success
+        ScriptCompilationCache<CompilationOutcome>(compilationCacheSize) {
+            it is Compilation && it.result is ResultWithDiagnostics.Success
         }
     } else {
         null
     }
 
-    private val scriptingHost = BasicJvmScriptingHost(compiler = compiler)
+    /**
+     * Bounds the invocations of the compiler, each loading the whole classpath,
+     * acquired only around them, so not by the callers waiting for the cached compilation.
+     */
+    private val compilationPermits = Semaphore(maxConcurrentCompilations)
+
+    private val scriptingHost = BasicJvmScriptingHost(compiler = compiler, evaluator = evaluator)
 
     /**
      * The class loader the script is compiled against, also evaluating it,
@@ -161,20 +186,51 @@ internal class DefaultScriptExecutor(
         }
     }
 
+    /**
+     * Resolving the classpath, see [compilationConfigurationTemplate],
+     * `null` until the first compilation, or after the failure of the previous one.
+     */
+    private val classpathResolution = AtomicReference<Deferred<ScriptCompilationConfiguration?>?>()
 
-    private val compilationConfigurationTemplate = ScriptCompilationConfiguration {
-        jvm {
-            dependenciesFromClassloader(
-                classLoader = classLoader,
-                wholeClasspath = true
-            )
-            // the default 1.8 target cannot inline functions of the classpath, e.g. `dependency(...)`
-            jvmTarget(scriptJvmTarget(System.getProperty("java.specification.version")))
+    /**
+     * Built on the first compilation, on the [dispatcher], as resolving the whole classpath
+     * would otherwise block the caller creating the executor, even if it never executes a script.
+     * The concurrent first compilations wait for it suspended, without holding their permits, nor their threads,
+     * and share its failure, reported as an internal failure, which is not kept,
+     * so the next compilation resolves the classpath again, as the failure might be transient.
+     * After a fatal error, see [shareFailure], the waiting compilations resolve it again.
+     */
+    private suspend fun compilationConfigurationTemplate(): ScriptCompilationConfiguration {
+        while (true) {
+            val resolving = classpathResolution.get()
+            if (resolving != null) {
+                return resolving.await() ?: continue
+            }
+            val resolution = CompletableDeferred<ScriptCompilationConfiguration?>()
+            if (!classpathResolution.compareAndSet(null, resolution)) continue
+            val template = try {
+                ScriptCompilationConfiguration {
+                    jvm {
+                        dependenciesFromClassloader(
+                            classLoader = classLoader,
+                            wholeClasspath = true
+                        )
+                        // the default 1.8 target cannot inline functions of the classpath, e.g. `dependency(...)`
+                        jvmTarget(scriptJvmTarget(System.getProperty("java.specification.version")))
+                    }
+                    // the script body has a CoroutineScope receiver, so it can launch coroutines without imports
+                    defaultImports(
+                        "kotlinx.coroutines.*"
+                    )
+                }
+            } catch (e: Throwable) {
+                classpathResolution.set(null)
+                resolution.shareFailure(e)
+                throw e
+            }
+            resolution.complete(template)
+            return template
         }
-        // the script body has a CoroutineScope receiver, so it can launch coroutines without imports
-        defaultImports(
-            "kotlinx.coroutines.*"
-        )
     }
 
     override suspend fun execute(
@@ -211,6 +267,9 @@ internal class DefaultScriptExecutor(
         return result
     }
 
+    /** What compiling the script gives, shared with the callers waiting for it in the cache. */
+    private sealed interface CompilationOutcome
+
     /**
      * The [source] of the script, together with the [result] of its compilation,
      * or `null`, if the script was not compiled because of the failure recognized in its source.
@@ -218,17 +277,16 @@ internal class DefaultScriptExecutor(
     private class Compilation(
         val source: ScriptSource,
         val result: ResultWithDiagnostics<CompiledScript>?,
-        /** The [ScriptSource.laterDeclaredDependencyCandidates] referring to the dependencies indeed. */
-        val laterDeclaredDependencyReferences: List<LaterDeclaredReference> = emptyList(),
-        /** The [ScriptSource.hiddenLocalFunctionCandidates] referring to other functions indeed. */
-        val hiddenLocalFunctionReferences: List<LaterDeclaredReference> = emptyList(),
-        /** The [ScriptSource.coroutineScopeCandidates] resolved to the coroutine scope indeed. */
-        val coroutineScopeReferences: List<LaterDeclaredReference> = emptyList(),
-        /** The [ScriptSource.coroutineScopeReceiverCandidates] referring to the coroutine scope indeed. */
-        val coroutineScopeReceiverReferences: List<ScriptReference> = emptyList(),
-        /** The [ScriptSource.shadowedFunctionCandidates] which would call the functions in the script. */
-        val shadowedFunctionReferences: List<Triple<ScriptReference, Int, Int>> = emptyList()
-    )
+        /** The failure messages of the [ScriptSource.candidates] confirmed by the confirming compilations, one for each kind of them. */
+        val confirmedFailures: List<String> = emptyList(),
+        /** The positions of the errors of the compilation explained by the [confirmedFailures], which are omitted. */
+        val explainedErrors: Set<ScriptPosition> = emptySet()
+    ) : CompilationOutcome
+
+    /** The compilation failed without giving a result, e.g. internally, reported with the failure [message]. */
+    private class FailedCompilation(
+        val message: String
+    ) : CompilationOutcome
 
     private inner class ScriptHandler(
         private val scriptId: Int,
@@ -246,61 +304,30 @@ internal class DefaultScriptExecutor(
         /** Parsed only when not compiled already, as the cached compilation keeps it. */
         private lateinit var source: ScriptSource
 
+        /** Reporting the failures of the [source], once it is known. */
+        private val reporter by lazy { ScriptErrorReporter(source) }
+
         suspend fun handle(): ScriptResult {
-            val compilation = try {
-                compile()
-            } catch (_: StackOverflowError) {
-                // thrown by parsing the script, while the compiler reports it as a diagnostic
-                return ScriptResult.Error(
-                    "error: The script is nested too deeply to be parsed.",
-                    ExecutionPhase.COMPILATION
-                )
-            } catch (e: Throwable) {
-                e.rethrowIfCancelledOrFatal()
-                // the internal failure of the parser, or of the compiler, shared by the callers waiting in the cache
-                logger.warn(e) { "Script[$scriptId]: Compilation (1/2) failed internally" }
-                return ScriptResult.Error(
-                    "error: The script could not be compiled because of an internal failure of the compiler: "
-                            // the callers waiting in the cache receive the copy recovered by kotlinx.coroutines
-                            + e.unwrapRecoveredCopy().let { listOfNotNull(it, it.cause) }.joinToString(", caused by: "),
-                    ExecutionPhase.COMPILATION
-                )
+            val compilation = when (val outcome = compile()) {
+                is Compilation -> outcome
+                is FailedCompilation -> return compilationFailure(outcome.message)
             }
             source = compilation.source
-            val compilationResult = compilation.result ?: return ScriptResult.Error(
-                ScriptErrorReporter(source).toSourceFailureMessage(),
-                ExecutionPhase.COMPILATION
+            val compilationResult = compilation.result ?: return compilationFailure(
+                reporter.toSourceFailureMessage()
             )
-            if (
-                compilation.laterDeclaredDependencyReferences.isNotEmpty()
-                || compilation.hiddenLocalFunctionReferences.isNotEmpty()
-                || compilation.shadowedFunctionReferences.isNotEmpty()
-                || compilation.coroutineScopeReferences.isNotEmpty()
-                || compilation.coroutineScopeReceiverReferences.isNotEmpty()
-            ) {
-                val failureMessage = listOfNotNull(
-                    compilation.coroutineScopeReceiverReferences.takeIf { it.isNotEmpty() }?.let {
-                        ScriptErrorReporter(source).toCoroutineScopeReceiverMessage(it)
-                    },
-                    compilation.coroutineScopeReferences.takeIf { it.isNotEmpty() }?.let {
-                        ScriptErrorReporter(source).toCoroutineScopeMessage(it)
-                    },
-                    compilation.shadowedFunctionReferences.takeIf { it.isNotEmpty() }?.let {
-                        ScriptErrorReporter(source).toShadowedFunctionMessage(it)
-                    },
-                    compilation.hiddenLocalFunctionReferences.takeIf { it.isNotEmpty() }?.let {
-                        ScriptErrorReporter(source).toHiddenLocalFunctionMessage(it)
-                    },
-                    compilation.laterDeclaredDependencyReferences.takeIf { it.isNotEmpty() }?.let {
-                        ScriptErrorReporter(source).toLaterDeclaredDependencyMessage(it)
-                    },
-                    // explained by the reference to the dependency
-                    (compilationResult as? Failure)?.let { ScriptErrorReporter(source).toFailureMessage(it.reports.filterNonIgnorable(source)) }
-                ).joinToString(separator = "\n\n")
-                logger.debug {
-                    "Script[$scriptId]: Compilation (1/2) failure message: $failureMessage"
-                }
-                return ScriptResult.Error(failureMessage, ExecutionPhase.COMPILATION)
+            if (compilation.confirmedFailures.isNotEmpty()) {
+                val failureMessage = (compilation.confirmedFailures + listOfNotNull(
+                    // without the errors explained by the confirmed references
+                    (compilationResult as? Failure)?.reports?.filterNonIgnorable(source)?.filterNot { diagnostic ->
+                        diagnostic.severity == ScriptDiagnostic.Severity.ERROR && diagnostic.location?.start?.let { start ->
+                            source.toScriptPosition(start.line, start.col) in compilation.explainedErrors
+                        } == true
+                    }?.takeIf { reports -> reports.any { it.severity == ScriptDiagnostic.Severity.ERROR } }?.let {
+                        reporter.toCompilationFailureMessage(it)
+                    }
+                )).joinToString(separator = "\n\n")
+                return compilationFailure(failureMessage)
             }
             val result = when (compilationResult) {
                 is Success -> {
@@ -311,21 +338,24 @@ internal class DefaultScriptExecutor(
                         }
                     )
                 }
-                is Failure -> {
-                    val failureMessage = ScriptErrorReporter(source).toFailureMessage(
-                        compilationResult.reports.filterNonIgnorable(source)
-                    )
-                    logger.debug {
-                        "Script[$scriptId]: Compilation (1/2) failure message: $failureMessage"
-                    }
-                    ScriptResult.Error(failureMessage, ExecutionPhase.COMPILATION)
-                }
+                is Failure -> compilationFailure(
+                    reporter.toCompilationFailureMessage(compilationResult.reports.filterNonIgnorable(source))
+                )
             }
 
             return result
         }
 
-        private suspend fun compile(): Compilation {
+        private fun compilationFailure(
+            failureMessage: String
+        ): ScriptResult.Error {
+            logger.debug {
+                "Script[$scriptId]: Compilation (1/2) failure message: $failureMessage"
+            }
+            return ScriptResult.Error(failureMessage, ExecutionPhase.COMPILATION)
+        }
+
+        private suspend fun compile(): CompilationOutcome {
 
             logger.debug { "Script[$scriptId]: Compiling (1/2)" }
 
@@ -336,11 +366,11 @@ internal class DefaultScriptExecutor(
                         script = script,
                         dependencies = allDependencies.map { it.name to it.type }
                     ),
-                    ::doCompile
-                ) ?: doCompile()
+                    ::compileOrFail
+                ) ?: compileOrFail()
             }
 
-            when (compilation.result) {
+            when ((compilation as? Compilation)?.result) {
                 is Success -> logger.debug {
                     "Script[$scriptId]: Compilation (1/2) succeeded after $duration"
                 }
@@ -352,33 +382,143 @@ internal class DefaultScriptExecutor(
             return compilation
         }
 
-        private suspend fun doCompile(): Compilation {
-            val source = source()
+        /**
+         * The [doCompile], or its internal failure, logged once, as it is shared with the callers waiting for it in the cache,
+         * unless it is the cancellation of the caller, or fatal, see [rethrowIfCancelledOrFatal],
+         * or the interruption of the thread, all of which are thrown.
+         */
+        private suspend fun compileOrFail(): CompilationOutcome = try {
+            doCompile().also { outcome ->
+                // the crashes of the compiler, reported without the stack traces
+                (outcome as? Compilation)?.result?.reports?.forEach { diagnostic ->
+                    if (diagnostic.severity == ScriptDiagnostic.Severity.ERROR) diagnostic.exception?.let {
+                        logger.warn(it) { "Script[$scriptId]: Compilation (1/2) failed internally: ${diagnostic.message}" }
+                    }
+                }
+            }
+        } catch (e: Throwable) {
+            // also causing the exception thrown by the compiler, like the one reported as a diagnostic
+            e.rethrowIfCancelledOrFatal()
+            // with the interrupt status restored where it was caught, see compile(source)
+            if (e is InterruptedException) throw e
+            logger.warn(e) { "Script[$scriptId]: Compilation (1/2) failed internally" }
+            FailedCompilation(internalFailureMessage(e, compiledSources))
+        }
+
+        /** The sources compiled for the script, which the messages of the internal failures might refer to. */
+        private val compiledSources: MutableList<ScriptSource> = Collections.synchronizedList(mutableListOf())
+
+        private suspend fun doCompile(): CompilationOutcome {
+            // the sources of all the compilations are derived from the script parsed once
+            val parsed: ScriptSource.Parsed
+            val source: ScriptSource
+            try {
+                parsed = ScriptSource.Parsed(script, preambleDependencies, ::mightBeClass)
+                source = parsed.source()
+            } catch (_: StackOverflowError) {
+                // while the compiler reports it as a diagnostic, and its other failures are internal
+                return FailedCompilation("error: The script is nested too deeply to be parsed.")
+            }
             if (!source.isWrapped) {
                 // the script alone, failing with the syntax errors of a regular script, without any candidates,
                 // unless it compiles, contrary to the lexer, while it cannot run without the script block
-                val result = compile(source).takeIf { it is Failure }
-                return Compilation(source, result)
+                return Compilation(source, compile(source).takeIf { it is Failure })
             }
             if (source.conflictingDependencyDeclarations.isNotEmpty()) {
                 return Compilation(source, result = null)
             }
-            val result = compile(source)
-            // unless already reported as unresolved
-            val errors = result.reports.filter { it.severity == ScriptDiagnostic.Severity.ERROR }.mapNotNull { diagnostic ->
-                diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }
+            val compilation = compile(parsed, source)
+            return hoistedCompilation(parsed, compilation) ?: compilation
+        }
+
+        /** The compilation of the [source] of the [parsed] script, with its [ScriptSource.candidates] confirmed, see [confirm]. */
+        private suspend fun compile(
+            parsed: ScriptSource.Parsed,
+            source: ScriptSource
+        ): CompilationOutcome {
+            if (source.candidates.isEmpty() && source.coroutineScopeReceiverCandidates.isEmpty()) return Compilation(source, compile(source))
+            // the confirming compilations do not depend on this one
+            return coroutineScope {
+                val compiled = async { compile(source) }
+                try {
+                    confirm(parsed, source, compiled)
+                } catch (failure: ConfirmingCompilationFailure) {
+                    val diagnostic = failure.diagnostic
+                    logger.warn(diagnostic.exception) {
+                        "Script[$scriptId]: Confirming compilation failed internally: ${diagnostic.message}"
+                    }
+                    when (val result = compiled.await()) {
+                        // otherwise the references it would confirm would be silently resolved to the wrong declarations
+                        is Success -> FailedCompilation(
+                            ScriptErrorReporter(failure.source).toCompilationFailureMessage(listOf(diagnostic))
+                        )
+                        // the errors of the script, more actionable, which might be the crash of the compiler as well
+                        is Failure -> Compilation(source, result)
+                    }
+                }
             }
-            if (
-                source.laterDeclaredDependencyCandidates.isEmpty()
-                && source.hiddenLocalFunctionCandidates.isEmpty()
-                && source.shadowedFunctionCandidates.isEmpty()
-                && source.coroutineScopeCandidates.isEmpty()
-                && source.coroutineScopeReceiverCandidates.isEmpty()
-            ) {
-                return Compilation(source, result)
+        }
+
+        /**
+         * The compilation of the [parsed] script with the local functions declared preceding the statements calling them,
+         * which are not visible there, unlike in the script, see [ScriptSource.Parsed.hoisted],
+         * if they are the only unresolved references of the failed [compilation], and the hoisted script compiles,
+         * otherwise `null`, as the errors of the script are reported for the script as it is.
+         */
+        private suspend fun hoistedCompilation(
+            parsed: ScriptSource.Parsed,
+            compilation: CompilationOutcome
+        ): CompilationOutcome? {
+            if (compilation !is Compilation || compilation.confirmedFailures.isNotEmpty()) return null
+            val result = compilation.result as? Failure ?: return null
+            val hoisted = parsed.hoisted(compilation.source, result.reports.unresolvedReferences(compilation.source)) ?: return null
+            logger.debug { "Script[$scriptId]: Compiling (1/2) with the local functions declared preceding their calls" }
+            return when (val outcome = compile(hoisted, hoisted.source())) {
+                is Compilation -> outcome.takeIf { it.result is Success }
+                // the internal failure of the confirming compilation, otherwise silently resolving the references to the wrong declarations
+                is FailedCompilation -> outcome
+            }
+        }
+
+        /**
+         * The compilation of the [source], with its [ScriptSource.candidates] confirmed by the confirming compilations,
+         * while it is being [compiled].
+         */
+        private suspend fun confirm(
+            parsed: ScriptSource.Parsed,
+            source: ScriptSource,
+            compiled: Deferred<ResultWithDiagnostics<CompiledScript>>
+        ): Compilation {
+            val candidates = source.candidates
+            /** The compilation of the confirming [source], failing fast on its internal failure, cancelling the other ones. */
+            suspend fun confirming(
+                source: ScriptSource
+            ) = compile(source).also { result ->
+                result.reports.firstOrNull { it.severity == ScriptDiagnostic.Severity.ERROR && it.exception != null }?.let {
+                    throw ConfirmingCompilationFailure(source, it)
+                }
+            }
+            // the types of the local properties, which are known only to the compiler, see ScriptSource.untypedPropertyCalls
+            val propertyTypes = if (source.untypedProperties.isEmpty()) emptyMap() else {
+                val typeProbes = parsed.source(propertyTypeProbes = true)
+                val unexpected = mutableListOf<String>()
+                val types = typeProbes.propertyTypes(confirming(typeProbes).reports) { unexpected += it.message }
+                val (mismatches, others) = unexpected.partition { it.startsWith("Initializer type mismatch") }
+                // like after the upgrade of the compiler, changing the message naming the type
+                if (mismatches.isNotEmpty()) logger.warn { "Script[$scriptId]: Unexpected messages of the type probes: ${mismatches.joinToString(separator = "; ")}" }
+                // like `Variable must be initialized` of a property assigned later, or the errors of the script
+                if (others.isNotEmpty()) logger.debug { "Script[$scriptId]: Other errors of the type probes: ${others.joinToString(separator = "; ")}" }
+                types
             }
             // recognizing the candidates referring to the wrong declarations indeed
-            val probe = source(confirming = true)
+            val probe = parsed.source(confirming = true, propertyTypes = propertyTypes)
+            // only the calls of the properties of unknown types, which cannot be confirmed without their copies
+            if (
+                probe.copiedProperties.isEmpty() && candidates.all { it in source.untypedPropertyCalls }
+                && source.coroutineScopeReceiverCandidates.isEmpty()
+            ) {
+                return Compilation(source, compiled.await())
+            }
             /**
              * The positions, from the start to the end, if known, of the warnings of the deprecated,
              * or opted in, declarations of this [message] in the [source], with their messages, see [ScriptSource.confirming].
@@ -401,7 +541,17 @@ internal class DefaultScriptExecutor(
                 source: ScriptSource,
                 message: String
             ) = markedRanges(source, message).map { it.first }
-            val reports = compile(probe).reports
+            val reports = confirming(probe).reports
+            val result = compiled.await()
+            val errorReports = result.reports.filter { it.severity == ScriptDiagnostic.Severity.ERROR }
+            // unless already reported as unresolved
+            val errors = errorReports.mapNotNull { diagnostic ->
+                diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }
+            }
+            // with their names, hinted at as not visible by the reporter of the errors already
+            val unresolved = result.reports.unresolvedReferences(source)
+            // unlike the other ones, the calls of which cannot be confirmed
+            val confirmedTypes = probe.confirmedPropertyTypes(reports)
             fun deprecated(
                 message: String
             ) = reports.marked(probe, message)
@@ -411,65 +561,226 @@ internal class DefaultScriptExecutor(
             // each assigned to the candidate of its name containing it, the one of the same end, if nested, like `a[0][1]`
             val hiddenWarnings = reports.markedRanges(probe, HIDDEN_LOCAL_FUNCTION)
             val hiddenCandidates = source.hiddenLocalFunctionCandidates
-            val hidden = hiddenWarnings.mapNotNullTo(HashSet()) { (start, end, message) ->
+            // with the lines of the declarations they are resolved to, if known, like of one of the overloads
+            val hidden = mutableMapOf<HiddenLocalFunctionReference, Int?>()
+            hiddenWarnings.forEach { (start, end, message) ->
                 hiddenCandidates.filter { candidate ->
                     start in candidate.reference && hiddenLocalFunctionMessage(candidate.reference.name) in message
-                            // the compiler reports the operators as unresolved, misleading, so they are hinted at as well
-                            && (candidate.isOperator || start !in errors)
+                            // like a delegate convention, not of a call of the same name within it, unless reported on the whole expression,
+                            // starting with it, like `getValue[0]`
+                            && candidate.inner.none { start in it && (end == null || end == it.end) }
                 }.let { matching ->
-                    matching.firstOrNull { it.reference.end == end } ?: matching.minByOrNull {
-                        (it.reference.end.line - it.reference.start.line) * 100_000 + it.reference.end.column - it.reference.start.column
-                    }
+                    // the operator called by the delegate convention reported at its callee, rather than by the call of the same name,
+                    // like `getValue` of `by getValue(cfg)`,
+                    // otherwise the innermost one, nested ones start later, or at the same position, ending earlier
+                    matching.firstOrNull { candidate ->
+                        candidate.delegateCallee?.let { start in it && end == it.end } == true
+                                && hiddenLocalFunctionMessage(candidate.reference.name, isOperator = true) in message
+                    } ?: matching.firstOrNull { it.reference.end == end } ?: matching.maxWithOrNull(
+                        compareBy<HiddenLocalFunctionReference> { it.reference.start }.thenByDescending { it.reference.end }
+                    )
+                }?.takeIf { candidate ->
+                    // chosen first, so that the warning of a plain call, like `get(1)` in `m[get(1)]`, is not assigned to the enclosing operator,
+                    // the compiler reports the operators as unresolved, misleading, so they are hinted at as well,
+                    // like the calls failing as resolved to other functions, like `print("")` returning `Unit` of `kotlin.io.print`,
+                    // or to the dependency of the same name, see ScriptSource.calledInsteadDependencies,
+                    // unlike the invoke operators of the unresolved values, like `q(2)`, hinted at as not visible already
+                    (candidate.isOperator && candidate.invokedValue == null) || (start to (candidate.invokedValue ?: candidate.reference.name)) !in unresolved
+                }?.let { candidate -> hidden.putIfAbsent(candidate, localFunctionLine(message)) }
+            }
+            // the calls of the local functions declared later, which apply, recognized also by the copies of the hidden local functions,
+            // unless already reported as unresolved, see ScriptSource.laterDeclaredFunctionCandidates
+            // each assigned to the candidate of its name containing it, the one of the same end, if nested, like `l[V(1)[0]]`, otherwise the innermost one
+            val laterFunctionMessages = mutableMapOf<LaterDeclaredFunctionReference, String>()
+            (reports.markedRanges(probe, LATER_DECLARED_LOCAL_FUNCTION) + hiddenWarnings).forEach { (start, end, message) ->
+                source.laterDeclaredFunctionCandidates.filter { candidate ->
+                    val name = candidate.reference.name
+                    start in candidate.reference && (laterDeclaredFunctionMessage(name) in message || hiddenLocalFunctionMessage(name) in message)
+                }.let { matching ->
+                    matching.firstOrNull { it.reference.end == end } ?: matching.maxWithOrNull(
+                        compareBy<LaterDeclaredFunctionReference> { it.reference.start }.thenByDescending { it.reference.end }
+                    )
+                }?.let { laterFunctionMessages.putIfAbsent(it, message) }
+            }
+            val laterDeclaredFunctionReferences = source.laterDeclaredFunctionCandidates.mapNotNull { candidate ->
+                laterFunctionMessages[candidate]?.takeIf {
+                    (candidate.reference.start to candidate.reference.name) !in unresolved
+                            && (!candidate.isConfirmedOnlyWhenFailing || errors.any { it in candidate.reference })
+                }?.let { message ->
+                    // naming the overload called in the script
+                    candidate.copy(line = localFunctionLine(message) ?: candidate.line)
                 }
             }
             val toReceiver = deprecated(COROUTINE_SCOPE_RECEIVER)
-            // the references not resolved to the moved declarations, unless already reported as errors
+            // the references not resolved to the moved declarations, unless already reported as errors, other than the one of the assignment
+            // to the property of the coroutine scope instead of the moved `var`, `'val' cannot be reassigned`, at the property, explained by it,
+            // while a reference within a lambda resolved to a value of its receiver, failing the same way, is not confirmed by the copies
             val toDeclarations = deprecated(COROUTINE_SCOPE_ORIGINAL)
             val coroutineScopeReferences = source.coroutineScopeCandidates.filter { candidate ->
-                toDeclarations.none { it in candidate.reference } && errors.none { it in candidate.reference }
+                toDeclarations.none { it in candidate.reference } && errors.none {
+                    it in candidate.reference && (candidate.assignment == null || it != candidate.reference.start)
+                }
             }
             // the calls not referring to the moved functions already, which would refer to them in the script, if they apply
             val toFunctions = deprecated(SHADOWED_ORIGINAL)
-            val toProperties = source.shadowedFunctionCandidates.filter { (reference) -> toFunctions.none { it in reference } }
-            // the remaining calls of the functions, which would refer to them in the script, if they apply, like the properties
-            val functionCandidates = coroutineScopeReferences.filter { it.isFunction }
+            val toLocals = source.shadowedFunctionCandidates.filter { (reference) -> toFunctions.none { it in reference } }
+            /** The one of these [candidates], the reference of which contains the position, as they do not overlap. */
+            fun <T : CandidateReference> candidateAt(
+                candidates: List<T>
+            ): (ScriptPosition) -> T? {
+                val sorted = candidates.sortedBy { it.reference.start }
+                return { position ->
+                    sorted.getOrNull(sorted.binarySearch { it.reference.start.compareTo(position) }.let { if (it >= 0) it else -it - 2 })
+                        ?.takeIf { position in it.reference }
+                }
+            }
+            // the lines of the local functions they call, if known, see SHADOWING_FUNCTION
+            val toLocalAt = candidateAt(toLocals)
+            val calledLocals = reports.markedRanges(probe, SHADOWING_FUNCTION).mapNotNull { (start, _, message) ->
+                toLocalAt(start)?.let { candidate -> probe.shadowingFunctionLine(message)?.let { candidate.reference to it } }
+            }.toMap()
+            // the remaining calls of the functions, which would refer to them in the script, if they apply, like the properties,
+            // and the references within the lambdas, unless resolved to their receivers, also in the script, see ScriptSource.coroutineScopeCopies
+            fun CoroutineScopeReference.isConfirmedByCopies() = isFunction || isInLambda
+            val confirmedCandidates = coroutineScopeReferences.filter { it.isConfirmedByCopies() }
             // independent of each other
-            val (shadowed, toCoroutineScope) = coroutineScope {
-                val shadowed = async {
-                    if (toProperties.isEmpty()) emptyList() else {
-                        val copies = source(confirming = true, shadowedFunctionCopies = true)
-                        compile(copies).reports.marked(copies, SHADOWED_FUNCTION)
+            val (shadowed, scopeCopies) = coroutineScope {
+                // the calls within the declarations of inferred types are resolved differently, see ScriptSource.overloadingFunctionCopies
+                val (inInferredTypes, inDeclaredTypes) = toLocals.partition { it.isInInferredType }
+                fun copies(
+                    candidates: List<ShadowedFunctionReference>,
+                    copies: () -> ScriptSource
+                ) = async {
+                    if (candidates.isEmpty()) emptyList() else {
+                        val source = copies()
+                        val candidateOf = candidateAt(candidates)
+                        confirming(source).reports.markedRanges(source, SHADOWED_FUNCTION).mapNotNull { (start, _, message) ->
+                            candidateOf(start)?.let { candidate ->
+                                // naming the overload called in the script
+                                candidate.copy(functionLine = source.shadowedFunctionLine(message) ?: candidate.functionLine)
+                            }
+                        }
                     }
                 }
-                val toCoroutineScope = async {
-                    if (functionCandidates.isEmpty()) emptyList() else {
-                        val copies = source(confirming = true, coroutineScopeCopies = true)
-                        compile(copies).reports.marked(copies, COROUTINE_SCOPE_FUNCTION)
+                val inferred = copies(inInferredTypes) { parsed.source(confirming = true, overloadingFunctionCopies = true) }
+                val declared = copies(inDeclaredTypes) { parsed.source(confirming = true, shadowedFunctionCopies = true) }
+                val shadowed = async { (inferred.await() + declared.await()).distinctBy { it.reference } }
+                // also declaring the copies of the constructors of the local classes, see ScriptSource.laterDeclaredClassCandidates,
+                // and of the scope functions, the receivers of the lambdas of which are the script instance in the script
+                val scopeCopies = async {
+                    if (
+                        confirmedCandidates.isEmpty() && source.laterDeclaredClassCandidates.isEmpty()
+                        && source.laterDeclaredDependencyCandidates.none { it.scopeCalls.isNotEmpty() }
+                    ) null else {
+                        val copies = parsed.source(confirming = true, coroutineScopeCopies = true)
+                        copies to confirming(copies).reports
                     }
                 }
-                shadowed.await() to toCoroutineScope.await()
+                shadowed.await() to scopeCopies.await()
+            }
+            val toCoroutineScope = scopeCopies?.let { (copies, reports) -> reports.marked(copies, COROUTINE_SCOPE_FUNCTION) }.orEmpty()
+            // only the ones, which the constructors apply to, unlike the dependency called anyway
+            val constructors = scopeCopies?.let { (copies, reports) -> reports.marked(copies, LATER_DECLARED_CLASS) }.orEmpty()
+            // the calls of the scope functions of the coroutine scope of the script body, the script instance in the script
+            val toScriptReceiver = scopeCopies?.let { (copies, reports) -> reports.marked(copies, SCRIPT_RECEIVER) }.orEmpty()
+            /** Whether it is within the lambda of a scope function of the script instance, declaring the dependency, which takes precedence there in the script. */
+            fun List<ScriptReference>.toScriptReceiver() = any { call -> toScriptReceiver.any { it in call } }
+            val laterDeclaredDependencyReferences = (source.laterDeclaredDependencyCandidates.filter { candidate ->
+                (functions.takeIf { candidate.isFunction }.orEmpty()
+                        // like `::x`, resolved to the property of the dependency instead of the local function
+                        + dependencies.takeIf { !candidate.isFunction || candidate.isCallableReference }.orEmpty())
+                    .any { it in candidate.reference } && !candidate.scopeCalls.toScriptReceiver()
+            } + source.laterDeclaredClassCandidates.filter { candidate ->
+                // calling the dependency without the copies, rather than e.g. the member of a receiver, which takes precedence in the script,
+                // like the script instance, the receiver of the lambdas of its scope functions, like `run { }`, declaring the dependency
+                constructors.any { it in candidate.reference } && dependencies.any { it in candidate.reference } && !candidate.scopeCalls.toScriptReceiver()
+            }).sortedBy { it.reference.start }
+            val hiddenLocalFunctionReferences = hiddenCandidates.filter {
+                it in hidden && (it !in source.untypedPropertyCalls || it.reference.name in confirmedTypes)
+            }.map { candidate ->
+                // naming the overload called in the script
+                hidden[candidate]?.let { candidate.copy(line = it) } ?: candidate
+            }
+            val reporter = ScriptErrorReporter(source)
+            /** The failure message of these confirmed [references] of one kind, unless there are none. */
+            fun <T : CandidateReference> message(
+                references: List<T>,
+                toMessage: ScriptErrorReporter.(List<T>) -> String
+            ) = references.takeIf { it.isNotEmpty() }?.let { reporter.toMessage(it) }
+            val toCoroutineScopeReferences = coroutineScopeReferences.filter { candidate ->
+                !candidate.isConfirmedByCopies() || toCoroutineScope.any { it in candidate.reference }
             }
             return Compilation(
                 source,
                 result,
-                laterDeclaredDependencyReferences = source.laterDeclaredDependencyCandidates.filter { candidate ->
-                    (functions.takeIf { candidate.isFunction }.orEmpty()
-                            // like `::x`, resolved to the property of the dependency instead of the local function
-                            + dependencies.takeIf { !candidate.isFunction || candidate.isCallableReference }.orEmpty())
-                        .any { it in candidate.reference }
-                },
-                // in the order of the script
-                coroutineScopeReferences = coroutineScopeReferences.filter { candidate ->
-                    !candidate.isFunction || toCoroutineScope.any { it in candidate.reference }
-                },
-                shadowedFunctionReferences = toProperties.filter { (reference) ->
-                    shadowed.any { it in reference }
-                },
-                coroutineScopeReceiverReferences = source.coroutineScopeReceiverCandidates.filter { candidate ->
-                    toReceiver.any { it in candidate } && errors.none { it in candidate }
-                },
-                hiddenLocalFunctionReferences = hiddenCandidates.filter { it in hidden }
+                confirmedFailures = listOfNotNull(
+                    source.coroutineScopeReceiverCandidates.filter { candidate ->
+                        toReceiver.any { it in candidate } && errors.none { it in candidate }
+                    }.takeIf { it.isNotEmpty() }?.let { reporter.toCoroutineScopeReceiverMessage(it) },
+                    // in the order of the script
+                    message(toCoroutineScopeReferences, ScriptErrorReporter::toCoroutineScopeMessage),
+                    // in the order of the script
+                    message(
+                        shadowed.associateBy { it.reference }.let { byReference ->
+                            toLocals.mapNotNull { candidate -> byReference[candidate.reference] }
+                        }.map { reference ->
+                            // naming the local function called, rather than all the visible ones
+                            calledLocals[reference.reference]?.let { reference.copy(lines = listOf(it)) } ?: reference
+                        },
+                        ScriptErrorReporter::toShadowedFunctionMessage
+                    ),
+                    message(hiddenLocalFunctionReferences, ScriptErrorReporter::toHiddenLocalFunctionMessage),
+                    message(laterDeclaredFunctionReferences, ScriptErrorReporter::toLaterDeclaredFunctionMessage),
+                    message(laterDeclaredDependencyReferences, ScriptErrorReporter::toLaterDeclaredDependencyMessage)
+                ),
+                // the errors of the calls resolved to the dependency instead, like `No value passed for parameter 'p1'` of `log()`,
+                // see ScriptSource.calledInsteadDependencies
+                explainedErrors = hiddenLocalFunctionReferences.filter {
+                    it.reference.name in source.calledInsteadDependencies
+                }.mapTo(HashSet()) { it.reference.start } + toCoroutineScopeReferences.flatMap { reference ->
+                    // `'val' cannot be reassigned` at the property, and the errors of the assignment, like `Assignment type mismatch`,
+                    // or of the operator of `+=`, or `++`, called on the property of the coroutine scope, at the operator
+                    listOfNotNull(reference.assignment?.let { reference.reference.start }, reference.assignment)
+                } + laterDeclaredFunctionReferences.flatMap { reference ->
+                    // like `None of the following candidates is applicable` of `maxOf(W(1), W(2))`, or `Argument type mismatch` at its arguments,
+                    // unlike the errors of the arguments themselves, like `Cannot create an instance of an abstract class`,
+                    // or of the calls as arguments, which start there, like `None of the following candidates is applicable` of `print(maxOf("a", 2))`
+                    errorReports.mapNotNull { diagnostic ->
+                        diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) }?.takeIf { position ->
+                            when (position) {
+                                reference.reference.start -> inapplicableCallErrors
+                                reference.indices -> argumentErrors + missingOperatorErrors
+                                in reference.arguments -> argumentErrors
+                                else -> emptyList()
+                            }.any { diagnostic.message.startsWith(it) }
+                        }
+                    }
+                }
             )
+        }
+
+        /**
+         * The beginnings of the messages of the errors of the calls resolved to the functions, which do not apply, reported at their arguments,
+         * see [LaterDeclaredFunctionReference.arguments], unlike the errors of the calls as arguments, which start there.
+         */
+        private val argumentErrors = listOf("Argument type mismatch", "Too many arguments")
+
+        /** The beginnings of the messages of the errors of the missing operators, reported at the indices of the array access, see [LaterDeclaredFunctionReference.indices]. */
+        private val missingOperatorErrors = listOf("No 'get' operator method", "No 'set' operator method")
+
+        /** The beginnings of the messages of the errors of the calls resolved to the functions, which do not apply, reported at the calls. */
+        private val inapplicableCallErrors = argumentErrors + missingOperatorErrors + listOf(
+            "None of the following candidates is applicable", "No value passed for parameter", "No parameter with name",
+            "Candidate '", "Inapplicable candidate"
+        )
+
+        /** The positions of the unresolved references among these reports of the compilation of the [source], with their names. */
+        private fun List<ScriptDiagnostic>.unresolvedReferences(
+            source: ScriptSource
+        ): Set<Pair<ScriptPosition, String>> = filter { it.severity == ScriptDiagnostic.Severity.ERROR }.mapNotNullTo(HashSet()) { diagnostic ->
+            unresolvedReference.matchEntire(diagnostic.message)?.let { match ->
+                diagnostic.location?.start?.let { source.toScriptPosition(it.line, it.col) to match.groupValues[1] }
+            }
         }
 
         /** Inspected once, as recognizing a callable dependency might inspect its members by reflection. */
@@ -477,28 +788,37 @@ internal class DefaultScriptExecutor(
             allDependencies.filter { it.isHidden }.map { it.preambleDependency }
         }
 
-        private fun source(
-            confirming: Boolean = false,
-            shadowedFunctionCopies: Boolean = false,
-            coroutineScopeCopies: Boolean = false
-        ) = ScriptSource(script, preambleDependencies, ::mightBeClass, confirming, shadowedFunctionCopies, coroutineScopeCopies)
-
         private suspend fun compile(
             source: ScriptSource
         ): ResultWithDiagnostics<CompiledScript> {
-            @OptIn(ExperimentalAtomicApi::class)
-            compilations.incrementAndFetch()
-            return try {
-                scriptingHost.compiler(
-                    script = source,
-                    scriptCompilationConfiguration = compilationConfig()
-                )
+            compiledSources += source
+            val result = try {
+                // resolving the classpath on the first compilation, which is not counted if it fails
+                val configuration = compilationConfig()
+                compilationPermits.withPermit {
+                    // as a free permit is taken without checking it, e.g. by the confirming compilations of the cancelled caller,
+                    // not counting the callers cancelled while waiting for the permit, or for the classpath
+                    currentCoroutineContext().ensureActive()
+                    @OptIn(ExperimentalAtomicApi::class)
+                    compilations.incrementAndFetch()
+                    scriptingHost.compiler(
+                        script = source,
+                        scriptCompilationConfiguration = configuration
+                    )
+                }
             } catch (e: CancellationException) {
                 // the cancellation of the caller is not a failure of the compilation,
                 // otherwise it would silently cancel the active caller, and the ones waiting in the cache, instead of failing them
                 currentCoroutineContext().ensureActive()
                 throw IllegalStateException("The compilation of the script was cancelled", e)
+            } catch (e: InterruptedException) {
+                // only the one of this thread, not the one causing a failure of another thread
+                throwRestoringInterruptStatus(e)
             }
+            // the compiler reports what it throws as a diagnostic, like `error: Java heap space`, not an error of the script
+            result.reports.fatalCause()?.let { throw it }
+            result.reports.firstNotNullOfOrNull { it.exception as? InterruptedException }?.let { throwRestoringInterruptStatus(it) }
+            return result
         }
 
 
@@ -521,8 +841,10 @@ internal class DefaultScriptExecutor(
                     evaluationResult.value.returnValue.toScriptResult(warnings)
                 }
                 is Failure -> {
+                    // e.g. while loading the script class
+                    evaluationResult.reports.fatalCause()?.let { throw it }
                     // in practice, this never happens
-                    val failureMessage = ScriptErrorReporter(source).toFailureMessage(
+                    val failureMessage = reporter.toFailureMessage(
                         evaluationResult.reports.filterNonIgnorable(source)
                     )
                     ScriptResult.Error(failureMessage, ExecutionPhase.EVALUATION)
@@ -564,7 +886,10 @@ internal class DefaultScriptExecutor(
             }
             // the script block closed early as well, followed by a statement of Unit type, or a declaration
             is ResultValue.Unit -> earlyClosedBlockError()
-            is ResultValue.Error -> failure(error, warnings, blockClassName = null)
+            is ResultValue.Error -> {
+                error.fatalCause()?.let { throw it }
+                failure(error, warnings, blockClassName = null)
+            }
             is ResultValue.NotEvaluated -> throw IllegalStateException(
                 "Should never happen"
             )
@@ -578,7 +903,7 @@ internal class DefaultScriptExecutor(
         private fun warningsMessage(
             warnings: List<ScriptDiagnostic>
         ): String? = if (warnings.isEmpty()) null else {
-            ScriptErrorReporter(source).toFailureMessage(warnings)
+            reporter.toFailureMessage(warnings)
         }
 
         private fun ResultValue.failure(
@@ -605,7 +930,7 @@ internal class DefaultScriptExecutor(
             )
         }
 
-        private fun compilationConfig() = ScriptCompilationConfiguration(compilationConfigurationTemplate) {
+        private suspend fun compilationConfig() = ScriptCompilationConfiguration(compilationConfigurationTemplate()) {
             providedProperties(
                 *(allDependencies.map { it.providedName to it.providedType }.toTypedArray())
             )
@@ -614,6 +939,15 @@ internal class DefaultScriptExecutor(
     }
 
 }
+
+/**
+ * The internal failure of the confirming compilation of the [source], reported by the compiler as this [diagnostic], like its crash,
+ * without the constructors the coroutine stack trace recovery would copy it with.
+ */
+private class ConfirmingCompilationFailure(
+    val source: ScriptSource,
+    val diagnostic: ScriptDiagnostic
+) : Exception(diagnostic.message, diagnostic.exception)
 
 /**
  * Sets the context class loader of every thread the coroutine resumes on.
@@ -645,14 +979,62 @@ private class ContextClassLoader(
 }
 
 /**
- * Rethrows this exception, unless it is a failure of the script, or of its compilation:
- * the cancellation of the caller, or a [VirtualMachineError], after which, unlike after the [StackOverflowError],
- * the JVM might not be able to continue.
+ * Whether this exception is a [VirtualMachineError], after which, unlike after the [StackOverflowError],
+ * the JVM might not be able to continue, so it is not reported as a failure of the script, or of its compilation, but thrown.
+ */
+private val Throwable.isFatal: Boolean
+    get() = this is VirtualMachineError && this !is StackOverflowError
+
+/** The first [fatalCause] of the exceptions of these diagnostics, e.g. reported by the compiler, if any. */
+private fun List<ScriptDiagnostic>.fatalCause(): Throwable? = firstNotNullOfOrNull { it.exception?.fatalCause() }
+
+/**
+ * Completes this deferred, which the callers waiting for the same work await, with the [failure] of the caller doing it, shared with them,
+ * or with `null`, after which they do the work again, if the [failure] is not the failure of the work:
+ * the cancellation, or the interruption, of the caller, or a fatal error, see [fatalCause].
+ */
+internal fun <T> CompletableDeferred<T?>.shareFailure(
+    failure: Throwable
+) {
+    if (failure is CancellationException || failure is InterruptedException || failure.fatalCause() != null) {
+        complete(null)
+    } else {
+        completeExceptionally(failure)
+    }
+}
+
+/**
+ * Rethrows this exception, if it is the cancellation of the caller, or its [fatalCause],
+ * neither of which is a failure of the script, or of its compilation.
  */
 private suspend fun Throwable.rethrowIfCancelledOrFatal() {
     if (this is CancellationException) currentCoroutineContext().ensureActive()
-    if (this is VirtualMachineError && this !is StackOverflowError) throw this
+    fatalCause()?.let { throw it }
 }
+
+/** This exception, or its first cause, which [isFatal], if any. */
+private fun Throwable.fatalCause(): Throwable? = firstCause { it.isFatal }
+
+/**
+ * Throws the [interruption] caught by this thread, restoring its interrupt status,
+ * as the interruption, like on shutdown, is not a failure of the compilation.
+ */
+private fun throwRestoringInterruptStatus(
+    interruption: InterruptedException
+): Nothing {
+    Thread.currentThread().interrupt()
+    throw interruption
+}
+
+/** This exception, or its first cause, matching the [predicate], if any. */
+private fun Throwable.firstCause(
+    predicate: (Throwable) -> Boolean
+): Throwable? = generateSequence(this) { exception ->
+    exception.read(null) { cause }?.takeUnless { it === exception }
+}.take(MAX_CAUSE_DEPTH).firstOrNull(predicate)
+
+/** Bounds the chain of causes, which might be cyclic. */
+private const val MAX_CAUSE_DEPTH = 100
 
 /**
  * The original exception, if this one is its copy made by the coroutine stack trace recovery,
