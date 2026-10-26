@@ -26,6 +26,7 @@ import com.xemantic.kotlin.test.should
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CompletableJob
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
@@ -41,6 +42,7 @@ import org.jetbrains.kotlin.config.JvmTarget
 import java.net.URL
 import java.util.Collections
 import java.util.Enumeration
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 import kotlin.reflect.full.createType
 import kotlin.reflect.typeOf
@@ -2464,7 +2466,250 @@ class ScriptExecutorTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                error: The script could not be compiled because of an internal failure of the compiler: java.lang.IllegalStateException: compiler crashed
+                error: The script could not be compiled because of an internal failure: java.lang.IllegalStateException: compiler crashed
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report the root cause of the doubly wrapped internal failure of the compiler`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            compiler = FailingCompiler {
+                throw IllegalStateException("Could not compile", RuntimeException(IllegalArgumentException("root cause")))
+            }
+        )
+
+        // when
+        val result = executor.execute("42")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                error: The script could not be compiled because of an internal failure: java.lang.IllegalStateException: Could not compile
+                  Caused by: java.lang.IllegalArgumentException: root cause
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should truncate the long message of the internal failure of the compiler`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            // like a dump of the bytecode
+            compiler = FailingCompiler { throw IllegalStateException("x".repeat(100_000)) }
+        )
+
+        // when
+        val result = executor.execute("42")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                error: The script could not be compiled because of an internal failure: java.lang.IllegalStateException: ${"x".repeat(500)}... [TRUNCATED]
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report StackOverflowError of the compiler as internal failure, not as the script nested too deeply`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            compiler = FailingCompiler { throw StackOverflowError() }
+        )
+
+        // when
+        val result = executor.execute("42")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                error: The script could not be compiled because of an internal failure: java.lang.StackOverflowError
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report the crash of the compiler at the position in the script`() = runTest {
+        // given
+        val script = """
+            class Cfg
+            operator fun Cfg.getValue(thisRef: Any?, property: kotlin.reflect.KProperty<*>): Int = 42
+            val cfg: Cfg? = Cfg()
+            val v: Int by cfg?.let { it }
+            v
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        // a bug of the compiler (2.4), crashing on a regular script as well
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:15: error: The compiler failed internally: While analysing script.kts:4:15: org.jetbrains.kotlin.utils.exceptions.KotlinIllegalArgumentExceptionWithAttachments: Exception in expression checkers
+                  Caused by: org.jetbrains.kotlin.utils.exceptions.KotlinIllegalArgumentExceptionWithAttachments: Expected expression 'FirAnonymousFunctionExpressionImpl' to be resolved
+                  | val v: Int by <error></error>cfg?.let { it }
+                  hint: it is a failure of the compiler itself - express this code differently.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should throw InterruptedException of the compiler restoring the interrupt status`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            // compiling on the thread of the test, read before the test loop would fail on its interrupt status
+            dispatcher = Dispatchers.Unconfined,
+            compiler = FailingCompiler { throw InterruptedException("compiler interrupted") }
+        )
+
+        // when
+        val failure = runCatching { executor.execute("42") }.exceptionOrNull()
+
+        // then
+        val interrupted = Thread.interrupted()
+        assert(failure is InterruptedException && failure.message == "compiler interrupted")
+        assert(interrupted)
+    }
+
+    @Test
+    fun `should throw InterruptedException reported by the compiler restoring the interrupt status`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            dispatcher = Dispatchers.Unconfined,
+            compiler = FakeCompiler {
+                ResultWithDiagnostics.Failure(
+                    ScriptDiagnostic(
+                        code = ScriptDiagnostic.unspecifiedError,
+                        message = "compiler interrupted",
+                        exception = InterruptedException("compiler interrupted")
+                    )
+                )
+            }
+        )
+
+        // when
+        val failure = runCatching { executor.execute("42") }.exceptionOrNull()
+
+        // then
+        val interrupted = Thread.interrupted()
+        assert(failure is InterruptedException && failure.message == "compiler interrupted")
+        assert(interrupted)
+    }
+
+    @Test
+    fun `should report InterruptedException of another thread causing the failure of the compiler as compilation error`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            dispatcher = Dispatchers.Unconfined,
+            compiler = FailingCompiler {
+                throw IllegalStateException("failed", ExecutionException(InterruptedException("worker thread interrupted")))
+            }
+        )
+
+        // when
+        val result = executor.execute("42")
+
+        // then
+        val interrupted = Thread.interrupted()
+        assert(!interrupted)
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                error: The script could not be compiled because of an internal failure: java.lang.IllegalStateException: failed
+                  Caused by: java.lang.InterruptedException: worker thread interrupted
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report InterruptedException causing the exception reported by the compiler as compilation error`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            dispatcher = Dispatchers.Unconfined,
+            compiler = FakeCompiler {
+                ResultWithDiagnostics.Failure(
+                    ScriptDiagnostic(
+                        code = ScriptDiagnostic.unspecifiedError,
+                        message = "Could not read file",
+                        exception = IllegalStateException("Could not read file", InterruptedException("worker thread interrupted"))
+                    )
+                )
+            }
+        )
+
+        // when
+        val result = executor.execute("42")
+
+        // then
+        val interrupted = Thread.interrupted()
+        assert(!interrupted)
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                error: The compiler failed internally: Could not read file
+                  Caused by: java.lang.InterruptedException: worker thread interrupted
+                  hint: it is a failure of the compiler itself - express the script differently.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not report VirtualMachineError causing the exception thrown by the compiler as compilation error`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            compiler = FailingCompiler { throw RuntimeException(OutOfMemoryError("compiler out of memory")) }
+        )
+
+        // when
+        val failure = runCatching { executor.execute("42") }.exceptionOrNull()
+
+        // then
+        assert(failure is OutOfMemoryError && failure.message == "compiler out of memory")
+    }
+
+    @Test
+    fun `should report internal failure of the compiler at the position in the script instead of the generated one`() = runTest {
+        // given
+        val script = """
+            val a = 1
+            val b = a + 1
+            b
+        """.trimIndent()
+        val executor = DefaultScriptExecutor(
+            compiler = object : JvmScriptCompiler() {
+                override suspend fun invoke(
+                    script: SourceCode,
+                    scriptCompilationConfiguration: ScriptCompilationConfiguration
+                ): ResultWithDiagnostics<CompiledScript> {
+                    val source = script as ScriptSource
+                    val line = (1..source.text.lines().size).first { source.toScriptLine(it) == 1 }
+                    throw IllegalStateException("While analysing ${source.locationId}:$line:9: boom")
+                }
+            }
+        )
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                error: The script could not be compiled because of an internal failure: java.lang.IllegalStateException: While analysing script.kts:2:9: boom
             """.trimIndent()
         }
     }
@@ -2484,7 +2729,8 @@ class ScriptExecutorTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                error: The script could not be compiled because of an internal failure of the compiler: java.lang.IllegalStateException: The compilation of the script was cancelled, caused by: java.util.concurrent.CancellationException: compiler cancelled
+                error: The script could not be compiled because of an internal failure: java.lang.IllegalStateException: The compilation of the script was cancelled
+                  Caused by: java.util.concurrent.CancellationException: compiler cancelled
             """.trimIndent()
         }
     }
@@ -2516,6 +2762,7 @@ class ScriptExecutorTest {
         val (ownerResult, waiterResult) = results
         assert(ownerResult is ScriptResult.Error && ownerResult.phase == ExecutionPhase.COMPILATION)
         assert(waiterResult is ScriptResult.Error && waiterResult.phase == ExecutionPhase.COMPILATION)
+        assert(ownerResult.message == "error: The script could not be compiled because of an internal failure: java.lang.IllegalStateException: compiler crashed")
         assert(waiterResult.message == ownerResult.message)
         assert(executor.compilationCount == 1)
     }
@@ -3118,7 +3365,7 @@ class ScriptExecutorTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                error: The script could not be compiled because of an internal failure of the compiler: java.lang.IllegalStateException: classpath unavailable
+                error: The script could not be compiled because of an internal failure: java.lang.IllegalStateException: classpath unavailable
             """.trimIndent()
         }
         retried should {
