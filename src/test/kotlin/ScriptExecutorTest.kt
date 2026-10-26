@@ -4569,6 +4569,23 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should call function of the script instead of callable dependency of the same name like a regular script with the dependencies as members of its base class`() = runTest {
+        // given
+        val scripts = listOf(
+            "fun x(): Int = 10\nx()",
+            "val r = x()\nfun x(): Int = 10\nr"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, listOf(dependency<() -> Int>("x") { 7 })) }
+
+        // then
+        // a regular script receiving the dependency as a provided property would return 7 instead (#101)
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(10, 10))
+    }
+
+    @Test
     fun `should report error at declaration moved out of the script body calling dependency with invoke operator of value class parameter shadowed by local function`() = runTest {
         // given
         val script = """
@@ -7067,6 +7084,50 @@ class ScriptExecutorTest {
         assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.firstOrNull()?.substringBefore(": error") } == listOf(
             "script.kts:6:37", "script.kts:6:25", "script.kts:6:46"
         ))
+    }
+
+    @Test
+    fun `should call the most specific of local overloads, while a regular script prefers the one of inferred type`() = runTest {
+        // given
+        val calls = listOf(
+            "fun h() = show(1)\nh()",
+            "val r = show(1)\nr",
+            "show(1)",
+            "listOf(1).map { show(it) }.single()"
+        )
+        val scripts = calls.map { call ->
+            "fun show(x: Int): String = \"int\"\nfun show(x: Any) = \"any\"\n$call"
+        }
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // a known difference, a regular script returns "any" (#100)
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("int", "int", "int", "int"))
+    }
+
+    @Test
+    fun `should call local overload from default value of parameter of function of inferred type, while a regular script calls the moved one`() = runTest {
+        // given
+        val script = """
+            val p = "!".trim()
+            fun show(x: Int): String = "int"
+            fun show(x: Any) = "any${'$'}p"
+            sealed interface S
+            class T : S { fun f(): String = show(1) }
+            fun h(x: String = show(1)) = x
+            h() + T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        // a known difference, a regular script returns "intint" (#102)
+        assert((result as? ScriptResult.Value)?.value == "any!int")
     }
 
     @Test
