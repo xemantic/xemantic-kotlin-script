@@ -23,17 +23,24 @@ import com.xemantic.kotlin.test.be
 import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
+import java.lang.management.ManagementFactory
+import java.lang.management.MonitorInfo
+import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import kotlin.concurrent.thread
+import kotlin.test.Test
+import kotlin.test.assertFailsWith
+import kotlin.time.Duration.Companion.milliseconds
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
-import kotlin.test.Test
-import kotlin.test.assertFailsWith
-import kotlin.time.Duration.Companion.milliseconds
 
 class ScriptCompilationCacheTest {
 
@@ -176,7 +183,130 @@ class ScriptCompilationCacheTest {
     }
 
     @Test
-    fun `should report unmatched closing brace of the script without compiling it`() = runTest {
+    fun `should not confirm references within nested coroutine scopes next to moved declarations of their names`() = runTest {
+        // given
+        val scripts = listOf(
+            "val r = supervisorScope { run { isActive } }\nval isActive get() = \"mine\"\nr",
+            "val r = coroutineScope { launch { } }\nfun launch(block: () -> Unit): String = \"mine\"\nr is Job",
+            "import kotlinx.coroutines.supervisorScope\nval r = supervisorScope { isActive }\nval isActive get() = \"mine\"\nr"
+        )
+        val executor = DefaultScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(true, true, true))
+        assert(executor.compilationCount == scripts.size)
+    }
+
+    @Test
+    fun `should count the compilation confirming the reference to later declared dependency`() = runTest {
+        // given
+        val script = """
+            fun show() = x
+            val x = 2
+            show()
+        """.trimIndent()
+        val executor = DefaultScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("x", 1)))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+        }
+        assert(executor.compilationCount == 2)
+    }
+
+    @Test
+    fun `should serve the compiled script rejected for referring to later declared dependency from the cache`() = runTest {
+        // given
+        val script = """
+            fun show() = x
+            val x = 2
+            show()
+        """.trimIndent()
+        val dependencies = listOf(dependency("x", 1))
+        val executor = DefaultScriptExecutor(compilationCacheSize = 10)
+
+        // when
+        val result1 = executor.execute(script, dependencies)
+        val result2 = executor.execute(script, dependencies)
+
+        // then
+        listOf(result1, result2).forEach { result ->
+            result should {
+                be<ScriptResult.Error>()
+                have(phase == ExecutionPhase.COMPILATION)
+                message sameAs """
+                    script.kts:1:14: error: 'x' refers to the dependency, as the property 'x' of the script body is declared later, at line 2.
+                      | fun show() = <error>x</error>
+                      hint: declare the property before line 1, or rename it.
+                """.trimIndent()
+            }
+        }
+        // the compilation and the confirming one, only for the first execution
+        assert(executor.compilationCount == 2)
+    }
+
+    @Test
+    fun `should serve the compiled scripts rejected for referring to wrong declarations from the cache`() = runTest {
+        // given
+        val scripts = listOf(
+            // hidden local function
+            "val strict = true\nfun check(flag: Boolean) { if (strict && !flag) throw IllegalStateException(\"strict\") }\nsealed interface S\nclass T : S { fun f() = check(false) }\nT().f()",
+            // resolved to the coroutine scope
+            "cancel()\nfun cancel() { println(\"order cancelled\") }\n\"done\"",
+            "val isActive get() = false\nisActive",
+            // shadowed function
+            "val cancel = { r: String -> \"prop \" + r }\nval x = cancel(\"a\")\nfun cancel(reason: String) = \"fun \" + reason\nx"
+        )
+        val executor = DefaultScriptExecutor(compilationCacheSize = 10)
+        val results1 = scripts.map { executor.execute(it) }
+        val compilationCount = executor.compilationCount
+
+        // when
+        val results2 = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results1.all { it is ScriptResult.Error && it.phase == ExecutionPhase.COMPILATION })
+        assert(results2.map { (it as? ScriptResult.Error)?.message } == results1.map { (it as? ScriptResult.Error)?.message })
+        assert(executor.compilationCount == compilationCount)
+    }
+
+    @Test
+    fun `should not cache the script rejected for referring to later declared dependency which also failed to compile`() = runTest {
+        // given
+        val script = """
+            fun show(): String = x
+            val x = "a"
+            show()
+        """.trimIndent()
+        val dependencies = listOf(dependency("x", 1))
+        val executor = DefaultScriptExecutor(compilationCacheSize = 10)
+        val result1 = executor.execute(script, dependencies)
+        val compilationCount = executor.compilationCount
+
+        // when
+        val result2 = executor.execute(script, dependencies)
+
+        // then
+        result1 should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            have(message.startsWith("script.kts:1:22: error: 'x' refers to the dependency"))
+        }
+        assert(result2 is ScriptResult.Error && result2.message == (result1 as ScriptResult.Error).message)
+        // the compilation and the confirming one, for each execution
+        assert(compilationCount == 2)
+        assert(executor.compilationCount == 4)
+    }
+
+    @Test
+    fun `should report unmatched closing brace of the script without caching its failed compilation`() = runTest {
         // given
         val script = """
             42 }
@@ -198,7 +328,7 @@ class ScriptCompilationCacheTest {
                 """.trimIndent()
             }
         }
-        assert(executor.compilationCount == 0)
+        assert(executor.compilationCount == 2)
     }
 
     @Test
@@ -337,6 +467,33 @@ class ScriptCompilationCacheTest {
 
     @Test
     @OptIn(ExperimentalCoroutinesApi::class)
+    fun `should compile again when the compiling caller is interrupted`() = runTest {
+        // given
+        val cache = ScriptCompilationCache<String>(maxSize = 10) { it != "failure" }
+        val key = ScriptCompilationCache.Key(script = "foo", dependencies = emptyList())
+        var compilations = 0
+        val compile: suspend () -> String = {
+            compilations++
+            delay(1.milliseconds)
+            if (compilations == 1) throw InterruptedException("owner interrupted")
+            "failure"
+        }
+        val owner = async { runCatching { cache.getOrCompile(key, compile) } }
+        val waiter = async { cache.getOrCompile(key, compile) }
+        runCurrent()
+
+        // when
+        val ownerFailure = owner.await().exceptionOrNull()
+        val result = waiter.await()
+
+        // then
+        assert(ownerFailure is InterruptedException)
+        assert(result == "failure")
+        assert(compilations == 2)
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
     fun `should not evict the script still being compiled`() = runTest {
         // given
         val cache = ScriptCompilationCache<String>(maxSize = 1) { true }
@@ -368,6 +525,152 @@ class ScriptCompilationCacheTest {
     }
 
     @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun `should resume the waiting caller without holding the lock of the compilations`() = runTest {
+        // given
+        val cache = ScriptCompilationCache<String>(maxSize = 10) { true }
+        val key = ScriptCompilationCache.Key(script = "foo", dependencies = emptyList())
+        val compiled = CompletableDeferred<Unit>()
+        val owner = async {
+            cache.getOrCompile(key) {
+                compiled.await()
+                "foo"
+            }
+        }
+        runCurrent()
+        var monitorsHeldByWaiter: List<MonitorInfo>? = null
+        // resumed inline by the completion of the compilation, as no dispatch is needed
+        launch(Dispatchers.Unconfined) {
+            cache.getOrCompile(key) { "bar" }
+            monitorsHeldByWaiter = ManagementFactory.getThreadMXBean().getThreadInfo(
+                longArrayOf(Thread.currentThread().id), true, false
+            ).single().lockedMonitors.toList()
+        }
+
+        // when
+        compiled.complete(Unit)
+        owner.await()
+
+        // then
+        assert(monitorsHeldByWaiter == emptyList<MonitorInfo>())
+    }
+
+    @Test
+    fun `should evict the compiled script before resuming the callers waiting for it`() = runTest {
+        // given
+        val resuming = CountDownLatch(1)
+        val resumed = CountDownLatch(1)
+        val cache = ScriptCompilationCache<String>(
+            maxSize = 1,
+            resume = { entry, result ->
+                if (result == "foo") {
+                    resuming.countDown()
+                    resumed.await()
+                }
+                entry.complete(result)
+            }
+        ) { true }
+        val key1 = ScriptCompilationCache.Key(script = "foo", dependencies = emptyList())
+        val key2 = ScriptCompilationCache.Key(script = "bar", dependencies = emptyList())
+        val compilations = Collections.synchronizedList(mutableListOf<String>())
+        val owner = thread {
+            runBlocking { cache.getOrCompile(key1) { compilations += "foo"; "foo" } }
+        }
+        resuming.await()
+
+        // when
+        cache.getOrCompile(key2) { compilations += "bar"; "bar" }
+        resumed.countDown()
+        owner.join()
+        val results = listOf(
+            cache.getOrCompile(key2) { compilations += "bar"; "bar" },
+            cache.getOrCompile(key1) { compilations += "foo"; "foo" }
+        )
+
+        // then
+        assert(results == listOf("bar", "foo"))
+        // the first one evicted, as the cache keeps one script
+        assert(compilations == listOf("foo", "bar", "foo"))
+    }
+
+    @Test
+    fun `should keep the compiled script cached when resuming the waiting callers fails`() = runTest {
+        // given
+        val cache = ScriptCompilationCache<String>(
+            maxSize = 10,
+            // like a fatal error of a waiting caller resumed inline
+            resume = { entry, result ->
+                entry.complete(result)
+                if (result == "foo") throw OutOfMemoryError("waiter out of memory")
+            }
+        ) { true }
+        val key = ScriptCompilationCache.Key(script = "foo", dependencies = emptyList())
+        var compilations = 0
+
+        // when
+        val failure = runCatching {
+            cache.getOrCompile(key) { compilations++; "foo" }
+        }.exceptionOrNull()
+        val result = cache.getOrCompile(key) { compilations++; "bar" }
+
+        // then
+        assert(failure is OutOfMemoryError && failure.message == "waiter out of memory")
+        assert(result == "foo")
+        assert(compilations == 1)
+    }
+
+    @Test
+    fun `should compile again when storing the compilation fails`() = runTest {
+        // given
+        var failing = true
+        val cache = ScriptCompilationCache<String>(maxSize = 10) {
+            if (failing) throw IllegalStateException("not stored") else true
+        }
+        val key = ScriptCompilationCache.Key(script = "foo", dependencies = emptyList())
+        var compilations = 0
+        val failure = runCatching {
+            cache.getOrCompile(key) { compilations++; "foo" }
+        }.exceptionOrNull()
+        failing = false
+
+        // when
+        val result = cache.getOrCompile(key) { compilations++; "bar" }
+
+        // then
+        assert(failure is IllegalStateException && failure.message == "not stored")
+        assert(result == "bar")
+        assert(compilations == 2)
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun `should compile again for the waiting caller when the compilation fails fatally`() = runTest {
+        // given
+        val cache = ScriptCompilationCache<String>(maxSize = 10) { true }
+        val key = ScriptCompilationCache.Key(script = "foo", dependencies = emptyList())
+        var compilations = 0
+        val compile: suspend () -> String = {
+            compilations++
+            delay(1.milliseconds)
+            if (compilations == 1) throw OutOfMemoryError("owner out of memory")
+            "foo"
+        }
+        val owner = async { runCatching { cache.getOrCompile(key, compile) } }
+        // not failing the test process, if the error is shared
+        val waiter = async { runCatching { cache.getOrCompile(key, compile) } }
+        runCurrent()
+
+        // when
+        val ownerFailure = owner.await().exceptionOrNull()
+        val result = waiter.await().getOrNull()
+
+        // then
+        assert(ownerFailure is OutOfMemoryError && ownerFailure.message == "owner out of memory")
+        assert(result == "foo")
+        assert(compilations == 2)
+    }
+
+    @Test
     fun `should not cache compilation of script referring to shadowed dependency`() = runTest {
         // given
         val valid = "limit + 1"
@@ -385,6 +688,29 @@ class ScriptCompilationCacheTest {
         assert(result is ScriptResult.Value)
         // not evicted by the shadowing script
         assert(executor.compilationCount == compilationCount)
+    }
+
+    @Test
+    fun `should not confirm this in local function referring to the receiver of a known lambda with receiver`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf("a")
+            fun size() = with(log) { this.size }
+            fun text() = buildString { this.append(size()) }
+            fun list() = log.apply { this.add("b") }
+            text() + list()
+        """.trimIndent()
+        val executor = DefaultScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "1[a, b]")
+        }
+        assert(executor.compilationCount == 1)
     }
 
 }
