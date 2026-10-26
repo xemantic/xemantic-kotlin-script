@@ -60,6 +60,7 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 - Tests run with kotlinx.coroutines debug mode (Gradle enables `-ea`), so an exception thrown by the script block arrives as a stack-trace-recovery copy wrapping the original, which `ScriptExecutor` unwraps.
   This hides bugs of the exception reporting which only show in production: test them with an exception class the recovery cannot copy, i.e. without a `(String)`, `(String, Throwable)` or `(Throwable)` constructor.
   An exception whose `getStackTrace()` contains `null` crashes the recovery itself, so such a case can only be tested by calling `ScriptErrorReporter` directly.
+  The same applies to a compilation failure shared through the compilation cache: the waiters receive such a copy, while the compiling caller gets the original, so a message built from its `cause` differs between them unless unwrapped.
 
 ## Anti-patterns to avoid
 
