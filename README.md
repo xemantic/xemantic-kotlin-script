@@ -79,6 +79,11 @@ when (result) {
   a name which the script body would resolve on its `CoroutineScope` receiver instead, like `coroutineContext` or `javaClass`,
   or such a function name, like `launch` or `let`, for a dependency which can be called,
   or a type which the script cannot refer to, like a private or a local class.
+  Where this document compares the script with a regular `.kts` file,
+  the dependencies are the members of an abstract base class of that script (`baseClass` of the scripting host), not provided properties (`providedProperties`),
+  so a function of the script shadows a callable dependency of its name:
+  `x()` calls `fun x(): Int = 10` of the script, also when the call precedes the function, while a regular script would prefer a provided property `x`
+  ([#101](https://github.com/xemantic/xemantic-kotlin-script/issues/101)).
 * A reference to a dependency preceding the declaration of a local property of the same name, like `x` in `fun show() = x` followed by `val x = 2`,
   or a call preceding the declaration of a local function of the same name,
   or of a local class, like `Foo(2)` followed by `class Foo(val v: Int)`, which constructs it, if a constructor applies
@@ -87,6 +92,26 @@ when (result) {
   Such a call within the lambda of a scope function receiving the script instance, which calls the dependency in a regular script,
   is recognized only for an unqualified `run`, `apply`, `runCatching` or `with`, while e.g. `kotlin.with(this) { Foo(2) }`,
   or a scope function declared by the script, is reported as well.
+* A call preceding the declaration of a local function of its name, like `print("x")` followed by `fun print(x: Any)`,
+  which calls another function instead, like `print` of the standard library, or fails, like an operator resolved to the `CoroutineScope`,
+  is reported as an error, if the local function applies, as in a regular script it calls the local function,
+  unless the call is resolved to a member of a receiver, like `append` in `buildString { append("x") }`, as in a regular script.
+* A function accessing the local declarations of the script body stays local to the script block, where it is visible only after its declaration,
+  so a call preceding it, like `b(x)` in `fun a(x: Int) = b(x) + 1` followed by `fun b(x: Int) = x * factor`, is unresolved there.
+  Then the script is compiled again with such functions declared preceding the statements calling them, each preceding the ones calling it,
+  if they are the only unresolved references, and the script compiles then
+  ([#4](https://github.com/xemantic/xemantic-kotlin-script/issues/4)).
+  The call stays reported as unresolved, with the hint to declare the function earlier, when the hoisting might change how any other name is resolved:
+  when the function refers to a declaration declared between the statement calling it and itself, like another function it calls,
+  or to a local `var`, or when it is an operator, or an operator is declared in between,
+  or when its type is inferred, while it is an extension, or contains a lambda, an anonymous function, or a class,
+  as a regular script calling it before its declaration resolves all of its functions after the members of the implicit receivers then, like `b()` in `with(obj) { b() }`,
+  or when another declaration of the script has its name,
+  or when a statement in between refers to its name otherwise, like a member of a receiver, `with(obj) { b() }`, or a parameter,
+  or when a call in between, or within it, is checked as resolved to another declaration than in a regular script, like `print` declared by the script later.
+  When the function accesses a local property declared after the call, the hint tells to declare them both earlier, or to pass the property as a parameter.
+  Functions calling each other, like `even` and `odd`, cannot be declared one preceding the other,
+  which the hint tells, suggesting to pass the local declarations they access as parameters instead, so they are compiled outside of the script body.
 * Scripts executed repeatedly, like an agent harness defined as a script, can skip the recompilation
   with `ScriptExecutor(compilationCacheSize = ...)`, keeping that many compiled scripts, the least recently used evicted first.
   A compiled script is reused when the script text, and the names and types of the dependencies are the same,
@@ -125,6 +150,13 @@ Most of these cases are reported as errors, while the following ones still resol
   like `name` in `user.run { name }` with `val name = "script"`, as it is a local variable of the block ([#36](https://github.com/xemantic/xemantic-kotlin-script/issues/36)),
 * a call of a function, of which only some overloads are compiled outside of the script body, when it precedes a local overload,
   or has a receiver, like `"a".fmt(1)` of the extension functions, or when a local overload refers to a local class, while the overloads are of both inferred and declared return types ([#30](https://github.com/xemantic/xemantic-kotlin-script/issues/30)),
+* a call of local overloads, like `show(1)` with `fun show(x: Int): String = "int"` and `fun show(x: Any) = "any"`, which calls the most specific one, `show(x: Int)`,
+  while a regular script prefers the one with the return type inferred from its expression body within a top-level statement, or a declaration of an inferred type, like `fun h() = show(1)`,
+  which seems to be a quirk of the compiler rather than a rule of the language ([#100](https://github.com/xemantic/xemantic-kotlin-script/issues/100)),
+* a call of a function, of which only some overloads are compiled outside of the script body, within a default value of a parameter of a function of an inferred return type,
+  like `show(1)` in `fun h(x: String = show(1)) = x`, which calls the local overload of an inferred type, while a regular script calls the most specific one ([#102](https://github.com/xemantic/xemantic-kotlin-script/issues/102)),
+* a call from the script body to a local function referring to a type alias declared after it, which is not visible to the function in a regular script, so the function does not apply there,
+  like `check(true)` calling `fun check(n: N)` followed by `typealias N = Boolean`, instead of `check` of the standard library, unless the call is within a declaration of an inferred type, and the function overloads one compiled outside of the script body ([#102](https://github.com/xemantic/xemantic-kotlin-script/issues/102)),
 * a call preceding a local class named like a callable dependency, when only a constructor with a parameter of a local class declared after the call applies, like `Foo(null)` followed by `class Bar` and `class Foo(val b: Bar?)` ([#31](https://github.com/xemantic/xemantic-kotlin-script/issues/31)),
 * a call from outside of the script body to a local property, whose function type is known only to the compiler, like `val print = printer()`,
   when the compiler names its type differently than it is visible there, like a local class, or a class which is not imported,
@@ -132,7 +164,11 @@ Most of these cases are reported as errors, while the following ones still resol
   or when it is made callable by an `invoke` operator extension declared by the script, like `operator fun Int.invoke(x: Any?)` of `val print = 1 + 2`,
   or when the property is assigned after its declaration, like `val print: Printer` followed by `print = Printer()`,
   or when another statement follows the property on the same line ([#32](https://github.com/xemantic/xemantic-kotlin-script/issues/32)),
-* a call preceding a local function named like a callable dependency, which refers to a local class declared later ([#33](https://github.com/xemantic/xemantic-kotlin-script/issues/33)),
+* a call preceding a local function named like a callable dependency, which refers to a local class, when the call is within the declaration of this class, or follows it on the same line,
+  passing a value of this class, like `f(P())`, or when the call follows it, which another call of its name precedes, while the function refers also to a local class declared after the call, and the call applies to the function regardless of the former,
+  like `f(null, null)` following `f(1, 1)` and `class P`, followed by `class R` and `fun f(p: P?, r: R?)` ([#33](https://github.com/xemantic/xemantic-kotlin-script/issues/33)),
+* a call preceding a local function, which compiles, when another local function of its name is visible already,
+  or when it is within a lambda, a class, or an extension function, while the local function refers to a local class, or is named like a function of its `CoroutineScope`, like `run { V(1) + V(2) }` calling another `plus` before `operator fun V.plus(o: V)` ([#51](https://github.com/xemantic/xemantic-kotlin-script/issues/51)),
 * a call within a lambda to a property compiled outside of the script body, named like a function of its `CoroutineScope`, whose function type is known only to the compiler, like `val launch get() = launcher()` ([#44](https://github.com/xemantic/xemantic-kotlin-script/issues/44)).
 
 Giving the declarations and the dependencies distinct names avoids them.

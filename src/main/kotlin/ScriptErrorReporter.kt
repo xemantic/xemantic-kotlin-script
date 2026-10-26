@@ -35,7 +35,8 @@ private const val MAX_INTERNAL_FAILURE_CAUSES = 8
 /** The longest message of an internal failure reported, as it might carry a dump of the bytecode, or of the source. */
 private const val MAX_INTERNAL_FAILURE_MESSAGE_LENGTH = 500
 
-private val unresolvedReference = Regex("Unresolved reference '(.+)'\\.")
+/** The error of the unresolved reference, with its name. */
+internal val unresolvedReference = Regex("Unresolved reference '(.+)'\\.")
 
 /** Reported without a location, e.g. for an object accessing the dependencies, which are the members of the script class. */
 private val declarationCapturingScript = Regex("(Object|Enum class|Interface|Nested class) '(.+)' captures the script class instance\\..*")
@@ -223,6 +224,19 @@ internal class ScriptErrorReporter(
             +"error: '${reference.name}' does not refer to the $kind of the script body declared at line ${hidden.line + 1}, which is not visible in '$declaration'.\n"
             appendSourceLines(reference.start, reference.end)
             appendNotVisibleHint(declaration, reference.name, hidden.line)
+        }
+    }.trimEnd()
+
+    /** The [references] of the script body calling other functions than the local functions declared later, see [ScriptSource.laterDeclaredFunctionCandidates]. */
+    fun toLaterDeclaredFunctionMessage(
+        references: List<LaterDeclaredFunctionReference>
+    ): String = references.joinToString(separator = "\n") { later ->
+        val reference = later.reference
+        buildString {
+            appendPosition(reference.start)
+            +"error: '${reference.name}' does not refer to the function of the script body declared at line ${later.line + 1}, which is not visible before its declaration.\n"
+            appendSourceLines(reference.start, reference.end)
+            appendNotDeclaredYetHint(reference.name, later.line, "functions", reference.start)
         }
     }.trimEnd()
 
@@ -582,14 +596,42 @@ internal class ScriptErrorReporter(
         if (declaration != null) {
             appendNotVisibleHint(declaration, name, line)
         } else if (line > position.line) {
-            val declarations = when (kind) {
-                CLASS -> "classes"
-                FUNCTION -> "functions"
-                else -> "properties"
+            // which cannot be declared preceding the calling one, see ScriptSource.Parsed.hoisted
+            val calledBack = if (kind == FUNCTION) source.callsBack(name, position) else null
+            // which would not be visible to it there
+            val properties = if (kind == FUNCTION && calledBack == null) source.laterAccessedProperties(name, position) else emptyList()
+            when {
+                calledBack != null -> {
+                    +"  hint: '$name' is declared at line ${line + 1}, and calls '$calledBack' back,"
+                    +" while the functions of the script body accessing its local declarations are visible only after their declaration, so they cannot call each other"
+                    +" - pass the local declarations they access as parameters instead.\n"
+                }
+                properties.isNotEmpty() -> {
+                    val names = properties.joinToString { "'$it'" }
+                    +"  hint: '$name' is declared at line ${line + 1}, and accesses $names declared after this call,"
+                    +" while the declarations of the script body are visible only after their declaration"
+                    +" - move them all before line ${position.line + 1}, or pass $names as ${if (properties.size == 1) "a parameter" else "parameters"}.\n"
+                }
+                else -> appendNotDeclaredYetHint(
+                    name, line, when (kind) {
+                        CLASS -> "classes"
+                        FUNCTION -> "functions"
+                        else -> "properties"
+                    }, position
+                )
             }
-            +"  hint: '$name' is declared at line ${line + 1}, while the $declarations of the script body are visible only after their declaration"
-            +" - move it before line ${position.line + 1}.\n"
         }
+    }
+
+    /** The hint of the reference at the [position] to the [name] declared later, at the 0-based [line], among these [declarations], like `functions`. */
+    private fun StringBuilder.appendNotDeclaredYetHint(
+        name: String,
+        line: Int,
+        declarations: String,
+        position: ScriptPosition
+    ) {
+        +"  hint: '$name' is declared at line ${line + 1}, while the $declarations of the script body are visible only after their declaration"
+        +" - move it before line ${position.line + 1}.\n"
     }
 
 }

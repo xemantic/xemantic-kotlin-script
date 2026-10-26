@@ -99,9 +99,6 @@ class ScriptErrorReporterTest {
         """.trimIndent()
     }
 
-    /**
-     * Tested directly, as the crashes of the compiler backend, which the callable references do not explain, are not known.
-     */
     @Test
     fun `should report compiler backend crash at nested class without intermediate representation`() {
         // given
