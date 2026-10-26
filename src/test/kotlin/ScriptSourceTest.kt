@@ -92,6 +92,44 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should move property with getter on the line after it without indentation`() {
+        // given
+        val script = "val size: Int\nget() = 3\nsize"
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        assert("val size: Int\nget() = 3" in moved && "get()" !in body)
+    }
+
+    @Test
+    fun `should keep in the script body calls of get and set on the line after property without indentation`() {
+        // given
+        val scripts = listOf(
+            "fun get(i: Int) = i * 2\nval x = 1\nget(3)",
+            "fun get() = 7\nval x = 1\nget()",
+            "fun set(v: Int) = v + 1\nvar y = 1\nset(5)",
+            "fun get() = 5\nval x = 1\nget() + 1",
+            "val get = 7\nval x = 1\n// note\nget",
+            "val set = 7\nval x = 1\n/* c */ set",
+            "fun get(p: String, b: () -> Int) = b()\nval x = 1\nget(\"/\") { 6 }",
+            "fun get(b: () -> Int) = b()\nval x = 1\nget { 6 }",
+            "fun set(b: () -> Int) = b()\nvar y = 1\nset { 6 }",
+            "fun get(i: Int) = i\nval x = 1\n@Suppress(\"UNUSED\") get(6)"
+        )
+
+        // when
+        val sources = scripts.map { ScriptSource(it) }
+
+        // then
+        assert(sources.zip(scripts).all { (source, script) ->
+            script.substringAfterLast('\n') in source.text.substringAfter(SCRIPT_BLOCK_START)
+        })
+    }
+
+    @Test
     fun `should give distinct location ids to scripts of the same hash code`() {
         // given
         val scripts = listOf("\"Aa\"", "\"BB\"")
