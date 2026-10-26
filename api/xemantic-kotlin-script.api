@@ -43,7 +43,9 @@ public final class com/xemantic/kotlin/script/ScriptExecutor$Dependency {
 }
 
 public final class com/xemantic/kotlin/script/ScriptExecutorKt {
-	public static final fun ScriptExecutor (Lkotlinx/coroutines/CoroutineDispatcher;I)Lcom/xemantic/kotlin/script/ScriptExecutor;
+	public static final synthetic fun ScriptExecutor (Lkotlinx/coroutines/CoroutineDispatcher;I)Lcom/xemantic/kotlin/script/ScriptExecutor;
+	public static final fun ScriptExecutor (Lkotlinx/coroutines/CoroutineDispatcher;II)Lcom/xemantic/kotlin/script/ScriptExecutor;
+	public static synthetic fun ScriptExecutor$default (Lkotlinx/coroutines/CoroutineDispatcher;IIILjava/lang/Object;)Lcom/xemantic/kotlin/script/ScriptExecutor;
 	public static synthetic fun ScriptExecutor$default (Lkotlinx/coroutines/CoroutineDispatcher;IILjava/lang/Object;)Lcom/xemantic/kotlin/script/ScriptExecutor;
 }
 

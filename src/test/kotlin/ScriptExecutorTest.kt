@@ -30,6 +30,7 @@ import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -43,9 +44,11 @@ import kotlin.reflect.typeOf
 import kotlin.script.experimental.api.CompiledScript
 import kotlin.script.experimental.api.ResultWithDiagnostics
 import kotlin.script.experimental.api.ScriptCompilationConfiguration
+import kotlin.script.experimental.api.ScriptDiagnostic
 import kotlin.script.experimental.api.SourceCode
 import kotlin.script.experimental.jvmhost.JvmScriptCompiler
 import kotlin.test.Test
+import kotlin.test.assertFailsWith
 import kotlin.time.Clock
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Instant
@@ -89,6 +92,16 @@ class FailingCompiler(
         script: SourceCode,
         scriptCompilationConfiguration: ScriptCompilationConfiguration
     ): ResultWithDiagnostics<CompiledScript> = failure()
+}
+
+/** Returns whatever the [compile] returns, instead of compiling the script. */
+class FakeCompiler(
+    private val compile: suspend () -> ResultWithDiagnostics<CompiledScript>
+) : JvmScriptCompiler() {
+    override suspend fun invoke(
+        script: SourceCode,
+        scriptCompilationConfiguration: ScriptCompilationConfiguration
+    ): ResultWithDiagnostics<CompiledScript> = compile()
 }
 
 class ScriptExecutorTest {
@@ -2485,6 +2498,227 @@ class ScriptExecutorTest {
 
         // then
         assert(failure is OutOfMemoryError && failure.message == "compiler out of memory")
+    }
+
+    @Test
+    fun `should not report VirtualMachineError reported by the compiler as compilation error`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            // like the compiler reporting the exception it caught as a diagnostic
+            compiler = FakeCompiler {
+                ResultWithDiagnostics.Failure(
+                    ScriptDiagnostic(
+                        code = ScriptDiagnostic.unspecifiedError,
+                        message = "Java heap space",
+                        exception = OutOfMemoryError("Java heap space")
+                    )
+                )
+            }
+        )
+
+        // when
+        val failure = runCatching { executor.execute("42") }.exceptionOrNull()
+
+        // then
+        assert(failure is OutOfMemoryError && failure.message == "Java heap space")
+    }
+
+    @Test
+    fun `should not report VirtualMachineError causing the exception reported by the compiler as compilation error`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            compiler = FakeCompiler {
+                ResultWithDiagnostics.Failure(
+                    ScriptDiagnostic(
+                        code = ScriptDiagnostic.unspecifiedError,
+                        message = "Could not read file",
+                        exception = IllegalStateException("Could not read file", OutOfMemoryError("Java heap space"))
+                    )
+                )
+            }
+        )
+
+        // when
+        val failure = runCatching { executor.execute("42") }.exceptionOrNull()
+
+        // then
+        assert(failure is OutOfMemoryError && failure.message == "Java heap space")
+    }
+
+    @Test
+    fun `should not report VirtualMachineError causing the cause of the exception reported by the compiler as compilation error`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            compiler = FakeCompiler {
+                ResultWithDiagnostics.Failure(
+                    ScriptDiagnostic(
+                        code = ScriptDiagnostic.unspecifiedError,
+                        message = "Could not read file",
+                        exception = RuntimeException(
+                            IllegalStateException("Could not read file", OutOfMemoryError("Java heap space"))
+                        )
+                    )
+                )
+            }
+        )
+
+        // when
+        val failure = runCatching { executor.execute("42") }.exceptionOrNull()
+
+        // then
+        assert(failure is OutOfMemoryError && failure.message == "Java heap space")
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun `should bound the number of concurrent compilations`() = runTest {
+        // given
+        val compiled = CompletableDeferred<Unit>()
+        var active = 0
+        var maxActive = 0
+        val executor = DefaultScriptExecutor(
+            dispatcher = StandardTestDispatcher(testScheduler),
+            maxConcurrentCompilations = 2,
+            compiler = FakeCompiler {
+                active++
+                maxActive = maxOf(maxActive, active)
+                try {
+                    compiled.await()
+                } finally {
+                    active--
+                }
+                ResultWithDiagnostics.Failure(ScriptDiagnostic(ScriptDiagnostic.unspecifiedError, "not compiled"))
+            }
+        )
+        val executions = listOf("1", "2", "3").map { script ->
+            async { executor.execute(script) }
+        }
+
+        // when
+        runCurrent()
+        val activeBeforeCompiled = active
+        compiled.complete(Unit)
+        val results = executions.map { it.await() }
+
+        // then
+        assert(activeBeforeCompiled == 2)
+        assert(maxActive == 2)
+        assert(executor.compilationCount == 3)
+        assert(results.all { it is ScriptResult.Error && it.phase == ExecutionPhase.COMPILATION })
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun `should not hold the compilation permit while waiting for the cached compilation`() = runTest {
+        // given
+        val compiled = CompletableDeferred<Unit>()
+        var active = 0
+        val executor = DefaultScriptExecutor(
+            dispatcher = StandardTestDispatcher(testScheduler),
+            compilationCacheSize = 10,
+            maxConcurrentCompilations = 2,
+            compiler = FakeCompiler {
+                active++
+                try {
+                    compiled.await()
+                } finally {
+                    active--
+                }
+                ResultWithDiagnostics.Failure(ScriptDiagnostic(ScriptDiagnostic.unspecifiedError, "not compiled"))
+            }
+        )
+        val owner = async { executor.execute("1") }
+        runCurrent()
+        val waiter = async { executor.execute("1") }
+        runCurrent()
+
+        // when
+        val other = async { executor.execute("2") }
+        runCurrent()
+        val activeWithWaiter = active
+        compiled.complete(Unit)
+        listOf(owner, waiter, other).awaitAll()
+
+        // then
+        assert(activeWithWaiter == 2)
+        assert(executor.compilationCount == 2)
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun `should not compile for the caller cancelled while waiting for a compilation permit`() = runTest {
+        // given
+        val compiled = CompletableDeferred<Unit>()
+        val executor = DefaultScriptExecutor(
+            dispatcher = StandardTestDispatcher(testScheduler),
+            maxConcurrentCompilations = 1,
+            compiler = FakeCompiler {
+                compiled.await()
+                ResultWithDiagnostics.Failure(ScriptDiagnostic(ScriptDiagnostic.unspecifiedError, "not compiled"))
+            }
+        )
+        val compiling = async { executor.execute("1") }
+        runCurrent()
+        val queued = launch { executor.execute("2") }
+        runCurrent()
+
+        // when
+        queued.cancelAndJoin()
+        compiled.complete(Unit)
+        val compilingResult = compiling.await()
+        val laterResult = executor.execute("3")
+
+        // then
+        assert(queued.isCancelled)
+        assert(compilingResult is ScriptResult.Error && compilingResult.phase == ExecutionPhase.COMPILATION)
+        assert(laterResult is ScriptResult.Error && laterResult.phase == ExecutionPhase.COMPILATION)
+        // the cancelled caller never invoked the compiler
+        assert(executor.compilationCount == 2)
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun `should compile again for the waiting caller when the caching owner is cancelled while waiting for a permit`() = runTest {
+        // given
+        val compiled = CompletableDeferred<Unit>()
+        val executor = DefaultScriptExecutor(
+            dispatcher = StandardTestDispatcher(testScheduler),
+            compilationCacheSize = 10,
+            maxConcurrentCompilations = 1,
+            compiler = FakeCompiler {
+                compiled.await()
+                ResultWithDiagnostics.Failure(ScriptDiagnostic(ScriptDiagnostic.unspecifiedError, "not compiled"))
+            }
+        )
+        val compiling = async { executor.execute("1") }
+        runCurrent()
+        val owner = launch { executor.execute("2") }
+        runCurrent()
+        val waiter = async { executor.execute("2") }
+        runCurrent()
+
+        // when
+        owner.cancelAndJoin()
+        compiled.complete(Unit)
+        val compilingResult = compiling.await()
+        val waiterResult = waiter.await()
+
+        // then
+        assert(owner.isCancelled)
+        assert(compilingResult is ScriptResult.Error && compilingResult.phase == ExecutionPhase.COMPILATION)
+        assert(waiterResult is ScriptResult.Error && waiterResult.phase == ExecutionPhase.COMPILATION)
+        assert(executor.compilationCount == 2)
+    }
+
+    @Test
+    fun `should reject non-positive number of concurrent compilations`() {
+        // when
+        val exception = assertFailsWith<IllegalArgumentException> {
+            ScriptExecutor(maxConcurrentCompilations = 0)
+        }
+
+        // then
+        assert(exception.message == "maxConcurrentCompilations must be positive, but was: 0")
     }
 
     @Test

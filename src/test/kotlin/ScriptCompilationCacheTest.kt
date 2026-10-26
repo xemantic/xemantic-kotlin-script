@@ -24,6 +24,7 @@ import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -365,6 +366,38 @@ class ScriptCompilationCacheTest {
         // then
         assert(results == listOf("foo", "foo"))
         assert(compilations == 2)
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun `should resume the waiting caller without holding the lock of the compilations`() = runTest {
+        // given
+        val cache = ScriptCompilationCache<String>(maxSize = 10) { true }
+        val key = ScriptCompilationCache.Key(script = "foo", dependencies = emptyList())
+        val entries = ScriptCompilationCache::class.java.getDeclaredField("entries").apply {
+            isAccessible = true
+        }.get(cache)
+        val compiled = CompletableDeferred<Unit>()
+        val owner = async {
+            cache.getOrCompile(key) {
+                compiled.await()
+                "foo"
+            }
+        }
+        runCurrent()
+        var lockHeldByWaiter: Boolean? = null
+        // resumed inline by the completion of the compilation, as no dispatch is needed
+        launch(Dispatchers.Unconfined) {
+            cache.getOrCompile(key) { "bar" }
+            lockHeldByWaiter = Thread.holdsLock(entries)
+        }
+
+        // when
+        compiled.complete(Unit)
+        owner.await()
+
+        // then
+        assert(lockHeldByWaiter == false)
     }
 
     @Test
