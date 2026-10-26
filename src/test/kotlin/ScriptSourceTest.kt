@@ -295,6 +295,40 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should keep long chain of properties with accessors reading local property in the script body as delegated properties`() {
+        // given
+        val count = 50_000
+        val script = buildString {
+            appendLine("var x = 1")
+            appendLine("val p0: Int get() = x")
+            (1 until count).forEach { appendLine("val p$it: Int get() = p${it - 1} + 1") }
+            append("p${count - 1}")
+        }
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        assert("val p" !in moved)
+        assert(body.lines().count { it == " by object {" } == count)
+    }
+
+    @Test
+    fun `should keep property with accessor reading earlier delegated property named like receiver member as delegated property`() {
+        // given
+        val script = "val items = listOf(1)\nval isActive get() = items.isEmpty()\nval t get() = items.size.toString() + isActive\nt"
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        assert("get()" !in moved)
+        assert(body.lines().count { it == " by object {" } == 2)
+    }
+
+    @Test
     fun `should keep moving property with accessors which cannot be delegated or do not read local properties`() {
         // given
         val scripts = listOf(
@@ -304,6 +338,8 @@ class ScriptSourceTest {
             "val items = listOf(1)\nval self get() = this.hashCode() + items.size\nself",
             "val items = listOf(1)\nval total: Int\n    @Suppress(\"unused\") get() = items.sum()\ntotal",
             "val items = listOf(1)\nvar total\n    get() = items.sum()\n    set(v) { }\ntotal",
+            // not applicable to a local variable
+            "val items = listOf(1)\n@Deprecated(\"x\")\nval total get() = items.size\ntotal",
             "fun Any.describe() = this::class.simpleName\nval items = listOf(1)\nval d get() = items.size.toString() + describe()\nd",
             "val total get() = 42\ntotal",
             "class User(val name: String)\nval name = \"script\"\nval greeting get() = User(\"user\").run { name }\ngreeting",

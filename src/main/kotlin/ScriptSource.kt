@@ -426,7 +426,7 @@ internal class ScriptSource(
         ) = range.forEach { line ->
             val bounds = lineBounds[line]
             lines += buildString {
-                bounds.takeWhile { it < end }.forEach { offset ->
+                for (offset in bounds.first..minOf(bounds.last, end - 1)) {
                     +(if (keep(offset) && !unsuppressed[offset]) script[offset] else ' ')
                 }
             }
@@ -1833,7 +1833,7 @@ private class ScriptStructure(
      * as their accessors may refer without a receiver only to the declarations of the script, the dependencies, the explicit imports,
      * the names declared within the accessors, the [nonReceiverNames], and the capitalized names, like the classes,
      * though never to the [receiverNames], also when imported under an alias, see [Reference.mightResolveOnScriptReceivers],
-     * unless declared before as the local variables, which take precedence over the receivers, and not called,
+     * unless declared before as the local variables, or the delegated properties, which take precedence over the receivers, and not called,
      * nor to the properties declared after, which are not visible to the local ones, unlike in the script,
      * nor to the members of the object, like `toString`, nor to the extensions of the script, nor to the backing `field`,
      * nor to the property itself, which is not visible in its own accessors either,
@@ -1860,15 +1860,16 @@ private class ScriptStructure(
         // the properties, which might be the constants moved together with the declarations reading them, are not variables
         val variableProperties = properties.filterNot { it.isConstant(dependencyNames, propertyNameCounts) }
         val variables = variableProperties.flatMapTo(HashSet()) { it.names }
-        // the local variables declared before, which take precedence over the receivers, unlike the ones declared later
-        val firstVariableStarts = variableProperties.startsByName(::minOf)
         // the properties declared after, which are not visible to the local ones, unlike in the script
         val lastPropertyStarts = declarations.filter { it.kind == DeclarationKind.PROPERTY }.startsByName(::maxOf)
         // resolved before the members of the receivers, if local, like `name` in `user.run { name }`, unlike in the script
         val localNames = declarations.filter {
             it.kind == DeclarationKind.PROPERTY || (it.kind == DeclarationKind.FUNCTION && !it.isExtension)
         }.flatMapTo(HashSet()) { it.names }
-        val candidates = declarations.filter { declaration ->
+        fun candidates(
+            /** The local variables declared before, which take precedence over the receivers, unlike the ones declared later. */
+            firstVariableStarts: Map<String, Int>
+        ) = declarations.filter { declaration ->
             declaration.isDelegable && declaration.name !in callableReferences && declaration.references.filter { reference ->
                 declaration.accessors.any { reference.offset in it.startOffset until it.endOffset }
             }.all {
@@ -1881,15 +1882,35 @@ private class ScriptStructure(
                         )
             }
         }
-        val delegated = mutableSetOf<ParsedDeclaration>()
-        do {
-            val reading = candidates.filter { candidate ->
-                candidate !in delegated && candidate.references.any { it.refersToLocal(variables) && !it.mightResolveOnReceiver }
+        // the candidates reading the local variables, directly, or through the other ones, each visited once
+        fun reading(
+            candidates: List<ParsedDeclaration>
+        ): Set<ParsedDeclaration> {
+            val readers = HashMap<String, MutableList<ParsedDeclaration>>()
+            candidates.forEach { candidate ->
+                candidate.references.filter { !it.isQualified && !it.isBound && !it.mightResolveOnReceiver }.mapTo(HashSet()) { it.name }.forEach {
+                    readers.getOrPut(it) { mutableListOf() } += candidate
+                }
             }
-            delegated += reading
-            reading.forEach { variables += it.name!! }
-        } while (reading.isNotEmpty())
-        return delegated
+            val delegated = LinkedHashSet<ParsedDeclaration>()
+            val read = HashSet(variables)
+            val queue = ArrayDeque(variables)
+            while (queue.isNotEmpty()) {
+                readers[queue.removeFirst()].orEmpty().forEach { reader ->
+                    if (delegated.add(reader) && read.add(reader.name!!)) queue += reader.name
+                }
+            }
+            return delegated
+        }
+        var firstVariableStarts = variableProperties.startsByName(::minOf)
+        while (true) {
+            val delegated = reading(candidates(firstVariableStarts))
+            // an earlier one named like a member of the receivers takes precedence over them, like a local variable,
+            // allowing more candidates, so rarely reconsidered
+            val starts = (variableProperties + delegated).startsByName(::minOf)
+            if (delegated.none { it.name in receiverNames } || starts == firstVariableStarts) return delegated
+            firstVariableStarts = starts
+        }
     }
 
     /**
@@ -2029,7 +2050,7 @@ private class ScriptStructure(
 
     /**
      * Whether the [property] could be local as the property delegated to an object, with the [accessors] turned into its operators,
-     * as all of them have the bodies, without the annotations and the modifiers, like `private set`,
+     * as all of them have the bodies, without the annotations and the modifiers, like `private set`, and the property has no annotations but `@Suppress`,
      * and do not refer to `this` or `super`, which would refer to the object instead,
      * while a `var` declares its type, which its setter needs, the getter is not omitted, using the backing field,
      * nor has a block body without the type, which is an error of the property in the script.
@@ -2055,7 +2076,8 @@ private class ScriptStructure(
                 && property.modifierList?.node?.getChildren(null).orEmpty().none {
                     it.elementType in KtTokens.MODIFIER_KEYWORDS && it.elementType !in visibilityModifiers
                 }
-                && property.memberOnlyAnnotationEntries().isEmpty()
+                // like `@Deprecated`, which is not applicable to a local variable, unlike `@Suppress`
+                && property.annotationEntries.all { it.useSiteTarget == null && it.shortName?.asString() == "Suppress" }
                 // like `val x: Int; get() = 1`, which would end the declaration before the delegate
                 && property.allChildren.takeWhile { it !== accessors.first() }.none { it.node.elementType == KtTokens.SEMICOLON }
                 && accessors.none { it.anyDescendantOfType<KtThisExpression>() || it.anyDescendantOfType<KtSuperExpression>() }

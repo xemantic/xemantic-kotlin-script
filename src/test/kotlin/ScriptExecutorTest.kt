@@ -2016,6 +2016,8 @@ class ScriptExecutorTest {
             "import kotlin.math.max\nval items = mutableListOf(1, 5)\nval top get() = items.fold(0) { a, b -> max(a, b) } + listOf(1).size + Pair(1, 2).first + items.map { it }.size\ntop",
             // named like the parameters of the operators of the object
             "val _property = \"local\"\nval _thisRef = \"!\"\nval items = listOf(1)\nval t get() = _property + _thisRef + items.size\nt",
+            // named like a member of the receivers, though declared before
+            "val items = listOf(1)\nval isActive get() = items.isEmpty()\nval t get() = items.size.toString() + isActive\nt",
             // within the lambdas without a receiver
             "val threshold = listOf(1).first()\nval items = listOf(1, 2, 3)\nval n get() = items.count { it > threshold }.toString() + items.map { it * threshold }.sum()\nn"
         )
@@ -2025,7 +2027,22 @@ class ScriptExecutorTest {
         val results = scripts.map { executor.execute(it) }
 
         // then
-        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("[20, 2]20", "[10, 2]10", 12, "total: 6", 6, 6, 9, "local!1", "26"))
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("[20, 2]20", "[10, 2]10", 12, "total: 6", 6, 6, 9, "local!1", "1false", "26"))
+    }
+
+    @Test
+    fun `should report property with accessor reading local property and annotation not applicable to local variable as compiled outside of script body`() = runTest {
+        // given
+        val script = "val items = listOf(1)\n@Deprecated(\"x\")\nval total get() = items.size\ntotal"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        val message = (result as ScriptResult.Error).message
+        assert("'total' is compiled outside of the script body, where 'items' (line 1) is not visible" in message)
+        assert("not applicable to target" !in message)
     }
 
     @Test
