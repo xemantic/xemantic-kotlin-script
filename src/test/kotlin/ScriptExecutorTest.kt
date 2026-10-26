@@ -3321,6 +3321,182 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report error at callable reference of moved class to function of script crashing compiler`() = runTest {
+        // given
+        val script = """
+            fun log(m: String) = m
+            sealed interface S
+            class T : S {
+                fun f() = listOf("a").map(::log)
+                fun g() = listOf("b").map(::log)
+            }
+            class U : S { fun h() = listOf("c").map(::log) }
+            T().f() + U().h()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:31: error: The compiler crashed generating the callable reference '::log'.
+                  |     fun f() = listOf("a").map(<error>::log</error>)
+                  hint: 'T' is compiled outside of the script body, where a callable reference to 'log' of the script crashes the compiler - replace it with a lambda using 'log'.
+
+                script.kts:5:31: error: The compiler crashed generating the callable reference '::log'.
+                  |     fun g() = listOf("b").map(<error>::log</error>)
+                  hint: 'T' is compiled outside of the script body, where a callable reference to 'log' of the script crashes the compiler - replace it with a lambda using 'log'.
+
+                script.kts:7:41: error: The compiler crashed generating the callable reference '::log'.
+                  | class U : S { fun h() = listOf("c").map(<error>::log</error>) }
+                  hint: 'U' is compiled outside of the script body, where a callable reference to 'log' of the script crashes the compiler - replace it with a lambda using 'log'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not report callable reference of moved class to its own member as crashing compiler`() = runTest {
+        // given
+        val script = """
+            fun log(m: String) = m
+            fun greet(s: String) = s
+            sealed interface S
+            class T(val log: String) : S {
+                fun f() = ::log
+                fun g() = listOf("a").map(::greet)
+            }
+            T("x").f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:6:31: error: The compiler crashed generating the callable reference '::greet'.
+                  |     fun g() = listOf("a").map(<error>::greet</error>)
+                  hint: 'T' is compiled outside of the script body, where a callable reference to 'greet' of the script crashes the compiler - replace it with a lambda using 'greet'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at callable reference of moved class to extension function of script crashing compiler`() = runTest {
+        // given
+        val script = """
+            fun String.up() = uppercase()
+            sealed interface S
+            class T : S { fun f() = listOf("a").map(String::up) }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:41: error: The compiler crashed generating the callable reference 'String::up'.
+                  | class T : S { fun f() = listOf("a").map(<error>String::up</error>) }
+                  hint: 'T' is compiled outside of the script body, where a callable reference to 'up' of the script crashes the compiler - replace it with a lambda using 'up'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at callable reference of moved class crashing compiler in script with package`() = runTest {
+        // given
+        val script = """
+            package foo
+            fun log(m: String) = m
+            sealed interface S
+            class T : S { fun f() = listOf("a").map(::log) }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:41: error: The compiler crashed generating the callable reference '::log'.
+                  | class T : S { fun f() = listOf("a").map(<error>::log</error>) }
+                  hint: 'T' is compiled outside of the script body, where a callable reference to 'log' of the script crashes the compiler - replace it with a lambda using 'log'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at callable reference split across lines crashing compiler`() = runTest {
+        // given
+        val script = """
+            fun String.up() = uppercase()
+            sealed interface S
+            class T : S {
+                fun f() = listOf("a").map(String
+                    ::up)
+            }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:31: error: The compiler crashed generating the callable reference 'String::up'.
+                  |     fun f() = listOf("a").map(<error>String
+                  |         ::up</error>)
+                  hint: 'T' is compiled outside of the script body, where a callable reference to 'up' of the script crashes the compiler - replace it with a lambda using 'up'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at callable reference of moved class to dependency crashing compiler`() = runTest {
+        // given
+        val script = """
+            sealed interface S
+            class T : S { fun f() = ::greeting }
+            T().f().get()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("greeting", "Hello")))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:25: error: The compiler crashed generating the callable reference '::greeting'.
+                  | class T : S { fun f() = <error>::greeting</error> }
+                  hint: 'T' is compiled outside of the script body, where a callable reference to 'greeting' of the script crashes the compiler - replace it with a lambda using 'greeting'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should initialize property with accessor modifier in the order of the script`() = runTest {
         // given
         val script = """
@@ -3340,6 +3516,46 @@ class ScriptExecutorTest {
             be<ScriptResult.Value>()
             have(value == "[a, b] 1")
         }
+    }
+
+    @Test
+    fun `should execute script with property accessors on the lines after it without indentation`() = runTest {
+        // given
+        val scripts = listOf(
+            "val size: Int\nget() = 3\nvar count = 0\nprivate set\ncount += size\ncount",
+            "val size: Int\nget() { return 3 }\nsize",
+            "var size = 2\nset\nget() = field + 1\nsize"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == List(scripts.size) { 3 })
+    }
+
+    @Test
+    fun `should execute calls of get and set on the lines after properties without indentation`() = runTest {
+        // given
+        val scripts = listOf(
+            "fun get(i: Int) = i * 2\nval x = 1\nget(3)",
+            "fun set(v: Int) = v + 1\nvar y = 1\nset(5)",
+            "val get = { 6 }\nval x = 1\nget()",
+            "fun get() = 5\nval x = 1\nget() + 1",
+            "val get = 6\nval x = 1\n// note\nget",
+            "fun get(p: String, b: () -> Int) = b()\nval x = 1\nget(\"/\") { 6 }",
+            "fun get(b: () -> Int) = b()\nval x = 1\nget { 6 }",
+            "fun set(b: () -> Int) = b()\nvar y = 1\nset { 6 }",
+            "fun get(i: Int) = i\nval x = 1\n@Suppress(\"UNUSED\") get(6)"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == List(scripts.size) { 6 })
     }
 
     @Test
