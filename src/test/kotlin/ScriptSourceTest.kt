@@ -90,7 +90,9 @@ class ScriptSourceTest {
             "fun c() = factor",
             "fun b() = c() * factor",
             ";",
-            "val y = 1; fun a() = b() + y",
+            // split after the `;`, see ScriptStructure.lineSplits
+            "val y = 1;",
+            " ".repeat(11) + "fun a() = b() + y",
             "",
             "",
             "a()",
@@ -159,7 +161,7 @@ class ScriptSourceTest {
         """.trimIndent()
 
         // when
-        val source = ScriptSource(script, dependencies = listOf(PreambleDependency("log", "val log: Any = 1", isCallable = true)))
+        val source = ScriptSource(script, dependencies = listOf(PreambleDependency("log", { _, _ -> "val log: Any = 1" }, isCallable = true)))
 
         // then
         // unlike the calls following them, the ones named like the dependencies, and the callable references
@@ -195,10 +197,12 @@ class ScriptSourceTest {
         assert(sources.all { it.untypedProperties == setOf("print", "log") })
         // also following the lines terminated by `\r\n`
         assert(sources.all { source ->
-            source.text.substringAfter(SCRIPT_BLOCK_START).lines().filter { it.isNotBlank() } == listOf(
+            source.text.substringAfter(SCRIPT_BLOCK_START).lines().filter { it.isNotBlank() }.map { it.trimEnd() } == listOf(
                 "val print = printer() // trailing",
                 "val `_typeProbe_0`: _ScriptTypeProbe = `print`",
-                "val trim = trimmer(); val x = 1",
+                // split after the `;`, see ScriptStructure.lineSplits
+                "val trim = trimmer();",
+                " ".repeat(22) + "val x = 1",
                 "val sum = (10L * 2) + 1",
                 "val (log, n) = logger() to 1",
                 "val `_typeProbe_1`: _ScriptTypeProbe = `log`",
@@ -248,7 +252,7 @@ class ScriptSourceTest {
         """.trimIndent()
 
         // when
-        val source = ScriptSource(script, listOf(PreambleDependency("f", "val `f`: (Any?) -> Int = TODO()", isCallable = true)), confirming = true)
+        val source = ScriptSource(script, listOf(PreambleDependency("f", { _, _ -> "val `f`: (Any?) -> Int = TODO()" }, isCallable = true)), confirming = true)
 
         // then
         val copies = source.text.lines().filter { "_InvisibleClass_" in it }.map { it.substringAfter("` ") }
@@ -278,7 +282,7 @@ class ScriptSourceTest {
             fun f(x: Int) = "fun-int"
             fun f(s: String) = "fun-str"
         """.trimIndent()
-        val dependencies = listOf("x", "Foo").map { PreambleDependency(it, "val `$it`: Int = TODO()") }
+        val dependencies = listOf("x", "Foo").map { PreambleDependency(it, { _, _ -> "val `$it`: Int = TODO()" }) }
         val sources = listOf<ScriptSource.Parsed.() -> ScriptSource>(
             { source() },
             { source(propertyTypeProbes = true) },
@@ -309,6 +313,24 @@ class ScriptSourceTest {
         // then
         val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
         assert("val size: Int\nget() = 3" in moved && "get()" !in body)
+    }
+
+    @Test
+    fun `should move with property any accessor following its accessor on the line after it without indentation`() {
+        // given
+        val scripts = listOf(
+            "var v = 0\nget() = field + 1\nset(3)\nv",
+            "var v = 0\nget() = field + 1\nset\nv",
+            "var v = 0\nget(3)\nset(value) { field = value }\nv"
+        )
+
+        // when
+        val sources = scripts.map { ScriptSource(it) }
+
+        // then
+        assert(sources.all { source ->
+            source.text.substringAfter(SCRIPT_BLOCK_START).let { body -> "get" !in body && "set" !in body }
+        })
     }
 
     @Test
@@ -382,6 +404,46 @@ class ScriptSourceTest {
         // then
         assert(topLevelSources.none { "abc" in it.text })
         assert(nestedSources.all { "abc" in it.text })
+        assert((topLevel + nested).zip(topLevelSources + nestedSources).all { (script, source) ->
+            script.substringBefore("/*").lines().map { it.trim() }.filter { it.isNotEmpty() }.all { it in source.text }
+        })
+    }
+
+    @Test
+    fun `should not analyze structure of script which is not wrapped`() {
+        // given
+        val scripts = listOf(
+            "x\nA().y\nclass A {\n  val y = 1\n",
+            "x\nA().y\nclass A {\n  val y = 1\n}\n}\nval x = 2"
+        )
+        val dependencies = listOf(PreambleDependency("x", { _, _ -> "val x: Int = 42" }))
+
+        // when
+        val sources = scripts.map { ScriptSource(it, dependencies) }
+
+        // then
+        assert(sources.none { it.isWrapped })
+        assert(sources.all { it.movedDeclarationName("A") == null && it.laterDeclaredDependencyCandidates.isEmpty() })
+    }
+
+    @Test
+    fun `should not wrap script left unclosed at its end, which would swallow or be closed by generated code`() {
+        // given
+        val scripts = listOf(
+            "A().x\nclass A {\n  val x = 1\n  /* abc\n}",
+            "f()\nfun f(): Int {\n  /* abc\n  return 1\n}",
+            "val a = 5\n\"\${a",
+            "val a = 5\r\nval s = \"\"\"abc",
+            "listOf(1,\n/* abc"
+        )
+        val dependencies = listOf(PreambleDependency("x", { _, _ -> "val x: Int = 42" }))
+
+        // when
+        val sources = scripts.map { ScriptSource(it, dependencies) }
+
+        // then
+        assert(sources.zip(scripts).all { (source, script) -> source.text == script.replace("\r\n", "\n") })
+        assert(sources.none { source -> (1..source.scriptLines.size).any { source.isGeneratedLine(it) } })
     }
 
     @Test

@@ -2472,6 +2472,9 @@ class ScriptExecutorTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
+                script.kts:1:10: error: Syntax error: Expecting ')'.
+                  | println(1<error></error>
+
                 script.kts:2:1: error: Syntax error: Unexpected '}' without matching '{'.
                   | <error>}</error>
             """.trimIndent()
@@ -2794,6 +2797,100 @@ class ScriptExecutorTest {
             "script.kts:1:15: error: Syntax error: Expecting '}'.",
             "script.kts:2:5: error: Syntax error: Expecting '}'."
         ))
+    }
+
+    @Test
+    fun `should report construct of script left unclosed at its end like regular script`() = runTest {
+        // given
+        val scripts = listOf(
+            "A().x\nclass A {\n  val x = 1\n  /* abc\n}",
+            "f()\nfun f(): Int {\n  /* abc\n  return 1\n}",
+            "A().x\nclass A {\n  val x = 1\n",
+            "val a = 5\n\"\${a",
+            "f()\nfun f() = \"\${1 + \n"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message } == listOf(
+            "script.kts:3:12: error: Syntax error: Missing '}.\n  |   val x = 1<error></error>\n\nscript.kts:4:3: info: Unterminated block comment, running to the end of the script.\n  |   <error>/*</error> abc\n  hint: close the comment with '*/' - the tokens reported as missing might be within it.",
+            "script.kts:2:15: error: Syntax error: Expecting '}'.\n  | fun f(): Int {<error></error>\n\nscript.kts:3:3: info: Unterminated block comment, running to the end of the script.\n  |   <error>/*</error> abc\n  hint: close the comment with '*/' - the tokens reported as missing might be within it.",
+            "script.kts:3:12: error: Syntax error: Missing '}.\n  |   val x = 1<error></error>",
+            "script.kts:2:5: error: Syntax error: Expecting '}'.\n  | \"\${a<error></error>",
+            "script.kts:2:17: error: Syntax error: Expecting an element.\n  | fun f() = \"\${1 +<error></error>"
+        ))
+    }
+
+    @Test
+    fun `should report syntax errors of script with unmatched closing brace like regular script`() = runTest {
+        // given
+        val scripts = listOf(
+            "val a = (1\n}",
+            "foo(1 }",
+            "foo(1}"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message } == listOf(
+            "script.kts:1:11: error: Syntax error: Expecting ')'.\n  | val a = (1<error></error>\n\n" +
+                    "script.kts:2:1: error: Syntax error: Unexpected '}' without matching '{'.\n  | <error>}</error>",
+            "script.kts:1:6: error: Syntax error: Expecting ')'.\n  | foo(1<error></error> }\n\n" +
+                    "script.kts:1:7: error: Syntax error: Unexpected '}' without matching '{'.\n  | foo(1 <error>}</error>",
+            "script.kts:1:6: error: Syntax error: Expecting ')'.\n  | foo(1<error></error>}\n\n" +
+                    "script.kts:1:6: error: Syntax error: Unexpected '}' without matching '{'.\n  | foo(1<error>}</error>"
+        ))
+    }
+
+    @Test
+    fun `should hint at unterminated block comment swallowing closing brace`() = runTest {
+        // given
+        val script = "class A {\n  val x = 1\n  /* abc\n}\nA().x"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:12: error: Syntax error: Missing '}.
+                  |   val x = 1<error></error>
+
+                script.kts:3:3: info: Unterminated block comment, running to the end of the script.
+                  |   <error>/*</error> abc
+                  hint: close the comment with '*/' - the tokens reported as missing might be within it.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report only syntax error of script left unclosed at its end referring to dependency`() = runTest {
+        // given
+        val script = "val y = x + 1\nfun f(): Int {\n  return y"
+        val dependencies = listOf(dependency("x", 42))
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, dependencies)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:11: error: Syntax error: Expecting '}'.
+                  |   return y<error></error>
+            """.trimIndent()
+        }
     }
 
     @Test
@@ -4061,6 +4158,155 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report only syntax error of accessor following valid accessor without indentation`() = runTest {
+        // given
+        val script = "var v = 0\nget() = field + 1\nset(3)\nv"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:5: error: Syntax error: Expecting parameter name.
+                  | set(<error>3</error>)
+
+                script.kts:3:7: error: Syntax error: Expecting function body.
+                  | set(3)<error></error>
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report only syntax error in body of getter without indentation`() = runTest {
+        // given
+        val script = "val size: Int\nget() {\n  return listOf(1, 2).sum(\n}\nsize"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:1: error: Syntax error: Expecting an argument.
+                  | <error></error>}
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should execute bare setter following getter without indentation as part of property`() = runTest {
+        // given
+        val script = "var v = 0\nget() = field + 1\nset\nv"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 1)
+        }
+    }
+
+    @Test
+    fun `should execute call with trailing lambda spelled like setter as setter of preceding property`() = runTest {
+        // given
+        val script = "fun set(i: Int, b: () -> Int) = b()\nval v = 2\nvar x = 1\nset(v) { 6 }"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == Unit)
+        }
+    }
+
+    @Test
+    fun `should execute statements following function with expression body and semicolon on the same line`() = runTest {
+        // given
+        val scripts = listOf(
+            "fun a() = 1; val z = 5\na() + z",
+            "val a = 6; fun b() = a; b()",
+            "fun a() = 1; fun b() = 5; a() + b()",
+            "val f = fun() = 1; val z = 5\nf() + z",
+            "fun a() = 1 /* c */; /* d */ val z = 5\na() + z",
+            "fun a() = b(); val z = 4\nfun b() = 2\na() + z",
+            "inline fun a() = 1; val z = 5\na() + z",
+            "enum class E { A }; fun a() = 1; E.A.ordinal + a() + 5",
+            "fun a() = 1;\na() + 5",
+            "class C; val z = 6\nz",
+            "fun a() = 1; /* multi\nline */ val z = 5\na() + z"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == List(scripts.size) { 6 })
+    }
+
+    @Test
+    fun `should report error at its column of line split after function with expression body and semicolon`() = runTest {
+        // given
+        val script = "fun a() = 1; val z = q; fun b() = r; b()"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:22: error: Unresolved reference 'q'.
+                  | fun a() = 1; val z = <error>q</error>; fun b() = r; b()
+
+                script.kts:1:35: error: Unresolved reference 'r'.
+                  | fun a() = 1; val z = q; fun b() = <error>r</error>; b()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report exception thrown on line split after function with expression body and semicolon`() = runTest {
+        // given
+        val script = """
+            fun a(): Int = TODO(); val z = 1
+            z + a()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs $$"""
+                kotlin.NotImplementedError: An operation is not implemented.
+                  at a(script.kts:1)
+                  | fun a(): Int = TODO(); val z = 1
+                  at <script body>(script.kts:2)
+                  | z + a()
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should execute calls of get and set on the lines after properties without indentation`() = runTest {
         // given
         val scripts = listOf(
@@ -4101,6 +4347,9 @@ class ScriptExecutorTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
+                script.kts:1:13: error: Syntax error: Expecting '"'.
+                  | val s = "abc<error></error>
+
                 script.kts:2:12: error: Syntax error: Unexpected '}' without matching '{'.
                   | println(s) <error>}</error>
             """.trimIndent()
@@ -5006,6 +5255,127 @@ class ScriptExecutorTest {
             be<ScriptResult.Value>()
             have(value == true)
             have(warnings == null)
+        }
+    }
+
+    @Test
+    fun `should report this in local function referring to the coroutine scope of the script body`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            fun tag() = "${'$'}this".substringBefore("@") + "/" + log.size
+            fun hash() = run { this.hashCode() }
+            fun size() = with(log) { this.size }
+            "${'$'}{tag()} ${'$'}{hash()} ${'$'}{size()}"
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:15: error: 'this' refers to the coroutine scope of the script body, while in a function of a regular script it refers to the script instance.
+                  | fun tag() = "${'$'}<error>this</error>".substringBefore("@") + "/" + log.size
+                  hint: refer to the coroutine scope as 'this@_script' instead.
+
+                script.kts:3:20: error: 'this' refers to the coroutine scope of the script body, while in a function of a regular script it refers to the script instance.
+                  | fun hash() = run { <error>this</error>.hashCode() }
+                  hint: refer to the coroutine scope as 'this@_script' instead.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report this in local function outside of the body of local class referring to the coroutine scope`() = runTest {
+        // given
+        val script = """
+            open class B(val v: Any)
+            fun f(): Any { class C(val s: Any = this); return C().s }
+            fun g() = object : B(this) { }.v
+            "${'$'}{f()} ${'$'}{g()}"
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:37: error: 'this' refers to the coroutine scope of the script body, while in a function of a regular script it refers to the script instance.
+                  | fun f(): Any { class C(val s: Any = <error>this</error>); return C().s }
+                  hint: refer to the coroutine scope as 'this@_script' instead.
+
+                script.kts:3:22: error: 'this' refers to the coroutine scope of the script body, while in a function of a regular script it refers to the script instance.
+                  | fun g() = object : B(<error>this</error>) { }.v
+                  hint: refer to the coroutine scope as 'this@_script' instead.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report members of Any called in local function without receiver on the coroutine scope`() = runTest {
+        // given
+        val script = """
+            fun name() = toString()
+            fun copy() = apply { }
+            fun self() = with(this) { this }
+            fun length() = with("abc") { toString().length }
+            fun active() = isActive && launch { }.isActive
+            "${'$'}{name()} ${'$'}{copy()} ${'$'}{self()} ${'$'}{length()} ${'$'}{active()}"
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:14: error: 'toString' is resolved on the coroutine scope of the script body, while in a function of a regular script it is resolved on the script instance.
+                  | fun name() = <error>toString</error>()
+                  hint: refer to the coroutine scope as 'this@_script' instead.
+
+                script.kts:2:14: error: 'apply' is resolved on the coroutine scope of the script body, while in a function of a regular script it is resolved on the script instance.
+                  | fun copy() = <error>apply</error> { }
+                  hint: refer to the coroutine scope as 'this@_script' instead.
+
+                script.kts:3:19: error: 'this' refers to the coroutine scope of the script body, while in a function of a regular script it refers to the script instance.
+                  | fun self() = with(<error>this</error>) { this }
+                  hint: refer to the coroutine scope as 'this@_script' instead.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should execute this in local function referring to other receivers`() = runTest {
+        // given
+        val script = """
+            fun a() = with(5) { this + 1 }
+            fun Int.b() = this + 1
+            fun c() = object { val v = 1; fun d() = this.v }.d()
+            fun e(): Int { class F(val v: Int) { fun g() = this.v }; return F(2).g() }
+            fun h() = this@_script.isActive
+            val i = fun Int.() = this + 1
+            a() + 5.b() + c() + e() + (if (h()) 1 else 0) + 2.i() + "${'$'}this".length * 0
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 6 + 6 + 1 + 2 + 1 + 3)
         }
     }
 

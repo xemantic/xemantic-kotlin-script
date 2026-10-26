@@ -30,6 +30,7 @@ import org.jetbrains.kotlin.com.intellij.psi.PsiErrorElement
 import org.jetbrains.kotlin.com.intellij.psi.PsiWhiteSpace
 import org.jetbrains.kotlin.com.intellij.psi.impl.source.tree.LeafPsiElement
 import org.jetbrains.kotlin.com.intellij.psi.tree.IElementType
+import org.jetbrains.kotlin.com.intellij.psi.util.PsiTreeUtil
 import org.jetbrains.kotlin.compiler.plugin.CompilerPluginRegistrar
 import org.jetbrains.kotlin.compiler.plugin.ExperimentalCompilerApi
 import org.jetbrains.kotlin.config.CompilerConfiguration
@@ -78,16 +79,18 @@ import org.jetbrains.kotlin.psi.KtSecondaryConstructor
 import org.jetbrains.kotlin.psi.KtPsiFactory
 import org.jetbrains.kotlin.psi.KtSimpleNameExpression
 import org.jetbrains.kotlin.psi.KtStringTemplateExpression
+import org.jetbrains.kotlin.psi.KtThisExpression
+import org.jetbrains.kotlin.psi.KtLambdaArgument
 import org.jetbrains.kotlin.psi.KtLambdaExpression
 import org.jetbrains.kotlin.psi.KtOperationReferenceExpression
 import org.jetbrains.kotlin.psi.KtTypeAlias
 import org.jetbrains.kotlin.psi.KtTypeParameter
 import org.jetbrains.kotlin.psi.KtUnaryExpression
 import org.jetbrains.kotlin.psi.KtUserType
+import org.jetbrains.kotlin.psi.KtValueArgument
 import org.jetbrains.kotlin.psi.KtValueArgumentName
 import org.jetbrains.kotlin.psi.KtAnnotatedExpression
 import org.jetbrains.kotlin.psi.KtLabeledExpression
-import org.jetbrains.kotlin.psi.KtValueArgument
 import org.jetbrains.kotlin.psi.KtValueArgumentList
 import org.jetbrains.kotlin.psi.KtWhenExpression
 import org.jetbrains.kotlin.psi.psiUtil.allChildren
@@ -96,6 +99,7 @@ import org.jetbrains.kotlin.psi.psiUtil.collectDescendantsOfType
 import org.jetbrains.kotlin.psi.psiUtil.endOffset
 import org.jetbrains.kotlin.psi.psiUtil.getReceiverExpression
 import org.jetbrains.kotlin.psi.psiUtil.forEachDescendantOfType
+import org.jetbrains.kotlin.psi.psiUtil.getQualifiedExpressionForSelector
 import org.jetbrains.kotlin.psi.psiUtil.parents
 import org.jetbrains.kotlin.psi.psiUtil.startOffset
 import org.jetbrains.kotlin.psi.psiUtil.startOffsetSkippingComments
@@ -383,6 +387,25 @@ internal const val COROUTINE_SCOPE_FUNCTION = "xemantic-kotlin-script: coroutine
 /** The opt-in message of the moved functions, see [ScriptSource.shadowedFunctionCandidates]. */
 internal const val SHADOWED_ORIGINAL = "xemantic-kotlin-script: shadowed original"
 
+/** The opt-in message of the type of the coroutine scope receiver of the script body, see [ScriptSource.coroutineScopeReceiverCandidates]. */
+internal const val COROUTINE_SCOPE_RECEIVER = "xemantic-kotlin-script: coroutine scope receiver"
+
+/**
+ * The names of the members of `Any` and of its extensions, which a local function might call on the coroutine scope without a receiver,
+ * while in the script they would be called on the script instance, see [ScriptSource.coroutineScopeReceiverCandidates],
+ * except `run` and `runCatching`, which behave the same, unless their lambdas refer to `this`, which is a candidate itself,
+ * and the API of the coroutine scope, like `launch` or `isActive`, which the local functions use as in the script body.
+ */
+private val implicitReceiverNames = setOf("toString", "hashCode", "equals", "javaClass", "let", "also", "apply", "takeIf", "takeUnless", "to")
+
+/**
+ * The functions taking a lambda with a receiver, which `this` within the lambda refers to,
+ * so it is not a candidate, see [ScriptSource.coroutineScopeReceiverCandidates], like `this` in `with(list) { this }`,
+ * while the receiver of the call is a candidate itself, like `apply`, or `this` in `with(this) { this }`, reported only once,
+ * except `run`, which has an overload without a receiver.
+ */
+private val receiverLambdaFunctions = setOf("with", "apply", "buildString", "buildList", "buildSet", "buildMap")
+
 /** The opt-in annotation marking the local copies of the declarations, reporting this [message] where they are used. */
 private fun optInMarker(
     message: String
@@ -393,10 +416,16 @@ private val nonIdentifierChars = Regex("[^A-Za-z0-9_]")
 /** A dependency, as declared in the preamble of the [ScriptSource]. */
 internal class PreambleDependency(
     val name: String,
-    /** The declaration of the property of the dependency, like `@get:JvmName("x\$dependency") val x: T = _dependency_x as T`. */
-    val accessor: String,
+    /**
+     * The declaration of the property of the dependency, like `@get:JvmName("x\$dependency") val x: T = _dependency_x as T`,
+     * referring to the [rootPackageClasses] by the given aliases, by their names,
+     * and casting the value in the getter, if `lazy`, see [ScriptSource].
+     */
+    val accessor: (aliases: Map<String, String>, lazy: Boolean) -> String,
     /** Whether it can be called like a function, so a local function of the same name shadows it. */
-    val isCallable: Boolean = false
+    val isCallable: Boolean = false,
+    /** The names of the top-level classes of the root package, which the type of the dependency refers to. */
+    val rootPackageClasses: Set<String> = emptySet()
 )
 
 /** The class of the outer receiver of the script body, declaring the shadowed dependencies, see [ScriptSource]. */
@@ -417,6 +446,18 @@ internal const val SCRIPT_BLOCK_START = "_script($DEPENDENCIES_CLASS()) `_depend
 /** The line ending the script block in the [ScriptSource.text]. */
 internal const val SCRIPT_BLOCK_END = "} }"
 
+/** The type of the coroutine scope receiver of the script body in the confirming compilation, see [ScriptSource.coroutineScopeReceiverCandidates]. */
+private const val COROUTINE_SCOPE_TYPE = "`_CoroutineScope\$`"
+
+/** The function giving the coroutine scope receiver of the script body the [COROUTINE_SCOPE_TYPE] in the confirming compilation. */
+private const val COROUTINE_SCOPE_FUNCTION_NAME = "`_coroutineScope\$`"
+
+/** The [SCRIPT_BLOCK_START] of the confirming compilation, keeping the label of the coroutine scope receiver of the script body. */
+private const val CONFIRMING_SCRIPT_BLOCK_START = "_script($DEPENDENCIES_CLASS()) `_dependencies\$`@{ $COROUTINE_SCOPE_FUNCTION_NAME(_script@{"
+
+/** The [SCRIPT_BLOCK_END] of the confirming compilation. */
+private const val CONFIRMING_SCRIPT_BLOCK_END = "}) }"
+
 /** The type, which the types of the local properties are not, probing them, see [ScriptSource.propertyTypeProbes]. */
 private const val TYPE_PROBE_CLASS = "_ScriptTypeProbe"
 
@@ -431,6 +472,7 @@ private const val BODY_SCOPE_CLASS = "`_ScriptBodyScope`"
  *
  * ```
  * <file annotations, package and imports>
+ * <the imports of the root package classes of the dependency types under their aliases>
  * <the dependency accessors, unless shadowed by the local declarations of the script body>
  * class _ScriptDependencies {
  * <the accessors of the shadowed dependencies>
@@ -450,17 +492,33 @@ private const val BODY_SCOPE_CLASS = "`_ScriptBodyScope`"
  * the inner one being the coroutine scope of the caller.
  * A callable dependency shadowed by a local function only is declared there nevertheless, see [calledInsteadDependencies].
  *
+ * The accessors refer to the classes of the root package by aliases, chosen not to occur in the script,
+ * where they cannot refer to them by their names: if the script has a `package` directive,
+ * or imports another class under the same name, or the class under another name.
+ * A type alias imported under the name of such a class is not told apart from a function,
+ * as it has no class at runtime, so the accessor refers to the type alias then.
+ * A script without a `package` directive, declaring a classifier moved out of the script body named like such a class,
+ * shadows it also in the alias, like in a regular script, where it shadows the type of the property of the base class,
+ * so the accessor casts the value only in its getter, letting the script run, if it does not refer to the dependency.
+ *
  * Declarations are moved by blanking them out with spaces in one copy of their lines,
  * and everything else in the other, so the columns of the script are retained,
  * while each line of the [text] maps back to the line of the script.
+ *
+ * A script which cannot be turned into a block this way, see [isWrapped], is the [text] as it is.
  *
  * The sources of the compilations of the same script, like the confirming ones, are derived from the script parsed once, see [Parsed].
  */
 internal class ScriptSource private constructor(
     script: String,
     dependencies: List<PreambleDependency>,
-    /** The structure of the script, not kept, as the compilation cache keeps the source. */
-    structure: ScriptStructure,
+    /** The script lexed and parsed, not kept, as the compilation cache keeps the source. */
+    analysis: ScriptAnalysis,
+    /**
+     * Whether this qualified name, which the script imports under the name of a class of the root package, see [ScriptSource],
+     * might be of a class, unlike e.g. of a function.
+     */
+    private val mightBeClass: (qualifiedName: String) -> Boolean,
     /**
      * Whether it is the source of the compilation confirming the [laterDeclaredDependencyCandidates]
      * and the [hiddenLocalFunctionCandidates], with the declarations they might refer to deprecated, with a warning, as the declarations deprecated with an error are less preferred by the overload resolution,
@@ -510,6 +568,7 @@ internal class ScriptSource private constructor(
     constructor(
         script: String,
         dependencies: List<PreambleDependency> = emptyList(),
+        mightBeClass: (qualifiedName: String) -> Boolean = { true },
         confirming: Boolean = false,
         shadowedFunctionCopies: Boolean = false,
         overloadingFunctionCopies: Boolean = false,
@@ -517,7 +576,7 @@ internal class ScriptSource private constructor(
         propertyTypeProbes: Boolean = false,
         propertyTypes: Map<String, String> = emptyMap()
     ) : this(
-        script.withoutByteOrderMark(), dependencies, scriptStructure(script.withoutByteOrderMark(), dependencies),
+        script.withoutByteOrderMark(), dependencies, scriptAnalysis(script.withoutByteOrderMark(), dependencies), mightBeClass,
         confirming, shadowedFunctionCopies, overloadingFunctionCopies, coroutineScopeCopies, propertyTypeProbes, propertyTypes,
         hoisting = null
     )
@@ -530,15 +589,18 @@ internal class ScriptSource private constructor(
     class Parsed private constructor(
         private val script: String,
         private val dependencies: List<PreambleDependency>,
-        private val structure: ScriptStructure,
+        private val analysis: ScriptAnalysis,
+        /** See [ScriptSource.mightBeClass]. */
+        private val mightBeClass: (qualifiedName: String) -> Boolean,
         private val hoisting: Hoisting?
     ) {
 
         constructor(
             script: String,
-            dependencies: List<PreambleDependency> = emptyList()
+            dependencies: List<PreambleDependency> = emptyList(),
+            mightBeClass: (qualifiedName: String) -> Boolean = { true }
         ) : this(
-            script.withoutByteOrderMark(), dependencies, scriptStructure(script.withoutByteOrderMark(), dependencies), hoisting = null
+            script.withoutByteOrderMark(), dependencies, scriptAnalysis(script.withoutByteOrderMark(), dependencies), mightBeClass, hoisting = null
         )
 
         /**
@@ -552,12 +614,12 @@ internal class ScriptSource private constructor(
             unresolved: Set<Pair<ScriptPosition, String>>
         ): Parsed? {
             if (hoisting != null) return null
-            val hoisting = structure.hoisting(unresolved.associate { (position, name) -> source.offset(position) to name }) ?: return null
+            val hoisting = analysis.structure?.hoisting(unresolved.associate { (position, name) -> source.offset(position) to name }) ?: return null
             if (source.candidates.any { candidate ->
                     val offset = source.offset(candidate.reference.start)
                     offset in hoisting.region && !(candidate is LaterDeclaredFunctionReference && offset in hoisting.references)
                 }) return null
-            return Parsed(script, dependencies, structure, hoisting)
+            return Parsed(script, dependencies, analysis, mightBeClass, hoisting)
         }
 
         /** The source of the compilation, see the parameters of [ScriptSource]. */
@@ -569,7 +631,7 @@ internal class ScriptSource private constructor(
             propertyTypeProbes: Boolean = false,
             propertyTypes: Map<String, String> = emptyMap()
         ): ScriptSource = ScriptSource(
-            script, dependencies, structure,
+            script, dependencies, analysis, mightBeClass,
             confirming, shadowedFunctionCopies, overloadingFunctionCopies, coroutineScopeCopies, propertyTypeProbes, propertyTypes,
             hoisting
         )
@@ -584,8 +646,27 @@ internal class ScriptSource private constructor(
 
     override val locationId: String
 
-    /** The first `}` closing the script block, which would otherwise end the script early. */
+    /** The first `}` closing nothing, which would close the script block, see [isWrapped]. */
     val unmatchedClosingBrace: ScriptPosition?
+
+    /**
+     * The innermost opening token left open at the end of the script, like `{`, `(`, `${'$'}{` or `"`, see [isWrapped],
+     * with its text as the name.
+     */
+    val unclosedOpening: ScriptReference?
+
+    /** The start of the block comment within the [unclosedOpening], which is not terminated, running to the end of the script. */
+    val unterminatedComment: ScriptPosition?
+
+    /**
+     * Whether the [text] is the script turned into a block, see [ScriptSource],
+     * unless the script has an [unmatchedClosingBrace], or an [unclosedOpening],
+     * where the code generated around the script body would be closed by the script, or would be swallowed or closed by it,
+     * misplacing the syntax errors.
+     * The [text] is the script alone then, as it is never valid, failing with the syntax errors of a regular script,
+     * and the script is not analyzed, without any moved declarations, nor candidates.
+     */
+    val isWrapped: Boolean
 
     /**
      * Whether the script ends with a declaration moved out of the script body, so it returns `Unit`,
@@ -616,6 +697,15 @@ internal class ScriptSource private constructor(
      * are resolved to the coroutine scope of the script body, rather than to the receivers of the lambdas.
      */
     val coroutineScopeCandidates: List<CoroutineScopeReference>
+
+    /**
+     * The unlabeled `this` within the local functions of the script body, outside of the bodies of the classes and of the extension functions,
+     * and the calls without a receiver of the members of `Any` and of its extensions there, like `toString()` or `apply { }`,
+     * which might refer to the coroutine scope receiver of the script body, while in the script they refer to the script instance.
+     * Confirmed by compiling the script with the type of this receiver marked with an opt-in, see [confirming],
+     * reporting the ones referring to it, unlike e.g. to the receiver of a lambda, like in `with(list) { this }`.
+     */
+    val coroutineScopeReceiverCandidates: List<ScriptReference>
 
     /**
      * The references of the script body which might refer to the dependencies, preceding the declarations
@@ -703,7 +793,7 @@ internal class ScriptSource private constructor(
 
     private val lineStarts: List<Int>
 
-    /** For each line of the [text], the line of the script, or `null` for the lines of the block and the preamble. */
+    /** For each line of the [text], the line of the script, or `null` for the generated lines of the block and the preamble, see [isWrapped]. */
     private val lineMapping: List<Int?>
 
     /** The names of the dependencies, by the 0-based lines of the [text] declaring their accessors. */
@@ -720,7 +810,16 @@ internal class ScriptSource private constructor(
         val lineBounds = lineBounds(script)
         lineStarts = lineBounds.map { it.first }
         scriptLines = lineBounds.map { script.substring(it.first, it.last + 1) }
-        unmatchedClosingBrace = structure.unmatchedClosingBrace?.let { position(it) }
+        val lexed = analysis.lexed
+        unmatchedClosingBrace = (lexed as? LexedScript.UnmatchedClosingBrace)?.let { position(it.offset) }
+        val unclosed = lexed as? LexedScript.Unclosed
+        unclosedOpening = unclosed?.let {
+            ScriptReference(script.substring(it.opening.first, it.opening.last + 1), position(it.opening.first), position(it.opening.last + 1))
+        }
+        unterminatedComment = unclosed?.unterminatedComment?.let { position(it) }
+        isWrapped = analysis.structure != null
+        // never valid, so not analyzed, without any moved declarations, nor candidates
+        val structure = analysis.structure ?: emptyStructure
         movedDeclarations = structure.movedDeclarations
         returnsUnit = structure.endsWithMovedDeclaration || hoisting?.endsWithHoistedFunction == true
         packageName = structure.packageName
@@ -785,12 +884,45 @@ internal class ScriptSource private constructor(
         coroutineScopeCandidates = structure.coroutineScopeCandidates.map { (reference, offset, isFunction, assignment) ->
             CoroutineScopeReference(reference.toScriptReference(), position(offset).line, isFunction, reference.isInLambda, assignment?.let { position(it) })
         }
+        coroutineScopeReceiverCandidates = structure.coroutineScopeReceiverCandidates.map { (name, range) -> range.toScriptReference(name) }
         scriptMemberCallableReferences = structure.scriptMemberCallableReferences.map { reference ->
             // like `String::up` split across lines
             reference.second.toScriptReference(reference.first) to script.substring(reference.second).split(lineBreak).joinToString("")
         }
         bodyDeclarations = structure.bodyDeclarations
         localReferences = structure.localReferences
+        // a callable one is visible to the moved declarations referring to it as a value, like `map(log)`, as in the script,
+        // while their calls, which in the script call the local function, if it applies, are confirmed, see hiddenLocalFunctionCandidates
+        val (shadowed, visible) = dependencies.partition {
+            it.name in structure.localProperties || (it.isCallable && it.name in structure.unconfirmedLocalFunctions)
+        }
+        calledInsteadDependencies = visible.filter { it.isCallable && it.name in structure.localFunctions }.mapTo(HashSet()) { it.name }
+        if (analysis.structure == null) {
+            text = scriptLines.joinToString(separator = "\n")
+            lineMapping = scriptLines.indices.toList()
+        } else {
+            val (lines, mapping) = wrap(script, dependencies, lineBounds, structure, copiedPropertyTypes, shadowed, visible)
+            text = lines.joinToString(separator = "\n")
+            lineMapping = mapping
+        }
+        // unique, as the frames of the script are recognized by it, also among the frames of other scripts
+        @OptIn(ExperimentalAtomicApi::class)
+        locationId = "\$${sourceIdSeq.incrementAndFetch()}.kts"
+    }
+
+    /**
+     * The lines of the [text] turned into a block, see [ScriptSource], with their [lineMapping],
+     * declaring the accessors of the [visible] dependencies, and of the [shadowed] ones as the members of the outer receiver of the script body.
+     */
+    private fun wrap(
+        script: String,
+        dependencies: List<PreambleDependency>,
+        lineBounds: List<IntRange>,
+        structure: ScriptStructure,
+        copiedPropertyTypes: Map<String, String>,
+        shadowed: List<PreambleDependency>,
+        visible: List<PreambleDependency>
+    ): Pair<List<String>, List<Int?>> {
         val deprecatedDependencies = if (confirming) {
             (laterDeclaredDependencyCandidates + laterDeclaredClassCandidates).mapTo(HashSet()) { it.reference.name }
         } else {
@@ -827,7 +959,7 @@ internal class ScriptSource private constructor(
         hoisting?.functions?.values?.flatten()?.forEach { hoisted.fill(true, it.first, it.last + 1) }
         val hoistedByLine = hoisting?.functions?.mapKeys { lineOf(it.key) }.orEmpty()
         val movedExcluded = BooleanArray(script.length)
-        // the comment runs to the end of the script, like in a regular script
+        // the comment runs to the end of the script, like in a regular script, while it would swallow the end of the script block
         structure.unterminatedComment?.let {
             excluded.fill(true, it, script.length)
             movedExcluded.fill(true, it, script.length)
@@ -836,19 +968,50 @@ internal class ScriptSource private constructor(
 
         val headerEnd = structure.headerEnd
         if (headerEnd > 0) {
-            addLines(0..lineOf(headerEnd - 1)) { it < headerEnd && !excluded[it] }
+            addLines(0..lineOf(headerEnd - 1)) { it < headerEnd && it < (structure.unterminatedComment ?: script.length) }
+        }
+        val usedAliases = mutableSetOf<String>()
+        val rootPackageAliases = dependencies.flatMapTo(sortedSetOf()) { it.rootPackageClasses }.filter { name ->
+            // as an alias hides the name of the class also from the script, like the alias of the script, e.g. `import A as B`,
+            // while a function imported under the name of the class does not hide it, e.g. `import a.f as A`
+            structure.isPackaged || structure.imports.any { (fqName, importedName) ->
+                if (fqName == name) importedName != name else importedName == name && mightBeClass(fqName)
+            }
+        }.associateWith { name ->
+            generateSequence("_root_${name.filter { it.isLetterOrDigit() || it == '_' }}") { "${it}_" }.first {
+                // an alias quoted in backticks is not resolved, so the script might refer to it
+                it !in script && usedAliases.add(it)
+            }
+        }
+        rootPackageAliases.forEach { (name, alias) ->
+            // reported as the error of the first dependency referring to it, e.g. of a class deprecated as hidden
+            preambleDependencies[lines.size] = dependencies.first { name in it.rootPackageClasses }.name
+            // quoted, as it might be a keyword, like `is`
+            lines += "import `$name` as $alias"
+            mapping += null
+        }
+        val shadowedRootPackageClasses = if (structure.isPackaged) {
+            emptySet()
+        } else {
+            movedDeclarations.filter {
+                it.kind != DeclarationKind.FUNCTION && it.kind != DeclarationKind.PROPERTY
+            }.mapNotNullTo(HashSet()) { it.name }
         }
         fun addAccessor(
             dependency: PreambleDependency
         ) {
             preambleDependencies[lines.size] = dependency.name
+            val accessor = dependency.accessor(rootPackageAliases, dependency.rootPackageClasses.any { it in shadowedRootPackageClasses })
             lines += if (dependency.name in deprecatedDependencies) {
-                "@kotlin.Deprecated(${stringLiteral(LATER_DECLARED_DEPENDENCY)}) ${dependency.accessor}"
+                "@kotlin.Deprecated(${stringLiteral(LATER_DECLARED_DEPENDENCY)}) $accessor"
             } else {
-                dependency.accessor
+                accessor
             }
             mapping += null
         }
+        val markedOriginals = confirming && !shadowedFunctionCopies && !overloadingFunctionCopies && !coroutineScopeCopies
+        // only where needed, keeping the other compilations like the compilation of the script
+        val markedReceiver = markedOriginals && coroutineScopeReceiverCandidates.isNotEmpty()
         // only the first confirming compilation confirms the laterDeclaredFunctionCandidates,
         // while their copies would take precedence over the copies of the other ones, like the members of the coroutine scope of the script body
         val confirmsLaterDeclaredFunctions = confirming && !shadowedFunctionCopies && !overloadingFunctionCopies && !coroutineScopeCopies
@@ -888,6 +1051,15 @@ internal class ScriptSource private constructor(
                 mapping += null
             }
         }
+        if (markedReceiver) {
+            // the opt-in of the type is reported where `this`, or a call without a receiver, refers to the receiver of this type
+            val receiverMarker = optInMarker(COROUTINE_SCOPE_RECEIVER)
+            lines += "@kotlin.RequiresOptIn(\"$COROUTINE_SCOPE_RECEIVER\", level = RequiresOptIn.Level.WARNING) annotation class $receiverMarker"
+            lines += "@$receiverMarker interface $COROUTINE_SCOPE_TYPE : kotlinx.coroutines.CoroutineScope"
+            lines += "@kotlin.OptIn($receiverMarker::class) fun $COROUTINE_SCOPE_FUNCTION_NAME(" +
+                    "block: suspend $COROUTINE_SCOPE_TYPE.() -> Any?): suspend kotlinx.coroutines.CoroutineScope.() -> Any? = kotlin.TODO()"
+            mapping += listOf(null, null, null)
+        }
         if (propertyTypeProbes && untypedProperties.isNotEmpty()) {
             lines += "class $TYPE_PROBE_CLASS"
             mapping += null
@@ -910,12 +1082,6 @@ internal class ScriptSource private constructor(
                 mapping += null
             }
         }
-        // a callable one is visible to the moved declarations referring to it as a value, like `map(log)`, as in the script,
-        // while their calls, which in the script call the local function, if it applies, are confirmed, see hiddenLocalFunctionCandidates
-        val (shadowed, visible) = dependencies.partition {
-            it.name in structure.localProperties || (it.isCallable && it.name in structure.unconfirmedLocalFunctions)
-        }
-        calledInsteadDependencies = visible.filter { it.isCallable && it.name in structure.localFunctions }.mapTo(HashSet()) { it.name }
         visible.forEach { addAccessor(it) }
         lines += "class $DEPENDENCIES_CLASS {"
         mapping += null
@@ -923,7 +1089,6 @@ internal class ScriptSource private constructor(
         shadowed.filterNot { it.isCallable && it.name in structure.movedFunctions }.forEach { addAccessor(it) }
         lines += "}"
         mapping += null
-        val markedOriginals = confirming && !shadowedFunctionCopies && !overloadingFunctionCopies && !coroutineScopeCopies
         val deprecatedFunctions = if (markedOriginals) {
             shadowedFunctionCandidates.mapTo(HashSet()) { it.reference.name }
         } else {
@@ -979,7 +1144,11 @@ internal class ScriptSource private constructor(
             mapping += null
         }
         // qualified, as the script might declare a function of its name
-        lines += if (coroutineScopeCopies) "$SCRIPT_BLOCK_START kotlin.with(this as $BODY_SCOPE_CLASS) {" else SCRIPT_BLOCK_START
+        lines += when {
+            markedReceiver -> CONFIRMING_SCRIPT_BLOCK_START
+            coroutineScopeCopies -> "$SCRIPT_BLOCK_START kotlin.with(this as $BODY_SCOPE_CLASS) {"
+            else -> SCRIPT_BLOCK_START
+        }
         mapping += null
         // the copies preceding the statements, where the local classes declared before them are visible
         val blockCopiesByLine = blockCopies.entries.groupBy({ lineOf(it.key) }) { it.value }
@@ -998,6 +1167,7 @@ internal class ScriptSource private constructor(
             lines += statement
             mapping += null
         }
+        val lineSplits = structure.lineSplits.groupBy { lineOf(it) }
         (lineOf(headerEnd)..lineBounds.lastIndex).forEach { line ->
             addPropertyTypeStatements(line)
             // separated, as the lines they are inserted between might be parsed as one expression otherwise
@@ -1018,8 +1188,13 @@ internal class ScriptSource private constructor(
                 lines += "@${optInMarker(message)}"
                 mapping += null
             }
-            addLines(line..line) { offset ->
-                offset >= headerEnd && !excluded[offset] && !hoisted[offset]
+            // each part of the split line keeps its columns, the others blanked out
+            val starts = listOf(lineBounds[line].first) + lineSplits[line].orEmpty()
+            starts.forEachIndexed { index, start ->
+                val end = starts.getOrNull(index + 1) ?: script.length
+                addLines(line..line) { offset ->
+                    offset in start until end && offset >= headerEnd && !excluded[offset] && !hoisted[offset]
+                }
             }
         }
         addPropertyTypeStatements(null)
@@ -1028,14 +1203,13 @@ internal class ScriptSource private constructor(
             lines += "null"
             mapping += null
         }
-        lines += if (coroutineScopeCopies) "} $SCRIPT_BLOCK_END" else SCRIPT_BLOCK_END
+        lines += when {
+            markedReceiver -> CONFIRMING_SCRIPT_BLOCK_END
+            coroutineScopeCopies -> "} $SCRIPT_BLOCK_END"
+            else -> SCRIPT_BLOCK_END
+        }
         mapping += null
-
-        text = lines.joinToString(separator = "\n")
-        lineMapping = mapping
-        // unique, as the frames of the script are recognized by it, also among the frames of other scripts
-        @OptIn(ExperimentalAtomicApi::class)
-        locationId = "\$${sourceIdSeq.incrementAndFetch()}.kts"
+        return lines to mapping
     }
 
     /**
@@ -1223,16 +1397,34 @@ private val sourceIdSeq = AtomicLong(0)
 /** Dropped like by kotlinc, which would otherwise report it as a syntax error, counting it in the columns of the first line. */
 private fun String.withoutByteOrderMark(): String = removePrefix("\uFEFF")
 
-/** The structure of the [script], see [ScriptStructure]. */
-private fun scriptStructure(
+/**
+ * The [lexed] script, see [LexedScript], and its [structure], see [ScriptStructure],
+ * or `null`, if it cannot be turned into a block, see [ScriptSource.isWrapped].
+ */
+private class ScriptAnalysis(
+    val lexed: LexedScript,
+    val structure: ScriptStructure?
+)
+
+/** The [ScriptAnalysis] of the [script]. */
+private fun scriptAnalysis(
     script: String,
     dependencies: List<PreambleDependency>
-) = ScriptStructure(
+): ScriptAnalysis {
     // the parser recognizes only `\n` as a line terminator, replacing each character keeps the offsets
-    script.replace('\r', '\n'),
-    dependencies.mapTo(HashSet()) { it.name },
-    lineBounds(script).map { it.first }
-)
+    val normalized = script.replace('\r', '\n')
+    val lexed = lexScript(normalized)
+    return ScriptAnalysis(
+        lexed,
+        // never valid, so not analyzed
+        (lexed as? LexedScript.Wrappable)?.let {
+            ScriptStructure(normalized, it.unterminatedComment, dependencies.mapTo(HashSet()) { dependency -> dependency.name }, lineBounds(script).map { bounds -> bounds.first })
+        }
+    )
+}
+
+/** The structure of a script which cannot be turned into a block, without any moved declarations, nor candidates, see [ScriptSource.isWrapped]. */
+private val emptyStructure by lazy { ScriptStructure("", null, emptySet(), listOf(0)) }
 
 /** The index of the line containing the [offset], given the sorted [lineStarts]. */
 private fun lineOf(
@@ -2194,6 +2386,8 @@ private class MemberCopy(
 
 private class ScriptStructure(
     private val script: String,
+    /** The start of the block comment ending the script unterminated at the top level, which would swallow the closing of the script block. */
+    val unterminatedComment: Int?,
     dependencyNames: Set<String>,
     /** The starts of the lines of the original script, unlike of the [script], where `\r\n` ends two lines. */
     lineStarts: List<Int>
@@ -2201,13 +2395,11 @@ private class ScriptStructure(
 
     val headerEnd: Int
 
-    private val lexed = lexScript(script)
+    /** Whether the script starts with a `package` directive. */
+    val isPackaged: Boolean
 
-    /** The offset of the first `}` closing the script block, which would otherwise end the script early. */
-    val unmatchedClosingBrace: Int? = lexed.unmatchedClosingBrace
-
-    /** The start of the block comment ending the script unterminated, which would swallow the closing of the script block. */
-    val unterminatedComment: Int? = lexed.unterminatedComment
+    /** The qualified names the script imports, except the ones imported with `*`, with the names they are imported under. */
+    val imports: List<Pair<String, String>>
 
     val movedDeclarations: List<Declaration>
 
@@ -2273,6 +2465,9 @@ private class ScriptStructure(
     /** The copies of the moved declarations, the members of the coroutine scope of the script body, see [ScriptSource.coroutineScopeCopies]. */
     val coroutineScopeMembers: List<String>
 
+    /** The names and the ranges of the [ScriptSource.coroutineScopeReceiverCandidates]. */
+    val coroutineScopeReceiverCandidates: List<Pair<String, IntRange>>
+
     /** See [ScriptSource.packageName]. */
     val packageName: String
 
@@ -2319,6 +2514,14 @@ private class ScriptStructure(
     /** The modifiers of the moved declarations, which are not applicable to the members of the script class, like `const`. */
     val movedBlankedRanges = mutableListOf<IntRange>()
 
+    /**
+     * The offsets following the `;` ending a statement of the script body, followed by another one on the same line,
+     * where the line of the script block is split,
+     * as a function with an expression body takes the `;` as its part, like `fun a() = 1;`,
+     * so the parser of a block rejects the statement following it on the same line, unlike the parser of a script.
+     */
+    val lineSplits: List<Int>
+
     /** The statements of the script block, see [hoisting]. */
     private val blockStatements: List<BlockStatement>
 
@@ -2354,6 +2557,10 @@ private class ScriptStructure(
             file.packageDirective,
             file.importList
         ).filter { it.textLength > 0 }.maxOfOrNull { it.endOffset } ?: 0
+        isPackaged = file.packageDirective?.isRoot == false
+        imports = file.importDirectives.filter { !it.isAllUnder }.mapNotNull { directive ->
+            directive.importedFqName?.let { it.asString() to (directive.aliasName ?: it.shortName().asString()) }
+        }
         val block = file.script?.blockExpression
         val statements = block?.statements.orEmpty()
         val declarations = statements.mapNotNull { parseDeclaration(it) }
@@ -2402,6 +2609,19 @@ private class ScriptStructure(
         localProperties = propertyNameSet - movedConstants.mapTo(HashSet()) { it.name!! }
         movedDeclarations = moved.map { it.toDeclaration(withNestedNames = true) }
         endsWithMovedDeclaration = moved.any { it.psi == statements.lastOrNull() }
+        val movedStatements = moved.mapTo(HashSet()) { it.psi }
+        lineSplits = statements.withIndex().mapNotNull { (index, statement) ->
+            // also followed by a comment, like `fun a() = 1; /* c */`, which the function takes as well
+            var last = PsiTreeUtil.getDeepestLast(statement)
+            while (last is PsiComment || last is PsiWhiteSpace) last = PsiTreeUtil.prevLeaf(last) ?: break
+            if (statement in movedStatements || last.node.elementType != KtTokens.SEMICOLON) return@mapNotNull null
+            val next = statements.subList(index + 1, statements.size).firstOrNull { it !in movedStatements } ?: return@mapNotNull null
+            // a line break within a comment does not separate the statements, unlike within a moved declaration, keeping its lines
+            val separated = generateSequence(PsiTreeUtil.nextLeaf(last)) { PsiTreeUtil.nextLeaf(it) }
+                .takeWhile { it.startOffset < next.startOffset }
+                .any { leaf -> '\n' in leaf.text && (leaf !is PsiComment || leaf.parents.any { it in movedStatements }) }
+            last.endOffset.takeIf { !separated }
+        }
         val (movedExtensions, movedMembers) = moved
             .filter { it.kind == DeclarationKind.FUNCTION || it.kind == DeclarationKind.PROPERTY }
             .partition { it.isExtension || (it.psi as? KtProperty)?.receiverTypeReference != null }
@@ -2680,6 +2900,20 @@ private class ScriptStructure(
             }
         }
         coroutineScopeCandidates = coroutineScopeCandidatesByStatement.values.flatten()
+        coroutineScopeReceiverCandidates = statements.filter { it !in movedStatements }.flatMap { statement ->
+            statement.collectDescendantsOfType<KtExpression> { expression ->
+                when (expression) {
+                    is KtThisExpression -> expression.getLabelName() == null
+                    is KtLabelReferenceExpression, is KtOperationReferenceExpression -> false
+                    is KtSimpleNameExpression -> expression.getReferencedName() in implicitReceiverNames
+                            && expression.getReceiverExpression() == null
+                            && expression.parent !is KtValueArgumentName && expression.parent !is KtCallableReferenceExpression
+                    else -> false
+                } && expression.isInLocalFunction(statement) && !expression.isInReceiverLambda(statement)
+            }.map { expression ->
+                ((expression as? KtSimpleNameExpression)?.getReferencedName() ?: "this") to (expression.startOffset until expression.endOffset)
+            }
+        }
         val laterDeclaredCandidatesByStatement = bodyCandidates { index, reference ->
             dependencyProperties[reference.name]?.takeIf { (declarationIndex) ->
                 // also when called, as the function of the same name might not apply
@@ -3256,7 +3490,9 @@ private class ScriptStructure(
         if (nameIdentifier == null && declaration !is KtDestructuringDeclaration) return null
         // like in the script, also the accessors starting a line, which is not indented more than the property, are its part,
         // moved or blanked out with it, as the local property in the script block has none, so they would be the statements following it,
-        // unless they do nothing, like `get()`, or do not parse, like `get(3)` or `get("/") { }`, being rather the calls following it
+        // unless they do nothing, like `get()`, or do not parse, like `get(3)` or `get("/") { }`, being rather the calls following it,
+        // while along with an accessor which is its part, like `get() = field + 1`, also the other one is, whatever it is,
+        // like a bare `set`, or `set(3)` with the syntax errors of a regular script
         val accessors = (declaration as? KtProperty)?.accessors.orEmpty().let { parsed ->
             fun KtPropertyAccessor.isUnindented() = isOnNewLine(startOffset)
                     && columnOf(startOffset) <= columnOf(declaration.startOffsetSkippingComments)
@@ -3265,11 +3501,16 @@ private class ScriptStructure(
             } else {
                 emptyList()
             }
-            val wellFormed = parsed.takeWhile { accessor ->
-                !accessor.isUnindented() || errorOffsets.none { it >= accessor.startOffset }
+            // the errors of an accessor might follow it, up to the next one
+            fun KtPropertyAccessor.isWellFormed(): Boolean {
+                val next = parsed.getOrNull(parsed.indexOf(this) + 1)
+                return errorOffsets.none { it >= startOffset && (next == null || it < next.startOffset) }
             }
-            // a bare `set` preceding a getter with a body is still the part of the property
-            wellFormed.take(wellFormed.indexOfLast { !it.isUnindented() || it.hasBody() || it.modifierList != null } + 1)
+            if (parsed.any { !it.isUnindented() || (it.isWellFormed() && (it.hasBody() || it.modifierList != null)) }) {
+                parsed
+            } else {
+                emptyList()
+            }
         }
         val end = (declaration as? KtProperty)?.accessors?.getOrNull(accessors.size)?.let { firstOmitted ->
             declaration.allChildren.toList().last {
@@ -3312,6 +3553,46 @@ private class ScriptStructure(
             },
             references = declaration.references(scope = declaration.parent, declaredNames)
         )
+    }
+
+    /**
+     * Whether the expression is within a function of the [statement] of the script body,
+     * not within the body of a class, nor within an extension function, which `this` would refer to,
+     * unlike e.g. the default values of the parameters of a class, or its supertypes, referring to the receiver outside of the class.
+     */
+    private fun KtExpression.isInLocalFunction(
+        statement: KtExpression
+    ): Boolean {
+        var inFunction = false
+        for (parent in parents) {
+            if (parent is KtClassBody) return false
+            if (parent is KtNamedFunction) {
+                if (parent.receiverTypeReference != null) return false
+                inFunction = true
+            }
+            if (parent === statement) break
+        }
+        return inFunction
+    }
+
+    /**
+     * Whether the nearest lambda within the [statement] containing the expression is passed to a function of the [receiverLambdaFunctions],
+     * or to `run` with a receiver, like `list.run { this }`, so it refers to the receiver of the lambda.
+     */
+    private fun KtExpression.isInReceiverLambda(
+        statement: KtExpression
+    ): Boolean {
+        val lambda = parents.takeWhile { it !== statement }.firstOrNull { it is KtLambdaExpression } as? KtLambdaExpression ?: return false
+        val call = lambda.call() ?: return false
+        val name = (call.calleeExpression as? KtSimpleNameExpression)?.getReferencedName()
+        return name in receiverLambdaFunctions || (name == "run" && call.getQualifiedExpressionForSelector() != null)
+    }
+
+    /** The call taking this lambda as an argument, like `with(x) { }`. */
+    private fun KtLambdaExpression.call(): KtCallExpression? = when (val argument = parent) {
+        is KtLambdaArgument -> argument.parent as? KtCallExpression
+        is KtValueArgument -> argument.parent?.parent as? KtCallExpression
+        else -> null
     }
 
     /** Whether the [offset] is preceded only by whitespaces in its line. */
@@ -3484,63 +3765,73 @@ private val enclosingOf = mapOf<IElementType, Set<IElementType>>(
     KtTokens.CLOSING_QUOTE to emptySet()
 )
 
-/** The offsets of the [ScriptStructure.unmatchedClosingBrace] and of the [ScriptStructure.unterminatedComment]. */
-private class LexedScript(
-    val unmatchedClosingBrace: Int?,
-    val unterminatedComment: Int?
-)
+/** How the script ends, recognized with the lexer, see [ScriptSource.isWrapped]. */
+private sealed interface LexedScript {
+
+    /** It can be wrapped, ending with the [unterminatedComment] at the top level, if any, see [ScriptStructure.unterminatedComment]. */
+    class Wrappable(val unterminatedComment: Int?) : LexedScript
+
+    /** See [ScriptSource.unmatchedClosingBrace]. */
+    class UnmatchedClosingBrace(val offset: Int) : LexedScript
+
+    /** See [ScriptSource.unclosedOpening] and [ScriptSource.unterminatedComment]. */
+    class Unclosed(val opening: IntRange, val unterminatedComment: Int?) : LexedScript
+
+}
 
 /**
  * Finds the first `}` closing the script block, which the script is wrapped in,
  * recognized with the lexer, as the parser of the script alone recovers from it differently,
- * and the block comment, or the KDoc, ending the script unterminated at the top level,
- * also when it closes only a nested comment, while within a block or a string it is a missing closing token.
+ * or the opening token left open at the end of the script,
+ * and the block comment, or the KDoc, ending the script unterminated,
+ * also when it closes only a nested comment.
  */
 private fun lexScript(
     script: String
 ): LexedScript {
     val lexer = KotlinLexer()
     lexer.start(script)
-    val opened = mutableListOf<IElementType>()
+    // the types and the ranges of the opening tokens
+    val opened = mutableListOf<Pair<IElementType, IntRange>>()
+    var unterminatedComment: Int? = null
     while (true) {
-        val type = lexer.tokenType ?: return LexedScript(null, null)
-        if (type in openingTokens) opened += type
+        val type = lexer.tokenType ?: return when (opened.isEmpty()) {
+            true -> LexedScript.Wrappable(unterminatedComment)
+            false -> LexedScript.Unclosed(opened.last().second, unterminatedComment)
+        }
+        if (type in openingTokens) opened += type to (lexer.tokenStart until lexer.tokenEnd)
         // ends the unterminated single-line string instead of the closing quote
         if (type == KtTokens.DANGLING_NEWLINE) {
-            val quote = opened.lastIndexOf(KtTokens.OPEN_QUOTE)
+            val quote = opened.indexOfLast { it.first == KtTokens.OPEN_QUOTE }
             if (quote >= 0) opened.subList(quote, opened.size).clear()
         }
         openingOf[type]?.let { closed ->
-            val opening = opened.lastIndexOf(closed)
-            val enclosing = opened.indexOfLast { it in enclosingOf.getValue(type) }
+            val opening = opened.indexOfLast { it.first == closed }
+            val enclosing = opened.indexOfLast { it.first in enclosingOf.getValue(type) }
             if (opening > enclosing) {
                 opened.subList(opening, opened.size).clear()
             } else if (type == KtTokens.RBRACE && enclosing == -1) {
-                return LexedScript(lexer.tokenStart, null)
+                return LexedScript.UnmatchedClosingBrace(lexer.tokenStart)
             }
         }
         if ((type == KtTokens.BLOCK_COMMENT || type == KtTokens.DOC_COMMENT) && lexer.tokenEnd == lexer.bufferEnd
-            && opened.isEmpty() && isUnterminatedComment(script, lexer.tokenStart)
+            && isUnterminatedComment(script.substring(lexer.tokenStart))
         ) {
-            return LexedScript(null, lexer.tokenStart)
+            unterminatedComment = lexer.tokenStart
         }
         lexer.advance()
     }
 }
 
-/** Whether the block comment starting at [start] is not closed, counting the nested comments like the lexer. */
+/**
+ * Whether the block [comment] ending the script is not terminated, also when it closes only a nested comment,
+ * as the lexer ends such a comment only at the end of the text, unlike the terminated one.
+ */
 private fun isUnterminatedComment(
-    script: String,
-    start: Int
+    comment: String
 ): Boolean {
-    var depth = 0
-    var offset = start
-    while (offset < script.length - 1) {
-        when {
-            script[offset] == '/' && script[offset + 1] == '*' -> { depth++; offset += 2 }
-            script[offset] == '*' && script[offset + 1] == '/' -> { depth--; offset += 2 }
-            else -> offset++
-        }
-    }
-    return depth > 0
+    val text = "$comment\n"
+    val lexer = KotlinLexer()
+    lexer.start(text)
+    return lexer.tokenEnd == text.length
 }

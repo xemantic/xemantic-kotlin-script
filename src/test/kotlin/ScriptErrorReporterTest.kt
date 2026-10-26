@@ -66,6 +66,24 @@ class ScriptErrorReporterTest {
         assert(lastLine == "    Suppressed: [FURTHER EXCEPTIONS OMITTED]")
     }
 
+    /**
+     * Tested directly, as a script which is not wrapped is never valid, failing to compile.
+     */
+    @Test
+    fun `should report script which is not wrapped by unclosed or unmatched token`() {
+        // given
+        val reporters = listOf("listOf(1,\n  \"\${2", "listOf(1 }").map { ScriptErrorReporter(ScriptSource(it)) }
+
+        // when
+        val messages = reporters.map { it.toSourceFailureMessage() }
+
+        // then
+        assert(messages == listOf(
+            "script.kts:2:4: error: Syntax error: '\${' is not closed.\n  |   \"<error>\${</error>2",
+            "script.kts:1:10: error: Syntax error: Unexpected '}' without matching '{'.\n  | listOf(1 <error>}</error>"
+        ))
+    }
+
     @Test
     fun `should report failure without diagnostics`() {
         // given
@@ -325,7 +343,7 @@ class ScriptErrorReporterTest {
     @Test
     fun `should report crash of the compiler in the accessor of the dependency`() {
         // given
-        val source = ScriptSource("x", listOf(PreambleDependency("x", "val `x`: Int = TODO()")))
+        val source = ScriptSource("x", listOf(PreambleDependency("x", { _, _ -> "val `x`: Int = TODO()" })))
         val line = source.text.lines().indexOfFirst { it.startsWith("val `x`") } + 1
         val diagnostic = ScriptDiagnostic(
             code = ScriptDiagnostic.unspecifiedError,

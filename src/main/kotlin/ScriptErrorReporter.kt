@@ -61,7 +61,12 @@ internal fun Iterable<ScriptDiagnostic>.filterNonIgnorable(
             "Loading modules:"
         ).any { diagnostic.message.startsWith(it) }
         ScriptDiagnostic.Severity.WARNING -> diagnostic.location?.let { source.isGeneratedLine(it.start.line) } == true
-        else -> false
+        // the parser of a regular script reports each token following the unmatched closing brace as unexpected
+        else -> source.unmatchedClosingBrace?.let { brace ->
+            diagnostic.location?.start?.let { start ->
+                source.toScriptPosition(start.line, start.col).let { it.line > brace.line || (it.line == brace.line && it.column > brace.column) }
+            }
+        } == true
     }
 }
 
@@ -93,9 +98,22 @@ internal class ScriptErrorReporter(
 
     private fun List<ScriptDiagnostic>.toFailureMessage(
         compilation: Boolean
-    ): String = describe(compilation).joinToString(separator = "\n").trimEnd().ifEmpty {
+    ): String = (describe(compilation) + listOfNotNull(unterminatedCommentHint())).joinToString(separator = "\n").trimEnd().ifEmpty {
         // e.g. when all the diagnostics of the failure were ignorable
         "error: Failed without any diagnostic message."
+    }
+
+    /**
+     * The block comment swallowing the rest of the script, see [ScriptSource.unterminatedComment],
+     * reported by the compiler as the missing closing tokens only, which might be within the comment.
+     */
+    private fun unterminatedCommentHint(): String? = source.unterminatedComment?.let { start ->
+        buildString {
+            appendPosition(start)
+            +"info: Unterminated block comment, running to the end of the script.\n"
+            appendSourceLines(start, start.copy(column = start.column + 2))
+            +"  hint: close the comment with '*/' - the tokens reported as missing might be within it.\n"
+        }
     }
 
     fun toFailureMessage(
@@ -172,10 +190,16 @@ internal class ScriptErrorReporter(
         }
     }
 
-    /** The failure recognized in the [source] before compiling it. */
+    /** The failure recognized in the [source] without the compilation reporting it, like the conflicting declarations. */
     fun toSourceFailureMessage(): String = source.unmatchedClosingBrace?.let {
-        // the brace would close the script block, misplacing all the errors
+        // the script alone compiled, contrary to the lexer, see [ScriptSource.isWrapped]
         toUnmatchedClosingBraceMessage(it)
+    } ?: source.unclosedOpening?.let { opening ->
+        buildString {
+            appendPosition(opening.start)
+            +"error: Syntax error: '${opening.name}' is not closed.\n"
+            appendSourceLines(opening.start, opening.end)
+        }.trimEnd()
     } ?: source.conflictingDependencyDeclarations.map { declaration ->
         buildString {
             appendPosition(declaration.start)
@@ -196,6 +220,22 @@ internal class ScriptErrorReporter(
             +"which is compiled outside of the script body.\n"
             appendSourceLines(reference.start, reference.end)
             +"  hint: rename the ${scope.kind}.\n"
+        }
+    }.trimEnd()
+
+    /** The [references] of the local functions of the script body to its coroutine scope, see [ScriptSource.coroutineScopeReceiverCandidates]. */
+    fun toCoroutineScopeReceiverMessage(
+        references: List<ScriptReference>
+    ): String = references.joinToString(separator = "\n") { reference ->
+        buildString {
+            appendPosition(reference.start)
+            if (reference.name == "this") {
+                +"error: 'this' refers to the coroutine scope of the script body, while in a function of a regular script it refers to the script instance.\n"
+            } else {
+                +"error: '${reference.name}' is resolved on the coroutine scope of the script body, while in a function of a regular script it is resolved on the script instance.\n"
+            }
+            appendSourceLines(reference.start, reference.end)
+            +"  hint: refer to the coroutine scope as 'this@_script' instead.\n"
         }
     }.trimEnd()
 
@@ -272,7 +312,7 @@ internal class ScriptErrorReporter(
         position: ScriptPosition
     ): String = buildString {
         appendPosition(position)
-        +"error: Syntax error: Unexpected '}' without matching '{'.\n"
+        +"error: $UNMATCHED_CLOSING_BRACE\n"
         appendSourceLines(position, position.copy(column = position.column + 1))
     }.trimEnd()
 
@@ -480,7 +520,18 @@ internal class ScriptErrorReporter(
             capturingDeclaration?.let { source.movedDeclarationName(it) }
         }
         range?.let { appendPosition(it.first) }
-        appendSeverityAndMessage(diagnostic)
+        appendSeverityAndMessage(
+            // more specific than the "Unexpected symbol" of the compiler, covering the brace,
+            // unlike e.g. the empty range of `Expecting ')'` of `foo(1}` at the same position
+            if (
+                range != null && range.first == source.unmatchedClosingBrace && range.second != range.first
+                && diagnostic.message.startsWith("Syntax error:")
+            ) {
+                diagnostic.copy(message = UNMATCHED_CLOSING_BRACE)
+            } else {
+                diagnostic
+            }
+        )
         if (range == null) return
         val (start, end) = range
         appendSourceLines(start, end)
@@ -679,6 +730,8 @@ private fun ScriptSource.generatedLocations(): Regex {
     val name = Regex.escape(locationId)
     return Regex("\\((\\d+),(\\d+)\\) in /?$name|$name(?::(\\d+)(?::(\\d+))?)?")
 }
+
+private const val UNMATCHED_CLOSING_BRACE = "Syntax error: Unexpected '}' without matching '{'."
 
 /**
  * The 0-based line of the script, and the 1-based column, if any, of the location matched by the [generatedLocations],

@@ -33,7 +33,13 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import org.jetbrains.kotlin.builtins.PrimitiveType
+import org.jetbrains.kotlin.builtins.StandardNames
+import org.jetbrains.kotlin.builtins.jvm.JavaToKotlinClassMap
 import org.jetbrains.kotlin.config.JvmTarget
+import org.jetbrains.kotlin.lexer.KotlinLexer
+import org.jetbrains.kotlin.lexer.KtTokens
+import org.jetbrains.kotlin.name.FqName
 import kotlin.concurrent.atomics.AtomicInt
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.concurrent.atomics.fetchAndIncrement
@@ -44,6 +50,7 @@ import java.lang.reflect.Modifier
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.reflect.KFunction
+import kotlin.reflect.KType
 import kotlin.reflect.KVisibility
 import kotlin.reflect.full.extensionReceiverParameter
 import kotlin.reflect.typeOf
@@ -150,6 +157,34 @@ internal class DefaultScriptExecutor(
      */
     private val classLoader: ClassLoader = Thread.currentThread().contextClassLoader
         ?: DefaultScriptExecutor::class.java.classLoader
+
+    /**
+     * Whether the [qualifiedName] might be of a class, see [ScriptSource],
+     * unless no class of this name can be found, like of a function, or of a type alias,
+     * while a built-in class, like `kotlin.String`, is mapped to a Java class, or has none, like `kotlin.IntArray`.
+     */
+    private fun mightBeClass(
+        qualifiedName: String
+    ): Boolean {
+        val fqName = FqName(qualifiedName)
+        if (JavaToKotlinClassMap.mapKotlinToJava(fqName.toUnsafe()) != null || fqName in builtInArrays) return true
+        val segments = fqName.pathSegments().map { it.asString() }
+        // the binary names of the classes nested in the classes of the preceding segments, like `a.B${'$'}C` of `a.B.C`
+        return segments.indices.reversed().any { index ->
+            val binaryName = segments.subList(0, index + 1).joinToString(".") +
+                    segments.subList(index + 1, segments.size).joinToString("") { "${'$'}$it" }
+            try {
+                Class.forName(binaryName, false, classLoader)
+                true
+            } catch (_: ClassNotFoundException) {
+                false
+            } catch (e: Throwable) {
+                if (e is VirtualMachineError) throw e
+                // e.g. a class referring to an optional class, which is missing
+                true
+            }
+        }
+    }
 
     /**
      * Resolving the classpath, see [compilationConfigurationTemplate],
@@ -378,13 +413,18 @@ internal class DefaultScriptExecutor(
             val parsed: ScriptSource.Parsed
             val source: ScriptSource
             try {
-                parsed = ScriptSource.Parsed(script, preambleDependencies)
+                parsed = ScriptSource.Parsed(script, preambleDependencies, ::mightBeClass)
                 source = parsed.source()
             } catch (_: StackOverflowError) {
                 // while the compiler reports it as a diagnostic, and its other failures are internal
                 return FailedCompilation("error: The script is nested too deeply to be parsed.")
             }
-            if (source.unmatchedClosingBrace != null || source.conflictingDependencyDeclarations.isNotEmpty()) {
+            if (!source.isWrapped) {
+                // the script alone, failing with the syntax errors of a regular script, without any candidates,
+                // unless it compiles, contrary to the lexer, while it cannot run without the script block
+                return Compilation(source, compile(source).takeIf { it is Failure })
+            }
+            if (source.conflictingDependencyDeclarations.isNotEmpty()) {
                 return Compilation(source, result = null)
             }
             val compilation = compile(parsed, source)
@@ -396,7 +436,7 @@ internal class DefaultScriptExecutor(
             parsed: ScriptSource.Parsed,
             source: ScriptSource
         ): CompilationOutcome {
-            if (source.candidates.isEmpty()) return Compilation(source, compile(source))
+            if (source.candidates.isEmpty() && source.coroutineScopeReceiverCandidates.isEmpty()) return Compilation(source, compile(source))
             // the confirming compilations do not depend on this one
             return coroutineScope {
                 val compiled = async { compile(source) }
@@ -473,7 +513,10 @@ internal class DefaultScriptExecutor(
             // recognizing the candidates referring to the wrong declarations indeed
             val probe = parsed.source(confirming = true, propertyTypes = propertyTypes)
             // only the calls of the properties of unknown types, which cannot be confirmed without their copies
-            if (probe.copiedProperties.isEmpty() && candidates.all { it in source.untypedPropertyCalls }) {
+            if (
+                probe.copiedProperties.isEmpty() && candidates.all { it in source.untypedPropertyCalls }
+                && source.coroutineScopeReceiverCandidates.isEmpty()
+            ) {
                 return Compilation(source, compiled.await())
             }
             /**
@@ -568,6 +611,7 @@ internal class DefaultScriptExecutor(
                     candidate.copy(line = localFunctionLine(message) ?: candidate.line)
                 }
             }
+            val toReceiver = deprecated(COROUTINE_SCOPE_RECEIVER)
             // the references not resolved to the moved declarations, unless already reported as errors, other than the one of the assignment
             // to the property of the coroutine scope instead of the moved `var`, `'val' cannot be reassigned`, at the property, explained by it,
             // while a reference within a lambda resolved to a value of its receiver, failing the same way, is not confirmed by the copies
@@ -670,6 +714,9 @@ internal class DefaultScriptExecutor(
                 source,
                 result,
                 confirmedFailures = listOfNotNull(
+                    source.coroutineScopeReceiverCandidates.filter { candidate ->
+                        toReceiver.any { it in candidate } && errors.none { it in candidate }
+                    }.takeIf { it.isNotEmpty() }?.let { reporter.toCoroutineScopeReceiverMessage(it) },
                     // in the order of the script
                     message(toCoroutineScopeReferences, ScriptErrorReporter::toCoroutineScopeMessage),
                     // in the order of the script
@@ -738,9 +785,7 @@ internal class DefaultScriptExecutor(
 
         /** Inspected once, as recognizing a callable dependency might inspect its members by reflection. */
         private val preambleDependencies by lazy {
-            allDependencies.filter { it.isHidden }.map { dependency ->
-                PreambleDependency(dependency.name, dependency.accessor, dependency.isCallable)
-            }
+            allDependencies.filter { it.isHidden }.map { it.preambleDependency }
         }
 
         private suspend fun compile(
@@ -1038,12 +1083,98 @@ private val ScriptExecutor.Dependency<*>.providedName: String
 private val ScriptExecutor.Dependency<*>.providedType: KotlinType
     get() = if (isHidden) KotlinType(typeOf<Any?>()) else KotlinType(type)
 
-// with an initializer, unlike a getter, the dependency can be smart cast,
-// while the getter is renamed, as a function moved out of the script body might be named like it, e.g. `getFoo` or `isFoo`,
-// to a name with `$`, which no function of the script can have, unless quoted in backticks
-// its warnings, like of the unchecked cast, are not reported, see [filterNonIgnorable]
-private val ScriptExecutor.Dependency<*>.accessor: String
-    get() = "@get:kotlin.jvm.JvmName(\"$name\\\$dependency\") val `$name`: $type = `$providedName` as $type"
+/** The built-in array classes, which have no class at runtime, like `kotlin.IntArray`, see [DefaultScriptExecutor.mightBeClass]. */
+private val builtInArrays = PrimitiveType.entries.map { it.arrayTypeFqName } + StandardNames.FqNames.array.toSafe()
+
+/** The dependency, as declared in the preamble of the script. */
+private val ScriptExecutor.Dependency<*>.preambleDependency: PreambleDependency
+    get() {
+        val rootPackageClasses = type.rootPackageClasses()
+        val renderedType = type.toString()
+        val rootPackageClassRanges = renderedType.rootPackageClassRanges(rootPackageClasses)
+        return PreambleDependency(
+            name = name,
+            // with an initializer, unlike a getter, the dependency can be smart cast,
+            // while the getter is renamed, as a function moved out of the script body might be named like it, e.g. `getFoo` or `isFoo`,
+            // to a name with `$`, which no function of the script can have, unless quoted in backticks
+            // its warnings, like of the unchecked cast, are not reported, see [filterNonIgnorable]
+            accessor = { aliases, lazy ->
+                val type = renderedType.withRootPackageAliases(rootPackageClassRanges, aliases)
+                "@get:kotlin.jvm.JvmName(\"$name\\\$dependency\") val `$name`: $type ${if (lazy) "get() =" else "="} `$providedName` as $type"
+            },
+            isCallable = isCallable,
+            rootPackageClasses = rootPackageClasses.values.toSet()
+        )
+    }
+
+/**
+ * The names of the top-level classes of the root package, which this type refers to,
+ * by the qualified names of the classes they are, or they nest, like `Outer.Nested`.
+ */
+private fun KType.rootPackageClasses(): Map<String, String> = buildMap {
+    fun KType.collect() {
+        (classifier as? KClass<*>)?.let { kClass ->
+            val qualifiedName = kClass.qualifiedName
+            // an array class, like of `Array<T>`, is of the package of its component type
+            if (qualifiedName != null && !kClass.java.isArray && kClass.java.packageName.isEmpty()) {
+                // a name cannot contain `.`, even if quoted in backticks
+                put(qualifiedName, qualifiedName.substringBefore('.'))
+            }
+        }
+        arguments.forEach { it.type?.collect() }
+    }
+    collect()
+}
+
+/**
+ * The ranges of the names of the top-level classes of the root package in this [KType.toString] rendering,
+ * referring to the [classes] of the root package, see [rootPackageClasses], with these names,
+ * like `Outer` of `Outer.Nested`.
+ */
+private fun String.rootPackageClassRanges(
+    classes: Map<String, String>
+): List<Pair<IntRange, String>> {
+    if (classes.isEmpty()) return emptyList()
+    val lexer = KotlinLexer()
+    lexer.start(this)
+    val tokens = buildList {
+        while (lexer.tokenType != null) {
+            add(Triple(lexer.tokenType!!, lexer.tokenStart, lexer.tokenEnd))
+            lexer.advance()
+        }
+    }
+    return tokens.indices.mapNotNull { index ->
+        val (type, start, end) = tokens[index]
+        if (type != KtTokens.IDENTIFIER || tokens.getOrNull(index - 1)?.first == KtTokens.DOT) return@mapNotNull null
+        // the segments of the qualified name, like `kotlin.collections.List`, quoted in backticks if needed, like `in`
+        val segments = generateSequence(index) { it + 2 }.takeWhile {
+            it == index || (tokens.getOrNull(it - 1)?.first == KtTokens.DOT && tokens.getOrNull(it)?.first == KtTokens.IDENTIFIER)
+        }.map { substring(tokens[it].second, tokens[it].third) }.toList()
+        // a soft keyword, like the variance `out` in `List<out T>`, which is lexed as an identifier, is followed by a space,
+        // unlike a name, which is quoted in backticks if it is a keyword
+        val isModifier = segments.size == 1 && !segments[0].startsWith('`') && tokens.getOrNull(index + 1)?.first == KtTokens.WHITE_SPACE
+        classes[segments.joinToString(".") { it.removeSurrounding("`") }]?.takeUnless { isModifier }?.let { (start until end) to it }
+    }
+}
+
+/**
+ * This [KType.toString] rendering, referring to the classes of the root package by the [aliases] of the top-level classes,
+ * by their names, at their [ranges], see [rootPackageClassRanges], like `_root_Outer.Nested` instead of `Outer.Nested`.
+ */
+private fun String.withRootPackageAliases(
+    ranges: List<Pair<IntRange, String>>,
+    aliases: Map<String, String>
+): String = buildString {
+    var copied = 0
+    ranges.forEach { (range, name) ->
+        aliases[name]?.let { alias ->
+            append(this@withRootPackageAliases, copied, range.first)
+            append(alias)
+            copied = range.last + 1
+        }
+    }
+    append(this@withRootPackageAliases, copied, this@withRootPackageAliases.length)
+}
 
 /** Whether it is of a function type, or of a type with the public `invoke` operator, so the script can call it. */
 private val ScriptExecutor.Dependency<*>.isCallable: Boolean

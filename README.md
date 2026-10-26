@@ -65,6 +65,11 @@ when (result) {
   the caller awaits all the coroutines the script launches, and cancelling the caller cancels the script.
   Cancellation cannot interrupt a blocking call of the script though, like `Thread.sleep`.
   Unlike in a regular `.kts` file, `this` in the script body is therefore this `CoroutineScope`, not the script instance.
+  In a function of the script body it is reported as an error,
+  so is a call there of a member of `Any`, or of its scope function, without a receiver, like `toString()` or `apply { }`,
+  as in a function of a regular script they refer to the script instance,
+  while the API of the `CoroutineScope`, like `launch { }` or `isActive`, can be used in the functions of the script body as well,
+  and the `CoroutineScope` itself can be referred to as `this@_script` anywhere in the script body.
 * The script is compiled and evaluated on `Dispatchers.IO`, as both might block.
   Another dispatcher can be given as `ScriptExecutor(dispatcher = ...)`,
   e.g. `Dispatchers.IO.limitedParallelism(4)` to bound the threads used by scripts,
