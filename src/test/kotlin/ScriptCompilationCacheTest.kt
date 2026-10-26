@@ -183,6 +183,24 @@ class ScriptCompilationCacheTest {
     }
 
     @Test
+    fun `should not confirm references within nested coroutine scopes next to moved declarations of their names`() = runTest {
+        // given
+        val scripts = listOf(
+            "val r = supervisorScope { run { isActive } }\nval isActive get() = \"mine\"\nr",
+            "val r = coroutineScope { launch { } }\nfun launch(block: () -> Unit): String = \"mine\"\nr is Job",
+            "import kotlinx.coroutines.supervisorScope\nval r = supervisorScope { isActive }\nval isActive get() = \"mine\"\nr"
+        )
+        val executor = DefaultScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(true, true, true))
+        assert(executor.compilationCount == scripts.size)
+    }
+
+    @Test
     fun `should count the compilation confirming the reference to later declared dependency`() = runTest {
         // given
         val script = """

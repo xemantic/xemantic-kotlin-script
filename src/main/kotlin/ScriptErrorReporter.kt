@@ -596,12 +596,30 @@ internal class ScriptErrorReporter(
         if (declaration != null) {
             appendNotVisibleHint(declaration, name, line)
         } else if (line > position.line) {
-            val declarations = when (kind) {
-                CLASS -> "classes"
-                FUNCTION -> "functions"
-                else -> "properties"
+            // which cannot be declared preceding the calling one, see ScriptSource.Parsed.hoisted
+            val calledBack = if (kind == FUNCTION) source.callsBack(name, position) else null
+            // which would not be visible to it there
+            val properties = if (kind == FUNCTION && calledBack == null) source.laterAccessedProperties(name, position) else emptyList()
+            when {
+                calledBack != null -> {
+                    +"  hint: '$name' is declared at line ${line + 1}, and calls '$calledBack' back,"
+                    +" while the functions of the script body accessing its local declarations are visible only after their declaration, so they cannot call each other"
+                    +" - pass the local declarations they access as parameters instead.\n"
+                }
+                properties.isNotEmpty() -> {
+                    val names = properties.joinToString { "'$it'" }
+                    +"  hint: '$name' is declared at line ${line + 1}, and accesses $names declared after this call,"
+                    +" while the declarations of the script body are visible only after their declaration"
+                    +" - move them all before line ${position.line + 1}, or pass $names as ${if (properties.size == 1) "a parameter" else "parameters"}.\n"
+                }
+                else -> appendNotDeclaredYetHint(
+                    name, line, when (kind) {
+                        CLASS -> "classes"
+                        FUNCTION -> "functions"
+                        else -> "properties"
+                    }, position
+                )
             }
-            appendNotDeclaredYetHint(name, line, declarations, position)
         }
     }
 
