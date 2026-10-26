@@ -138,6 +138,44 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should move property with getter on the line after it without indentation`() {
+        // given
+        val script = "val size: Int\nget() = 3\nsize"
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        assert("val size: Int\nget() = 3" in moved && "get()" !in body)
+    }
+
+    @Test
+    fun `should keep in the script body calls of get and set on the line after property without indentation`() {
+        // given
+        val scripts = listOf(
+            "fun get(i: Int) = i * 2\nval x = 1\nget(3)",
+            "fun get() = 7\nval x = 1\nget()",
+            "fun set(v: Int) = v + 1\nvar y = 1\nset(5)",
+            "fun get() = 5\nval x = 1\nget() + 1",
+            "val get = 7\nval x = 1\n// note\nget",
+            "val set = 7\nval x = 1\n/* c */ set",
+            "fun get(p: String, b: () -> Int) = b()\nval x = 1\nget(\"/\") { 6 }",
+            "fun get(b: () -> Int) = b()\nval x = 1\nget { 6 }",
+            "fun set(b: () -> Int) = b()\nvar y = 1\nset { 6 }",
+            "fun get(i: Int) = i\nval x = 1\n@Suppress(\"UNUSED\") get(6)"
+        )
+
+        // when
+        val sources = scripts.map { ScriptSource(it) }
+
+        // then
+        assert(sources.zip(scripts).all { (source, script) ->
+            script.substringAfterLast('\n') in source.text.substringAfter(SCRIPT_BLOCK_START)
+        })
+    }
+
+    @Test
     fun `should move function reading only constants together with them when called by declaration which cannot be local`() {
         // given
         val script = """
@@ -329,6 +367,40 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should keep long chain of properties with accessors reading local property in the script body as delegated properties`() {
+        // given
+        val count = 50_000
+        val script = buildString {
+            appendLine("var x = 1")
+            appendLine("val p0: Int get() = x")
+            (1 until count).forEach { appendLine("val p$it: Int get() = p${it - 1} + 1") }
+            append("p${count - 1}")
+        }
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        assert("val p" !in moved)
+        assert(body.lines().count { it == " by object {" } == count)
+    }
+
+    @Test
+    fun `should keep property with accessor reading earlier delegated property named like receiver member as delegated property`() {
+        // given
+        val script = "val items = listOf(1)\nval isActive get() = items.isEmpty()\nval t get() = items.size.toString() + isActive\nt"
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        assert("get()" !in moved)
+        assert(body.lines().count { it == " by object {" } == 2)
+    }
+
+    @Test
     fun `should keep moving property with accessors which cannot be delegated or do not read local properties`() {
         // given
         val scripts = listOf(
@@ -338,6 +410,10 @@ class ScriptSourceTest {
             "val items = listOf(1)\nval self get() = this.hashCode() + items.size\nself",
             "val items = listOf(1)\nval total: Int\n    @Suppress(\"unused\") get() = items.sum()\ntotal",
             "val items = listOf(1)\nvar total\n    get() = items.sum()\n    set(v) { }\ntotal",
+            // not applicable to a local variable
+            "val items = listOf(1)\n@Deprecated(\"x\")\nval total get() = items.size\ntotal",
+            "@Target(AnnotationTarget.PROPERTY)\nannotation class Tag\nval items = listOf(1)\n@Tag\nval total get() = items.size\ntotal",
+            "val items = listOf(1)\n@get:Suppress(\"x\")\nval total get() = items.size\ntotal",
             "fun Any.describe() = this::class.simpleName\nval items = listOf(1)\nval d get() = items.size.toString() + describe()\nd",
             "val total get() = 42\ntotal",
             "class User(val name: String)\nval name = \"script\"\nval greeting get() = User(\"user\").run { name }\ngreeting",
@@ -355,6 +431,17 @@ class ScriptSourceTest {
             "import kotlin.let\nval items = listOf(1, 2)\nval t get() = items.size.toString() + let { 1 }\nt",
             "import kotlin.jvm.javaClass\nval items = listOf(1, 2)\nval t get() = items.size.toString() + javaClass.name\nt",
             "fun let(x: Int) = x\nval items = listOf(1, 2)\nval t get() = items.size.toString() + let { it::class.simpleName }\nt",
+            // imported under an alias
+            "import kotlin.let as myLet\nval items = listOf(1, 2)\nval t get() = items.size.toString() + myLet { it::class.simpleName }\nt",
+            "import kotlinx.coroutines.launch as go\nval items = mutableListOf(1, 2)\nval t: Int\n    get() { go { items += 5 }; return items.size }\nt",
+            // called, while a local property declared before cannot be invoked
+            "val items = listOf(1, 2)\nval let = items.size + 1\nval t get() = items.size.toString() + let { it::class.simpleName }\nt",
+            // resolved on the receiver of a lambda before the local property, unlike the script
+            "class User(val name: String)\nval name = \"local\"\nval items = listOf(1)\nval t get() = items.size.toString() + with(User(\"u\")) { name }\nt",
+            "class User(val name: String)\nfun name() = \"local\"\nval items = listOf(1)\nval t get() = items.size.toString() + listOf(1).map { User(\"u\").run { name } }\nt",
+            "class Box { val factor = 10; fun count(block: Box.() -> Int) = block() }\nval factor = listOf(2).first()\nval items = listOf(1)\nval t get() = items.size + Box().count { factor }\nt",
+            "fun <T> T.twice(block: T.() -> Int) = block()\nclass Box { val factor = 10 }\nval factor = listOf(2).first()\nval items = listOf(1)\nval t get() = items.size + Box().twice { factor }\nt",
+            "class Box { fun g() = \"box\" }\nfun g() = \"script\"\nval items = listOf(1)\nval t get() = items.size.toString() + with(Box()) { g() }\nt",
             // not visible in the accessors, if declared after them, unlike in the script
             "val items = listOf(1)\nval t get() = items.size.toString() + isActive\nval isActive = \"mine\"\nt",
             "val items = listOf(1)\nval t get() = items.size.toString() + javaClass\nval javaClass = \"mine\"\nt",
@@ -371,6 +458,58 @@ class ScriptSourceTest {
             val (moved, body) = source.movedAndBody()
             assert("get()" in moved || "set(value)" in moved)
             assert(" by object " !in body)
+        }
+    }
+
+    @Test
+    fun `should keep property with accessor reading local properties within lambdas without receiver as delegated property`() {
+        // given
+        val locals = "val factor = listOf(2).first()\nval items = listOf(1, 2)\n"
+        val scripts = listOf(
+            locals + "val t get() = items.count { it > factor }.toString() + items.map { x -> listOf(x).sumOf { it * factor } }.sum()\nt",
+            locals + "val t get() = items.zip(items) { a, b -> a + b * factor }.sum()\nt",
+            locals + "val t get() = items.mapTo(HashSet()) { it * factor }.size\nt",
+            locals + "val t get() = items.maxOfOrNull { it * factor }\nt",
+            locals + "val t get() = items.associateWith { it }.mapValues { it.value * factor }.values.sum()\nt",
+            locals + "val t get() = items.chunked(2) { it.sum() * factor }.sum()\nt",
+            // labeled, or annotated
+            locals + "val t get() = items.map label@{ it * factor }.sum()\nt",
+            locals + "val t get() = items.map(@Suppress(\"x\") { it * factor }).sum()\nt",
+            // declared by the script without a receiver of the lambda
+            "fun <T> twice(block: () -> T) = listOf(block(), block())\n" + locals + "val t get() = items.size + twice { factor }.sum()\nt",
+            // not a function
+            "class Page(val count: Int)\n" + locals + "val t get() = items.count { it > factor }\nt",
+            "fun process(map: String) = map\n" + locals + "val t get() = items.map { it * factor }.sum()\nt",
+            // a moved function is resolved like in the script
+            "class Box { fun g() = \"box\" }\n@JvmName(\"gg\") fun g() = \"script\"\nval items = listOf(1)\nval t get() = items.size.toString() + with(Box()) { g() }\nt"
+        )
+
+        // when
+        val sources = scripts.map { ScriptSource(it) }
+
+        // then
+        sources.forEach { source ->
+            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            assert("get()" !in moved && " by object " in body)
+        }
+    }
+
+    @Test
+    fun `should keep property with accessor reading local property and annotations applicable to local variable as delegated property`() {
+        // given
+        val scripts = listOf(
+            "val items = listOf(1)\n@OptIn(ExperimentalStdlibApi::class)\nval t get() = items.size\nt",
+            "@Target(AnnotationTarget.PROPERTY, AnnotationTarget.LOCAL_VARIABLE)\nannotation class Tag\nval items = listOf(1)\n@Tag\nval t get() = items.size\nt",
+            "annotation class Tag\nval items = listOf(1)\n@Tag @Suppress(\"unused\")\nval t get() = items.size\nt"
+        )
+
+        // when
+        val sources = scripts.map { ScriptSource(it) }
+
+        // then
+        sources.forEach { source ->
+            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            assert("get()" !in moved && " by object " in body)
         }
     }
 
@@ -467,7 +606,9 @@ class ScriptSourceTest {
             "val log = mutableListOf<String>()\ninline fun status() = log.size.toString() + suffix\nval suffix = \"!\"\nstatus()",
             "val log = mutableListOf<String>()\ninline fun logged() { helper() }\nfun helper() { log += \"h\" }\nlogged()\nlog",
             "class User(val name: String)\nval name = \"script\"\nval log = mutableListOf<String>()\ninline fun g() = log.size.toString() + User(\"u\").run { name }\ng()",
-            "val log = mutableListOf<String>()\ninline fun status() = log.size.toString() + isActive\nstatus()"
+            "val log = mutableListOf<String>()\ninline fun status() = log.size.toString() + isActive\nstatus()",
+            "import kotlin.let as myLet\nval log = mutableListOf<String>()\ninline fun status() = log.size.toString() + myLet { 1 }\nstatus()",
+            "val log = mutableListOf<String>()\nval let = log.size + 1\ninline fun status() = log.size.toString() + let { 1 }\nstatus()"
         )
 
         // when
