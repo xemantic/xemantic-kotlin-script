@@ -1983,6 +1983,155 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should execute script with property getter reading local property`() = runTest {
+        // given
+        val script = """
+            val items = mutableListOf(1, 2)
+            val total: Int get() = items.sum()
+            items += 3
+            total
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 6)
+        }
+    }
+
+    @Test
+    fun `should execute scripts with property accessors reading local properties`() = runTest {
+        // given
+        val scripts = listOf(
+            "val items = mutableListOf(1, 2)\nvar first: Int\n    get() = items.first()\n    set(v) { items[0] = v * 2 }\nfirst = 10\nitems.toString() + first",
+            "val items = mutableListOf(1, 2)\nvar first: Int\n    set(value: Int) { items[0] = value }\n    get(): Int { return items.first() }\nfirst = 10\nitems.toString() + first",
+            "val items = mutableListOf(1, 2)\nval total get() = items.sum()\nval double get() = total * 2\nitems += 3\ndouble",
+            "val items = mutableListOf(1, 2)\nval total: Int get() = items.sum()\nfun show() = \"total: \$total\"\nitems += 3\nshow()",
+            "val items = mutableListOf(1, 2)\nprivate val total get(): Int = items.sum(); items += 3; total",
+            "val items = mutableListOf(1, 2)\n/** The sum. */\n@Suppress(\"unused\")\nval total: Int get() = items.sum() // the sum\nitems += 3\ntotal",
+            "import kotlin.math.max\nval items = mutableListOf(1, 5)\nval top get() = items.fold(0) { a, b -> max(a, b) } + listOf(1).size + Pair(1, 2).first + items.map { it }.size\ntop",
+            // named like the parameters of the operators of the object
+            "val _property = \"local\"\nval _thisRef = \"!\"\nval items = listOf(1)\nval t get() = _property + _thisRef + items.size\nt"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("[20, 2]20", "[10, 2]10", 12, "total: 6", 6, 6, 9, "local!1"))
+    }
+
+    @Test
+    fun `should not resolve calls of property accessors reading local properties on the implicit receivers of the script body`() = runTest {
+        // given
+        val scripts = listOf(
+            "val items = listOf(1, 2)\nval t get() = items.size.toString() + javaClass.name\nt",
+            "val items = listOf(1, 2)\nval t get() = items.size.toString() + let { it::class.simpleName }\nt",
+            "val items = listOf(1, 2)\nval t get() = items.isEmpty() || isActive\nt",
+            "val items = listOf(1, 2)\nval t get() = items.size.also { launch { } }\nt",
+            "import kotlinx.coroutines.launch\nval items = mutableListOf(1, 2)\nval t: Int\n    get() { launch { items += 5 }; return items.size }\nt",
+            "import kotlinx.coroutines.isActive\nval items = listOf(1, 2)\nval t get() = items.isEmpty() || isActive\nt",
+            "import kotlin.let\nval items = listOf(1, 2)\nval t get() = items.size.toString() + let { 1 }\nt",
+            "import kotlin.jvm.javaClass\nval items = listOf(1, 2)\nval t get() = items.size.toString() + javaClass.name\nt",
+            "fun let(x: Int) = x\nval items = listOf(1, 2)\nval t get() = items.size.toString() + let { it::class.simpleName }\nt",
+            "val items = listOf(1)\nval t get() = items.size.toString() + isActive\nval isActive = \"mine\"\nt",
+            "val items = listOf(1)\nval t get() = items.size.toString() + javaClass\nval javaClass = \"mine\"\nt",
+            "val items = listOf(1)\nval t get() = items.size.toString() + coroutineContext\nval coroutineContext = \"mine\"\nt",
+            "val items = listOf(1)\nval t get() = items.size.toString() + ensureActive()\nfun ensureActive() = \"mine\"\nt"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) } +
+                executor.execute(scripts[1], listOf(dependency("let", 1)))
+
+        // then
+        assert(results.all { (it as? ScriptResult.Error)?.phase == ExecutionPhase.COMPILATION })
+    }
+
+    @Test
+    fun `should execute script with property getter reading local property and referring to names resolved by the script`() = runTest {
+        // given
+        val script = """
+            fun double(x: Int) = x * 2
+            val items = listOf(listOf(1, 2), listOf(3))
+            val isActive = 10
+            val total get() = maxOf(items.size, 1) + listOf(bonus).sum() + double(items.sumOf { it.count { it > 1 } }) + isActive
+            total
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("bonus", 100)))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2 + 100 + 4 + 10)
+        }
+    }
+
+    @Test
+    fun `should report exception thrown by property getter reading local property at the lines of the script`() = runTest {
+        // given
+        val script = """
+            val items = mutableListOf<Int>()
+            @Suppress("unused")
+            val first: Int
+                get() {
+                    val offset = 1
+                    return items.first() + offset
+                }
+            first
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        val lines = (result as ScriptResult.Error).message.lines()
+        assert(lines.first() == "java.util.NoSuchElementException: List is empty.")
+        assert(lines.drop(2) == listOf(
+            "  at <lambda>(script.kts:6)",
+            "  |         return items.first() + offset",
+            "  at <lambda>(script.kts:3)",
+            "  | val first: Int",
+            "  at <script body>(script.kts:8)",
+            "  | first"
+        ))
+    }
+
+    @Test
+    fun `should report error at property getter reading local property`() = runTest {
+        // given
+        val script = """
+            val items = mutableListOf(1, 2)
+            val total: String get() = items.sum()
+            total
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:27: error: Return type mismatch: expected 'String', actual 'Int'.
+                  | val total: String get() = <error>items.sum()</error>
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should execute statement following star import in the script body`() = runTest {
         // given
         val script = """
@@ -2044,6 +2193,54 @@ class ScriptExecutorTest {
         result should {
             be<ScriptResult.Value>()
             have(value == 1)
+        }
+    }
+
+    @Test
+    fun `should not treat locally bound name as reference to function declared later`() = runTest {
+        // given
+        val script = """
+            import kotlinx.coroutines.launch
+            val sizes = listOf("ab").map { work -> work.length }
+            var total = 0
+            for (work in sizes) total += work
+            fun work() = launch { }
+            work()
+            sizes + total
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == listOf(2, 2))
+        }
+    }
+
+    @Test
+    fun `should refer to class declared later by name of local function or member extension property before it`() = runTest {
+        // given
+        val check = "Regex::class.java.declaredMethods.any { it.name == \"mine\" }"
+        val bindings = listOf(
+            "val found = run {\n    fun Regex() = 1\n    $check\n}",
+            "class Box {\n    fun Regex() = 2\n    val found = $check\n}\nval found = Box().found",
+            "class Box {\n    val Int.Regex get() = 3\n    val found = $check\n}\nval found = Box().found"
+        )
+        val scripts = bindings.map { "$it\nclass Regex { fun mine() = 4 }\nfound" }
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        results.forEach { result ->
+            result should {
+                be<ScriptResult.Value>()
+                have(value == true)
+            }
         }
     }
 
@@ -2627,8 +2824,8 @@ class ScriptExecutorTest {
         // given
         val script = $$"""
             val prefix = "local"
-            val greeting get() = "$prefix!"
-            greeting
+            val Int.greeting get() = "$prefix!"
+            1.greeting
         """.trimIndent()
         val executor = ScriptExecutor()
 
@@ -2640,10 +2837,30 @@ class ScriptExecutorTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
             message sameAs $$"""
-                script.kts:2:24: error: Unresolved reference 'prefix'.
-                  | val greeting get() = "$<error>prefix</error>!"
+                script.kts:2:28: error: Unresolved reference 'prefix'.
+                  | val Int.greeting get() = "$<error>prefix</error>!"
                   hint: 'greeting' is compiled outside of the script body, where 'prefix' (line 1) is not visible - pass it as a parameter, or declare it within 'greeting'.
             """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should execute script with property accessor reading local property shadowing dependency`() = runTest {
+        // given
+        val script = $$"""
+            val prefix = "local"
+            val greeting get() = "$prefix!"
+            greeting
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("prefix", "dep")))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "local!")
         }
     }
 
@@ -3782,7 +3999,9 @@ class ScriptExecutorTest {
         // given
         val scripts = listOf(
             "val r = cancel(\"too late\")\nfun cancel(reason: String) = \"cancelled: \" + reason\nr",
-            "val isActive = false\nval status get() = if (isActive) \"on\" else \"off\"\nstatus + isActive"
+            "val isActive = false\ninline fun <reified T> status() = if (isActive) \"on\" else \"off\"\nstatus<Int>() + isActive",
+            "val isActive = false\nval status get() = if (isActive) \"on\" else \"off\"\nstatus + isActive",
+            "val isActive = false\ninline fun status() = if (isActive) \"on\" else \"off\"\nstatus() + isActive"
         )
         val executor = ScriptExecutor()
 
@@ -3792,7 +4011,125 @@ class ScriptExecutorTest {
         // then
         assert((results[0] as? ScriptResult.Value)?.value == "cancelled: too late")
         // not moved, unlike other constants, as the script body would refer to its coroutine scope instead, so not visible to the getter
-        assert((results[1] as? ScriptResult.Error)?.message?.lines()?.first() == "script.kts:2:24: error: Unresolved reference 'isActive'.")
+        assert("script.kts:2:39: error: Unresolved reference 'isActive'." in (results[1] as ScriptResult.Error).message.lines())
+        // unless the property, or the inline function, stays local, see `should execute scripts with property accessors reading local properties`
+        assert(results.drop(2).map { (it as? ScriptResult.Value)?.value } == listOf("offfalse", "offfalse"))
+    }
+
+    @Test
+    fun `should execute script with inline function reading local property`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            inline fun logged(block: () -> Unit) { log += "start"; block() }
+            logged { }
+            log
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == listOf("start"))
+        }
+    }
+
+    @Test
+    fun `should execute scripts with inline functions reading local properties`() = runTest {
+        // given
+        val scripts = listOf(
+            "val log = mutableListOf<String>()\nfun helper() { log += \"h\" }\ninline fun logged(block: () -> Unit) { helper(); block() }\nlogged { }\nlog",
+            "val log = mutableListOf<String>()\ninline fun <T> logged(name: String, crossinline block: () -> T, noinline after: () -> Unit = { }): T {\n    log += name\n    return block().also { after() }\n}\n" +
+                    "val r = logged(\"a\", { for (i in 1..5) { if (i == 2) break }; if (log.size > 5) return@logged 0; 7 }) { log += \"after\" }\nr.toString() + log",
+            "val items = mutableListOf(1, 2)\n@Suppress(\"NOTHING_TO_INLINE\") private inline fun total() = items.sum()\nitems += 3\ntotal()",
+            "val log = mutableListOf<String>()\nsuspend inline fun step(block: suspend () -> Unit) { log += \"s\"; block() }\nstep { kotlinx.coroutines.delay(1) }\nlog"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(listOf("h"), "7[a, after]", 6, listOf("s")))
+    }
+
+    @Test
+    fun `should report inline functions reading local property which would be resolved differently if local`() = runTest {
+        // given
+        val scripts = listOf(
+            // `this` of the script block, the coroutine
+            "val log = mutableListOf<String>()\ninline fun tag() = \"\$this\" + log.size\ntag()",
+            // the overload staying local would hide the moved one
+            "val log = mutableListOf<String>()\ninline fun f(x: Any): String { log += \"any\"; return \"any\" }\ninline fun f(x: String): String = \"string\"\nf(\"a\") + log",
+            // called before its declaration, resolved to the function of the coroutine scope instead
+            "val log = mutableListOf<String>()\nval r = run { \"std\" }\ninline fun run(block: () -> String): String { log += \"mine\"; return block() }\nr + log",
+            // called where a receiver resolves it in the script, like `run` of the class
+            "val log = mutableListOf<String>()\ninline fun run(block: () -> String): String { log += \"mine\"; return block() }\nclass A { fun go() = run { \"a\" } }\nA().go() + log",
+            // an inline function cannot be recursive
+            "val log = mutableListOf<String>()\ninline fun count(n: Int): Int = if (n == 0) log.size else count(n - 1)\ncount(2)"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+    }
+
+    @Test
+    fun `should report inline function reading local property which cannot be local`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            inline fun logged(block: () -> Unit) { log += "start"; block() }
+            fun outer(): Int { logged { return 5 }; return 1 }
+            outer()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:40: error: Unresolved reference 'log'.
+                  | inline fun logged(block: () -> Unit) { <error>log</error> += "start"; block() }
+                  hint: 'logged' is an inline function compiled outside of the script body, where 'log' (line 1) is not visible - pass it as a parameter, or declare it within 'logged'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report suspending call in lambda of inline function reading local property`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            inline fun logged(block: () -> Unit) { log += "start"; block() }
+            logged { kotlinx.coroutines.delay(1) }
+            log
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:29: error: Suspension functions can only be called within coroutine body.
+                  | logged { kotlinx.coroutines.<error>delay</error>(1) }
+                  hint: 'logged' is compiled without 'inline', as it reads the local values of the script body, so its lambdas cannot suspend - pass the local values to 'logged' as parameters to keep it inline.
+            """.trimIndent()
+        }
     }
 
     @Test

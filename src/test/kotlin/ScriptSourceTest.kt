@@ -162,6 +162,210 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should not move function referred to before its declaration only by locally bound names`() {
+        // given
+        val scripts = listOf(
+            "val m = listOf(1).map { format -> format }\nfun format() = 7\nm",
+            "val m = listOf(1 to 2).map { (format, b) -> format + b }\nfun format() = 7\nm",
+            "fun twice(format: Int) = format * 2\nfun format() = 7\ntwice(format())",
+            "val m = run { val format = 1; format }\nfun format() = 7\nm",
+            "var s = 0\nfor (format in listOf(1, 2)) s += format\nfun format() = 7\ns",
+            "val m = try { error(\"x\") } catch (format: Exception) { format.message }\nfun format() = 7\nm",
+            "val m = when (val format = 1) { else -> format }\nfun format() = 7\nm",
+            "class Box { val format = 1; fun get() = format }\nfun format() = 7\nBox().get()"
+        )
+
+        // when
+        val sources = scripts.map { ScriptSource(it) }
+
+        // then
+        sources.forEach { source ->
+            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            assert("fun format()" !in moved && "fun format()" in body)
+        }
+    }
+
+    @Test
+    fun `should move declaration referred to before its declaration by locally bound name called, naming type, or bound by function only`() {
+        // given
+        val scripts = listOf(
+            "val m = listOf(1).map { format -> format() }\nfun format() = 7\nm" to "fun format()",
+            "val m = listOf(1).map { format -> ::format }\nfun format() = 7\nm" to "fun format()",
+            "val m = listOf(1).map { Foo -> val f: Foo? = null; f }\nclass Foo\nm" to "class Foo",
+            "val m = listOf(1).map { Foo -> Foo() }\nclass Foo\nm" to "class Foo",
+            "val m = run {\n    fun Regex() = 1\n    Regex::class.qualifiedName\n}\nclass Regex\nm" to "class Regex",
+            "class Box { fun Regex() = 1; val k = Regex::class.qualifiedName }\nclass Regex\nBox().k" to "class Regex",
+            "class Box {\n    val Int.Regex get() = 1\n    val k = Regex::class.qualifiedName\n}\nclass Regex\nBox().k" to "class Regex",
+            "val m = run {\n    fun Foo() = 1\n    Foo::toString\n}\nclass Foo\nm" to "class Foo"
+        )
+
+        // when
+        val sources = scripts.map { (script, declaration) -> ScriptSource(script) to declaration }
+
+        // then
+        sources.forEach { (source, declaration) ->
+            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            assert(declaration in moved && declaration !in body)
+        }
+    }
+
+    @Test
+    fun `should keep property with accessors reading local property in the script body as delegated property`() {
+        // given
+        val script = """
+            val items = mutableListOf(1, 2)
+            var first: Int
+                get() = items.first()
+                set(v) { items[0] = v }
+            val total: Int get() = items.sum(); total + first
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        assert("items" !in moved)
+        val lines = body.lines()
+        // the accessors retain their columns, like the copies of the types, mapped to their lines
+        assert(" ".repeat(10) + "= items.first()" in lines && " ".repeat(8) + "v" in lines && " ".repeat(9) + ") { items[0] = v }" in lines)
+        assert(lines.count { it == " ".repeat(9) + ": Int" } == 3)
+        // the accessor ends with the semicolon
+        assert(" ".repeat(21) + "= items.sum();" in lines && " ".repeat(36) + "total + first" in lines)
+        assert(source.text.lines().indices.mapNotNull { source.toScriptLine(it + 1) } == listOf(0, 1, 1, 2, 1, 2, 3, 3, 1, 3, 3, 4, 4, 4, 4, 4, 4, 4))
+    }
+
+    @Test
+    fun `should keep moving property with accessors which cannot be delegated or do not read local properties`() {
+        // given
+        val scripts = listOf(
+            "val items = listOf(1)\nvar c = 0\n    set(value) { field = value + items.size }\nc",
+            "val items = listOf(1)\nval Int.plusSize get() = this + items.size\n1.plusSize",
+            "val items = listOf(1)\nval described get() = items.size.toString() + toString()\ndescribed",
+            "val items = listOf(1)\nval self get() = this.hashCode() + items.size\nself",
+            "val items = listOf(1)\nval total: Int\n    @Suppress(\"unused\") get() = items.sum()\ntotal",
+            "val items = listOf(1)\nvar total\n    get() = items.sum()\n    set(v) { }\ntotal",
+            "fun Any.describe() = this::class.simpleName\nval items = listOf(1)\nval d get() = items.size.toString() + describe()\nd",
+            "val total get() = 42\ntotal",
+            "class User(val name: String)\nval name = \"script\"\nval greeting get() = User(\"user\").run { name }\ngreeting",
+            // resolved on the implicit receivers of the object, or of the script block, unlike in the script
+            "val items = listOf(1)\nval t get() = items.size.toString() + javaClass.name\nt",
+            "val items = listOf(1)\nval t get() = items.size.toString() + let { 1 }\nt",
+            "val items = listOf(1)\nval t get() = items.isEmpty() || isActive\nt",
+            "val items = listOf(1)\nval t get() = items.size.also { launch { } }\nt",
+            // a local property is not visible in its own accessors, nor can be referred to by a callable reference
+            "val items = listOf(1)\nval countdown: Int get() = if (items.isEmpty()) 0 else items.size + countdown\ncountdown",
+            "val items = listOf(1)\nval total get() = items.size\nval r = ::total\nr.get()",
+            // resolved on the implicit receivers, even if imported or declared, unless declared before as a local property
+            "import kotlinx.coroutines.launch\nval items = mutableListOf(1, 2)\nval t: Int\n    get() { launch { items += 5 }; return items.size }\nt",
+            "import kotlinx.coroutines.isActive\nval items = listOf(1, 2)\nval t get() = items.isEmpty() || isActive\nt",
+            "import kotlin.let\nval items = listOf(1, 2)\nval t get() = items.size.toString() + let { 1 }\nt",
+            "import kotlin.jvm.javaClass\nval items = listOf(1, 2)\nval t get() = items.size.toString() + javaClass.name\nt",
+            "fun let(x: Int) = x\nval items = listOf(1, 2)\nval t get() = items.size.toString() + let { it::class.simpleName }\nt",
+            // not visible in the accessors, if declared after them, unlike in the script
+            "val items = listOf(1)\nval t get() = items.size.toString() + isActive\nval isActive = \"mine\"\nt",
+            "val items = listOf(1)\nval t get() = items.size.toString() + javaClass\nval javaClass = \"mine\"\nt",
+            "val items = listOf(1)\nval t get() = items.size.toString() + coroutineContext\nval coroutineContext = \"mine\"\nt",
+            "val items = listOf(1)\nval t get() = items.size.toString() + ensureActive()\nfun ensureActive() = \"mine\"\nt",
+            "val items = listOf(1)\nval t get() = items.size.toString() + suffix\nval suffix = \"mine\"\nt"
+        )
+
+        // when
+        val sources = scripts.map { ScriptSource(it) }
+
+        // then
+        sources.forEach { source ->
+            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            assert("get()" in moved || "set(value)" in moved)
+            assert(" by object " !in body)
+        }
+    }
+
+    @Test
+    fun `should keep moving property with accessor calling dependency named like extension applicable to any receiver`() {
+        // given
+        val script = "val items = listOf(1, 2)\nval t get() = items.size.toString() + let { it::class.simpleName }\nt"
+
+        // when
+        val source = ScriptSource(script, listOf(PreambleDependency("let", "val let: Int = 1")))
+
+        // then
+        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        assert("get()" in moved && " by object " !in body)
+    }
+
+    @Test
+    fun `should keep inline function reading local property in the script body without the inline modifiers`() {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            inline fun logged(crossinline block: () -> Unit, noinline after: () -> Unit) { log += "start"; block(); after() }
+            logged({ }) { }
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        assert("logged" !in moved)
+        // the rest keeps its columns
+        assert(" ".repeat(7) + "fun logged(" + " ".repeat(12) + "block: () -> Unit, " + " ".repeat(9) + "after: () -> Unit)" in body)
+    }
+
+    @Test
+    fun `should recognize lambdas passed to inline function kept local only in calls without receiver`() {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            inline fun logged(block: () -> Unit) { log += "start"; block() }
+            class Other { fun logged(block: () -> Unit) = block() }
+            logged { }
+            Other().logged { }
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        assert(source.localInlineFunctionArguments.map { it.start.line } == listOf(3))
+    }
+
+    @Test
+    fun `should keep moving inline function which cannot be local or does not read local properties`() {
+        // given
+        val scripts = listOf(
+            "val log = mutableListOf<String>()\ninline fun f() = 1\nf()",
+            // the non-local control flow of the lambdas of its calls
+            "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"a\"; block() }\nfun outer(): Int { logged { return 5 }; return 1 }\nouter()",
+            "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"a\"; block() }\nfun outer(): Int { logged({ return@outer 5 }); return 1 }\nouter()",
+            "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"a\"; block() }\nfor (i in 1..3) { logged { if (i == 2) break } }\nlog",
+            "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"a\"; block() }\nouter@ for (i in 1..3) { for (j in 1..3) { logged { if (j == 2) continue@outer } } }\nlog",
+            "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"a\"; block() }\nlistOf(1).forEach { logged { return@forEach } }\nlog",
+            // which cannot be local, or might resolve the names on the receivers
+            "val log = mutableListOf<String>()\ninline fun <reified T> logged() { log += T::class.simpleName!! }\nlogged<Int>()\nlog",
+            "val log = mutableListOf<String>()\ninline fun String.logged() { log += this }\n\"a\".logged()\nlog",
+            "val log = mutableListOf<String>()\n@JvmName(\"lg\") inline fun logged() { log += \"a\" }\nlogged()\nlog",
+            "class User(val name: String)\nval name = \"script\"\ninline fun greeting() = User(\"user\").run { name }\ngreeting()",
+            // not visible in the local function, if declared after it, unlike in the script
+            "val log = mutableListOf<String>()\ninline fun status() = log.size.toString() + isActive\nval isActive = false\nstatus()",
+            "val log = mutableListOf<String>()\ninline fun status() = log.size.toString() + suffix\nval suffix = \"!\"\nstatus()",
+            "val log = mutableListOf<String>()\ninline fun logged() { helper() }\nfun helper() { log += \"h\" }\nlogged()\nlog",
+            "class User(val name: String)\nval name = \"script\"\nval log = mutableListOf<String>()\ninline fun g() = log.size.toString() + User(\"u\").run { name }\ng()",
+            "val log = mutableListOf<String>()\ninline fun status() = log.size.toString() + isActive\nstatus()"
+        )
+
+        // when
+        val sources = scripts.map { ScriptSource(it) }
+
+        // then
+        sources.forEach { source ->
+            val (moved, _) = source.text.split(SCRIPT_BLOCK_START)
+            assert("inline fun" in moved)
+        }
+    }
+
+    @Test
     fun `should give distinct location ids to scripts of the same hash code`() {
         // given
         val scripts = listOf("\"Aa\"", "\"BB\"")
