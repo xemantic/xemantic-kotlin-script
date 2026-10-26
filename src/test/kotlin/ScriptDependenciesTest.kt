@@ -163,6 +163,128 @@ class ScriptDependenciesTest {
     }
 
     @Test
+    fun `should not report warnings of dependency accessor of type with redundant projection`() = runTest {
+        // given
+        val script = """
+            c.compareTo("a")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            provide<Comparable<in String>>("c", "b")
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 1)
+            have(warnings == null)
+        }
+    }
+
+    @Test
+    fun `should not report warnings of dependency accessor shadowed by local property`() = runTest {
+        // given
+        val script = """
+            val numbers = numbers.size
+            numbers
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            provide<List<out Number>>("numbers", listOf(1, 2.0))
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+            have(warnings == null)
+        }
+    }
+
+    @Test
+    fun `should not report warnings of dependency accessor in compilation error`() = runTest {
+        // given
+        val script = """
+            c.compareTo(42)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            provide<Comparable<in String>>("c", "b")
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:13: error: Argument type mismatch: actual type is 'Int', but 'CapturedType(in String)' was expected.
+                  | c.compareTo(<error>42</error>)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not report warnings of dependency accessor together with runtime exception`() = runTest {
+        // given
+        val script = """
+            val text = c as String
+            error(text)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            provide<Comparable<in String>>("c", "b")
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IllegalStateException: b
+                  at <script body>(script.kts:2)
+                  | error(text)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report warnings of header and declarations moved out of the script body together with dependency accessors`() = runTest {
+        // given
+        val script = """
+            @file:OptIn()
+            fun twice(x: Int) = x as Int * 2
+            twice(c.compareTo("a"))
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            provide<Comparable<in String>>("c", "b")
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+            warnings sameAs """
+                script.kts:1:1: warning: '@OptIn' without any arguments has no effect.
+                  | <error>@file:OptIn()</error>
+
+                script.kts:2:23: warning: Cast is redundant.
+                  | fun twice(x: Int) = x <error>as Int</error> * 2
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should reject duplicate dependency name`() = runTest {
         // given
         val executor = ScriptExecutor()

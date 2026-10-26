@@ -284,7 +284,7 @@ internal class DefaultScriptExecutor(
             if (compilation.confirmedFailures.isNotEmpty()) {
                 val failureMessage = (compilation.confirmedFailures + listOfNotNull(
                     // without the errors explained by the confirmed references
-                    (compilationResult as? Failure)?.reports?.filterNonIgnorable()?.filterNot { diagnostic ->
+                    (compilationResult as? Failure)?.reports?.filterNonIgnorable(source)?.filterNot { diagnostic ->
                         diagnostic.severity == ScriptDiagnostic.Severity.ERROR && diagnostic.location?.start?.let { start ->
                             source.toScriptPosition(start.line, start.col) in compilation.explainedErrors
                         } == true
@@ -298,13 +298,13 @@ internal class DefaultScriptExecutor(
                 is Success -> {
                     evaluate(
                         compiledScript = compilationResult.value,
-                        warnings = compilationResult.reports.filter {
+                        warnings = compilationResult.reports.filterNonIgnorable(source).filter {
                             it.severity == ScriptDiagnostic.Severity.WARNING
                         }
                     )
                 }
                 is Failure -> compilationFailure(
-                    reporter.toCompilationFailureMessage(compilationResult.reports.filterNonIgnorable())
+                    reporter.toCompilationFailureMessage(compilationResult.reports.filterNonIgnorable(source))
                 )
             }
 
@@ -800,7 +800,7 @@ internal class DefaultScriptExecutor(
                     evaluationResult.reports.fatalCause()?.let { throw it }
                     // in practice, this never happens
                     val failureMessage = reporter.toFailureMessage(
-                        evaluationResult.reports.filterNonIgnorable()
+                        evaluationResult.reports.filterNonIgnorable(source)
                     )
                     ScriptResult.Error(failureMessage, ExecutionPhase.EVALUATION)
                 }
@@ -1038,9 +1038,12 @@ private val ScriptExecutor.Dependency<*>.providedName: String
 private val ScriptExecutor.Dependency<*>.providedType: KotlinType
     get() = if (isHidden) KotlinType(typeOf<Any?>()) else KotlinType(type)
 
-// with an initializer, unlike a getter, the dependency can be smart cast
+// with an initializer, unlike a getter, the dependency can be smart cast,
+// while the getter is renamed, as a function moved out of the script body might be named like it, e.g. `getFoo` or `isFoo`,
+// to a name with `$`, which no function of the script can have, unless quoted in backticks
+// its warnings, like of the unchecked cast, are not reported, see [filterNonIgnorable]
 private val ScriptExecutor.Dependency<*>.accessor: String
-    get() = "@kotlin.Suppress(\"UNCHECKED_CAST\") val `$name`: $type = `$providedName` as $type"
+    get() = "@get:kotlin.jvm.JvmName(\"$name\\\$dependency\") val `$name`: $type = `$providedName` as $type"
 
 /** Whether it is of a function type, or of a type with the public `invoke` operator, so the script can call it. */
 private val ScriptExecutor.Dependency<*>.isCallable: Boolean

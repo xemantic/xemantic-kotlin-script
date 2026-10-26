@@ -2377,6 +2377,58 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should execute script starting with UTF-8 byte order mark`() = runTest {
+        // given
+        val script = "\uFEFF1 + 1"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should execute script starting with UTF-8 byte order mark followed by file annotation and package`() = runTest {
+        // given
+        val script = "\uFEFF@file:Suppress(\"UNUSED_VARIABLE\")\npackage foo\nval x = 1\nx + 1"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should report error column of script starting with UTF-8 byte order mark not counting it`() = runTest {
+        // given
+        val script = "\uFEFF1 + foo"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:5: error: Unresolved reference 'foo'.
+                  | 1 + <error>foo</error>
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should hint to declare function before its use when it accesses destructured local declarations`() = runTest {
         // given
         val script = """
@@ -2700,6 +2752,48 @@ class ScriptExecutorTest {
             be<ScriptResult.Value>()
             have(value == 24)
         }
+    }
+
+    @Test
+    fun `should end script with unterminated block comment like regular script`() = runTest {
+        // given
+        val scripts = listOf(
+            "val a = 2\n/* abc\na",
+            "val a = 2\na /** doc",
+            "val a = 2\na\n/* a /* b */ c",
+            "fun f() = 2\nf()\n/* abc",
+            "import kotlin.math.PI /* abc"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(Unit, 2, 2, 2, Unit))
+    }
+
+    @Test
+    fun `should report unterminated block comment within braces of script where it swallows closing brace`() = runTest {
+        // given
+        val scripts = listOf(
+            "class A {\n  /* abc\n  val x = 1\n}\nA().x",
+            "class A {\n  val x = 1\n  /* abc\n}\nA().x",
+            "fun f(): Int {\n  /* abc\n  return 1\n}\nf()",
+            "val a = 5\n\"\${a /* x }\""
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.first() } == listOf(
+            "script.kts:1:10: error: Syntax error: Missing '}.",
+            "script.kts:2:12: error: Syntax error: Missing '}.",
+            "script.kts:1:15: error: Syntax error: Expecting '}'.",
+            "script.kts:2:5: error: Syntax error: Expecting '}'."
+        ))
     }
 
     @Test
@@ -4547,6 +4641,138 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should use function moved out of the script body named like the getter of a dependency`() = runTest {
+        // given
+        val script = """
+            val r = getFoo()
+            fun getFoo() = 2
+            r + foo
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("foo", 40)))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+            have(warnings == null)
+        }
+    }
+
+    @Test
+    fun `should use function moved out of the script body named like the getter of a dependency starting with is`() = runTest {
+        // given
+        val script = """
+            val r = isReady()
+            fun isReady() = !isReady
+            r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("isReady", true)))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == false)
+            have(warnings == null)
+        }
+    }
+
+    @Test
+    fun `should use function moved out of the script body named like the hidden name of a dependency`() = runTest {
+        // given
+        val script = """
+            val r = _dependency_foo()
+            fun _dependency_foo() = 2
+            r + foo
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("foo", 40)))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+            have(warnings == null)
+        }
+    }
+
+    @Test
+    fun `should use function moved out of the script body named like the getter of a shadowed dependency`() = runTest {
+        // given
+        val script = """
+            val r = getFoo()
+            fun getFoo() = 2
+            val foo = 1
+            r + foo
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("foo", 40)))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 3)
+            have(warnings == null)
+        }
+    }
+
+    @Test
+    fun `should report dependency used before the local property shadowing it next to function moved out of the script body named like its getter`() = runTest {
+        // given
+        val script = """
+            val r = getFoo() + foo
+            fun getFoo() = 2
+            val foo = 1
+            r + foo
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("foo", 40)))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:20: error: 'foo' refers to the dependency, as the property 'foo' of the script body is declared later, at line 3.
+                  | val r = getFoo() + <error>foo</error>
+                  hint: declare the property before line 1, or rename it.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should use function moved out of the script body named like the getter of a dependency of value class type`() = runTest {
+        // given
+        val script = """
+            val r = getTimeout()
+            fun getTimeout() = 2L
+            r + timeout.inWholeHours
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("timeout", 5.hours)))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 7L)
+            have(warnings == null)
+        }
+    }
+
+    @Test
     fun `should recognize declarations of the script named with backticks`() = runTest {
         // given
         val scripts = listOf(
@@ -4760,6 +4986,68 @@ class ScriptExecutorTest {
         result should {
             be<ScriptResult.Value>()
             have(value == true)
+        }
+    }
+
+    @Test
+    fun `should refer to the coroutine scope of the script body by the script block label without warnings`() = runTest {
+        // given
+        val script = """
+            val nested = listOf(1).map { this@_script.isActive }.single()
+            this@_script is Job && this@_script === coroutineContext[Job] && this@_script.isActive && nested
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == true)
+            have(warnings == null)
+        }
+    }
+
+    @Test
+    fun `should return from the script body by the script block label`() = runTest {
+        // given
+        val script = """
+            if (limit > 0) return@_script "early"
+            "late"
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("limit", 1)))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "early")
+            have(warnings == null)
+        }
+    }
+
+    @Test
+    fun `should not resolve the label of the outer lambda of the script block`() = runTest {
+        // given
+        val script = """
+            this@_dependencies
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:5: error: Unresolved label.
+                  | this<error>@_dependencies</error>
+            """.trimIndent()
         }
     }
 

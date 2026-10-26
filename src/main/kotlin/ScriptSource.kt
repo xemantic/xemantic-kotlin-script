@@ -393,7 +393,7 @@ private val nonIdentifierChars = Regex("[^A-Za-z0-9_]")
 /** A dependency, as declared in the preamble of the [ScriptSource]. */
 internal class PreambleDependency(
     val name: String,
-    /** The declaration of the property of the dependency, like `val x: T = _dependency_x as T`. */
+    /** The declaration of the property of the dependency, like `@get:JvmName("x\$dependency") val x: T = _dependency_x as T`. */
     val accessor: String,
     /** Whether it can be called like a function, so a local function of the same name shadows it. */
     val isCallable: Boolean = false
@@ -404,8 +404,15 @@ internal const val DEPENDENCIES_CLASS_NAME = "_ScriptDependencies"
 
 private const val DEPENDENCIES_CLASS = "`$DEPENDENCIES_CLASS_NAME`"
 
-/** The line starting the script block in the [ScriptSource.text]. */
-internal const val SCRIPT_BLOCK_START = "_script($DEPENDENCIES_CLASS()) { {"
+/**
+ * The line starting the script block in the [ScriptSource.text].
+ *
+ * The outer lambda is labeled, as otherwise both lambdas would be labeled `_script`,
+ * reporting `this@_script`, the coroutine scope of the script body, as ambiguous,
+ * with a name containing `$`, which a script would have to quote in backticks to refer to it,
+ * as it is not an API.
+ */
+internal const val SCRIPT_BLOCK_START = "_script($DEPENDENCIES_CLASS()) `_dependencies\$`@{ {"
 
 /** The line ending the script block in the [ScriptSource.text]. */
 internal const val SCRIPT_BLOCK_END = "} }"
@@ -429,7 +436,7 @@ private const val BODY_SCOPE_CLASS = "`_ScriptBodyScope`"
  * <the accessors of the shadowed dependencies>
  * }
  * <declarations which cannot be local>
- * _script(_ScriptDependencies()) { {
+ * _script(_ScriptDependencies()) `_dependencies$`@{ {
  * <the rest of the script>
  * } }
  * ```
@@ -510,7 +517,7 @@ internal class ScriptSource private constructor(
         propertyTypeProbes: Boolean = false,
         propertyTypes: Map<String, String> = emptyMap()
     ) : this(
-        script, dependencies, scriptStructure(script, dependencies),
+        script.withoutByteOrderMark(), dependencies, scriptStructure(script.withoutByteOrderMark(), dependencies),
         confirming, shadowedFunctionCopies, overloadingFunctionCopies, coroutineScopeCopies, propertyTypeProbes, propertyTypes,
         hoisting = null
     )
@@ -530,7 +537,9 @@ internal class ScriptSource private constructor(
         constructor(
             script: String,
             dependencies: List<PreambleDependency> = emptyList()
-        ) : this(script, dependencies, scriptStructure(script, dependencies), hoisting = null)
+        ) : this(
+            script.withoutByteOrderMark(), dependencies, scriptStructure(script.withoutByteOrderMark(), dependencies), hoisting = null
+        )
 
         /**
          * The script with the local functions declared preceding the statements calling them, see [ScriptStructure.hoisting],
@@ -818,11 +827,16 @@ internal class ScriptSource private constructor(
         hoisting?.functions?.values?.flatten()?.forEach { hoisted.fill(true, it.first, it.last + 1) }
         val hoistedByLine = hoisting?.functions?.mapKeys { lineOf(it.key) }.orEmpty()
         val movedExcluded = BooleanArray(script.length)
+        // the comment runs to the end of the script, like in a regular script
+        structure.unterminatedComment?.let {
+            excluded.fill(true, it, script.length)
+            movedExcluded.fill(true, it, script.length)
+        }
         structure.movedBlankedRanges.forEach { movedExcluded.fill(true, it.first, it.last + 1) }
 
         val headerEnd = structure.headerEnd
         if (headerEnd > 0) {
-            addLines(0..lineOf(headerEnd - 1)) { it < headerEnd }
+            addLines(0..lineOf(headerEnd - 1)) { it < headerEnd && !excluded[it] }
         }
         fun addAccessor(
             dependency: PreambleDependency
@@ -1087,6 +1101,14 @@ internal class ScriptSource private constructor(
     ): String? = preambleDependencies[line - 1]
 
     /**
+     * Whether the 1-based [line] of the [text] is generated, like the accessor of a dependency or the lines of the script block,
+     * so the script cannot change it, unlike the lines of the header and of the declarations moved out of the script body.
+     */
+    fun isGeneratedLine(
+        line: Int
+    ): Boolean = line - 1 in lineMapping.indices && lineMapping[line - 1] == null
+
+    /**
      * The name of the declaration moved out of the script body, which contains the [position].
      */
     fun movedDeclarationAt(
@@ -1197,6 +1219,9 @@ private val lineBreak = Regex("\\s*\n\\s*")
 
 @OptIn(ExperimentalAtomicApi::class)
 private val sourceIdSeq = AtomicLong(0)
+
+/** Dropped like by kotlinc, which would otherwise report it as a syntax error, counting it in the columns of the first line. */
+private fun String.withoutByteOrderMark(): String = removePrefix("\uFEFF")
 
 /** The structure of the [script], see [ScriptStructure]. */
 private fun scriptStructure(
@@ -2176,7 +2201,13 @@ private class ScriptStructure(
 
     val headerEnd: Int
 
-    val unmatchedClosingBrace: Int? = unmatchedClosingBrace(script)
+    private val lexed = lexScript(script)
+
+    /** The offset of the first `}` closing the script block, which would otherwise end the script early. */
+    val unmatchedClosingBrace: Int? = lexed.unmatchedClosingBrace
+
+    /** The start of the block comment ending the script unterminated, which would swallow the closing of the script block. */
+    val unterminatedComment: Int? = lexed.unterminatedComment
 
     val movedDeclarations: List<Declaration>
 
@@ -3453,18 +3484,26 @@ private val enclosingOf = mapOf<IElementType, Set<IElementType>>(
     KtTokens.CLOSING_QUOTE to emptySet()
 )
 
+/** The offsets of the [ScriptStructure.unmatchedClosingBrace] and of the [ScriptStructure.unterminatedComment]. */
+private class LexedScript(
+    val unmatchedClosingBrace: Int?,
+    val unterminatedComment: Int?
+)
+
 /**
- * The offset of the first `}` closing the script block, which the script is wrapped in,
- * recognized with the lexer, as the parser of the script alone recovers from it differently.
+ * Finds the first `}` closing the script block, which the script is wrapped in,
+ * recognized with the lexer, as the parser of the script alone recovers from it differently,
+ * and the block comment, or the KDoc, ending the script unterminated at the top level,
+ * also when it closes only a nested comment, while within a block or a string it is a missing closing token.
  */
-private fun unmatchedClosingBrace(
+private fun lexScript(
     script: String
-): Int? {
+): LexedScript {
     val lexer = KotlinLexer()
     lexer.start(script)
     val opened = mutableListOf<IElementType>()
     while (true) {
-        val type = lexer.tokenType ?: return null
+        val type = lexer.tokenType ?: return LexedScript(null, null)
         if (type in openingTokens) opened += type
         // ends the unterminated single-line string instead of the closing quote
         if (type == KtTokens.DANGLING_NEWLINE) {
@@ -3477,9 +3516,31 @@ private fun unmatchedClosingBrace(
             if (opening > enclosing) {
                 opened.subList(opening, opened.size).clear()
             } else if (type == KtTokens.RBRACE && enclosing == -1) {
-                return lexer.tokenStart
+                return LexedScript(lexer.tokenStart, null)
             }
+        }
+        if ((type == KtTokens.BLOCK_COMMENT || type == KtTokens.DOC_COMMENT) && lexer.tokenEnd == lexer.bufferEnd
+            && opened.isEmpty() && isUnterminatedComment(script, lexer.tokenStart)
+        ) {
+            return LexedScript(null, lexer.tokenStart)
         }
         lexer.advance()
     }
+}
+
+/** Whether the block comment starting at [start] is not closed, counting the nested comments like the lexer. */
+private fun isUnterminatedComment(
+    script: String,
+    start: Int
+): Boolean {
+    var depth = 0
+    var offset = start
+    while (offset < script.length - 1) {
+        when {
+            script[offset] == '/' && script[offset + 1] == '*' -> { depth++; offset += 2 }
+            script[offset] == '*' && script[offset + 1] == '/' -> { depth--; offset += 2 }
+            else -> offset++
+        }
+    }
+    return depth > 0
 }
