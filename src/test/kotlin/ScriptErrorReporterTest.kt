@@ -100,6 +100,74 @@ class ScriptErrorReporterTest {
     }
 
     @Test
+    fun `should report compiler backend crash at nested class without intermediate representation`() {
+        // given
+        val reporter = ScriptErrorReporter(
+            ScriptSource("sealed interface S\nclass A : S { inner class I { fun f() = 1 } }\nclass T : S { inner class I { fun f() = 1 } }\nT().I().f()")
+        )
+
+        // when
+        val message = reporter.toFailureMessage(listOf(backendCrash("public final fun f (): kotlin.Int declared in <root>._.T.I")))
+
+        // then
+        message sameAs """
+            script.kts:3:27: error: Exception while generating code for public final fun f (): kotlin.Int declared in <root>._.T.I
+              Caused by: java.lang.AssertionError: Non-mapped local declaration
+              | class T : S { inner class <error>I</error> { fun f() = 1 } }
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report compiler backend crash at function of moved class rather than at moved function of its name`() {
+        // given
+        val reporter = ScriptErrorReporter(
+            ScriptSource("inline fun f() = 1\nsealed interface S\nclass T : S { fun f() = object { fun g() = 1 } }\nT().f()")
+        )
+
+        // when
+        val message = reporter.toFailureMessage(listOf(backendCrash("public final fun g (): kotlin.Int declared in <root>._.T.f.<no name provided>")))
+
+        // then
+        message sameAs """
+            script.kts:3:19: error: Exception while generating code for public final fun g (): kotlin.Int declared in <root>._.T.f.<no name provided>
+              Caused by: java.lang.AssertionError: Non-mapped local declaration
+              | class T : S { fun <error>f</error>() = object { fun g() = 1 } }
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report compiler backend crash at moved function without intermediate representation`() {
+        // given
+        val reporter = ScriptErrorReporter(ScriptSource("inline fun g() = 1\ng()"))
+
+        // when
+        val message = reporter.toFailureMessage(listOf(backendCrash("public final fun g (): kotlin.Int declared in <root>._")))
+
+        // then
+        message sameAs """
+            script.kts:1:12: error: Exception while generating code for public final fun g (): kotlin.Int declared in <root>._
+              Caused by: java.lang.AssertionError: Non-mapped local declaration
+              | inline fun <error>g</error>() = 1
+        """.trimIndent()
+    }
+
+    /** Like the one reported by the compiler, followed by the intermediate representation of the [code]. */
+    private fun backendCrash(
+        code: String
+    ) = ScriptDiagnostic(
+        code = ScriptDiagnostic.unspecifiedError,
+        message = """
+            Exception while generating code for $code:
+            FUN name:f visibility:public modality:FINAL returnType:kotlin.Int
+              BLOCK_BODY
+        """.trimIndent(),
+        exception = RuntimeException(
+            "Exception while generating code for $code:\nFUN name:f",
+            AssertionError("Non-mapped local declaration\n\n in FUN name:f")
+        )
+    )
+
+    @Test
     fun `should report native frame and frames without source information`() {
         // given
         fun failure(
