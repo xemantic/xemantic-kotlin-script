@@ -21,6 +21,7 @@ package com.xemantic.kotlin.script
 import com.xemantic.kotlin.test.assert
 import com.xemantic.kotlin.test.sameAs
 import kotlin.script.experimental.api.ScriptDiagnostic
+import kotlin.script.experimental.api.SourceCode
 import kotlin.test.Test
 
 class ScriptErrorReporterTest {
@@ -63,6 +64,67 @@ class ScriptErrorReporterTest {
         val lastLine = lines.last()
         assert(omittedLineCount == 1)
         assert(lastLine == "    Suppressed: [FURTHER EXCEPTIONS OMITTED]")
+    }
+
+    @Test
+    fun `should report script which is not wrapped by unclosed or unmatched token`() {
+        // given
+        val reporters = listOf("listOf(1,\n  \"\${2", "listOf(1 }").map { ScriptErrorReporter(ScriptSource(it)) }
+
+        // when
+        val messages = reporters.map { it.toSourceFailureMessage() }
+
+        // then
+        assert(messages == listOf(
+            "script.kts:2:4: error: Syntax error: '\${' is not closed.\n  |   \"<error>\${</error>2",
+            "script.kts:1:10: error: Syntax error: Unexpected '}' without matching '{'.\n  | listOf(1 <error>}</error>"
+        ))
+    }
+
+    /** Standing for the classes declared in the script, nested in this one, standing for the script class. */
+    enum class Color { RED }
+
+    class Box { companion object }
+
+    @Suppress("ClassName")
+    class _ScriptDependencies
+
+    @Test
+    fun `should report exception message naming only the classes declared in the script without the name of the script class`() {
+        // given
+        val name = ScriptErrorReporterTest::class.java.name
+        val throwable = RuntimeException(
+            "$name.Color.RED, $name\$Box\$Companion@1f, $name.Cat, $name\$Cat, $name\$_ScriptDependencies, x$name.Color, ${name}x.Color"
+        ).apply { stackTrace = emptyArray() }
+        val reporter = ScriptErrorReporter(ScriptSource("throw x"), scriptClassName = name, classLoader = javaClass.classLoader)
+
+        // when
+        val message = reporter.toFailureMessage(throwable, warnings = emptyList())
+
+        // then
+        message sameAs
+                "java.lang.RuntimeException: Color.RED, Box.Companion@1f, $name.Cat, $name\$Cat, $name\$_ScriptDependencies, x$name.Color, ${name}x.Color"
+    }
+
+    @Test
+    fun `should report exception of the diagnostic without the name of the script class`() {
+        // given
+        val name = ScriptErrorReporterTest::class.java.name
+        val diagnostic = ScriptDiagnostic(
+            code = ScriptDiagnostic.unspecifiedError,
+            message = "Unable to instantiate class $name",
+            exception = NoClassDefFoundError("$name\$Box").apply { stackTrace = emptyArray() }
+        )
+        val reporter = ScriptErrorReporter(ScriptSource("foo"), scriptClassName = name, classLoader = javaClass.classLoader)
+
+        // when
+        val message = reporter.toFailureMessage(listOf(diagnostic))
+
+        // then
+        message sameAs """
+            error: Unable to instantiate class $name
+              Caused by: java.lang.NoClassDefFoundError: Box
+        """.trimIndent()
     }
 
     @Test
@@ -153,9 +215,118 @@ class ScriptErrorReporterTest {
         """.trimIndent()
     }
 
+    @Test
+    fun `should report compiler backend crash at moved property of accessor`() {
+        // given
+        val reporter = ScriptErrorReporter(ScriptSource("inline fun g() = 1\nval x: Int get() = g()\nx"))
+
+        // when
+        val message = reporter.toFailureMessage(listOf(backendCrash("public final fun <get-x> (): kotlin.Int declared in <root>._")))
+
+        // then
+        message sameAs """
+            script.kts:2:5: error: Exception while generating code for public final fun <get-x> (): kotlin.Int declared in <root>._
+              Caused by: java.lang.AssertionError: Non-mapped local declaration
+              | val <error>x</error>: Int get() = g()
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report compiler backend crash of library function without location and with whole root cause message`() {
+        // given
+        val reporter = ScriptErrorReporter(ScriptSource("inline fun map() = 1\nmap()"))
+        val crash = backendCrash(
+            code = "public final fun map (): kotlin.Int declared in kotlin.collections.CollectionsKt",
+            rootCause = "Non-mapped local declaration\nof the lambda\n\n in FUN name:f"
+        )
+
+        // when
+        val message = reporter.toFailureMessage(listOf(crash))
+
+        // then
+        message sameAs """
+            error: Exception while generating code for public final fun map (): kotlin.Int declared in kotlin.collections.CollectionsKt
+              Caused by: java.lang.AssertionError: Non-mapped local declaration
+              of the lambda
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report compiler backend crash of unknown wording without intermediate representation`() {
+        // given
+        val reporter = ScriptErrorReporter(ScriptSource("fun log(m: String) = m\nsealed interface S\nclass T : S { fun f() = listOf(\"a\").map(::log) }\nT().f()"))
+        val crash = ScriptDiagnostic(
+            code = ScriptDiagnostic.unspecifiedError,
+            message = "Code generation failed for f in T:\nFUN name:f visibility:public modality:FINAL returnType:kotlin.Int\n  BLOCK_BODY",
+            exception = RuntimeException(
+                "Code generation failed for f in T:\nFUN name:f",
+                AssertionError("Non-mapped local declaration: VALUE_PARAMETER INSTANCE_RECEIVER kind:DispatchReceiver name:<this> type:<root>._").apply {
+                    stackTrace = arrayOf(StackTraceElement("org.jetbrains.kotlin.backend.jvm.codegen.ExpressionCodegen", "visitGetValue", "ExpressionCodegen.kt", 1))
+                }
+            )
+        )
+
+        // when
+        val message = reporter.toFailureMessage(listOf(crash))
+
+        // then
+        message sameAs """
+            error: Code generation failed for f in T
+              Caused by: java.lang.AssertionError: Non-mapped local declaration: VALUE_PARAMETER INSTANCE_RECEIVER kind:DispatchReceiver name:<this> type:<root>._
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report compiler backend crash of moved class not capturing the script class instance at the class rather than at its callable references`() {
+        // given
+        val reporter = ScriptErrorReporter(ScriptSource("fun log(m: String) = m\nsealed interface S\nclass T : S { fun f() = listOf(\"a\").map(::log) }\nT().f()"))
+
+        // when
+        val message = reporter.toFailureMessage(listOf(backendCrash("public final fun f (): kotlin.Int declared in <root>._.T")))
+
+        // then
+        message sameAs """
+            script.kts:3:7: error: Exception while generating code for public final fun f (): kotlin.Int declared in <root>._.T
+              Caused by: java.lang.AssertionError: Non-mapped local declaration
+              | class <error>T</error> : S { fun f() = listOf("a").map(::log) }
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report compiler backend crash at nested class named like the moved class enclosing it`() {
+        // given
+        val reporter = ScriptErrorReporter(ScriptSource("sealed interface S\nclass T : S {\n    class T { fun f() = 1 }\n}\nT.T().f()"))
+
+        // when
+        val message = reporter.toFailureMessage(listOf(backendCrash("public final fun f (): kotlin.Int declared in <root>._.T.T")))
+
+        // then
+        message sameAs """
+            script.kts:3:11: error: Exception while generating code for public final fun f (): kotlin.Int declared in <root>._.T.T
+              Caused by: java.lang.AssertionError: Non-mapped local declaration
+              |     class <error>T</error> { fun f() = 1 }
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report compiler backend crash without cause without intermediate representation`() {
+        // given
+        val reporter = ScriptErrorReporter(ScriptSource("inline fun map() = 1\nmap()"))
+        val crash = backendCrash("public final fun map (): kotlin.Int declared in kotlin.collections.CollectionsKt").let {
+            it.copy(exception = RuntimeException(it.message))
+        }
+
+        // when
+        val message = reporter.toFailureMessage(listOf(crash))
+
+        // then
+        message sameAs "error: Exception while generating code for public final fun map (): kotlin.Int declared in kotlin.collections.CollectionsKt"
+    }
+
     /** Like the one reported by the compiler, followed by the intermediate representation of the [code]. */
     private fun backendCrash(
-        code: String
+        code: String,
+        rootCause: String = "Non-mapped local declaration\n\n in FUN name:f"
     ) = ScriptDiagnostic(
         code = ScriptDiagnostic.unspecifiedError,
         message = """
@@ -165,7 +336,7 @@ class ScriptErrorReporterTest {
         """.trimIndent(),
         exception = RuntimeException(
             "Exception while generating code for $code:\nFUN name:f",
-            AssertionError("Non-mapped local declaration\n\n in FUN name:f")
+            AssertionError(rootCause)
         )
     )
 
@@ -218,6 +389,212 @@ class ScriptErrorReporterTest {
         message sameAs """
             java.lang.RuntimeException: b
               at Boom.<clinit>(script.kts)
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report crash of the compiler in generated code without position and generated names`() {
+        // given
+        val source = ScriptSource("foo")
+        val location = "${source.locationId}:1:1"
+        val diagnostic = ScriptDiagnostic(
+            code = ScriptDiagnostic.unspecifiedError,
+            message = "While analysing $location: java.lang.IllegalStateException: Exception in expression checkers",
+            exception = RuntimeException(
+                "While analysing $location: java.lang.IllegalStateException: Exception in expression checkers",
+                IllegalStateException("Exception in expression checkers", IllegalArgumentException("Unexpected element at $location"))
+            )
+        )
+        val reporter = ScriptErrorReporter(source)
+
+        // when
+        val message = reporter.toCompilationFailureMessage(listOf(diagnostic))
+
+        // then
+        message sameAs """
+            error: The compiler failed internally: While analysing script.kts: java.lang.IllegalStateException: Exception in expression checkers
+              Caused by: java.lang.IllegalArgumentException: Unexpected element at script.kts
+              hint: it is a failure of the compiler itself - express the script differently.
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report limited number of causes of internal failure`() {
+        // given
+        val throwable = (1..20).fold(null as Throwable?) { cause, index ->
+            RuntimeException("failure ${21 - index}", cause)
+        }!!
+
+        // when
+        val message = internalFailureMessage(throwable)
+
+        // then
+        message sameAs """
+            error: The script could not be compiled because of an internal failure: java.lang.RuntimeException: failure 1
+              Caused by: java.lang.RuntimeException: failure 2
+              Caused by: java.lang.RuntimeException: failure 3
+              Caused by: java.lang.RuntimeException: failure 4
+              Caused by: java.lang.RuntimeException: failure 5
+              Caused by: java.lang.RuntimeException: failure 6
+              Caused by: java.lang.RuntimeException: failure 7
+              Caused by: java.lang.RuntimeException: failure 8
+              [FURTHER CAUSES OMITTED]
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report circular causes of internal failure once`() {
+        // given
+        val first = RuntimeException("first")
+        val second = IllegalStateException("second", first)
+        first.initCause(second)
+
+        // when
+        val message = internalFailureMessage(first)
+
+        // then
+        message sameAs """
+            error: The script could not be compiled because of an internal failure: java.lang.RuntimeException: first
+              Caused by: java.lang.IllegalStateException: second
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report internal failure with multiline message indented`() {
+        // given
+        val throwable = IllegalStateException("Back-end failed\nFile being compiled: (1,1)")
+
+        // when
+        val message = internalFailureMessage(throwable)
+
+        // then
+        message sameAs """
+            error: The script could not be compiled because of an internal failure: java.lang.IllegalStateException: Back-end failed
+              File being compiled: (1,1)
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report crash of the compiler with the message of its diagnostic`() {
+        // given
+        val diagnostic = ScriptDiagnostic(
+            code = ScriptDiagnostic.unspecifiedError,
+            message = "Could not read classpath entry /x.jar",
+            exception = java.io.IOException()
+        )
+        val reporter = ScriptErrorReporter(ScriptSource("foo"))
+
+        // when
+        val message = reporter.toCompilationFailureMessage(listOf(diagnostic))
+
+        // then
+        message sameAs """
+            error: The compiler failed internally: Could not read classpath entry /x.jar
+              Caused by: java.io.IOException
+              hint: it is a failure of the compiler itself - express the script differently.
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report crash of the compiler in the accessor of the dependency`() {
+        // given
+        val source = ScriptSource("x", listOf(PreambleDependency("x", { _, _ -> "val `x`: Int = TODO()" })))
+        val line = source.text.lines().indexOfFirst { it.startsWith("val `x`") } + 1
+        val diagnostic = ScriptDiagnostic(
+            code = ScriptDiagnostic.unspecifiedError,
+            message = "Exception in expression checkers",
+            location = SourceCode.Location(SourceCode.Position(line, 1)),
+            exception = IllegalStateException("Exception in expression checkers")
+        )
+        val reporter = ScriptErrorReporter(source)
+
+        // when
+        val message = reporter.toCompilationFailureMessage(listOf(diagnostic))
+
+        // then
+        message sameAs """
+            dependency 'x': error: The compiler failed internally: Exception in expression checkers
+              hint: it is a failure of the compiler itself - express the script differently.
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report crash of the compiler marking the range of its location`() {
+        // given
+        val source = ScriptSource("val a = 1\nval b = a + 1\nb")
+        val line = (1..source.text.lines().size).first { source.toScriptLine(it) == 1 }
+        val diagnostic = ScriptDiagnostic(
+            code = ScriptDiagnostic.unspecifiedError,
+            message = "Exception in expression checkers",
+            location = SourceCode.Location(SourceCode.Position(line, 9), SourceCode.Position(line, 14)),
+            exception = IllegalStateException("Exception in expression checkers")
+        )
+        val reporter = ScriptErrorReporter(source)
+
+        // when
+        val message = reporter.toCompilationFailureMessage(listOf(diagnostic))
+
+        // then
+        message sameAs """
+            script.kts:2:9: error: The compiler failed internally: Exception in expression checkers
+              | val b = <error>a + 1</error>
+              hint: it is a failure of the compiler itself - express this code differently.
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should report crash of the compiler at oversized line without position`() {
+        // given
+        val source = ScriptSource("foo")
+        val diagnostic = ScriptDiagnostic(
+            code = ScriptDiagnostic.unspecifiedError,
+            message = "While analysing ${source.locationId}:99999999999:1: boom",
+            exception = IllegalStateException("boom")
+        )
+        val reporter = ScriptErrorReporter(source)
+
+        // when
+        val message = reporter.toCompilationFailureMessage(listOf(diagnostic))
+
+        // then
+        message sameAs """
+            error: The compiler failed internally: While analysing script.kts: boom
+              Caused by: java.lang.IllegalStateException: boom
+              hint: it is a failure of the compiler itself - express the script differently.
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should rewrite generated locations of the script`() {
+        // given
+        val source = ScriptSource("val a = 1\nval b = a + 1\nb")
+        val line = (1..source.text.lines().size).first { source.toScriptLine(it) == 1 }
+        val generated = (1..source.text.lines().size).first { source.toScriptLine(it) == null }
+        val message = "at ${source.locationId}:$line, ($line,9) in /${source.locationId}, " +
+                "${source.locationId}:$generated:1, ($generated,1) in /${source.locationId}, ${source.locationId}"
+
+        // when
+        val rewritten = message.toScriptLocations(listOf(source))
+
+        // then
+        assert(rewritten == "at script.kts:2, script.kts:2:9, script.kts, script.kts, script.kts")
+    }
+
+    @Test
+    fun `should report wrapper of internal failure mentioning class of the cause without message`() {
+        // given
+        val throwable = IllegalStateException(
+            "Couldn't inline method call at line 3 of script: java.lang.NullPointerException",
+            NullPointerException()
+        )
+
+        // when
+        val message = internalFailureMessage(throwable)
+
+        // then
+        message sameAs """
+            error: The script could not be compiled because of an internal failure: java.lang.IllegalStateException: Couldn't inline method call at line 3 of script: java.lang.NullPointerException
+              Caused by: java.lang.NullPointerException
         """.trimIndent()
     }
 
