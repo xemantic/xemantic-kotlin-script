@@ -103,8 +103,10 @@ internal class DefaultScriptExecutor(
     private val compilations = AtomicInt(0)
 
     /**
-     * The number of the actual compilations, not served by the cache,
-     * including the ones confirming the [ScriptSource.laterDeclaredDependencyCandidates].
+     * The number of the invocations of the compiler, the ones bounded by the `maxConcurrentCompilations`,
+     * so not counting the compilations served by the cache,
+     * while counting each confirming one, see [ScriptSource.confirming],
+     * even when the compilation of the script failed.
      */
     @OptIn(ExperimentalAtomicApi::class)
     internal val compilationCount: Int get() = compilations.load()
@@ -141,20 +143,28 @@ internal class DefaultScriptExecutor(
     private val classLoader: ClassLoader = Thread.currentThread().contextClassLoader
         ?: DefaultScriptExecutor::class.java.classLoader
 
-
-    private val compilationConfigurationTemplate = ScriptCompilationConfiguration {
-        jvm {
-            dependenciesFromClassloader(
-                classLoader = classLoader,
-                wholeClasspath = true
+    /**
+     * Built on the first compilation, on the [dispatcher], as resolving the whole classpath
+     * would otherwise block the caller creating the executor, even if it never executes a script.
+     * The concurrent first compilations wait for it, holding their permits,
+     * while its failure, reported as the internal failure of the compiler, is not kept,
+     * so the next compilation resolves the classpath again, as the failure might be transient.
+     */
+    private val compilationConfigurationTemplate by lazy {
+        ScriptCompilationConfiguration {
+            jvm {
+                dependenciesFromClassloader(
+                    classLoader = classLoader,
+                    wholeClasspath = true
+                )
+                // the default 1.8 target cannot inline functions of the classpath, e.g. `dependency(...)`
+                jvmTarget(scriptJvmTarget(System.getProperty("java.specification.version")))
+            }
+            // the script body has a CoroutineScope receiver, so it can launch coroutines without imports
+            defaultImports(
+                "kotlinx.coroutines.*"
             )
-            // the default 1.8 target cannot inline functions of the classpath, e.g. `dependency(...)`
-            jvmTarget(scriptJvmTarget(System.getProperty("java.specification.version")))
         }
-        // the script body has a CoroutineScope receiver, so it can launch coroutines without imports
-        defaultImports(
-            "kotlinx.coroutines.*"
-        )
     }
 
     override suspend fun execute(
@@ -224,6 +234,9 @@ internal class DefaultScriptExecutor(
         /** Parsed only when not compiled already, as the cached compilation keeps it. */
         private lateinit var source: ScriptSource
 
+        /** Reporting the failures of the [source], once it is known. */
+        private val reporter by lazy { ScriptErrorReporter(source) }
+
         suspend fun handle(): ScriptResult {
             val compilation = try {
                 compile()
@@ -245,9 +258,8 @@ internal class DefaultScriptExecutor(
                 )
             }
             source = compilation.source
-            val compilationResult = compilation.result ?: return ScriptResult.Error(
-                ScriptErrorReporter(source).toSourceFailureMessage(),
-                ExecutionPhase.COMPILATION
+            val compilationResult = compilation.result ?: return compilationFailure(
+                reporter.toSourceFailureMessage()
             )
             if (
                 compilation.laterDeclaredDependencyReferences.isNotEmpty()
@@ -255,26 +267,33 @@ internal class DefaultScriptExecutor(
                 || compilation.shadowedFunctionReferences.isNotEmpty()
                 || compilation.coroutineScopeReferences.isNotEmpty()
             ) {
+                // like `No value passed for parameter 'p1'` of `log()`, see ScriptSource.calledInsteadDependencies
+                val calledInstead = compilation.hiddenLocalFunctionReferences.filter {
+                    it.reference.name in source.calledInsteadDependencies
+                }.mapTo(HashSet()) { it.reference.start }
                 val failureMessage = listOfNotNull(
                     compilation.coroutineScopeReferences.takeIf { it.isNotEmpty() }?.let {
-                        ScriptErrorReporter(source).toCoroutineScopeMessage(it)
+                        reporter.toCoroutineScopeMessage(it)
                     },
                     compilation.shadowedFunctionReferences.takeIf { it.isNotEmpty() }?.let {
-                        ScriptErrorReporter(source).toShadowedFunctionMessage(it)
+                        reporter.toShadowedFunctionMessage(it)
                     },
                     compilation.hiddenLocalFunctionReferences.takeIf { it.isNotEmpty() }?.let {
-                        ScriptErrorReporter(source).toHiddenLocalFunctionMessage(it)
+                        reporter.toHiddenLocalFunctionMessage(it)
                     },
                     compilation.laterDeclaredDependencyReferences.takeIf { it.isNotEmpty() }?.let {
-                        ScriptErrorReporter(source).toLaterDeclaredDependencyMessage(it)
+                        reporter.toLaterDeclaredDependencyMessage(it)
                     },
-                    // explained by the reference to the dependency
-                    (compilationResult as? Failure)?.let { ScriptErrorReporter(source).toFailureMessage(it.reports.filterNonIgnorable()) }
+                    // explained by the reference to the dependency, like the errors of the calls resolved to the dependency instead, omitted
+                    (compilationResult as? Failure)?.reports?.filterNonIgnorable()?.filterNot { diagnostic ->
+                        diagnostic.severity == ScriptDiagnostic.Severity.ERROR && diagnostic.location?.start?.let { start ->
+                            source.toScriptPosition(start.line, start.col) in calledInstead
+                        } == true
+                    }?.takeIf { reports -> reports.any { it.severity == ScriptDiagnostic.Severity.ERROR } }?.let {
+                        reporter.toFailureMessage(it)
+                    }
                 ).joinToString(separator = "\n\n")
-                logger.debug {
-                    "Script[$scriptId]: Compilation (1/2) failure message: $failureMessage"
-                }
-                return ScriptResult.Error(failureMessage, ExecutionPhase.COMPILATION)
+                return compilationFailure(failureMessage)
             }
             val result = when (compilationResult) {
                 is Success -> {
@@ -285,18 +304,21 @@ internal class DefaultScriptExecutor(
                         }
                     )
                 }
-                is Failure -> {
-                    val failureMessage = ScriptErrorReporter(source).toFailureMessage(
-                        compilationResult.reports.filterNonIgnorable()
-                    )
-                    logger.debug {
-                        "Script[$scriptId]: Compilation (1/2) failure message: $failureMessage"
-                    }
-                    ScriptResult.Error(failureMessage, ExecutionPhase.COMPILATION)
-                }
+                is Failure -> compilationFailure(
+                    reporter.toFailureMessage(compilationResult.reports.filterNonIgnorable())
+                )
             }
 
             return result
+        }
+
+        private fun compilationFailure(
+            failureMessage: String
+        ): ScriptResult.Error {
+            logger.debug {
+                "Script[$scriptId]: Compilation (1/2) failure message: $failureMessage"
+            }
+            return ScriptResult.Error(failureMessage, ExecutionPhase.COMPILATION)
         }
 
         private suspend fun compile(): Compilation {
@@ -381,12 +403,18 @@ internal class DefaultScriptExecutor(
             val hidden = hiddenWarnings.mapNotNullTo(HashSet()) { (start, end, message) ->
                 hiddenCandidates.filter { candidate ->
                     start in candidate.reference && hiddenLocalFunctionMessage(candidate.reference.name) in message
-                            // the compiler reports the operators as unresolved, misleading, so they are hinted at as well
-                            && (candidate.isOperator || start !in errors)
+                            // like a delegate convention, not of a call of the same name within it
+                            && candidate.inner.none { start in it }
                 }.let { matching ->
-                    matching.firstOrNull { it.reference.end == end } ?: matching.minByOrNull {
-                        (it.reference.end.line - it.reference.start.line) * 100_000 + it.reference.end.column - it.reference.start.column
-                    }
+                    // the innermost one, nested ones start later, or at the same position, ending earlier
+                    matching.firstOrNull { it.reference.end == end } ?: matching.maxWithOrNull(
+                        compareBy<LaterDeclaredReference> { it.reference.start }.thenByDescending { it.reference.end }
+                    )
+                }?.takeIf { candidate ->
+                    // chosen first, so that the warning of a plain call, like `get(1)` in `m[get(1)]`, is not assigned to the enclosing operator,
+                    // the compiler reports the operators as unresolved, misleading, so they are hinted at as well,
+                    // like the calls failing as resolved to the dependency of the same name, see ScriptSource.calledInsteadDependencies
+                    candidate.isOperator || start !in errors || candidate.reference.name in source.calledInsteadDependencies
                 }
             }
             // the references not resolved to the moved declarations, unless already reported as errors
@@ -453,12 +481,14 @@ internal class DefaultScriptExecutor(
         ): ResultWithDiagnostics<CompiledScript> {
             val result = try {
                 compilationPermits.withPermit {
+                    // resolving the classpath on the first compilation, which is not counted if it fails
+                    val configuration = compilationConfig()
                     // not counting the callers cancelled while waiting for the permit
                     @OptIn(ExperimentalAtomicApi::class)
                     compilations.incrementAndFetch()
                     scriptingHost.compiler(
                         script = source,
-                        scriptCompilationConfiguration = compilationConfig()
+                        scriptCompilationConfiguration = configuration
                     )
                 }
             } catch (e: CancellationException) {
@@ -493,7 +523,7 @@ internal class DefaultScriptExecutor(
                 }
                 is Failure -> {
                     // in practice, this never happens
-                    val failureMessage = ScriptErrorReporter(source).toFailureMessage(
+                    val failureMessage = reporter.toFailureMessage(
                         evaluationResult.reports.filterNonIgnorable()
                     )
                     ScriptResult.Error(failureMessage, ExecutionPhase.EVALUATION)
@@ -549,7 +579,7 @@ internal class DefaultScriptExecutor(
         private fun warningsMessage(
             warnings: List<ScriptDiagnostic>
         ): String? = if (warnings.isEmpty()) null else {
-            ScriptErrorReporter(source).toFailureMessage(warnings)
+            reporter.toFailureMessage(warnings)
         }
 
         private fun ResultValue.failure(
