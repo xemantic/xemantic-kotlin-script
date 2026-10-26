@@ -23,6 +23,14 @@ import com.xemantic.kotlin.test.be
 import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
+import java.lang.management.ManagementFactory
+import java.lang.management.MonitorInfo
+import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import kotlin.concurrent.thread
+import kotlin.test.Test
+import kotlin.test.assertFailsWith
+import kotlin.time.Duration.Companion.milliseconds
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -33,14 +41,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
-import java.lang.management.ManagementFactory
-import java.lang.management.MonitorInfo
-import java.util.Collections
-import java.util.concurrent.CountDownLatch
-import kotlin.concurrent.thread
-import kotlin.test.Test
-import kotlin.test.assertFailsWith
-import kotlin.time.Duration.Companion.milliseconds
 
 class ScriptCompilationCacheTest {
 
@@ -689,7 +689,6 @@ class ScriptCompilationCacheTest {
         // not evicted by the shadowing script
         assert(executor.compilationCount == compilationCount)
     }
-
 
     @Test
     fun `should not confirm this in local function referring to the receiver of a known lambda with receiver`() = runTest {
