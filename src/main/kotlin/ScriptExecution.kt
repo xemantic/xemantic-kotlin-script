@@ -387,6 +387,15 @@ internal class DefaultScriptExecutor(
             if (source.unmatchedClosingBrace != null || source.conflictingDependencyDeclarations.isNotEmpty()) {
                 return Compilation(source, result = null)
             }
+            val compilation = compile(parsed, source)
+            return hoistedCompilation(parsed, compilation) ?: compilation
+        }
+
+        /** The compilation of the [source] of the [parsed] script, with its [ScriptSource.candidates] confirmed, see [confirm]. */
+        private suspend fun compile(
+            parsed: ScriptSource.Parsed,
+            source: ScriptSource
+        ): CompilationOutcome {
             if (source.candidates.isEmpty()) return Compilation(source, compile(source))
             // the confirming compilations do not depend on this one
             return coroutineScope {
@@ -407,6 +416,27 @@ internal class DefaultScriptExecutor(
                         is Failure -> Compilation(source, result)
                     }
                 }
+            }
+        }
+
+        /**
+         * The compilation of the [parsed] script with the local functions declared preceding the statements calling them,
+         * which are not visible there, unlike in the script, see [ScriptSource.Parsed.hoisted],
+         * if they are the only unresolved references of the failed [compilation], and the hoisted script compiles,
+         * otherwise `null`, as the errors of the script are reported for the script as it is.
+         */
+        private suspend fun hoistedCompilation(
+            parsed: ScriptSource.Parsed,
+            compilation: CompilationOutcome
+        ): CompilationOutcome? {
+            if (compilation !is Compilation || compilation.confirmedFailures.isNotEmpty()) return null
+            val result = compilation.result as? Failure ?: return null
+            val hoisted = parsed.hoisted(compilation.source, result.reports.unresolvedReferences(compilation.source)) ?: return null
+            logger.debug { "Script[$scriptId]: Compiling (1/2) with the local functions declared preceding their calls" }
+            return when (val outcome = compile(hoisted, hoisted.source())) {
+                is Compilation -> outcome.takeIf { it.result is Success }
+                // the internal failure of the confirming compilation, otherwise silently resolving the references to the wrong declarations
+                is FailedCompilation -> outcome
             }
         }
 
@@ -550,6 +580,21 @@ internal class DefaultScriptExecutor(
             // the calls not referring to the moved functions already, which would refer to them in the script, if they apply
             val toFunctions = deprecated(SHADOWED_ORIGINAL)
             val toLocals = source.shadowedFunctionCandidates.filter { (reference) -> toFunctions.none { it in reference } }
+            /** The one of these [candidates], the reference of which contains the position, as they do not overlap. */
+            fun <T : CandidateReference> candidateAt(
+                candidates: List<T>
+            ): (ScriptPosition) -> T? {
+                val sorted = candidates.sortedBy { it.reference.start }
+                return { position ->
+                    sorted.getOrNull(sorted.binarySearch { it.reference.start.compareTo(position) }.let { if (it >= 0) it else -it - 2 })
+                        ?.takeIf { position in it.reference }
+                }
+            }
+            // the lines of the local functions they call, if known, see SHADOWING_FUNCTION
+            val toLocalAt = candidateAt(toLocals)
+            val calledLocals = reports.markedRanges(probe, SHADOWING_FUNCTION).mapNotNull { (start, _, message) ->
+                toLocalAt(start)?.let { candidate -> probe.shadowingFunctionLine(message)?.let { candidate.reference to it } }
+            }.toMap()
             // the remaining calls of the functions, which would refer to them in the script, if they apply, like the properties,
             // and the references within the lambdas, unless resolved to their receivers, also in the script, see ScriptSource.coroutineScopeCopies
             fun CoroutineScopeReference.isConfirmedByCopies() = isFunction || isInLambda
@@ -564,8 +609,9 @@ internal class DefaultScriptExecutor(
                 ) = async {
                     if (candidates.isEmpty()) emptyList() else {
                         val source = copies()
+                        val candidateOf = candidateAt(candidates)
                         confirming(source).reports.markedRanges(source, SHADOWED_FUNCTION).mapNotNull { (start, _, message) ->
-                            candidates.find { start in it.reference }?.let { candidate ->
+                            candidateOf(start)?.let { candidate ->
                                 // naming the overload called in the script
                                 candidate.copy(functionLine = source.shadowedFunctionLine(message) ?: candidate.functionLine)
                             }
@@ -628,7 +674,12 @@ internal class DefaultScriptExecutor(
                     message(toCoroutineScopeReferences, ScriptErrorReporter::toCoroutineScopeMessage),
                     // in the order of the script
                     message(
-                        toLocals.mapNotNull { candidate -> shadowed.find { it.reference === candidate.reference } },
+                        shadowed.associateBy { it.reference }.let { byReference ->
+                            toLocals.mapNotNull { candidate -> byReference[candidate.reference] }
+                        }.map { reference ->
+                            // naming the local function called, rather than all the visible ones
+                            calledLocals[reference.reference]?.let { reference.copy(lines = listOf(it)) } ?: reference
+                        },
                         ScriptErrorReporter::toShadowedFunctionMessage
                     ),
                     message(hiddenLocalFunctionReferences, ScriptErrorReporter::toHiddenLocalFunctionMessage),

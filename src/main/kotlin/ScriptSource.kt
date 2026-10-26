@@ -28,6 +28,7 @@ import org.jetbrains.kotlin.com.intellij.psi.PsiComment
 import org.jetbrains.kotlin.com.intellij.psi.PsiElement
 import org.jetbrains.kotlin.com.intellij.psi.PsiErrorElement
 import org.jetbrains.kotlin.com.intellij.psi.PsiWhiteSpace
+import org.jetbrains.kotlin.com.intellij.psi.impl.source.tree.LeafPsiElement
 import org.jetbrains.kotlin.com.intellij.psi.tree.IElementType
 import org.jetbrains.kotlin.compiler.plugin.CompilerPluginRegistrar
 import org.jetbrains.kotlin.compiler.plugin.ExperimentalCompilerApi
@@ -59,6 +60,7 @@ import org.jetbrains.kotlin.psi.KtForExpression
 import org.jetbrains.kotlin.psi.KtFunctionLiteral
 import org.jetbrains.kotlin.psi.KtLabelReferenceExpression
 import org.jetbrains.kotlin.psi.KtNamedDeclaration
+import org.jetbrains.kotlin.psi.KtNameReferenceExpression
 import org.jetbrains.kotlin.psi.KtNamedFunction
 import org.jetbrains.kotlin.psi.KtObjectDeclaration
 import org.jetbrains.kotlin.psi.KtOperationExpression
@@ -98,6 +100,7 @@ import org.jetbrains.kotlin.psi.psiUtil.parents
 import org.jetbrains.kotlin.psi.psiUtil.startOffset
 import org.jetbrains.kotlin.psi.psiUtil.startOffsetSkippingComments
 import java.util.IdentityHashMap
+import java.util.PriorityQueue
 import kotlin.concurrent.atomics.AtomicLong
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.concurrent.atomics.incrementAndFetch
@@ -338,6 +341,20 @@ private fun shadowedFunctionMessage(
 /** The offset in the message of [shadowedFunctionMessage]. */
 private val shadowedFunctionOffset = Regex("${Regex.escape(SHADOWED_FUNCTION)} at (\\d+);")
 
+/**
+ * The opt-in message of the local functions, one of which the [ScriptSource.shadowedFunctionCandidates] call, telling which one,
+ * declared at the offset of the script, see [ScriptSource.shadowingFunctionLine].
+ */
+internal const val SHADOWING_FUNCTION = "xemantic-kotlin-script: shadowing function"
+
+/** The opt-in message of the local function declared at the [offset] of the script, see [SHADOWING_FUNCTION]. */
+private fun shadowingFunctionMessage(
+    offset: Int
+): String = "$SHADOWING_FUNCTION at $offset;"
+
+/** The offset in the message of [shadowingFunctionMessage]. */
+private val shadowingFunctionOffset = Regex("${Regex.escape(SHADOWING_FUNCTION)} at (\\d+);")
+
 /** The first of the letters replacing the names of the local functions overloading the moved ones, see [ScriptSource.overloadingFunctionCopies]. */
 private const val RENAMED_CHARS = '\u4E00'
 
@@ -477,7 +494,9 @@ internal class ScriptSource private constructor(
      * The types of the [untypedProperties], as named by their probes, see [propertyTypeProbes],
      * which the confirming compilation declares their copies of, checking whether they are the same types, see [confirmedPropertyTypes].
      */
-    propertyTypes: Map<String, String>
+    propertyTypes: Map<String, String>,
+    /** The local functions declared preceding the statements calling them, see [Parsed.hoisted]. */
+    private val hoisting: Hoisting?
 ) : SourceCode {
 
     /** The source of the [script] parsed on its own, see [Parsed]. */
@@ -492,7 +511,8 @@ internal class ScriptSource private constructor(
         propertyTypes: Map<String, String> = emptyMap()
     ) : this(
         script, dependencies, scriptStructure(script, dependencies),
-        confirming, shadowedFunctionCopies, overloadingFunctionCopies, coroutineScopeCopies, propertyTypeProbes, propertyTypes
+        confirming, shadowedFunctionCopies, overloadingFunctionCopies, coroutineScopeCopies, propertyTypeProbes, propertyTypes,
+        hoisting = null
     )
 
     /**
@@ -500,12 +520,36 @@ internal class ScriptSource private constructor(
      * which differ only by the declarations they add or mark, see [ScriptSource.confirming].
      * Once the sources are given, it is not needed anymore, while they do not keep it.
      */
-    class Parsed(
+    class Parsed private constructor(
         private val script: String,
-        private val dependencies: List<PreambleDependency> = emptyList()
+        private val dependencies: List<PreambleDependency>,
+        private val structure: ScriptStructure,
+        private val hoisting: Hoisting?
     ) {
 
-        private val structure = scriptStructure(script, dependencies)
+        constructor(
+            script: String,
+            dependencies: List<PreambleDependency> = emptyList()
+        ) : this(script, dependencies, scriptStructure(script, dependencies), hoisting = null)
+
+        /**
+         * The script with the local functions declared preceding the statements calling them, see [ScriptStructure.hoisting],
+         * which the [unresolved] references of the compilation of its [source] call, with their names,
+         * or `null`, if they cannot be, or if the hoisting might change how a candidate of the [source] is resolved,
+         * other than the calls of the hoisted functions, see [ScriptSource.candidates].
+         */
+        fun hoisted(
+            source: ScriptSource,
+            unresolved: Set<Pair<ScriptPosition, String>>
+        ): Parsed? {
+            if (hoisting != null) return null
+            val hoisting = structure.hoisting(unresolved.associate { (position, name) -> source.offset(position) to name }) ?: return null
+            if (source.candidates.any { candidate ->
+                    val offset = source.offset(candidate.reference.start)
+                    offset in hoisting.region && !(candidate is LaterDeclaredFunctionReference && offset in hoisting.references)
+                }) return null
+            return Parsed(script, dependencies, structure, hoisting)
+        }
 
         /** The source of the compilation, see the parameters of [ScriptSource]. */
         fun source(
@@ -517,7 +561,8 @@ internal class ScriptSource private constructor(
             propertyTypes: Map<String, String> = emptyMap()
         ): ScriptSource = ScriptSource(
             script, dependencies, structure,
-            confirming, shadowedFunctionCopies, overloadingFunctionCopies, coroutineScopeCopies, propertyTypeProbes, propertyTypes
+            confirming, shadowedFunctionCopies, overloadingFunctionCopies, coroutineScopeCopies, propertyTypeProbes, propertyTypes,
+            hoisting
         )
 
     }
@@ -648,13 +693,16 @@ internal class ScriptSource private constructor(
 
     private val bodyDeclarations: List<Declaration>
 
+    /** See [ScriptStructure.localReferences]. */
+    private val localReferences: Map<String, Set<String>>
+
     init {
         val lineBounds = lineBounds(script)
         lineStarts = lineBounds.map { it.first }
         scriptLines = lineBounds.map { script.substring(it.first, it.last + 1) }
         unmatchedClosingBrace = structure.unmatchedClosingBrace?.let { position(it) }
         movedDeclarations = structure.movedDeclarations
-        returnsUnit = structure.endsWithMovedDeclaration
+        returnsUnit = structure.endsWithMovedDeclaration || hoisting?.endsWithHoistedFunction == true
         fun IntRange.toScriptReference(
             name: String = script.substring(first, last + 1)
         ) = ScriptReference(name, position(first), position(last + 1))
@@ -678,7 +726,10 @@ internal class ScriptSource private constructor(
                 candidate.scopeCalls.map { it.toScriptReference() }
             )
         }
-        laterDeclaredFunctionCandidates = structure.laterDeclaredFunctionCandidates.map { candidate ->
+        // calling the hoisted functions, as in the script
+        laterDeclaredFunctionCandidates = structure.laterDeclaredFunctionCandidates.filter {
+            hoisting == null || it.reference.offset !in hoisting.references
+        }.map { candidate ->
             LaterDeclaredFunctionReference(
                 candidate.reference.toScriptReference(),
                 position(candidate.offset).line,
@@ -714,6 +765,7 @@ internal class ScriptSource private constructor(
             CoroutineScopeReference(reference.toScriptReference(), position(offset).line, isFunction, reference.isInLambda, assignment?.let { position(it) })
         }
         bodyDeclarations = structure.bodyDeclarations
+        localReferences = structure.localReferences
         val deprecatedDependencies = if (confirming) {
             (laterDeclaredDependencyCandidates + laterDeclaredClassCandidates).mapTo(HashSet()) { it.reference.name }
         } else {
@@ -725,8 +777,11 @@ internal class ScriptSource private constructor(
         // the confirming compilation reports the deprecations, even if suppressed by the script
         val unsuppressed = BooleanArray(script.length)
         if (confirming || propertyTypeProbes) structure.suppressions.forEach { unsuppressed.fill(true, it.first, it.last + 1) }
-        val renamed = CharArray(script.length)
-        if (overloadingFunctionCopies) structure.renamedRanges.forEach { (range, char) -> renamed.fill(char, range.first, range.last + 1) }
+        val renamed = if (overloadingFunctionCopies && structure.renamedRanges.isNotEmpty()) {
+            CharArray(script.length).also { renamed -> structure.renamedRanges.forEach { (range, char) -> renamed.fill(char, range.first, range.last + 1) } }
+        } else {
+            null
+        }
         fun addLines(
             range: IntRange,
             keep: (offset: Int) -> Boolean
@@ -734,7 +789,7 @@ internal class ScriptSource private constructor(
             val bounds = lineBounds[line]
             lines += buildString {
                 bounds.forEach { offset ->
-                    +(if (keep(offset) && !unsuppressed[offset]) (if (renamed[offset] != '\u0000') renamed[offset] else script[offset]) else ' ')
+                    +(if (keep(offset) && !unsuppressed[offset]) (renamed?.get(offset)?.takeIf { it != '\u0000' } ?: script[offset]) else ' ')
                 }
             }
             mapping += line
@@ -743,6 +798,9 @@ internal class ScriptSource private constructor(
         val excluded = BooleanArray(script.length)
         movedDeclarations.forEach { excluded.fill(true, it.start, it.end) }
         structure.blankedRanges.forEach { excluded.fill(true, it.first, it.last + 1) }
+        val hoisted = BooleanArray(script.length)
+        hoisting?.functions?.values?.flatten()?.forEach { hoisted.fill(true, it.first, it.last + 1) }
+        val hoistedByLine = hoisting?.functions?.mapKeys { lineOf(it.key) }.orEmpty()
         val movedExcluded = BooleanArray(script.length)
         structure.movedBlankedRanges.forEach { movedExcluded.fill(true, it.first, it.last + 1) }
 
@@ -878,6 +936,18 @@ internal class ScriptSource private constructor(
             lines += "}"
             repeat(structure.coroutineScopeMembers.size + structure.scopeFunctionCopies.size + 2) { mapping += null }
         }
+        // each marked on the line preceding it, telling which one is called, see SHADOWING_FUNCTION
+        val shadowingMessagesByLine = if (markedOriginals) {
+            structure.shadowingFunctions.filterKeys { !excluded[it] && !hoisted[it] }.entries.associate { (start, offset) ->
+                lineOf(start) to shadowingFunctionMessage(offset)
+            }
+        } else {
+            emptyMap()
+        }
+        shadowingMessagesByLine.values.forEach { message ->
+            lines += "@kotlin.RequiresOptIn(${stringLiteral(message)}, level = RequiresOptIn.Level.WARNING) annotation class ${optInMarker(message)}"
+            mapping += null
+        }
         // qualified, as the script might declare a function of its name
         lines += if (coroutineScopeCopies) "$SCRIPT_BLOCK_START kotlin.with(this as $BODY_SCOPE_CLASS) {" else SCRIPT_BLOCK_START
         mapping += null
@@ -900,12 +970,26 @@ internal class ScriptSource private constructor(
         }
         (lineOf(headerEnd)..lineBounds.lastIndex).forEach { line ->
             addPropertyTypeStatements(line)
+            // separated, as the lines they are inserted between might be parsed as one expression otherwise
+            hoistedByLine[line]?.let { functions ->
+                lines += ";"
+                mapping += null
+                functions.forEach { function ->
+                    addLines(lineOf(function.first)..lineOf(function.last)) { it in function && !excluded[it] }
+                }
+                lines += ";"
+                mapping += null
+            }
             blockCopiesByLine[line]?.flatten()?.forEach { (messages, declaration) ->
                 lines += messages.joinToString(separator = " ", postfix = " ") { "@${optInMarker(it)}" } + declaration
                 mapping += null
             }
+            shadowingMessagesByLine[line]?.let { message ->
+                lines += "@${optInMarker(message)}"
+                mapping += null
+            }
             addLines(line..line) { offset ->
-                offset >= headerEnd && !excluded[offset]
+                offset >= headerEnd && !excluded[offset] && !hoisted[offset]
             }
         }
         addPropertyTypeStatements(null)
@@ -1009,6 +1093,12 @@ internal class ScriptSource private constructor(
         position(it.first) to position(it.last + 1)
     }
 
+    /** The 0-based line of the local function named in this opt-in [message], see [SHADOWING_FUNCTION]. */
+    fun shadowingFunctionLine(
+        message: String
+    ): Int? = shadowingFunctionOffset.find(message)?.groupValues?.get(1)?.toInt()
+        ?.let { position(it).line }
+
     /** The 0-based line of the moved function, or of its copy, named in this opt-in [message], see [shadowedFunctionCopies]. */
     fun shadowedFunctionLine(
         message: String
@@ -1025,6 +1115,44 @@ internal class ScriptSource private constructor(
         (it.name == name || name in it.destructuredNames) && (kind == null || it.kind == kind)
     }?.let {
         position(it.start).line to it.kind
+    }
+
+    /** The offset in the script of the [position]. */
+    fun offset(
+        position: ScriptPosition
+    ): Int = lineStarts[position.line] + position.column
+
+    /**
+     * The name of the local function containing the [position], which the local function of the [name] calls back,
+     * directly, or by the local functions it calls, so they cannot be declared one preceding the other, see [Parsed.hoisted].
+     */
+    fun callsBack(
+        name: String,
+        position: ScriptPosition
+    ): String? {
+        val offset = offset(position)
+        val caller = bodyDeclarations.find {
+            it.kind == DeclarationKind.FUNCTION && offset >= it.start && offset < it.end
+        }?.name ?: return null
+        return caller.takeIf {
+            caller != name && caller in listOf(name).closure { function -> localReferences[function].orEmpty().filter { it in localReferences } }
+        }
+    }
+
+    /**
+     * The names of the local properties, which the local function of the [name] refers to, declared between the [position] and the function,
+     * which are not visible to it there, in the order of their declaration.
+     */
+    fun laterAccessedProperties(
+        name: String,
+        position: ScriptPosition
+    ): List<String> {
+        val offset = offset(position)
+        val function = bodyDeclarations.find { it.kind == DeclarationKind.FUNCTION && it.name == name } ?: return emptyList()
+        val references = localReferences[name].orEmpty()
+        return bodyDeclarations.filter { it.kind == DeclarationKind.PROPERTY && it.start > offset && it.start < function.start }
+            .flatMap { listOfNotNull(it.name) + it.destructuredNames }
+            .filter { it in references }
     }
 
     private fun position(
@@ -1195,13 +1323,44 @@ private fun KtDeclaration.memberOnlyAnnotationEntries(): List<KtAnnotationEntry>
 }
 
 /**
+ * Whether the function is of an inferred type, and might call a function within the scope of an implicit receiver,
+ * like its receiver, or the one of a lambda, where the script, calling it before its declaration,
+ * resolves all of its functions after the members of the receivers, unlike a local function, see [ScriptStructure.hoisting].
+ */
+private fun KtNamedFunction.mightResolveAfterImplicitReceivers(): Boolean =
+    !hasBlockBody() && !hasDeclaredReturnType() && (
+        receiverTypeReference != null || modifierList?.contextReceiverList != null
+            || bodyExpression?.anyDescendantOfType<KtElement> { it is KtLambdaExpression || it is KtNamedFunction || it is KtClassOrObject } == true
+            || valueParameters.any { parameter -> parameter.defaultValue?.anyDescendantOfType<KtElement> { it is KtLambdaExpression || it is KtNamedFunction || it is KtClassOrObject } == true }
+    )
+
+/**
+ * The names this function refers to unqualified, like `f` of `f(1)`, unlike `x.f()`, or a named argument,
+ * unless it declares a value, or a function, of the same name, which might be referred to instead, like the parameter of a lambda.
+ */
+private fun KtNamedFunction.unboundReferences(): Set<String> {
+    val bound = collectDescendantsOfType<KtNamedDeclaration> { it is KtParameter || it is KtProperty || it is KtDestructuringDeclarationEntry || it is KtNamedFunction }
+        .mapNotNullTo(HashSet()) { it.name }
+    return collectDescendantsOfType<KtNameReferenceExpression> { reference ->
+        val parent = reference.parent
+        parent !is KtValueArgumentName && parent !is KtUserType
+                && (parent as? KtQualifiedExpression)?.selectorExpression != reference
+                && !(parent is KtCallExpression && (parent.parent as? KtQualifiedExpression)?.selectorExpression == parent)
+    }.mapTo(HashSet()) { it.getReferencedName() } - bound
+}
+
+/**
  * The declaration of a function of the same signature, which is never called, like `fun f(s: String): Nothing = kotlin.TODO()`,
  * without the default values of the parameters, which might refer to the local declarations,
  * of the return type inferred, if it is inferred in the script, and if it [keepsInferredType],
  * otherwise declared as `Nothing`, like the return type of a block body.
  */
 private fun KtNamedFunction.signature(
-    keepsInferredType: Boolean = true
+    keepsInferredType: Boolean = true,
+    /** The replacements of the names of the types, see [singleLineText]. */
+    renamed: Map<PsiElement, String> = emptyMap(),
+    /** The receiver of the copy, like `kotlinx.coroutines.CoroutineScope`, unless the function has one already. */
+    receiver: String? = null
 ): String? = if (
     typeParameters.any { it.nameIdentifier == null } || valueParameters.any { it.typeReference == null || it.name == null }
 ) {
@@ -1213,25 +1372,29 @@ private fun KtNamedFunction.signature(
         +" "
     }
     +"fun "
-    +typeParameters.copiedTypeParameters()
+    +typeParameters.copiedTypeParameters(renamed)
     receiverTypeReference?.let {
         +"("
-        +it.singleLineText()
+        +it.singleLineText(renamed)
         +")."
+    } ?: receiver?.let {
+        +it
+        +"."
     }
     +"`$name`("
-    +valueParameters.copiedParameters()
+    +valueParameters.copiedParameters(renamed)
     +")"
     // keeping the type of the call, which might be an argument of another one, inferred if it is inferred from the expression,
     // as the compiler prefers the script functions of the inferred types to the other ones, see CLAUDE.md,
-    // so the confirming compilation reports that the inferred `Nothing` should be declared, an error ignored there
+    // so the confirming compilation reports that the inferred `Nothing` should be declared, an error ignored there,
+    // as declaring it would lose this preference, while `Nothing` applies wherever the type of the original might be expected
     when {
-        typeReference != null -> +": ${typeReference!!.singleLineText()}"
+        typeReference != null -> +": ${typeReference!!.singleLineText(renamed)}"
         !isOfInferredType() || !keepsInferredType -> +": Nothing"
     }
     typeConstraintList?.let {
         +" where "
-        +it.singleLineText()
+        +it.singleLineText(renamed)
     }
     +" = kotlin.TODO()"
 }
@@ -1306,6 +1469,44 @@ private fun KtClass.constructorCopies(
 
 /** The prefix of the name of the class replacing a local class in the copies of its constructors, see [constructorCopies]. */
 private const val LATER_DECLARED_CLASS_PREFIX = "_LaterDeclaredClass_"
+
+/**
+ * The declaration of the class replacing this local class, named [name], in the copies preceding its declaration, see [ScriptSource.laterDeclaredDependencyCandidates],
+ * of the same type parameters and supertypes, of the names of their types [renamed], like `abstract class P_ : Runnable` of `class P(val v: Int) : Runnable`,
+ * so the copies apply to the same arguments as the declarations referring to the local class, as no value preceding it is of the local class.
+ * The supertypes are not initialized, an error ignored there, as the class is never instantiated.
+ */
+private fun KtClassOrObject.placeholder(
+    name: String,
+    renamed: Map<PsiElement, String>
+): String = buildString {
+    +"abstract class $name"
+    typeParameterList?.let { +it.singleLineText(renamed) }
+    superTypeListEntries.mapNotNull { it.typeReference }.takeIf { it.isNotEmpty() }?.let { types ->
+        +" : "
+        +types.joinToString { it.singleLineText(renamed) }
+    }
+    typeConstraintList?.let {
+        +" where "
+        +it.singleLineText(renamed)
+    }
+}
+
+/** The prefix of the name of the class replacing a local class in the copies preceding its declaration, see [placeholder]. */
+private const val PLACEHOLDER_CLASS_PREFIX = "_InvisibleClass_"
+
+/** These elements, and the ones they refer to, transitively. */
+private inline fun <T> List<T>.closure(
+    references: (T) -> List<T>
+): Set<T> {
+    val closure = LinkedHashSet<T>()
+    var elements = distinct()
+    while (elements.isNotEmpty()) {
+        closure += elements
+        elements = elements.flatMap { references(it) }.distinct().filter { it !in closure }
+    }
+    return closure
+}
 
 /**
  * The overriding declaration of the member of `Any` of the same signature as this function, like `override fun toString(): kotlin.String`,
@@ -1852,6 +2053,46 @@ private class DeclaredNames {
 }
 
 /**
+ * A statement of the script body staying in the script block, see [ScriptStructure.hoisting],
+ * from its [start], without the comments preceding it, like of a declaration, to its [end].
+ */
+private class BlockStatement(
+    private val psi: KtExpression,
+    val start: Int,
+    val end: Int,
+    /** The name of the local function it declares, if any. */
+    val function: String?,
+    /** Whether it declares a local function, which might be hoisted, see [ScriptStructure.hoisting]. */
+    val isHoistable: Boolean,
+    /**
+     * The index of the first statement of the script block sharing its line, preceding which the hoisted functions are inserted,
+     * so the inserted lines do not split another statement, like the copies, see [ScriptStructure.blockCopies].
+     */
+    val insertion: Int,
+    /** The offset where the functions hoisted preceding it are inserted, like the copies, preceding its line. */
+    val insertionOffset: Int
+) {
+    /** The names it refers to, or declares, by their offsets, recognized only when hoisting, see [ScriptStructure.hoisting]. */
+    val identifiers: Map<Int, String> by lazy {
+        psi.collectDescendantsOfType<LeafPsiElement> { it.elementType == KtTokens.IDENTIFIER }
+            .associate { it.startOffset to KtPsiUtil.unquoteIdentifier(it.text) }
+    }
+}
+
+/**
+ * The local functions declared preceding the statements calling them, see [ScriptStructure.hoisting]:
+ * the ranges of these functions, each following the ones it calls, by the offsets preceding the lines of which they are declared,
+ * the offsets of the [references] to them, which were unresolved, the [region] of the script, which the hoisting changes,
+ * and whether the script ends with a hoisted function, so it returns `Unit`, see [ScriptSource.returnsUnit].
+ */
+private class Hoisting(
+    val functions: Map<Int, List<IntRange>>,
+    val references: Set<Int>,
+    val region: IntRange,
+    val endsWithHoistedFunction: Boolean
+)
+
+/**
  * The top-level structure of the script, recognized with the Kotlin parser:
  * the header of file annotations, package and imports, and the declarations
  * which cannot be local to the script block, see [ScriptSource].
@@ -1945,6 +2186,9 @@ private class ScriptStructure(
     /** The names of the local functions overloading the [overloadedFunctions], renamed with these letters, see [ScriptSource.overloadingFunctionCopies]. */
     val renamedRanges: List<Pair<IntRange, Char>>
 
+    /** The offsets of the names of the local functions, which the [shadowedFunctionCandidates] might call, marked by the confirming compilation, by their starts, see [SHADOWING_FUNCTION]. */
+    val shadowingFunctions: Map<Int, Int>
+
     /** See [ScriptSource.coroutineScopeCandidates]. */
     val coroutineScopeCandidates: List<CoroutineScopeCandidate>
 
@@ -1991,6 +2235,27 @@ private class ScriptStructure(
 
     /** The modifiers of the moved declarations, which are not applicable to the members of the script class, like `const`. */
     val movedBlankedRanges = mutableListOf<IntRange>()
+
+    /** The statements of the script block, see [hoisting]. */
+    private val blockStatements: List<BlockStatement>
+
+    /** The offsets of the declarations of the script, by the names they declare, see [hoisting]. */
+    private val declarationStarts: Map<String, List<Int>>
+
+    /** The offsets of the operator functions of the script, see [hoisting]. */
+    private val operatorStarts: List<Int>
+
+    /**
+     * The names of the local declarations of the script body, which each local function refers to, by its name,
+     * unless it declares a value or a function of the same name, see [ScriptSource.callsBack].
+     */
+    val localReferences: Map<String, Set<String>>
+
+    /** The names of the local variables of the script body, the `var` ones, see [hoisting]. */
+    private val localVariables: Set<String>
+
+    /** Whether the last statement of the script stays in the script block, see [Hoisting.endsWithHoistedFunction]. */
+    private val endsWithBlockStatement: Boolean
 
     private val declaredNames = DeclaredNames()
 
@@ -2267,6 +2532,11 @@ private class ScriptStructure(
                 }
             }
         }
+        // the local overloads, one of which the candidates call, starting their lines, so that they can be marked on the lines preceding them
+        val ambiguousNames = shadowedFunctionCandidates.filter { it.isFunction && it.locals.size > 1 }.mapTo(HashSet()) { it.reference.name }
+        shadowingFunctions = overloadingFunctions.filterKeys { it in ambiguousNames }.values.flatten().map { it.second }.filter { function ->
+            script.substring(script.lastIndexOf('\n', function.start - 1) + 1, function.start).isBlank()
+        }.associate { it.start to it.line() }
         // unlike the extension properties, which do not apply without their receivers
         val coroutineScopeDeclarations = moved.filter {
             (it.kind == DeclarationKind.FUNCTION || (it.kind == DeclarationKind.PROPERTY && (it.psi as? KtProperty)?.receiverTypeReference == null))
@@ -2415,9 +2685,76 @@ private class ScriptStructure(
                 .filterNot { it.refersToTypes(invisibleClasses) }
                 .mapNotNull { function -> function.signature()?.let { message(function) to it } }
         }
+        // the local classes of the names declared once, which the placeholders replace, see placeholderCopies
+        val uniqueLocalClasses = localClasses.groupBy { it.name!! }.filterValues { it.size == 1 }.mapValues { it.value.single() }
+        /**
+         * The references of these parts of a declaration to the local classes of these [invisibleClasses] names, unqualified, unless shadowed by its type parameters,
+         * which are the only declarations taking precedence over the local classes of the script body there, as the classes declared later than them are not visible,
+         * or `null`, if it refers to them qualified, like `P.Inner`, which their placeholders do not declare, or to a class of a name declared more than once.
+         */
+        fun List<PsiElement>.invisibleClassReferences(
+            invisibleClasses: Set<String>,
+            typeParameters: List<KtTypeParameter>
+        ): List<Pair<PsiElement, ParsedDeclaration>>? {
+            val shadowed = typeParameters.mapNotNullTo(HashSet()) { it.name }
+            return flatMap { part -> part.collectDescendantsOfType<KtUserType> { it.qualifier == null && it.referencedName in invisibleClasses && it.referencedName !in shadowed } }
+                .map { type ->
+                    val name = type.referenceExpression?.getReferencedNameElement()
+                    val localClass = uniqueLocalClasses[type.referencedName]
+                    if (name == null || localClass == null || type.parent is KtUserType) return null
+                    name to localClass
+                }
+        }
+        /** The references of the declaration of the local class, which its placeholder copies, see [placeholder]. */
+        fun ParsedDeclaration.placeholderReferences(
+            invisibleClasses: Set<String>
+        ) = (psi as KtClassOrObject).let { declaration ->
+            (listOfNotNull(declaration.typeParameterList, declaration.typeConstraintList) + declaration.superTypeListEntries.mapNotNull { it.typeReference })
+                .invisibleClassReferences(invisibleClasses, declaration.typeParameters)
+        }
+        /**
+         * The copies of the local functions of each name, like [functionCopies], while the ones referring to the local classes not visible there
+         * refer to their placeholders instead, declared preceding them, of the same type parameters and supertypes, see [placeholder],
+         * so they apply to the same arguments, as no value preceding a local class is of it.
+         * These are the extensions of the coroutine scope of the script body, ranking below the local functions, like the copies following the classes,
+         * so a call applying to both, like `f(null)` of `fun f(x: P?)` following `class P`, is not ambiguous,
+         * and above the dependencies, the members of the receivers of the script block.
+         * The ones of a function at the places, where different classes it refers to are not visible, rank the same,
+         * so a call applying to both of them is ambiguous, see README.
+         */
+        val placeholderCopies = { name: String, invisibleClasses: Set<String> ->
+            localFunctionsByName[name].orEmpty().flatMap { function ->
+                val declaration = function.psi as KtNamedFunction
+                // the types of the signature, unlike the default values replaced in the copy, of a function without a receiver, like the dependency
+                val references = (
+                    declaration.valueParameters.mapNotNull { it.typeReference }
+                        + listOfNotNull(declaration.typeParameterList, declaration.typeConstraintList, declaration.typeReference)
+                ).invisibleClassReferences(invisibleClasses, declaration.typeParameters) ?: return@flatMap emptyList()
+                if (references.isEmpty()) return@flatMap listOfNotNull(declaration.signature()?.let { LATER_DECLARED_FUNCTION to it })
+                // also the ones their declarations refer to, like their supertypes, by the classes
+                val classReferences = HashMap<ParsedDeclaration, List<Pair<PsiElement, ParsedDeclaration>>>()
+                references.map { it.second }.closure { localClass ->
+                    classReferences.getOrPut(localClass) { localClass.placeholderReferences(invisibleClasses) ?: return@flatMap emptyList() }.map { it.second }
+                }
+                // named after the first declared of the classes it replaces, itself or the ones it refers to, which tells which of them are replaced,
+                // so the copies at the places, where the same ones are not visible, like preceding and following an unrelated class, declare the same placeholders
+                val placeholderNames = classReferences.keys.associateWith { localClass ->
+                    val replaced = listOf(localClass).closure { classReferences.getValue(it).map { (_, referred) -> referred } }
+                    "`$PLACEHOLDER_CLASS_PREFIX${replaced.minOf { statementIndices.getValue(it.psi) }}_${localClass.name}`"
+                }
+                fun List<Pair<PsiElement, ParsedDeclaration>>.renamed() = associate { (name, localClass) -> name to placeholderNames.getValue(localClass) }
+                // in the order of the declarations, which refer only to the ones preceding them
+                val placeholders = classReferences.entries.sortedBy { statementIndices.getValue(it.key.psi) }.map { (localClass, classReferences) ->
+                    (localClass.psi as KtClassOrObject).placeholder(placeholderNames.getValue(localClass), classReferences.renamed())
+                }
+                val copy = declaration.signature(renamed = references.renamed(), receiver = "kotlinx.coroutines.CoroutineScope")
+                    ?: return@flatMap emptyList()
+                (placeholders + copy).map { LATER_DECLARED_FUNCTION to it }
+            }
+        }
         laterDeclaredFunctionCopies = copies(
             laterDeclaredCandidatesByStatement.mapValues { (_, candidates) -> candidates.filter { it.isFunction }.map { it.reference } },
-            functionCopies(localFunctionsByName) { LATER_DECLARED_FUNCTION }
+            placeholderCopies
         )
         // the local functions, also the extension ones, by the indices of their statements, unless named like the dependencies, see laterDeclaredDependencyCandidates
         val namedFunctions = buildMap<String, MutableList<Pair<Int, ParsedDeclaration>>> {
@@ -2535,7 +2872,115 @@ private class ScriptStructure(
                 declaration.accessors.forEach { blankedRanges += it.startOffset until it.endOffset }
             }
         }
+        // the names declared once, as the overloads, or the declarations of other kinds, would be resolved together in the script
+        val declarationCounts = declarations.flatMap { listOfNotNull(it.name) + it.destructuredNames }.groupingBy { it }.eachCount()
+        val blockIndices = statements.indices.filter { declarationsByPsi[statements[it]] !in moved }
+        val insertions = blockIndices.map { copyPlace(it).first }
+        var insertion = 0
+        blockStatements = blockIndices.mapIndexed { index, statementIndex ->
+            val statement = statements[statementIndex]
+            val declaration = declarationsByPsi[statement]
+            val function = declaration?.takeIf { it.kind == DeclarationKind.FUNCTION }?.name
+            BlockStatement(
+                psi = statement,
+                start = declaration?.start ?: statement.startOffsetSkippingComments,
+                end = statement.endOffset,
+                function = function,
+                isHoistable = function != null && !declaration.isOperator && declarationCounts[function] == 1 && function !in dependencyNames
+                        && !(declaration.psi as KtNamedFunction).mightResolveAfterImplicitReceivers(),
+                insertion = (if (index > 0 && insertions[index] == insertions[index - 1]) insertion else index).also { insertion = it },
+                insertionOffset = insertions[index]
+            )
+        }
+        localVariables = statements.filter { declarationsByPsi[it] !in moved }.flatMap { statement ->
+            when (statement) {
+                is KtProperty -> listOfNotNull(statement.name).takeIf { statement.isVar }.orEmpty()
+                is KtDestructuringDeclaration -> statement.entries.mapNotNull { it.name }.takeIf { statement.isVar }.orEmpty()
+                else -> emptyList()
+            }
+        }.toSet()
+        endsWithBlockStatement = statements.isNotEmpty() && declarationsByPsi[statements.last()] !in moved
+        declarationStarts = declarations.flatMap { declaration ->
+            (listOfNotNull(declaration.name) + declaration.destructuredNames).map { it to declaration.start }
+        }.groupBy({ it.first }) { it.second }
+        operatorStarts = declarations.filter { it.isOperator }.map { it.start }
+        val bodyNames = declarations.filter { it !in moved }.flatMapTo(HashSet()) { listOfNotNull(it.name) + it.destructuredNames }
+        localReferences = blockStatements.zip(blockIndices).mapNotNull { (statement, index) ->
+            val function = statements[index] as? KtNamedFunction ?: return@mapNotNull null
+            statement.function?.let { it to function.unboundReferences().filterTo(HashSet()) { name -> name in bodyNames } }
+        }.toMap()
     }
+
+    /**
+     * The local functions, which the [unresolved] references, by their offsets, call, declared later in the script block,
+     * which are not visible there, while in the script they are, declared preceding the statements calling them instead,
+     * each preceding the hoisted functions calling it, unless they call each other,
+     * or `null`, if it might change how any other reference is resolved, or if another reference is unresolved.
+     *
+     * The statements gaining the visibility of a hoisted function might refer to its name only by these unresolved references,
+     * which refer to it in the script, as nothing else of this name is visible there,
+     * unlike e.g. a member of an implicit receiver, which a local function takes precedence over.
+     * A hoisted function does not refer to the declarations in between, which are not visible there anymore,
+     * while the script resolves them after the implicit receivers, as declared later than the statement calling it, if its type is inferred,
+     * nor to the local variables, whose smart casts it might affect,
+     * and it is not an operator, nor any declaration in between, as the operators are referred to without their names, like `a + b`.
+     * A hoisted function of an inferred type, which the script resolves after the implicit receivers, as called before its declaration,
+     * has no scopes of implicit receivers, see [mightResolveAfterImplicitReceivers].
+     */
+    fun hoisting(
+        unresolved: Map<Int, String>
+    ): Hoisting? {
+        if (unresolved.isEmpty()) return null
+        val functionIndices = blockStatements.indices.filter { blockStatements[it].function != null }
+            .associateBy { blockStatements[it].function!! }
+        // by the callers, which precede the callees, so each caller is hoisted already, when its callees are
+        val requests = unresolved.map { (offset, name) ->
+            val caller = (blockStatements.binarySearchBy(offset) { it.start }.let { if (it >= 0) it else -it - 2 })
+                .takeIf { it >= 0 && offset < blockStatements[it].end } ?: return null
+            val callee = functionIndices[name]?.takeIf { it > caller && blockStatements[it].isHoistable } ?: return null
+            caller to callee
+        }.sortedBy { it.first }
+        // the index of the statement, which each hoisted function precedes
+        val targets = mutableMapOf<Int, Int>()
+        requests.forEach { (caller, callee) ->
+            val target = blockStatements[targets[caller] ?: caller].insertion
+            targets[callee] = minOf(targets[callee] ?: target, target)
+        }
+        val hoistedFunctions = targets.keys.associateBy { blockStatements[it].function!! }
+        // the declarations in between, declared later than the statement calling it, which the script resolves after the implicit receivers,
+        // if they are not resolved yet, while the local declarations are resolved before them, like the hoisted functions
+        targets.forEach { (index, target) ->
+            val hoisted = blockStatements[index]
+            val between = blockStatements[target].insertionOffset until hoisted.start
+            if (
+                operatorStarts.any { it in between }
+                || hoisted.identifiers.values.any { name -> declarationStarts[name].orEmpty().any { it in between } }
+                || hoisted.identifiers.values.any { it in localVariables }
+            ) return null
+        }
+        // the hoisted functions preceding each statement, each following the ones it calls, which are declared later than it,
+        // as it does not refer to the ones declared in between
+        val functions = targets.entries.groupBy({ it.value }) { it.key }.mapValues { (_, indices) -> indices.sortedDescending() }
+        val positions = IntArray(blockStatements.size)
+        blockStatements.indices.flatMap { index ->
+            functions[index].orEmpty() + listOf(index).filter { it !in targets }
+        }.forEachIndexed { position, index -> positions[index] = position }
+        // the statements gaining the visibility of the hoisted functions declared later, referring to them only by the unresolved references
+        blockStatements.forEachIndexed { index, statement ->
+            if (statement.identifiers.any { (offset, name) ->
+                    hoistedFunctions[name]?.let { hoisted -> hoisted > index && positions[hoisted] < positions[index] } == true && unresolved[offset] != name
+                }) return null
+        }
+        return Hoisting(
+            functions = functions.entries.associate { (target, indices) ->
+                blockStatements[target].insertionOffset to indices.map { blockStatements[it].start until blockStatements[it].end }
+            },
+            references = unresolved.keys,
+            region = functions.keys.minOf { blockStatements[it].insertionOffset } until targets.keys.maxOf { blockStatements[it].end },
+            endsWithHoistedFunction = endsWithBlockStatement && blockStatements.lastIndex in targets
+        )
+    }
+
 
     /** The [propertyTypes] which are types indeed, which the copies of the [untypedProperties] are declared of, by their names, see [ScriptSource.propertyTypes]. */
     fun copiedPropertyTypes(

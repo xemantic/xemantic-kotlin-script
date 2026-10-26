@@ -1671,7 +1671,7 @@ class ScriptExecutorTest {
     }
 
     @Test
-    fun `should hint to declare function before its use when it accesses local declarations of the script body`() = runTest {
+    fun `should call function accessing local declarations of the script body before its declaration`() = runTest {
         // given
         val script = """
             val prefix = ">"
@@ -1686,12 +1686,443 @@ class ScriptExecutorTest {
 
         // then
         result should {
+            be<ScriptResult.Value>()
+            have(value == ">x")
+        }
+    }
+
+    @Test
+    fun `should hint to declare function before its use when it accesses local declarations of the script body declared after the use`() = runTest {
+        // given
+        val script = """
+            val formatted = format("x")
+            val prefix = ">"
+            fun format(text: String) = prefix + text
+            formatted
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                script.kts:2:17: error: Unresolved reference 'format'.
+                script.kts:1:17: error: Unresolved reference 'format'.
                   | val formatted = <error>format</error>("x")
-                  hint: 'format' is declared at line 3, while the functions of the script body are visible only after their declaration - move it before line 2.
+                  hint: 'format' is declared at line 3, and accesses 'prefix' declared after this call, while the declarations of the script body are visible only after their declaration - move them all before line 1, or pass 'prefix' as a parameter.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call function accessing local declarations of the script body from function declared before it`() = runTest {
+        // given
+        val script = """
+            val factor = 2
+            fun a(x: Int) = b(x) + 1
+            fun b(x: Int) = x * factor
+            a(3)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 7)
+        }
+    }
+
+    @Test
+    fun `should call chain of functions accessing local declarations of the script body declared in reverse order`() = runTest {
+        // given
+        val script = $$"""
+            val name = "World"
+            fun greet() = "${salutation()}, ${target()}!"
+            val unrelated = 1
+            fun salutation() = if (target() == name) "Hello" else "Hi"
+            fun target() = name
+            println(greet())
+            greet() + unrelated
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "Hello, World!1")
+        }
+    }
+
+    @Test
+    fun `should return Unit from script ending with function accessing local declarations called before its declaration`() = runTest {
+        // given
+        val script = """
+            val (w, h) = 3 to 4
+            val area = computeArea()
+            fun computeArea() = w * h
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == Unit)
+        }
+    }
+
+    @Test
+    fun `should report frames at lines of function accessing local declarations called before its declaration`() = runTest {
+        // given
+        val script = """
+            val limit = 1
+            fun a(x: Int) = b(x)
+            fun b(x: Int): Int = if (x > limit) error("too big: ${'$'}x") else x
+            a(2)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs $$"""
+                java.lang.IllegalStateException: too big: 2
+                  at b(script.kts:3)
+                  | fun b(x: Int): Int = if (x > limit) error("too big: $x") else x
+                  at a(script.kts:2)
+                  | fun a(x: Int) = b(x)
+                  at <script body>(script.kts:4)
+                  | a(2)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint that mutually recursive functions accessing local declarations of the script body cannot call each other`() = runTest {
+        // given
+        val script = """
+            val limit = 10
+            fun even(n: Int): Boolean = if (n >= limit) true else odd(n + 1)
+            fun odd(n: Int): Boolean = if (n >= limit) false else even(n + 1)
+            even(0)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:55: error: Unresolved reference 'odd'.
+                  | fun even(n: Int): Boolean = if (n >= limit) true else <error>odd</error>(n + 1)
+                  hint: 'odd' is declared at line 3, and calls 'even' back, while the functions of the script body accessing its local declarations are visible only after their declaration, so they cannot call each other - pass the local declarations they access as parameters instead.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not call function accessing local declarations before its declaration when local class declared in between calls own member of its name`() = runTest {
+        // given
+        val script = $$"""
+            val factor = 2
+            fun a() = b()
+            class C { fun x() = b()
+             fun b() = "inner" }
+            fun b() = "local $factor"
+            a() + C().x()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:11: error: Unresolved reference 'b'.
+                  | fun a() = <error>b</error>()
+                  hint: 'b' is declared at line 5, while the functions of the script body are visible only after their declaration - move it before line 2.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not call function accessing local declarations before its declaration when local class declared in between calls constructor property of its name`() = runTest {
+        // given
+        val script = $$"""
+            val factor = 2
+            fun a() = b()
+            class C(val b: () -> String) { fun x() = b() }
+            fun b() = "local $factor"
+            a() + C { "inner" }.x()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:11: error: Unresolved reference 'b'.
+                  | fun a() = <error>b</error>()
+                  hint: 'b' is declared at line 4, while the functions of the script body are visible only after their declaration - move it before line 2.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not call function accessing local declarations before its declaration when it calls member of lambda receiver named like function declared in between`() = runTest {
+        // given
+        val script = $$"""
+            val factor = 2
+            class Obj { fun b() = "member" }
+            fun a() = c()
+            fun b() = "local $factor"
+            fun c() = with(Obj()) { b() }
+            a()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:11: error: Unresolved reference 'c'.
+                  | fun a() = <error>c</error>()
+                  hint: 'c' is declared at line 5, while the functions of the script body are visible only after their declaration - move it before line 3.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call function accessing local declarations before its declaration from lambda with receiver without member of its name`() = runTest {
+        // given
+        val script = $$"""
+            val factor = 2
+            class Obj { fun x() = "member" }
+            fun a() = b()
+            val r = with(Obj()) { b() }
+            fun b() = "local $factor"
+            a() + r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "local 2local 2")
+        }
+    }
+
+    @Test
+    fun `should call function accessing local declarations before its declaration from statement sharing line ending multiline string`() = runTest {
+        // given
+        val script = "val factor = 2\nval text = \"\"\"\nmulti\n\"\"\"; fun a() = b() + text.length\nfun b() = factor\na()"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 9)
+        }
+    }
+
+    @Test
+    fun `should not call function accessing local declarations before its declaration when it calls function declared in between`() = runTest {
+        // given
+        val script = $$"""
+            val factor = 2
+            fun main() = report()
+            fun format(x: Int) = "${x * factor}"
+            fun report() = format(1)
+            main()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:14: error: Unresolved reference 'report'.
+                  | fun main() = <error>report</error>()
+                  hint: 'report' is declared at line 4, while the functions of the script body are visible only after their declaration - move it before line 2.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not call function accessing local declarations before its declaration when it calls other function than the local one of its name declared later`() = runTest {
+        // given
+        val script = $$"""
+            val factor = 2
+            fun a() = b()
+            fun b() = print(factor)
+            fun print(x: Any) = "printed $x $factor"
+            a()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:11: error: 'print' does not refer to the function of the script body declared at line 4, which is not visible before its declaration.
+                  | fun b() = <error>print</error>(factor)
+                  hint: 'print' is declared at line 4, while the functions of the script body are visible only after their declaration - move it before line 3.
+
+                script.kts:2:11: error: Unresolved reference 'b'.
+                  | fun a() = <error>b</error>()
+                  hint: 'b' is declared at line 3, while the functions of the script body are visible only after their declaration - move it before line 2.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not call function of inferred type accessing local declarations before its declaration when it calls function within lambda with receiver`() = runTest {
+        // given
+        val script = $$"""
+            val factor = 2
+            class Obj { fun b() = "member" }
+            fun b() = "local $factor"
+            fun a() = c()
+            fun c() = with(Obj()) { b() } + factor
+            val x = d()
+            fun d() = run { with(Obj()) { b() } } + factor
+            a() + x
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:11: error: Unresolved reference 'c'.
+                  | fun a() = <error>c</error>()
+                  hint: 'c' is declared at line 5, while the functions of the script body are visible only after their declaration - move it before line 4.
+
+                script.kts:6:9: error: Unresolved reference 'd'.
+                  | val x = <error>d</error>()
+                  hint: 'd' is declared at line 7, while the functions of the script body are visible only after their declaration - move it before line 6.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call function of declared type accessing local declarations before its declaration when it calls function within lambda with receiver`() = runTest {
+        // given
+        val script = $$"""
+            val factor = 2
+            class Obj { fun b() = "member" }
+            fun b() = "local $factor"
+            fun a() = c()
+            fun c(): String = with(Obj()) { b() } + factor
+            a()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "local 22")
+        }
+    }
+
+    @Test
+    fun `should not hint that function calls back the one calling it when it only binds a value of its name`() = runTest {
+        // given
+        val script = $$"""
+            val k = "!"
+            fun format(x: Int) = render(x)
+            fun render(x: Int) = listOf(x).joinToString { format -> "$format$k" }
+            format(1)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:22: error: Unresolved reference 'render'.
+                  | fun format(x: Int) = <error>render</error>(x)
+                  hint: 'render' is declared at line 3, while the functions of the script body are visible only after their declaration - move it before line 2.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not call function accessing local variable before its declaration`() = runTest {
+        // given
+        val script = """
+            var count = 0
+            fun a() = b()
+            fun b() = ++count
+            a()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:11: error: Unresolved reference 'b'.
+                  | fun a() = <error>b</error>()
+                  hint: 'b' is declared at line 3, while the functions of the script body are visible only after their declaration - move it before line 2.
             """.trimIndent()
         }
     }
@@ -1949,8 +2380,8 @@ class ScriptExecutorTest {
     fun `should hint to declare function before its use when it accesses destructured local declarations`() = runTest {
         // given
         val script = """
-            val (w, h) = 3 to 4
             println(area())
+            val (w, h) = 3 to 4
             fun area() = w * h
         """.trimIndent()
         val executor = ScriptExecutor()
@@ -1963,9 +2394,9 @@ class ScriptExecutorTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                script.kts:2:9: error: Unresolved reference 'area'.
+                script.kts:1:9: error: Unresolved reference 'area'.
                   | println(<error>area</error>())
-                  hint: 'area' is declared at line 3, while the functions of the script body are visible only after their declaration - move it before line 2.
+                  hint: 'area' is declared at line 3, and accesses 'w', 'h' declared after this call, while the declarations of the script body are visible only after their declaration - move them all before line 1, or pass 'w', 'h' as parameters.
             """.trimIndent()
         }
     }
@@ -4138,6 +4569,23 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should call function of the script instead of callable dependency of the same name like a regular script with the dependencies as members of its base class`() = runTest {
+        // given
+        val scripts = listOf(
+            "fun x(): Int = 10\nx()",
+            "val r = x()\nfun x(): Int = 10\nr"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, listOf(dependency<() -> Int>("x") { 7 })) }
+
+        // then
+        // a regular script receiving the dependency as a provided property would return 7 instead (#101)
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(10, 10))
+    }
+
+    @Test
     fun `should report error at declaration moved out of the script body calling dependency with invoke operator of value class parameter shadowed by local function`() = runTest {
         // given
         val script = """
@@ -4736,6 +5184,170 @@ class ScriptExecutorTest {
             be<ScriptResult.Value>()
             have(value == 2)
         }
+    }
+
+    @Test
+    fun `should report error at call of dependency before local function of the same name referring to local class declared later`() = runTest {
+        // given
+        val script = """
+            val p = "!"
+            val r = f(emptyList())
+            class P
+            fun f(xs: List<P>) = "local" + p
+            r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<(List<Any?>) -> String>("f") { "dep" }))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 4.
+                  | val r = <error>f</error>(emptyList())
+                  hint: declare the function before line 2, or rename it.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report errors at calls of dependencies around local classes declared later which local function of the same name refers to`() = runTest {
+        // given
+        val scripts = listOf(
+            // within the supertype of the class
+            "val p = \"!\"\nval a = f(1)\nabstract class S { fun g() = f(null) }\nclass P : S() { val q = p }\nfun f(x: P?) = \"local\" + p\na + P().g()",
+            // following the class, preceded by a call the function does not apply to
+            "val p = \"!\"\nval a = f(1)\nclass P\nval c = f(emptyList())\nfun f(xs: List<P>) = \"local\" + p\na + c",
+            "val p = \"!\"\nval a = f(listOf(1))\nclass P\nval r = f(null)\nfun f(x: P?) = \"local\" + p\na + r",
+            "val p = \"!\"\nval a = f(listOf(1))\nclass P\nval r = f(mutableListOf(P()))\nfun f(xs: MutableList<P>) = \"local\" + p\na + r",
+            // preceding and following it, also another class
+            "val p = \"!\"\nval a = f(null)\nclass P\nval b = f(null)\nval c = f(P())\nfun f(x: P?) = \"local\" + p\na + b + c",
+            "val p = \"!\"\nval a = f(null)\nclass X { val q = p }\nval b = f(null)\nclass P { val q = p }\nfun f(x: P?) = \"local\" + p\na + b",
+            "val p = \"!\"\nval a = f(1)\nclass P { val q = p }\nval b = f(P(), null)\nclass R { val q = p }\nfun f(x: P?, y: R?) = \"local\" + p\na + b",
+            // applying through the supertypes of the class, declared before the call, or later
+            "val p = \"!\"\nval c = Comparator<Runnable> { _, _ -> 0 }\nval r = f(c)\nclass P(val v: Int) : Runnable { override fun run() {} }\nfun f(c: Comparator<in P>) = \"local\" + p\nr",
+            "val p = \"!\"\nopen class Base\nval c = Comparator<Base> { _, _ -> 0 }\nval a = f(c)\nclass P : Base() { val q = p }\nfun f(c: Comparator<in P>) = \"local\" + p\na",
+            "val p = \"!\"\nval c = Comparator<Runnable> { _, _ -> 0 }\nval a = f(c)\nabstract class S : Runnable\nclass P : S() { override fun run() {} }\nfun f(c: Comparator<in P>) = \"local\" + p\na",
+            // of the type parameters, or the bound of the type parameter of the function
+            "val p = \"!\"\nval a = f(emptyList())\nclass P<out T : Number>(val t: T)\nfun f(xs: List<P<Int>>) = \"local\" + p\na",
+            "val p = \"!\"\nval a = f(null)\nclass P { val q = p }\nfun <T : P> f(x: T?) = \"local\" + p\na",
+            // the overloads declared before the class compete with the ones following it, as in the script
+            "val p = \"!\"\nfun h(x: Int): Int = 1 + p.length\nval a = f(\"x\")\nclass P { val q = p }\nfun h(x: Any): String = \"s\" + p\nval b = f(h(1))\nfun f(xs: List<P>) = \"localP\" + p\nfun f(n: Int) = \"localInt\" + p\na + b",
+            // with a multiline literal
+            "val p = \"!\"\nval r = f(null)\nclass P(val s: String = \"\"\"a\nb\"\"\") { val t = p }\nval c = x\nfun f(x: P?) = \"local\" + p\nval x = \"localx\"\nr + c",
+            // within the class, or following it on the same line, without a value of the class
+            "val p = \"!\"\nval a = f(1)\nclass P { val q = p; fun g() = f(null) }\nfun f(x: P?) = \"local\" + p\na + P().g()",
+            "val p = \"!\"\nval a = f(1)\nclass P { val q = p }; val b = f(null)\nfun f(x: P?) = \"local\" + p\na + b"
+        )
+        val dependencies = listOf(
+            dependency<(Any?) -> String>("f") { "dep" }, dependency<(Any?) -> String>("g") { "depg" }, dependency("x", "depx")
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, dependencies) }
+
+        // then
+        assert(results.map { result -> (result as? ScriptResult.Error)?.message?.lines()?.filter { it.startsWith("script.kts") } } == listOf(
+            listOf("script.kts:3:30: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 5."),
+            // calling the dependency, as the confirmed calls are not explained
+            listOf(
+                "script.kts:4:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 5.",
+                "script.kts:4:11: error: Cannot infer type for type parameter 'T'. Specify it explicitly."
+            ),
+            listOf("script.kts:4:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 5."),
+            listOf("script.kts:4:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 5."),
+            listOf(
+                "script.kts:2:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 6.",
+                "script.kts:4:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 6.",
+                "script.kts:5:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 6."
+            ),
+            listOf(
+                "script.kts:2:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 6.",
+                "script.kts:4:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 6."
+            ),
+            listOf(
+                "script.kts:4:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 6.",
+                "script.kts:4:16: error: Too many arguments for 'fun invoke(p1: Any?): String'."
+            ),
+            listOf("script.kts:3:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 5."),
+            listOf("script.kts:4:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 6."),
+            listOf("script.kts:3:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 6."),
+            listOf(
+                "script.kts:2:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 4.",
+                "script.kts:2:11: error: Cannot infer type for type parameter 'T'. Specify it explicitly."
+            ),
+            listOf("script.kts:2:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 4."),
+            listOf("script.kts:6:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 7."),
+            listOf(
+                "script.kts:2:9: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 6.",
+                "script.kts:5:9: error: 'x' refers to the dependency, as the property 'x' of the script body is declared later, at line 7."
+            ),
+            listOf("script.kts:3:32: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 4."),
+            listOf("script.kts:3:32: error: 'f' refers to the dependency, as the function 'f' of the script body is declared later, at line 4.")
+        ))
+    }
+
+    @Test
+    fun `should call dependency within local class which local function of the same name declared later refers to when passing value of the class`() = runTest {
+        // given
+        val scripts = listOf(
+            "val p = \"!\"\nval a = f(1)\nclass P { val q = p; fun g() = f(P()) }\nfun f(x: P) = \"local\" + p\na + P().g()",
+            "val p = \"!\"\nval a = f(1)\nclass P { val q = p }; val b = f(P())\nfun f(x: P) = \"local\" + p\na + b"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, listOf(dependency<(Any?) -> String>("f") { "dep" })) }
+
+        // then
+        // unlike in a regular script, calling the local function, see README
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("depdep", "depdep"))
+    }
+
+    @Test
+    fun `should call dependencies around local classes declared later which local function of the same name does not apply to`() = runTest {
+        // given
+        val scripts = listOf(
+            // the local declarations between the call and the class, and the calls of the other dependencies within the class
+            "val p = \"!\"\nval a = f(1)\nclass R { fun f(x: Int) = \"recv\" }\nclass P { val q = p; fun g() = with(R()) { f(2) } }\nfun f(x: P?) = \"local\" + p\na + P().g()",
+            "val p = \"!\"\nval a = f(1)\nclass P { val q = p; fun h() = g(2) }\nfun f(x: P?) = \"local\" + p\nfun g(s: String) = \"localg\" + p\na + P().h()",
+            "val p = \"!\"\nval r = f(listOf(1))\nclass P\nfun f(xs: List<P>) = \"local\" + p\nr",
+            "val p = \"!\"\nval a = f(listOf(1))\nclass P\nval r = f(listOf(2))\nfun f(xs: List<P>) = \"local\" + p\na + r",
+            "val p = \"!\"\nval c = Comparator<Runnable> { _, _ -> 0 }\nval r = f(c)\nclass P(val v: Int)\nfun f(c: Comparator<in P>) = \"local\" + p\nr",
+            // within the classes, which the function refers to through the other ones, or not at all, or following them on another line
+            "val p = \"!\"\nval a = f(1)\nclass Q { val q = p; fun h() = f(2) }\nclass P(val q: Q)\nfun f(xs: List<P>) = \"local\" + p\na + Q().h()",
+            "val p = \"!\"\nval a = f(1)\nabstract class S { fun g() = f(listOf(2)) }\nclass P : S() { val q = p }\nfun f(x: P?) = \"local\" + p\na + P().g()",
+            "val p = \"!\"\nval a = f(\"s\")\nclass P { val q = p; fun g() = f(\"t\") }\nfun <P : Number> f(x: P) = \"local\" + p\na + P().g()",
+            "val p = \"!\"\nval a = f(1)\nclass P { val q = p }; val b = listOf(\n  1); val c = f(3)\nfun f(xs: List<P>) = \"local\" + p\na + c",
+            // referring also to the local classes declared before the calls
+            "val p = \"!\"\nclass Q { val q = p }\nval a = f(\"s\")\nclass P { val q = p }\nfun f(q: Q?, xs: List<P>? = null) = \"local\" + p\na",
+            "val p = \"!\"\nclass Q { val q = p }\nval a = f(1)\nclass P { val q = p }\nfun f(q: Q, xs: List<P>? = null) = \"local\" + p\na",
+            "val p = \"!\"\nclass Q { val q = p }\nval a = f(listOf(\"s\"))\nclass P { val q = p }\nfun f(xs: List<Q>, ys: List<P>? = null) = \"local\" + p\na",
+            "val p = \"!\"\nclass Q { val q = p }\nval a = f(1)\nclass P { val q = p }\nfun f(q: Q) = \"localQ\" + p\nfun f(x: P) = \"localP\" + p\na",
+            // a qualified type named like a local class, and a call within the class resolved to its member
+            "val p = \"!\"\nval a = f(1)\nclass Pair { val q = p; fun g() = f(2) }\nfun f(x: kotlin.Pair<Int, Int>) = \"local\" + p\na + Pair().g()",
+            "val p = \"!\"\nval a = f(1)\nabstract class S { fun f(x: Int) = \"member\" }\nclass P : S() { val q = p; fun g() = f(2) }\nfun f(xs: List<P>) = \"local\" + p\na + P().g()",
+            // within the lambdas of the scope functions of the script instance, declaring the dependency
+            "val p = \"!\"\nval a = run { f(null) }\nclass P\nfun f(x: P?) = \"local\" + p\na",
+            "val p = \"!\"\nval b = run { f(null) }\nclass P\nval c = run { f(null) }\nfun f(x: P?) = \"local\" + p\nb + c"
+        )
+        val dependencies = listOf(
+            dependency<(Any?) -> String>("f") { "dep" }, dependency<(Any?) -> String>("g") { "depg" }, dependency("x", "depx")
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, dependencies) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(
+            "deprecv", "depdepg", "dep", "depdep", "dep", "depdep", "depdep", "depdep", "depdep", "dep", "dep", "dep", "dep", "depdep", "depmember",
+            "dep", "depdep"
+        ))
     }
 
     @Test
@@ -6475,7 +7087,103 @@ class ScriptExecutorTest {
     }
 
     @Test
-    fun `should report call resolved to local overload naming the overloads of the script body and the moved one a regular script calls`() = runTest {
+    fun `should call the most specific of local overloads, while a regular script prefers the one of inferred type`() = runTest {
+        // given
+        val calls = listOf(
+            "fun h() = show(1)\nh()",
+            "val r = show(1)\nr",
+            "show(1)",
+            "listOf(1).map { show(it) }.single()"
+        )
+        val scripts = calls.map { call ->
+            "fun show(x: Int): String = \"int\"\nfun show(x: Any) = \"any\"\n$call"
+        }
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // a known difference, a regular script returns "any" (#100)
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("int", "int", "int", "int"))
+    }
+
+    @Test
+    fun `should call local overload from default value of parameter of function of inferred type, while a regular script calls the most specific one`() = runTest {
+        // given
+        val script = """
+            val p = "!".trim()
+            fun show(x: Int): String = "int"
+            fun show(x: Any) = "any${'$'}p"
+            sealed interface S
+            class T : S { fun f(): String = show(1) }
+            fun h(x: String = show(1)) = x
+            h() + T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        // a known difference, a regular script returns "intint" (#102)
+        assert((result as? ScriptResult.Value)?.value == "any!int")
+    }
+
+    @Test
+    fun `should report call resolved to local overload naming only the overload of the script body it calls`() = runTest {
+        // given
+        val script = """
+            val p = "!".trim()
+            fun show(x: String) = "str${'$'}p"
+            fun show(x: Any) = "any${'$'}p"
+            fun show(x: Int): String = "int"
+            sealed interface S
+            class T : S { fun f(): String = show(1) }
+            fun h(): String = show(1)
+            h() + T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:7:19: error: 'show' refers to the function of the script body declared at line 3, instead of its overload declared at line 4, which a regular script calls.
+                  | fun h(): String = <error>show</error>(1)
+                  hint: 'show' (line 4) is compiled outside of the script body, unlike its overload declared at line 3, which hides it there - rename one of them.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report call resolved to local overload naming all the overloads of the script body when the one it calls is not known`() = runTest {
+        // given
+        val script = """
+            val p = "!".trim(); fun show(x: String) = "str${'$'}p"
+            fun show(x: Int): String = "int"
+            1; fun show(x: Any) = "any${'$'}p"
+            sealed interface S
+            class T : S { fun f(): String = show(1) }
+            fun h(): String = show(1)
+            h() + T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert((result as? ScriptResult.Error)?.message?.lines()?.firstOrNull() ==
+                "script.kts:6:19: error: 'show' refers to one of the functions of the script body declared at lines 1, 3, instead of its overload declared at line 2, which a regular script calls.")
+    }
+
+    @Test
+    fun `should report call resolved to local overload naming the overload of the script body it calls and the moved one a regular script calls`() = runTest {
         // given
         val script = """
             val p = "!".trim()
@@ -6497,9 +7205,9 @@ class ScriptExecutorTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                script.kts:8:1: error: 'show' refers to one of the functions of the script body declared at lines 2, 4, instead of its overload declared at line 5, which a regular script calls.
+                script.kts:8:1: error: 'show' refers to the function of the script body declared at line 4, instead of its overload declared at line 5, which a regular script calls.
                   | <error>show</error>(1) + T().f()
-                  hint: 'show' (line 5) is compiled outside of the script body, unlike its overloads declared at lines 2, 4, which hide it there - rename one of them.
+                  hint: 'show' (line 5) is compiled outside of the script body, unlike its overload declared at line 4, which hides it there - rename one of them.
             """.trimIndent()
         }
     }
