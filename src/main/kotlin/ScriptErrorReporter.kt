@@ -40,6 +40,9 @@ private val declarationCapturingScript = Regex("(Object|Enum class|Enum entry|In
  */
 private val backendCrash = Regex("Exception while generating code for (?:.* fun (\\S+) .*|.*) declared in (.+):")
 
+/** A part of a binary or canonical class name, like `$Lid` of `_$Box$Lid`, possibly empty, like in `_$$$result$1$1$Dog`. */
+private val classNamePart = Regex("([.$])([\\p{L}\\p{N}_]*)")
+
 internal fun Iterable<ScriptDiagnostic>.filterNonIgnorable() = filterNot { diagnostic ->
     diagnostic.severity == ScriptDiagnostic.Severity.DEBUG && listOf(
         "Using JDK home inferred from java.home",
@@ -60,6 +63,23 @@ internal class ScriptErrorReporter(
     private val scriptClassName: String? = null,
     private val blockClassName: String? = null
 ) {
+
+    /**
+     * The name of a class qualified by the script class, like `_.Color` of `Enum.valueOf`, or `_$Box$Lid` of `ClassCastException`,
+     * and of the default string representation, as long as the binary name continues, not preceded by a part of another name,
+     * matching the parts with a single character class, as a repeated group would overflow the stack on a long message.
+     */
+    private val scriptQualifiedName = scriptClassName?.let {
+        // also the element class of an array, like `[L_$Circle;`
+        Regex("(?:(?<=\\[L)|(?<![\\p{L}\\p{N}_.$]))${Regex.escape(it)}([.$][\\p{L}\\p{N}_.$]*)")
+    }
+
+    /** The names qualified by the script class written in the string literals of the script, like `_.Color`, which are kept. */
+    private val writtenQualifiedNames by lazy {
+        source.stringLiterals.flatMapTo(HashSet()) { literal ->
+            scriptQualifiedName?.findAll(literal)?.mapNotNull { it.toDeclaredClassName()?.first }.orEmpty()
+        }
+    }
 
     fun toFailureMessage(
         diagnostics: List<ScriptDiagnostic>
@@ -224,8 +244,45 @@ internal class ScriptErrorReporter(
         }
         message?.let {
             +": "
-            +it
+            +it.withoutScriptClassName()
         }
+    }
+
+    /**
+     * The names of the classes declared in the script qualified by the script class, like `_.Color.BLUE`, as named in the script, like `Color.BLUE`,
+     * also without the synthetic names of the classes enclosing a local class, like `_$$$result$1$1$Dog`,
+     * but not the names written in the string literals of the script.
+     * The text built at runtime to look like such a name, like `"_" + ".Color"`, cannot be told from it, and is rewritten as well.
+     */
+    private fun String.withoutScriptClassName(): String = scriptQualifiedName?.replace(this) { match ->
+        match.toDeclaredClassName()?.takeIf { (qualified) -> qualified !in writtenQualifiedNames }?.second ?: match.value
+    } ?: this
+
+    /**
+     * The name qualified by the script class up to the classes declared in the script, like `_.Color` of `_.Color.BLUE`,
+     * and the name as in the script, like `Color.BLUE`, or `null`, if it does not name a class declared in the script.
+     * A canonical name, separated by dots, starts with the declared class, while a binary name might start with the synthetic names,
+     * like `$$result$1$1$make`, which might be named like a class of the script as well, so the last sequence of the declared classes is taken.
+     */
+    private fun MatchResult.toDeclaredClassName(): Pair<String, String>? {
+        val parts = classNamePart.findAll(groupValues[1]).map { it.groupValues[1] to it.groupValues[2] }.toList()
+        val classNames = source.classNames
+        val enclosingClassNames = source.enclosingClassNames
+        val first = if (parts.first().first == ".") {
+            0.takeIf { parts.first().second in classNames } ?: return null
+        } else {
+            val last = parts.indexOfLast { (_, name) -> name in classNames }.takeIf { it != -1 } ?: return null
+            // unlike e.g. a function named like a class, enclosing a local class
+            generateSequence(last) { index -> (index - 1).takeIf { it >= 0 && parts[it].second in enclosingClassNames } }.last().takeIf { start ->
+                // the synthetic names are separated by dollars only
+                parts.subList(1, start + 1).none { (separator) -> separator == "." }
+            } ?: return null
+        }
+        var last = first
+        while (parts[last].second in enclosingClassNames && parts.getOrNull(last + 1)?.second in classNames) last++
+        fun List<Pair<String, String>>.join() = joinToString("") { (separator, name) -> separator + name }
+        return scriptClassName + parts.take(last + 1).join() to
+                parts.subList(first, last + 1).joinToString(".") { it.second } + parts.drop(last + 1).join()
     }
 
     private fun Class<*>.className(): String = when {
@@ -257,7 +314,7 @@ internal class ScriptErrorReporter(
             }
             when {
                 scriptLine != null -> Frame(
-                    location = "${element.functionName()}(script.kts:${scriptLine + 1})",
+                    location = "${element.functionName(scriptLine)}(script.kts:${scriptLine + 1})",
                     sourceLine = source.scriptLines[scriptLine]
                 )
                 // like a static initializer of an object declared in the script
@@ -291,9 +348,12 @@ internal class ScriptErrorReporter(
 
     /**
      * The name of the function of this script frame, in terms of the script,
-     * e.g. `Checker.check`, `<script body>` or `<lambda>`.
+     * e.g. `Checker.check`, `<script body>`, `<lambda>` or `<get-x>` of a property accessor,
+     * the accessors told by the 0-based [scriptLine] of the frame, if any.
      */
-    private fun StackTraceElement.functionName(): String {
+    private fun StackTraceElement.functionName(
+        scriptLine: Int? = null
+    ): String {
         val owner = when {
             className == blockClassName || className == scriptClassName -> ""
             blockClassName != null && className.startsWith("$blockClassName$") ->
@@ -312,8 +372,13 @@ internal class ScriptErrorReporter(
         return when {
             isLambda || (type != null && type.all { it.isDigit() }) -> "<lambda>"
             type == null && className == blockClassName && methodParts == listOf("invokeSuspend") -> "<script body>"
-            type == null -> methodParts.last()
-            else -> "$type.${methodParts.last()}"
+            else -> {
+                // the local functions of an accessor are named after it, like `getX$inner`
+                val function = scriptLine?.takeIf { methodParts.size == 1 }?.let { line ->
+                    this@ScriptErrorReporter.source.accessorName(methodParts.single(), owner, line)
+                } ?: methodParts.last()
+                if (type == null) function else "$type.$function"
+            }
         }
     }
 

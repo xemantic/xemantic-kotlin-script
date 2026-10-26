@@ -1097,6 +1097,305 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report enum constant not found without the name of the script class`() = runTest {
+        // given
+        val script = """
+            enum class Color { RED, GREEN }
+            Color.valueOf("BLUE")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.withoutJdkLineNumbers() sameAs """
+                java.lang.IllegalArgumentException: No enum constant Color.BLUE
+                  at java.lang.Enum.valueOf(Enum.java:<line>)
+                  at <script body>(script.kts:2)
+                  | Color.valueOf("BLUE")
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report enum constant not found without the name of the script class in a package`() = runTest {
+        // given
+        val script = """
+            package com.acme
+            enum class Color { RED, GREEN }
+            Color.valueOf("BLUE")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.withoutJdkLineNumbers() sameAs """
+                java.lang.IllegalArgumentException: No enum constant Color.BLUE
+                  at java.lang.Enum.valueOf(Enum.java:<line>)
+                  at <script body>(script.kts:3)
+                  | Color.valueOf("BLUE")
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report class cast of classes declared in the script without the name of the script class`() = runTest {
+        // given
+        val script = """
+            sealed interface Shape
+            class Circle : Shape
+            class Square : Shape
+            val shape: Shape = Circle()
+            shape as Square
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.withoutHashCodes() sameAs """
+                java.lang.ClassCastException: class Circle cannot be cast to class Square (Circle and Square are in unnamed module of loader org.jetbrains.kotlin.scripting.compiler.plugin.impl.CompiledScriptClassLoader @<hash>)
+                  at <script body>(script.kts:5)
+                  | shape as Square
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report class cast of local classes of the script body without their synthetic names`() = runTest {
+        // given
+        val script = """
+            open class Animal
+            class Dog : Animal()
+            val animal: Any = Animal()
+            animal as Dog
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.withoutHashCodes() sameAs """
+                java.lang.ClassCastException: class Animal cannot be cast to class Dog (Animal and Dog are in unnamed module of loader org.jetbrains.kotlin.scripting.compiler.plugin.impl.CompiledScriptClassLoader @<hash>)
+                  at <script body>(script.kts:4)
+                  | animal as Dog
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report default string representations of the classes declared in the script without the name of the script class`() = runTest {
+        // given
+        val script = $$"""
+            class Box { class Lid }
+            object Registry
+            class Holder { companion object }
+            class Note
+            throw IllegalStateException("${Box.Lid()} $Registry ${Holder.Companion} ${Note()} ${Box::class}")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.withoutHashCodes().lines().first() sameAs
+                    "java.lang.IllegalStateException: Box.Lid@<hash> Registry@<hash> Holder.Companion@<hash> Note@<hash> class Box"
+        }
+    }
+
+    @Test
+    fun `should report the message of the cause without the name of the script class`() = runTest {
+        // given
+        val script = """
+            enum class Color { RED }
+            fun parse(name: String): Color = try {
+                Color.valueOf(name)
+            } catch (e: IllegalArgumentException) {
+                throw IllegalStateException("cannot parse", e)
+            }
+            parse("BLUE")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.withoutJdkLineNumbers() sameAs """
+                java.lang.IllegalStateException: cannot parse
+                  at parse(script.kts:5)
+                  |     throw IllegalStateException("cannot parse", e)
+                  at <script body>(script.kts:7)
+                  | parse("BLUE")
+                Caused by: java.lang.IllegalArgumentException: No enum constant Color.BLUE
+                  at java.lang.Enum.valueOf(Enum.java:<line>)
+                  at parse(script.kts:3)
+                  |     Color.valueOf(name)
+                  at <script body>(script.kts:7)
+                  | parse("BLUE")
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should keep names in exception messages which the script wrote itself`() = runTest {
+        // given
+        val script = """
+            enum class Color { RED }
+            throw IllegalStateException("_.Color _.Shape my_.Color _Color __.Color x._.Color")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first() sameAs
+                    "java.lang.IllegalStateException: _.Color _.Shape my_.Color _Color __.Color x._.Color"
+        }
+    }
+
+    @Test
+    fun `should report enum constant not found without the name of the script class written in a comment or a longer name`() = runTest {
+        // given
+        val script = """
+            // see _.Color
+            object Palette_ { enum class Color { RED } }
+            enum class Color { RED }
+            val red = Palette_.Color.RED
+            Color.valueOf("BLUE")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first() sameAs "java.lang.IllegalArgumentException: No enum constant Color.BLUE"
+        }
+    }
+
+    @Test
+    fun `should report class cast of local class declared in a function named like a class of the script`() = runTest {
+        // given
+        val script = """
+            interface Shape
+            class Square : Shape
+            fun Shape(): Shape {
+                class Impl : Shape
+                return Impl()
+            }
+            Shape() as Square
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first().substringBefore(" (") sameAs
+                    "java.lang.ClassCastException: class Impl cannot be cast to class Square"
+        }
+    }
+
+    @Test
+    fun `should report class cast of arrays of classes declared in the script without the name of the script class`() = runTest {
+        // given
+        val script = """
+            sealed interface Shape
+            class Circle : Shape
+            class Square : Shape
+            val shapes: Any = arrayOf(Circle())
+            shapes as Array<Square>
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first().substringBefore(" (") sameAs
+                    "java.lang.ClassCastException: class [LCircle; cannot be cast to class [LSquare;"
+        }
+    }
+
+    @Test
+    fun `should report class cast of local classes without the synthetic names named like a class of the script`() = runTest {
+        // given
+        val script = """
+            class result
+            fun make(): Any {
+                open class Animal
+                class Dog : Animal()
+                return Animal()
+            }
+            make() as result
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first().substringBefore(" (") sameAs
+                    "java.lang.ClassCastException: class Animal cannot be cast to class result"
+        }
+    }
+
+    @Test
+    fun `should report exception with a very long message resembling the name of the script class`() = runTest {
+        // given
+        val script = """
+            error("_" + ".".repeat(100_000) + "${'$'}".repeat(100_000))
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message.lines().first() sameAs
+                    "java.lang.IllegalStateException: _" + ".".repeat(100_000) + "$".repeat(100_000)
+        }
+    }
+
+    /** The line numbers of the frames of the JDK, like `Enum.java:293`, which differ between its versions. */
+    private fun String.withoutJdkLineNumbers() = replace(Regex("(\\w+\\.java):\\d+\\)"), "$1:<line>)")
+
+    /** Like `@1b6d3586` of the default string representation, which differs on every run. */
+    private fun String.withoutHashCodes() = replace(Regex("@[0-9a-f]+\\b"), "@<hash>")
+
+    @Test
     fun `should report suppressed exceptions`() = runTest {
         // given
         val script = """
@@ -2274,6 +2573,359 @@ class ScriptExecutorTest {
                   at <script body>(script.kts:2)
                   | lambda()
             """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frame of property getter by the property name`() = runTest {
+        // given
+        val script = """
+            val g: Int get() = error("boom")
+            g
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: boom
+                  at <get-g>(script.kts:1)
+                  | val g: Int get() = error("boom")
+                  at <script body>(script.kts:2)
+                  | g
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frame of property setter by the property name`() = runTest {
+        // given
+        val script = """
+            var s: Int
+                get() = 0
+                set(value) { error("cannot set ${'$'}value") }
+            s = 42
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: cannot set 42
+                  at <set-s>(script.kts:3)
+                  |     set(value) { error("cannot set ${'$'}value") }
+                  at <script body>(script.kts:4)
+                  | s = 42
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frames of accessors of boolean property named with is prefix by the property name`() = runTest {
+        // given
+        val script = """
+            var isOn: Boolean
+                get() = error("cannot get")
+                set(value) { isOn }
+            isOn = true
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: cannot get
+                  at <get-isOn>(script.kts:2)
+                  |     get() = error("cannot get")
+                  at <set-isOn>(script.kts:3)
+                  |     set(value) { isOn }
+                  at <script body>(script.kts:4)
+                  | isOn = true
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frame of extension property getter by the property name`() = runTest {
+        // given
+        val script = """
+            val String.shout: String get() = error("cannot shout ${'$'}this")
+            "hello".shout
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: cannot shout hello
+                  at <get-shout>(script.kts:1)
+                  | val String.shout: String get() = error("cannot shout ${'$'}this")
+                  at <script body>(script.kts:2)
+                  | "hello".shout
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frame of class member property getter by the class and the property name`() = runTest {
+        // given
+        val script = """
+            class Foo {
+                val x: Int get() = error("no x")
+            }
+            Foo().x
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: no x
+                  at Foo.<get-x>(script.kts:2)
+                  |     val x: Int get() = error("no x")
+                  at <script body>(script.kts:4)
+                  | Foo().x
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frame of delegated property getter by the property name and of the delegate by its function`() = runTest {
+        // given
+        val script = """
+            class Boom {
+                operator fun getValue(thisRef: Any?, property: Any?): Int = error("boom")
+            }
+            class Foo {
+                val x by Boom()
+            }
+            Foo().x
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: boom
+                  at Boom.getValue(script.kts:2)
+                  |     operator fun getValue(thisRef: Any?, property: Any?): Int = error("boom")
+                  at Foo.<get-x>(script.kts:5)
+                  |     val x by Boom()
+                  at <script body>(script.kts:7)
+                  | Foo().x
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frame of property getter with JVM name by the property name`() = runTest {
+        // given
+        val script = """
+            class Foo {
+                val x: Int
+                    @JvmName("fetchX") get() = error("no x")
+            }
+            Foo().x
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: no x
+                  at Foo.<get-x>(script.kts:3)
+                  |         @JvmName("fetchX") get() = error("no x")
+                  at <script body>(script.kts:5)
+                  | Foo().x
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frame of function named like property getter by the function name`() = runTest {
+        // given
+        val script = """
+            val g: Int get() = 1
+            fun getG(times: Int): Int = error("boom ${'$'}times")
+            getG(g)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: boom 1
+                  at getG(script.kts:2)
+                  | fun getG(times: Int): Int = error("boom ${'$'}times")
+                  at <script body>(script.kts:3)
+                  | getG(g)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frame of member function named like getter of property of another class in the same line by the function name`() = runTest {
+        // given
+        val script = """
+            class P { val x: Int get() = 1 }; class Q { val y: Int get() = 2; fun getX(): Int = error("boom") }
+            Q().getX()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: boom
+                  at Q.getX(script.kts:1)
+                  | class P { val x: Int get() = 1 }; class Q { val y: Int get() = 2; fun getX(): Int = error("boom") }
+                  at <script body>(script.kts:2)
+                  | Q().getX()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frame of function of nested class named like getter of property of nested class of the same name by the function name`() = runTest {
+        // given
+        val script = """
+            class A { class N { val x: Int get() = 1 } }; class B { class N { fun getX(): Int = error("boom") } }
+            B.N().getX()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: boom
+                  at N.getX(script.kts:1)
+                  | class A { class N { val x: Int get() = 1 } }; class B { class N { fun getX(): Int = error("boom") } }
+                  at <script body>(script.kts:2)
+                  | B.N().getX()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frame of function of local class named like getter of property of local class of the same name by the function name`() = runTest {
+        // given
+        val script = """
+            fun a() { class L { val x: Int get() = 1 } }; fun b(): Int { class L { fun getX(): Int = error("boom") }; return L().getX() }
+            b()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: boom
+                  at L.getX(script.kts:1)
+                  | fun a() { class L { val x: Int get() = 1 } }; fun b(): Int { class L { fun getX(): Int = error("boom") }; return L().getX() }
+                  at b(script.kts:1)
+                  | fun a() { class L { val x: Int get() = 1 } }; fun b(): Int { class L { fun getX(): Int = error("boom") }; return L().getX() }
+                  at <script body>(script.kts:2)
+                  | b()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frames of functions named like property getter called by the getter by the function names`() = runTest {
+        // given
+        val script = """
+            val g: Int get() { class L { fun getG(): Int = error("boom") }; return L().getG() }
+            val x: Int get() = C().getX(); class C { fun getX(): Int = g }
+            x
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.IllegalStateException: boom
+                  at L.getG(script.kts:1)
+                  | val g: Int get() { class L { fun getG(): Int = error("boom") }; return L().getG() }
+                  at <get-g>(script.kts:1)
+                  | val g: Int get() { class L { fun getG(): Int = error("boom") }; return L().getG() }
+                  at C.getX(script.kts:2)
+                  | val x: Int get() = C().getX(); class C { fun getX(): Int = g }
+                  at <get-x>(script.kts:2)
+                  | val x: Int get() = C().getX(); class C { fun getX(): Int = g }
+                  at <script body>(script.kts:3)
+                  | x
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report frame of uninitialized lateinit property getter by the property name`() = runTest {
+        // given
+        val script = """
+            class Foo { lateinit var x: String }
+            Foo().x
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            // the first frame is the one of the standard library throwing the exception
+            assert(message.endsWith("""
+                  at Foo.<get-x>(script.kts:1)
+                  | class Foo { lateinit var x: String }
+                  at <script body>(script.kts:2)
+                  | Foo().x
+            """.trimIndent().prependIndent("  ")))
         }
     }
 
