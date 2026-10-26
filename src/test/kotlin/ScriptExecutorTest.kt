@@ -23,19 +23,28 @@ import com.xemantic.kotlin.test.be
 import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CompletableJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.currentTime
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.jetbrains.kotlin.config.JvmTarget
 import java.util.concurrent.Executors
 import kotlin.reflect.full.createType
 import kotlin.reflect.typeOf
+import kotlin.script.experimental.api.CompiledScript
+import kotlin.script.experimental.api.ResultWithDiagnostics
+import kotlin.script.experimental.api.ScriptCompilationConfiguration
+import kotlin.script.experimental.api.SourceCode
+import kotlin.script.experimental.jvmhost.JvmScriptCompiler
 import kotlin.test.Test
 import kotlin.time.Clock
 import kotlin.time.Duration.Companion.hours
@@ -70,6 +79,16 @@ class OptionalUser {
 
 class DurationLogger {
     operator fun invoke(duration: kotlin.time.Duration) = "dep:$duration"
+}
+
+/** Fails with whatever the [failure] throws, instead of compiling the script. */
+class FailingCompiler(
+    private val failure: suspend () -> Nothing
+) : JvmScriptCompiler() {
+    override suspend fun invoke(
+        script: SourceCode,
+        scriptCompilationConfiguration: ScriptCompilationConfiguration
+    ): ResultWithDiagnostics<CompiledScript> = failure()
 }
 
 class ScriptExecutorTest {
@@ -2575,6 +2594,91 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report internal failure of the compiler as compilation error`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            compiler = FailingCompiler { throw IllegalStateException("compiler crashed") }
+        )
+
+        // when
+        val result = executor.execute("42")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                error: The script could not be compiled because of an internal failure of the compiler: java.lang.IllegalStateException: compiler crashed
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report compilation cancelled by the compiler while the caller is active as compilation error`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            compiler = FailingCompiler { throw CancellationException("compiler cancelled") }
+        )
+
+        // when
+        val result = executor.execute("42")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                error: The script could not be compiled because of an internal failure of the compiler: java.lang.IllegalStateException: The compilation of the script was cancelled, caused by: java.util.concurrent.CancellationException: compiler cancelled
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun `should report internal failure of the compiler as compilation error to all the callers waiting for the cached compilation`() = runTest {
+        // given
+        val failing = CompletableDeferred<Unit>()
+        val executor = DefaultScriptExecutor(
+            // so the waiter is waiting in the cache before the compiler fails
+            dispatcher = StandardTestDispatcher(testScheduler),
+            compilationCacheSize = 10,
+            compiler = FailingCompiler {
+                failing.await()
+                throw IllegalStateException("compiler crashed")
+            }
+        )
+        val owner = async { executor.execute("42") }
+        runCurrent()
+        val waiter = async { executor.execute("42") }
+        runCurrent()
+
+        // when
+        failing.complete(Unit)
+        val results = listOf(owner.await(), waiter.await())
+
+        // then
+        val (ownerResult, waiterResult) = results
+        assert(ownerResult is ScriptResult.Error && ownerResult.phase == ExecutionPhase.COMPILATION)
+        assert(waiterResult is ScriptResult.Error && waiterResult.phase == ExecutionPhase.COMPILATION)
+        assert(waiterResult.message == ownerResult.message)
+        assert(executor.compilationCount == 1)
+    }
+
+    @Test
+    fun `should not report VirtualMachineError of the compiler as compilation error`() = runTest {
+        // given
+        val executor = DefaultScriptExecutor(
+            compiler = FailingCompiler { throw OutOfMemoryError("compiler out of memory") }
+        )
+
+        // when
+        val failure = runCatching { executor.execute("42") }.exceptionOrNull()
+
+        // then
+        assert(failure is OutOfMemoryError && failure.message == "compiler out of memory")
+    }
+
+    @Test
     fun `should run script body with the class loader of the script as the context class loader`() = runTest {
         // given
         val script = """
@@ -2663,6 +2767,182 @@ class ScriptExecutorTest {
                 script.kts:2:11: error: Nested class 'Nested' captures the script class instance. Try to use the explicit 'inner' modifier for both the nested 'Nested' and outer 'Outer'.
                   |     class <error>Nested</error> { fun greet() = greeting }
                   hint: 'Nested' is compiled outside of the script body, where a nested class cannot access the dependencies, nor the functions of the script - pass them as parameters.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at callable reference of moved class to function of script crashing compiler`() = runTest {
+        // given
+        val script = """
+            fun log(m: String) = m
+            sealed interface S
+            class T : S {
+                fun f() = listOf("a").map(::log)
+                fun g() = listOf("b").map(::log)
+            }
+            class U : S { fun h() = listOf("c").map(::log) }
+            T().f() + U().h()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:31: error: The compiler crashed generating the callable reference '::log'.
+                  |     fun f() = listOf("a").map(<error>::log</error>)
+                  hint: 'T' is compiled outside of the script body, where a callable reference to 'log' of the script crashes the compiler - replace it with a lambda using 'log'.
+
+                script.kts:5:31: error: The compiler crashed generating the callable reference '::log'.
+                  |     fun g() = listOf("b").map(<error>::log</error>)
+                  hint: 'T' is compiled outside of the script body, where a callable reference to 'log' of the script crashes the compiler - replace it with a lambda using 'log'.
+
+                script.kts:7:41: error: The compiler crashed generating the callable reference '::log'.
+                  | class U : S { fun h() = listOf("c").map(<error>::log</error>) }
+                  hint: 'U' is compiled outside of the script body, where a callable reference to 'log' of the script crashes the compiler - replace it with a lambda using 'log'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not report callable reference of moved class to its own member as crashing compiler`() = runTest {
+        // given
+        val script = """
+            fun log(m: String) = m
+            fun greet(s: String) = s
+            sealed interface S
+            class T(val log: String) : S {
+                fun f() = ::log
+                fun g() = listOf("a").map(::greet)
+            }
+            T("x").f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:6:31: error: The compiler crashed generating the callable reference '::greet'.
+                  |     fun g() = listOf("a").map(<error>::greet</error>)
+                  hint: 'T' is compiled outside of the script body, where a callable reference to 'greet' of the script crashes the compiler - replace it with a lambda using 'greet'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at callable reference of moved class to extension function of script crashing compiler`() = runTest {
+        // given
+        val script = """
+            fun String.up() = uppercase()
+            sealed interface S
+            class T : S { fun f() = listOf("a").map(String::up) }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:41: error: The compiler crashed generating the callable reference 'String::up'.
+                  | class T : S { fun f() = listOf("a").map(<error>String::up</error>) }
+                  hint: 'T' is compiled outside of the script body, where a callable reference to 'up' of the script crashes the compiler - replace it with a lambda using 'up'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at callable reference of moved class crashing compiler in script with package`() = runTest {
+        // given
+        val script = """
+            package foo
+            fun log(m: String) = m
+            sealed interface S
+            class T : S { fun f() = listOf("a").map(::log) }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:41: error: The compiler crashed generating the callable reference '::log'.
+                  | class T : S { fun f() = listOf("a").map(<error>::log</error>) }
+                  hint: 'T' is compiled outside of the script body, where a callable reference to 'log' of the script crashes the compiler - replace it with a lambda using 'log'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at callable reference split across lines crashing compiler`() = runTest {
+        // given
+        val script = """
+            fun String.up() = uppercase()
+            sealed interface S
+            class T : S {
+                fun f() = listOf("a").map(String
+                    ::up)
+            }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:31: error: The compiler crashed generating the callable reference 'String::up'.
+                  |     fun f() = listOf("a").map(<error>String
+                  |         ::up</error>)
+                  hint: 'T' is compiled outside of the script body, where a callable reference to 'up' of the script crashes the compiler - replace it with a lambda using 'up'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at callable reference of moved class to dependency crashing compiler`() = runTest {
+        // given
+        val script = """
+            sealed interface S
+            class T : S { fun f() = ::greeting }
+            T().f().get()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("greeting", "Hello")))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:25: error: The compiler crashed generating the callable reference '::greeting'.
+                  | class T : S { fun f() = <error>::greeting</error> }
+                  hint: 'T' is compiled outside of the script body, where a callable reference to 'greeting' of the script crashes the compiler - replace it with a lambda using 'greeting'.
             """.trimIndent()
         }
     }
