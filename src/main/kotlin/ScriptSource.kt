@@ -36,6 +36,7 @@ import org.jetbrains.kotlin.compiler.plugin.ExperimentalCompilerApi
 import org.jetbrains.kotlin.config.CompilerConfiguration
 import org.jetbrains.kotlin.lexer.KotlinLexer
 import org.jetbrains.kotlin.lexer.KtTokens
+import org.jetbrains.kotlin.load.java.JvmAbi
 import org.jetbrains.kotlin.psi.KtAnnotation
 import org.jetbrains.kotlin.psi.KtAnonymousInitializer
 import org.jetbrains.kotlin.psi.KtAnnotationEntry
@@ -55,11 +56,14 @@ import org.jetbrains.kotlin.psi.KtDeclarationWithBody
 import org.jetbrains.kotlin.psi.KtDestructuringDeclaration
 import org.jetbrains.kotlin.psi.KtDestructuringDeclarationEntry
 import org.jetbrains.kotlin.psi.KtElement
+import org.jetbrains.kotlin.psi.KtEnumEntry
+import org.jetbrains.kotlin.psi.KtEscapeStringTemplateEntry
 import org.jetbrains.kotlin.psi.KtExpression
 import org.jetbrains.kotlin.psi.KtFile
 import org.jetbrains.kotlin.psi.KtForExpression
 import org.jetbrains.kotlin.psi.KtFunctionLiteral
 import org.jetbrains.kotlin.psi.KtLabelReferenceExpression
+import org.jetbrains.kotlin.psi.KtLiteralStringTemplateEntry
 import org.jetbrains.kotlin.psi.KtNamedDeclaration
 import org.jetbrains.kotlin.psi.KtNameReferenceExpression
 import org.jetbrains.kotlin.psi.KtNamedFunction
@@ -77,7 +81,9 @@ import org.jetbrains.kotlin.psi.KtQualifiedExpression
 import org.jetbrains.kotlin.psi.KtScriptInitializer
 import org.jetbrains.kotlin.psi.KtSecondaryConstructor
 import org.jetbrains.kotlin.psi.KtPsiFactory
+import org.jetbrains.kotlin.psi.KtScript
 import org.jetbrains.kotlin.psi.KtSimpleNameExpression
+import org.jetbrains.kotlin.psi.KtStringTemplateEntryWithExpression
 import org.jetbrains.kotlin.psi.KtStringTemplateExpression
 import org.jetbrains.kotlin.psi.KtThisExpression
 import org.jetbrains.kotlin.psi.KtLambdaArgument
@@ -96,6 +102,7 @@ import org.jetbrains.kotlin.psi.KtWhenExpression
 import org.jetbrains.kotlin.psi.psiUtil.allChildren
 import org.jetbrains.kotlin.psi.psiUtil.anyDescendantOfType
 import org.jetbrains.kotlin.psi.psiUtil.collectDescendantsOfType
+import org.jetbrains.kotlin.psi.psiUtil.containingClassOrObject
 import org.jetbrains.kotlin.psi.psiUtil.endOffset
 import org.jetbrains.kotlin.psi.psiUtil.getReceiverExpression
 import org.jetbrains.kotlin.psi.psiUtil.forEachDescendantOfType
@@ -791,6 +798,15 @@ internal class ScriptSource private constructor(
     /** The package of the script, like `foo.bar`, or an empty string, if it has none. */
     val packageName: String
 
+    /** The names of the classes and the objects declared in the script, including `Companion` of an unnamed companion object, and the enum entries. */
+    val classNames: Set<String>
+
+    /** The names of the [classNames] enclosing other classes, objects or enum entries, which qualify their names. */
+    val enclosingClassNames: Set<String>
+
+    /** The contents of the string literals of the script, with the escapes resolved, and a NUL character in place of each template expression. */
+    val stringLiterals: List<String>
+
     private val lineStarts: List<Int>
 
     /** For each line of the [text], the line of the script, or `null` for the generated lines of the block and the preamble, see [isWrapped]. */
@@ -802,6 +818,9 @@ internal class ScriptSource private constructor(
     private val movedDeclarations: List<Declaration>
 
     private val bodyDeclarations: List<Declaration>
+
+    /** The accessors of the properties, which might be in a stack trace, by their JVM names. */
+    private val propertyAccessors: Map<String, List<PropertyAccessor>>
 
     /** See [ScriptStructure.localReferences]. */
     private val localReferences: Map<String, Set<String>>
@@ -823,6 +842,9 @@ internal class ScriptSource private constructor(
         movedDeclarations = structure.movedDeclarations
         returnsUnit = structure.endsWithMovedDeclaration || hoisting?.endsWithHoistedFunction == true
         packageName = structure.packageName
+        classNames = structure.classNames
+        enclosingClassNames = structure.enclosingClassNames
+        stringLiterals = structure.stringLiterals
         fun IntRange.toScriptReference(
             name: String = script.substring(first, last + 1)
         ) = ScriptReference(name, position(first), position(last + 1))
@@ -890,6 +912,7 @@ internal class ScriptSource private constructor(
             reference.second.toScriptReference(reference.first) to script.substring(reference.second).split(lineBreak).joinToString("")
         }
         bodyDeclarations = structure.bodyDeclarations
+        propertyAccessors = structure.propertyAccessors.groupBy { it.jvmName }
         localReferences = structure.localReferences
         // a callable one is visible to the moved declarations referring to it as a value, like `map(log)`, as in the script,
         // while their calls, which in the script call the local function, if it applies, are confirmed, see hiddenLocalFunctionCandidates
@@ -1293,16 +1316,25 @@ internal class ScriptSource private constructor(
     }
 
     /**
-     * The start and the end of the name of the declaration moved out of the script body,
-     * or of the class nested in it, as the compiler names it without the enclosing classes.
+     * The name in the script, the start and the end of the name of the class moved out of the script body, or nested in one,
+     * reported by the [index]th of the [count] diagnostics without a location naming the class like the compiler,
+     * without the enclosing classes, and a companion object as `Companion`, also when named.
+     * The classes of the [name] are told by their order, counting only the ones referring to the members of the script class,
+     * like the dependencies, as only these capture the script class instance, if there are enough of them,
+     * otherwise all of them, as the compiler reports also e.g. a companion object calling its own function named like a function of the script.
      */
-    fun movedDeclarationName(
-        name: String
-    ): Pair<ScriptPosition, ScriptPosition>? = (
-            movedDeclarations.find { it.name == name }?.nameRange
-                ?: movedDeclarations.firstNotNullOfOrNull { it.nestedNameRanges[name] }
-    )?.let {
-        position(it.first) to position(it.last + 1)
+    fun movedClassName(
+        name: String,
+        index: Int,
+        count: Int
+    ): Triple<String, ScriptPosition, ScriptPosition>? {
+        val classes = movedDeclarations.flatMap { it.classNames }.filter {
+            if (name == "Companion") it.isCompanion || it.name == name else it.name == name && !it.isCompanion
+        }
+        val candidates = classes.filter { it.refersToScript }.takeIf { it.size >= count } ?: classes
+        return (candidates.getOrNull(index) ?: candidates.lastOrNull())?.let {
+            Triple(it.name ?: name, position(it.range.first), position(it.range.last + 1))
+        }
     }
 
     /** The 0-based line of the local function named in this opt-in [message], see [SHADOWING_FUNCTION]. */
@@ -1340,6 +1372,26 @@ internal class ScriptSource private constructor(
         (it.name == name || name in it.destructuredNames) && (kind == null || it.kind == kind)
     }?.let {
         position(it.start).line to it.kind
+    }
+
+    /**
+     * The name of the accessor of the JVM [method], like `<get-x>` of `getX`, as Kotlin names it,
+     * if it is the method name of an accessor of a property of the [owner] declared at the 0-based [line],
+     * unlike a function of this name, or `null`.
+     *
+     * @param owner the binary name of the class declaring the method within the script class or the script block,
+     *   like `A$N`, or `f$L` of a local class of the function `f`, or empty for the script class.
+     */
+    fun accessorName(
+        method: String,
+        owner: String,
+        line: Int
+    ): String? {
+        // like `1` of a class declared in a lambda
+        val path = owner.split('$').filter { part -> part.isNotEmpty() && !part.all { it.isDigit() } }
+        return propertyAccessors[method]?.find { accessor ->
+            line in accessor.lines && (accessor.ownerPath?.equals(path) ?: (accessor.ownerClass == path.lastOrNull()))
+        }?.name
     }
 
     /** The offset in the script of the [position]. */
@@ -1535,13 +1587,25 @@ private class Declaration(
     val nameRange: IntRange?,
     /** The names of a destructuring declaration, like `val (a, b) = pair`. */
     val destructuredNames: List<String> = emptyList(),
-    /** The ranges of the names of the classes nested in the declaration, by these names, the first one of each name. */
-    val nestedNameRanges: Map<String, IntRange> = emptyMap(),
+    /** The classes of the declaration, including itself, if it is one, in the order of the script. */
+    val classNames: List<ClassName> = emptyList(),
     /**
      * The ranges of the names of the classes and the functions nested in the declaration, by their paths within it, like `I.f`,
      * as the compiler names them in the failures of its backend, the first one of each path.
      */
     val nestedPathRanges: Map<String, IntRange> = emptyMap()
+)
+
+/** A class or an object, with the [range] of its name, or of the `companion` keyword of an unnamed companion object. */
+private class ClassName(
+    val name: String?,
+    val isCompanion: Boolean,
+    val range: IntRange,
+    /**
+     * Whether it refers to the members of the script class by their names, outside of its nested classes, so it might capture the script class instance,
+     * unless e.g. the name refers to an inherited member instead.
+     */
+    val refersToScript: Boolean
 )
 
 internal enum class DeclarationKind {
@@ -1580,6 +1644,91 @@ private fun KtNamedDeclaration.pathName(): String? =
 
 private fun KtDeclaration.memberOnlyAnnotationEntries(): List<KtAnnotationEntry> = annotationEntries.filter {
     it.useSiteTarget != null || it.shortName?.asString() in memberOnlyAnnotations
+}
+
+/** An accessor of a property, which might be in a stack trace, see [ScriptSource.accessorName]. */
+private class PropertyAccessor(
+    /** Like `<get-x>`. */
+    val name: String,
+    /**
+     * The names of the declarations containing the property, like `A`, `N` of `A.N`, or `f`, `L` of a local class of the function `f`,
+     * as they qualify the binary name of its class, empty for the script class,
+     * or `null`, if they qualify it otherwise, like an object literal, or a class in the initializer of a property.
+     */
+    val ownerPath: List<String>?,
+    /** The class declaring the property, if its [ownerPath] is unknown, as long as no other class of the script is named like it. */
+    val ownerClass: String?,
+    val jvmName: String,
+    /** The 0-based lines of the accessor, or of the whole property for a default accessor. */
+    val lines: IntRange
+)
+
+/**
+ * The accessors of the property, which might be in a stack trace, having a body, or delegating, or checking the initialization of a `lateinit` property,
+ * named like `getX` and `setX` of `x`, or `isOn` and `setOn` of `isOn`, or with `@JvmName`, also as `@get:JvmName`.
+ * The bridges, like of a generic getter, the synthetic accessors, like `access$getX`, and the names of the internal accessors,
+ * suffixed with the module name, are not recognized.
+ */
+private fun KtProperty.accessors(
+    lineOf: (offset: Int) -> Int,
+    uniqueClassNames: Set<String>
+): List<PropertyAccessor> {
+    val name = name ?: return emptyList()
+    val container = containingClassOrObject
+    // the members of an object literal are reported like the lambdas
+    if (container is KtObjectDeclaration && container.isObjectLiteral()) return emptyList()
+    val ownerPath = ownerPath()
+    val ownerClass = if (ownerPath == null) container?.pathName()?.takeIf { it in uniqueClassNames } ?: return emptyList() else null
+    fun accessor(
+        getter: Boolean,
+        range: IntRange?
+    ): PropertyAccessor? {
+        if (range == null) return null
+        val target = if (getter) "get" else "set"
+        val annotations = (if (getter) this.getter else setter)?.annotationEntries.orEmpty() +
+                annotationEntries.filter { it.useSiteTarget?.text == target }
+        val jvmName = annotations.filter { it.shortName?.asString() == "JvmName" }.firstNotNullOfOrNull { annotation ->
+            (annotation.valueArguments.firstOrNull()?.getArgumentExpression() as? KtStringTemplateExpression)?.entries?.takeIf { entries ->
+                entries.all { it is KtLiteralStringTemplateEntry || it is KtEscapeStringTemplateEntry }
+            }?.joinToString("") { (it as? KtEscapeStringTemplateEntry)?.unescapedValue ?: it.text }
+        } ?: if (getter) JvmAbi.getterName(name) else JvmAbi.setterName(name)
+        return PropertyAccessor("<$target-$name>", ownerPath, ownerClass, jvmName, lineOf(range.first)..lineOf(range.last))
+    }
+    val whole = startOffset until endOffset
+    return listOfNotNull(
+        accessor(
+            getter = true,
+            range = getter?.takeIf { it.hasBody() }?.let { it.startOffset until it.endOffset }
+                ?: whole.takeIf { hasDelegate() || hasModifier(KtTokens.LATEINIT_KEYWORD) }
+        ),
+        accessor(
+            getter = false,
+            range = setter?.takeIf { it.hasBody() }?.let { it.startOffset until it.endOffset }
+                ?: whole.takeIf { hasDelegate() && isVar }
+        )
+    )
+}
+
+/** See [PropertyAccessor.ownerPath], skipping the lambdas, which add the numbers to the binary name. */
+private fun KtProperty.ownerPath(): List<String>? {
+    val path = mutableListOf<String>()
+    var accessed: KtProperty? = null
+    for (element in parents) {
+        when {
+            element is KtScript || element is KtFile -> break
+            element === accessed -> {}
+            element is KtObjectDeclaration && element.isObjectLiteral() -> return null
+            element is KtClassOrObject -> path += element.pathName() ?: return null
+            element is KtNamedFunction -> path += element.name ?: return null
+            // like `g` of `_$g$L` of a local class of the getter of `g`
+            element is KtPropertyAccessor -> {
+                accessed = element.property
+                path += element.property.name ?: return null
+            }
+            element is KtProperty -> return null
+        }
+    }
+    return path.asReversed()
 }
 
 /**
@@ -2389,7 +2538,7 @@ private class ScriptStructure(
     /** The start of the block comment ending the script unterminated at the top level, which would swallow the closing of the script block. */
     val unterminatedComment: Int?,
     dependencyNames: Set<String>,
-    /** The starts of the lines of the original script, unlike of the [script], where `\r\n` ends two lines. */
+    /** The starts of the lines of the original script, unlike of the [script], where `\r\n` ends two lines, see also [ScriptSource.accessorName]. */
     lineStarts: List<Int>
 ) {
 
@@ -2471,6 +2620,18 @@ private class ScriptStructure(
     /** See [ScriptSource.packageName]. */
     val packageName: String
 
+    /** See [ScriptSource.classNames]. */
+    val classNames: Set<String>
+
+    /** See [ScriptSource.enclosingClassNames]. */
+    val enclosingClassNames: Set<String>
+
+    /** See [ScriptSource.stringLiterals]. */
+    val stringLiterals: List<String>
+
+    /** See [ScriptSource.accessorName]. */
+    val propertyAccessors: List<PropertyAccessor>
+
     /** The names and the ranges of the [ScriptSource.scriptMemberCallableReferences]. */
     val scriptMemberCallableReferences: List<Pair<String, IntRange>>
 
@@ -2548,6 +2709,26 @@ private class ScriptStructure(
     init {
         val file = psiFactory.createFile("script.kts", script)
         packageName = file.packageFqName.asString()
+        val classes = file.collectDescendantsOfType<KtClassOrObject>()
+        fun KtClassOrObject.className() = name ?: "Companion".takeIf { this is KtObjectDeclaration && isCompanion() }
+        classNames = classes.mapNotNullTo(HashSet()) { it.className() }
+        enclosingClassNames = classes.filter { declaration ->
+            declaration.collectDescendantsOfType<KtClassOrObject> { it !== declaration }.isNotEmpty()
+        }.mapNotNullTo(HashSet()) { it.className() }
+        stringLiterals = file.collectDescendantsOfType<KtStringTemplateExpression>().map { literal ->
+            literal.entries.joinToString("") { entry ->
+                when (entry) {
+                    is KtEscapeStringTemplateEntry -> entry.unescapedValue
+                    is KtStringTemplateEntryWithExpression -> "\u0000"
+                    else -> entry.text
+                }
+            }
+        }
+        val uniqueClassNames = file.collectDescendantsOfType<KtClassOrObject>().mapNotNull { it.pathName() }
+            .groupingBy { it }.eachCount().filterValues { it == 1 }.keys
+        propertyAccessors = file.collectDescendantsOfType<KtProperty>().flatMap { property ->
+            property.accessors({ lineOf(lineStarts, it) }, uniqueClassNames)
+        }
         headerEnd = listOfNotNull(
             file.firstChild?.takeIf { it.node.elementType == KtTokens.SHEBANG_COMMENT },
             // like `@file:JvmName("x")`, while the parser takes there also a stray `@` of the script body
@@ -2607,7 +2788,6 @@ private class ScriptStructure(
             }
         }
         localProperties = propertyNameSet - movedConstants.mapTo(HashSet()) { it.name!! }
-        movedDeclarations = moved.map { it.toDeclaration(withNestedNames = true) }
         endsWithMovedDeclaration = moved.any { it.psi == statements.lastOrNull() }
         val movedStatements = moved.mapTo(HashSet()) { it.psi }
         lineSplits = statements.withIndex().mapNotNull { (index, statement) ->
@@ -2627,6 +2807,11 @@ private class ScriptStructure(
             .partition { it.isExtension || (it.psi as? KtProperty)?.receiverTypeReference != null }
         val scriptMemberNames = movedMembers.flatMapTo(HashSet(dependencyNames)) { listOfNotNull(it.name) + it.destructuredNames }
         val scriptExtensionNames = movedExtensions.mapNotNullTo(HashSet()) { it.name }
+        movedDeclarations = moved.map { declaration ->
+            declaration.toDeclaration(withNestedNames = true) {
+                it.refersToLocal(scriptMemberNames) || it.name in scriptExtensionNames
+            }
+        }
         scriptMemberCallableReferences = moved.filter { it.kind == DeclarationKind.CLASS }.flatMap { declaration ->
             declaration.references.filter {
                 it.isCallableReference && it.canAccessScriptMembers && if (it.isQualified) {
@@ -3431,8 +3616,10 @@ private class ScriptStructure(
     ) {
         /** Without the comments preceding the declaration, which are left in the script body. */
         val start = psi.startOffsetSkippingComments
+        /** @param refersToScript whether the reference refers to the members of the script class. */
         fun toDeclaration(
-            withNestedNames: Boolean = false
+            withNestedNames: Boolean = false,
+            refersToScript: (Reference) -> Boolean = { false }
         ) = Declaration(
             name = name,
             kind = kind,
@@ -3440,20 +3627,28 @@ private class ScriptStructure(
             end = end,
             nameRange = nameRange,
             destructuredNames = destructuredNames,
-            nestedNameRanges = if (withNestedNames && psi is KtClassOrObject) {
-                buildMap {
-                    psi.collectDescendantsOfType<KtClassOrObject> { it !== psi }.forEach { nested ->
-                        nested.nameIdentifier?.let { putIfAbsent(nested.name!!, it.startOffset until it.endOffset) }
-                        // as the compiler names it in its diagnostics, also when named
-                        if (nested is KtObjectDeclaration && nested.isCompanion()) {
-                            (nested.nameIdentifier ?: nested.modifierList?.getModifier(KtTokens.COMPANION_KEYWORD))?.let {
-                                putIfAbsent("Companion", it.startOffset until it.endOffset)
-                            }
+            classNames = if (withNestedNames && psi is KtClassOrObject) {
+                (listOf(psi) + psi.collectDescendantsOfType<KtClassOrObject> { it !== psi }).mapNotNull { declaration ->
+                    val isCompanion = declaration is KtObjectDeclaration && declaration.isCompanion()
+                    val nameElement = declaration.nameIdentifier
+                        ?: declaration.modifierList?.getModifier(KtTokens.COMPANION_KEYWORD)?.takeIf { isCompanion }
+                        ?: return@mapNotNull null
+                    val range = declaration.startOffset until declaration.endOffset
+                    // capturing the script class instance on their own, unlike the object literals, and the enum entries, capturing it also for their enum class
+                    val nestedRanges = declaration.collectDescendantsOfType<KtClassOrObject> {
+                        it !== declaration && !(it is KtObjectDeclaration && it.isObjectLiteral()) && it !is KtEnumEntry
+                    }.map { it.startOffset until it.endOffset }
+                    ClassName(
+                        name = declaration.name,
+                        isCompanion = isCompanion,
+                        range = nameElement.startOffset until nameElement.endOffset,
+                        refersToScript = references.any { reference ->
+                            reference.offset in range && nestedRanges.none { reference.offset in it } && refersToScript(reference)
                         }
-                    }
+                    )
                 }
             } else {
-                emptyMap()
+                emptyList()
             },
             nestedPathRanges = if (withNestedNames) {
                 buildMap {

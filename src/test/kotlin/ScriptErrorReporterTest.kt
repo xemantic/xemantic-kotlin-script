@@ -85,6 +85,23 @@ class ScriptErrorReporterTest {
     }
 
     @Test
+    fun `should report exception message naming only the classes declared in the script without the name of the script class`() {
+        // given
+        val source = ScriptSource("enum class Color { RED }\nfun f() { class Dog; class Box { companion object } }")
+        val throwable = RuntimeException(
+            "_\$\$\$result\$1\$1\$f\$Dog, _.Color.RED, _\$Box\$Companion@1f, _.x.Color, _\$x.Color, _.Cat, _\$_ScriptDependencies, x_.Color, _Color"
+        ).apply { stackTrace = emptyArray() }
+        val reporter = ScriptErrorReporter(source, scriptClassName = "_")
+
+        // when
+        val message = reporter.toFailureMessage(throwable, warnings = emptyList())
+
+        // then
+        message sameAs
+                "java.lang.RuntimeException: Dog, Color.RED, Box.Companion@1f, _.x.Color, _\$x.Color, _.Cat, _\$_ScriptDependencies, x_.Color, _Color"
+    }
+
+    @Test
     fun `should report failure without diagnostics`() {
         // given
         val reporter = ScriptErrorReporter(ScriptSource("foo"))

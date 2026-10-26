@@ -423,7 +423,7 @@ class ScriptSourceTest {
 
         // then
         assert(sources.none { it.isWrapped })
-        assert(sources.all { it.movedDeclarationName("A") == null && it.laterDeclaredDependencyCandidates.isEmpty() })
+        assert(sources.all { it.movedClassName("A", index = 0, count = 1) == null && it.laterDeclaredDependencyCandidates.isEmpty() })
     }
 
     @Test
@@ -497,6 +497,117 @@ class ScriptSourceTest {
         // then
         val body = source.text.substringAfter(SCRIPT_BLOCK_START)
         assert("fun f(): Int {" in body && "class C {" in body)
+    }
+
+    @Test
+    fun `should name accessor only of property of the class of the frame`() {
+        // given
+        val script = "class P { val x: Int get() = 1 }; class Q { fun getX(): Int = 2 }"
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        assert(source.accessorName("getX", owner = "P", line = 0) == "<get-x>")
+        assert(source.accessorName("getX", owner = "Q", line = 0) == null)
+        assert(source.accessorName("getX", owner = "", line = 0) == null)
+    }
+
+    @Test
+    fun `should name accessor only of property of the nested class of the frame`() {
+        // given
+        val script = "class A { class N { val x: Int get() = 1 } }; class B { class N { fun getX(): Int = 2 } }"
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        assert(source.accessorName("getX", owner = "A\$N", line = 0) == "<get-x>")
+        assert(source.accessorName("getX", owner = "B\$N", line = 0) == null)
+    }
+
+    @Test
+    fun `should name accessor only of property of the local class of the frame`() {
+        // given
+        val script = """
+            fun a() { class L { val x: Int get() = 1 } }; fun b() { class L { fun getX(): Int = 2 } }
+            val g: Int get() { class M { val y: Int get() = 3 }; return M().y }
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        assert(source.accessorName("getX", owner = "a\$L", line = 0) == "<get-x>")
+        assert(source.accessorName("getX", owner = "b\$L", line = 0) == null)
+        assert(source.accessorName("getY", owner = "g\$M", line = 1) == "<get-y>")
+    }
+
+    @Test
+    fun `should name accessor of top-level property only at the lines of the accessor`() {
+        // given
+        val script = """
+            var x: Int
+                get() = 1
+                set(value) { }
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        assert(source.accessorName("getX", owner = "", line = 0) == null)
+        assert(source.accessorName("getX", owner = "", line = 1) == "<get-x>")
+        assert(source.accessorName("getX", owner = "", line = 2) == null)
+        assert(source.accessorName("setX", owner = "", line = 1) == null)
+        assert(source.accessorName("setX", owner = "", line = 2) == "<set-x>")
+    }
+
+    @Test
+    fun `should name accessors of companion object, lateinit and delegated properties`() {
+        // given
+        val script = """
+            class C {
+                companion object { val x: Int get() = 1 }
+            }
+            object O {
+                companion object Factory { lateinit var y: String }
+                var z: Int by mutableMapOf("z" to 1)
+            }
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        assert(source.accessorName("getX", owner = "C\$Companion", line = 1) == "<get-x>")
+        assert(source.accessorName("getY", owner = "O\$Factory", line = 4) == "<get-y>")
+        assert(source.accessorName("getZ", owner = "O", line = 5) == "<get-z>")
+        assert(source.accessorName("setZ", owner = "O", line = 5) == "<set-z>")
+    }
+
+    @Test
+    fun `should name accessors by their JVM names capitalized like the compiler`() {
+        // given
+        val script = """
+            val ärger: Int get() = 1
+            var isOn: Boolean get() = true; set(value) { }
+            val isolated: Int get() = 2
+            val y: Int @JvmName("fetchY") get() = 3
+            val z: Int @JvmName("fetchZ") get() = 4
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        assert(source.accessorName("getärger", owner = "", line = 0) == "<get-ärger>")
+        assert(source.accessorName("isOn", owner = "", line = 1) == "<get-isOn>")
+        assert(source.accessorName("setOn", owner = "", line = 1) == "<set-isOn>")
+        assert(source.accessorName("getIsolated", owner = "", line = 2) == "<get-isolated>")
+        assert(source.accessorName("fetchY", owner = "", line = 3) == "<get-y>")
+        assert(source.accessorName("getY", owner = "", line = 3) == null)
+        assert(source.accessorName("fetchZ", owner = "", line = 4) == "<get-z>")
     }
 
     @Test
