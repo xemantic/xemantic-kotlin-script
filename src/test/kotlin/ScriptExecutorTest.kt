@@ -2015,7 +2015,16 @@ class ScriptExecutorTest {
             "val items = mutableListOf(1, 2)\n/** The sum. */\n@Suppress(\"unused\")\nval total: Int get() = items.sum() // the sum\nitems += 3\ntotal",
             "import kotlin.math.max\nval items = mutableListOf(1, 5)\nval top get() = items.fold(0) { a, b -> max(a, b) } + listOf(1).size + Pair(1, 2).first + items.map { it }.size\ntop",
             // named like the parameters of the operators of the object
-            "val _property = \"local\"\nval _thisRef = \"!\"\nval items = listOf(1)\nval t get() = _property + _thisRef + items.size\nt"
+            "val _property = \"local\"\nval _thisRef = \"!\"\nval items = listOf(1)\nval t get() = _property + _thisRef + items.size\nt",
+            // named like a member of the receivers, though declared before
+            "val items = listOf(1)\nval isActive get() = items.isEmpty()\nval t get() = items.size.toString() + isActive\nt",
+            // within the lambdas without a receiver
+            "val threshold = listOf(1).first()\nval items = listOf(1, 2, 3)\nval n get() = items.count { it > threshold }.toString() + items.map { it * threshold }.sum()\nn",
+            "val factor = listOf(2).first()\nval items = listOf(1, 2)\nval t get() = items.zip(items) { a, b -> a + b * factor }.sum()\nt",
+            "fun <T> twice(block: () -> T) = listOf(block(), block())\nval factor = listOf(2).first()\nval items = listOf(1, 2)\nval t get() = items.map label@{ it * factor }.sum() + twice { factor }.sum()\nt",
+            "class Box { fun g() = \"box\" }\n@JvmName(\"gg\") fun g() = \"script\"\nval items = listOf(1)\nval t get() = items.size.toString() + with(Box()) { g() }\nt",
+            // with the annotations applicable to a local variable
+            "val items = listOf(1)\n@OptIn(ExperimentalStdlibApi::class)\nval t get() = items.size\nt"
         )
         val executor = ScriptExecutor()
 
@@ -2023,7 +2032,39 @@ class ScriptExecutorTest {
         val results = scripts.map { executor.execute(it) }
 
         // then
-        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("[20, 2]20", "[10, 2]10", 12, "total: 6", 6, 6, 9, "local!1"))
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("[20, 2]20", "[10, 2]10", 12, "total: 6", 6, 6, 9, "local!1", "1false", "26", 9, 10, "1script", 1))
+    }
+
+    @Test
+    fun `should report property with accessor reading local property and annotation not applicable to local variable as compiled outside of script body`() = runTest {
+        // given
+        val script = "val items = listOf(1)\n@Deprecated(\"x\")\nval total get() = items.size\ntotal"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        val message = (result as ScriptResult.Error).message
+        assert("'total' is compiled outside of the script body, where 'items' (line 1) is not visible" in message)
+        assert("not applicable to target" !in message)
+    }
+
+    @Test
+    fun `should not resolve name within lambda with receiver of property accessor reading local properties to local property`() = runTest {
+        // given
+        val script = "class User(val name: String)\nval name = \"local\"\nval items = listOf(1)\nval t get() = items.size.toString() + with(User(\"u\")) { name }\nt"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            have("'t' is compiled outside of the script body, where 'items' (line 3) is not visible" in message)
+        }
     }
 
     @Test
@@ -2039,6 +2080,9 @@ class ScriptExecutorTest {
             "import kotlin.let\nval items = listOf(1, 2)\nval t get() = items.size.toString() + let { 1 }\nt",
             "import kotlin.jvm.javaClass\nval items = listOf(1, 2)\nval t get() = items.size.toString() + javaClass.name\nt",
             "fun let(x: Int) = x\nval items = listOf(1, 2)\nval t get() = items.size.toString() + let { it::class.simpleName }\nt",
+            "import kotlin.let as myLet\nval items = listOf(1, 2)\nval t get() = items.size.toString() + myLet { it::class.simpleName }\nt",
+            "import kotlinx.coroutines.launch as go\nval items = mutableListOf(1, 2)\nval t: Int\n    get() { go { items += 5 }; return items.size }\nt",
+            "val items = listOf(1, 2)\nval let = items.size + 1\nval t get() = items.size.toString() + let { it::class.simpleName }\nt",
             "val items = listOf(1)\nval t get() = items.size.toString() + isActive\nval isActive = \"mine\"\nt",
             "val items = listOf(1)\nval t get() = items.size.toString() + javaClass\nval javaClass = \"mine\"\nt",
             "val items = listOf(1)\nval t get() = items.size.toString() + coroutineContext\nval coroutineContext = \"mine\"\nt",
@@ -4045,7 +4089,10 @@ class ScriptExecutorTest {
             "val log = mutableListOf<String>()\ninline fun <T> logged(name: String, crossinline block: () -> T, noinline after: () -> Unit = { }): T {\n    log += name\n    return block().also { after() }\n}\n" +
                     "val r = logged(\"a\", { for (i in 1..5) { if (i == 2) break }; if (log.size > 5) return@logged 0; 7 }) { log += \"after\" }\nr.toString() + log",
             "val items = mutableListOf(1, 2)\n@Suppress(\"NOTHING_TO_INLINE\") private inline fun total() = items.sum()\nitems += 3\ntotal()",
-            "val log = mutableListOf<String>()\nsuspend inline fun step(block: suspend () -> Unit) { log += \"s\"; block() }\nstep { kotlinx.coroutines.delay(1) }\nlog"
+            "val log = mutableListOf<String>()\nsuspend inline fun step(block: suspend () -> Unit) { log += \"s\"; block() }\nstep { kotlinx.coroutines.delay(1) }\nlog",
+            // called within the lambdas without a receiver
+            "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"a\"; block() }\nlistOf(1).forEach { logged { } }\nlog",
+            "val log = mutableListOf<Int>()\nvar x = 1\ninline fun i(block: () -> Unit) { block(); log += x }\nfun h() { log += x }\ninline fun j(block: () -> Unit) { block(); h() }\ni { j { } }\nx = 2\ni { j { } }\nlog"
         )
         val executor = ScriptExecutor()
 
@@ -4053,7 +4100,7 @@ class ScriptExecutorTest {
         val results = scripts.map { executor.execute(it) }
 
         // then
-        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(listOf("h"), "7[a, after]", 6, listOf("s")))
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(listOf("h"), "7[a, after]", 6, listOf("s"), listOf("a"), listOf(1, 1, 2, 2)))
     }
 
     @Test
