@@ -215,7 +215,7 @@ internal class DefaultScriptExecutor(
         /** The [ScriptSource.coroutineScopeCandidates] resolved to the coroutine scope indeed. */
         val coroutineScopeReferences: List<LaterDeclaredReference> = emptyList(),
         /** The [ScriptSource.shadowedFunctionCandidates] which would call the functions in the script. */
-        val shadowedFunctionReferences: List<Triple<ScriptReference, Int, Int>> = emptyList()
+        val shadowedFunctionReferences: List<ShadowedFunctionReference> = emptyList()
     )
 
     private inner class ScriptHandler(
@@ -424,19 +424,34 @@ internal class DefaultScriptExecutor(
             }
             // the calls not referring to the moved functions already, which would refer to them in the script, if they apply
             val toFunctions = deprecated(SHADOWED_ORIGINAL)
-            val toProperties = source.shadowedFunctionCandidates.filter { (reference) -> toFunctions.none { it in reference } }
-            // the remaining calls of the functions, which would refer to them in the script, if they apply, like the properties
-            val functionCandidates = coroutineScopeReferences.filter { it.isFunction }
+            val toLocals = source.shadowedFunctionCandidates.filter { (reference) -> toFunctions.none { it in reference } }
+            // the remaining calls of the functions, which would refer to them in the script, if they apply, like the properties,
+            // and the references within the lambdas, unless resolved to their receivers, also in the script, see ScriptSource.coroutineScopeCopies
+            fun LaterDeclaredReference.isConfirmedByCopies() = isFunction || isInLambda
+            val confirmedCandidates = coroutineScopeReferences.filter { it.isConfirmedByCopies() }
             // independent of each other
             val (shadowed, toCoroutineScope) = coroutineScope {
-                val shadowed = async {
-                    if (toProperties.isEmpty()) emptyList() else {
-                        val copies = source(confirming = true, shadowedFunctionCopies = true)
-                        compile(copies).reports.marked(copies, SHADOWED_FUNCTION)
+                // the calls within the declarations of inferred types are resolved differently, see ScriptSource.overloadingFunctionCopies
+                val (inInferredTypes, inDeclaredTypes) = toLocals.partition { it.isInInferredType }
+                fun copies(
+                    candidates: List<ShadowedFunctionReference>,
+                    copies: () -> ScriptSource
+                ) = async {
+                    if (candidates.isEmpty()) emptyList() else {
+                        val source = copies()
+                        compile(source).reports.markedRanges(source, SHADOWED_FUNCTION).mapNotNull { (start, _, message) ->
+                            candidates.find { start in it.reference }?.let { candidate ->
+                                // naming the overload called in the script
+                                candidate.copy(functionLine = source.shadowedFunctionLine(message) ?: candidate.functionLine)
+                            }
+                        }
                     }
                 }
+                val inferred = copies(inInferredTypes) { source(confirming = true, overloadingFunctionCopies = true) }
+                val declared = copies(inDeclaredTypes) { source(confirming = true, shadowedFunctionCopies = true) }
+                val shadowed = async { (inferred.await() + declared.await()).distinctBy { it.reference } }
                 val toCoroutineScope = async {
-                    if (functionCandidates.isEmpty()) emptyList() else {
+                    if (confirmedCandidates.isEmpty()) emptyList() else {
                         val copies = source(confirming = true, coroutineScopeCopies = true)
                         compile(copies).reports.marked(copies, COROUTINE_SCOPE_FUNCTION)
                     }
@@ -454,11 +469,10 @@ internal class DefaultScriptExecutor(
                 },
                 // in the order of the script
                 coroutineScopeReferences = coroutineScopeReferences.filter { candidate ->
-                    !candidate.isFunction || toCoroutineScope.any { it in candidate.reference }
+                    !candidate.isConfirmedByCopies() || toCoroutineScope.any { it in candidate.reference }
                 },
-                shadowedFunctionReferences = toProperties.filter { (reference) ->
-                    shadowed.any { it in reference }
-                },
+                // in the order of the script
+                shadowedFunctionReferences = toLocals.mapNotNull { candidate -> shadowed.find { it.reference === candidate.reference } },
                 hiddenLocalFunctionReferences = hiddenCandidates.filter { it in hidden }
             )
         }
@@ -473,8 +487,9 @@ internal class DefaultScriptExecutor(
         private fun source(
             confirming: Boolean = false,
             shadowedFunctionCopies: Boolean = false,
+            overloadingFunctionCopies: Boolean = false,
             coroutineScopeCopies: Boolean = false
-        ) = ScriptSource(script, preambleDependencies, confirming, shadowedFunctionCopies, coroutineScopeCopies)
+        ) = ScriptSource(script, preambleDependencies, confirming, shadowedFunctionCopies, overloadingFunctionCopies, coroutineScopeCopies)
 
         private suspend fun compile(
             source: ScriptSource

@@ -4605,6 +4605,54 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report references within lambdas resolved to the coroutine scope of the script body instead of moved declarations`() = runTest {
+        // given
+        val scripts = listOf(
+            "val r = run { launch { } }\nfun launch(block: () -> Unit): String = \"mine\"\nr",
+            "val r = listOf(1).map { cancel() }\nfun cancel(): String = \"mine\"\nr",
+            "val r = \"x\".let { isActive }\nval isActive get() = \"mine\"\nr",
+            "val r = with(this) { launch { } }\nfun launch(block: () -> Unit): String = \"mine\"\nr",
+            // the type alias declared after the copies would not be visible to them
+            "val r = launch { }\ntypealias Block = () -> Unit\nfun launch(block: Block): String = \"mine\"\nr",
+            "val r = run { launch { } }\ntypealias Block = () -> Unit\nfun launch(block: Block): String = \"mine\"\nr",
+            "val r = run { launch { } }\nval launch get() = { b: () -> Unit -> \"mine\" }\nr"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+        results[0] should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                script.kts:1:15: error: 'launch' refers to the coroutine scope of the script body, instead of the function declared at line 2, which is compiled outside of the script body.
+                  | val r = run { <error>launch</error> { } }
+                  hint: rename the function.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should execute references within nested coroutine scopes next to moved declarations of their names`() = runTest {
+        // given
+        val scripts = listOf(
+            "val r = coroutineScope { launch { } }\nfun launch(block: () -> Unit): String = \"mine\"\nr is Job",
+            "val r = withContext(Dispatchers.Default) { async { 1 } }.await()\nfun async(block: () -> Int): Int = 2\nr",
+            "val r = supervisorScope { run { isActive } }\nval isActive get() = \"mine\"\nr",
+            "val r = Job().apply { cancel() }.isCancelled\nfun cancel(): String = \"mine\"\nr"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(true, 1, true, true))
+    }
+
+    @Test
     fun `should report calls resolved to the coroutine scope after comments and shadowed functions in the order of the script`() = runTest {
         // given
         val scripts = listOf(
@@ -4843,6 +4891,221 @@ class ScriptExecutorTest {
             be<ScriptResult.Value>()
             have(value == 6)
         }
+    }
+
+
+    @Test
+    fun `should report call of the script body resolved to local overload hiding the overload moved out of the script body`() = runTest {
+        // given
+        val script = """
+            val p = "!".trim()
+            fun show(x: Any) = "any${'$'}p"
+            fun show(x: Int) = "int"
+            sealed interface S
+            class T : S { fun f() = show(1) }
+            show(1) + T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:6:1: error: 'show' refers to the function of the script body declared at line 2, instead of its overload declared at line 3, which a regular script calls.
+                  | <error>show</error>(1) + T().f()
+                  hint: 'show' (line 3) is compiled outside of the script body, unlike its overload declared at line 2, which hides it there - rename one of them.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report calls resolved to local overloads hiding the overloads moved out of the script body within lambdas, local functions and callable references`() = runTest {
+        // given
+        val scripts = listOf(
+            "val p = \"!\".trim()\nfun show(x: Any) = \"any${'$'}p\"\nfun show(x: Int) = \"int\"\nsealed interface S\nclass T : S { fun f() = show(1) }\nval g = { show(1) }\ng() + T().f()",
+            "val p = \"!\".trim()\nfun show(x: Any) = \"any${'$'}p\"\nfun show(x: Int) = \"int\"\nsealed interface S\nclass T : S { fun f() = show(1) }\nfun h() = show(1)\nh() + T().f()",
+            "val p = \"!\".trim()\nfun show(x: Any) = \"any${'$'}p\"\nfun show(x: Int) = \"int\"\nsealed interface S\nclass T : S { fun f() = show(1) }\nlistOf(1).map(::show).toString() + T().f()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.firstOrNull() } == listOf(
+            "script.kts:6:11: error: 'show' refers to the function of the script body declared at line 2, instead of its overload declared at line 3, which a regular script calls.",
+            "script.kts:6:11: error: 'show' refers to the function of the script body declared at line 2, instead of its overload declared at line 3, which a regular script calls.",
+            "script.kts:6:17: error: 'show' refers to the function of the script body declared at line 2, instead of its overload declared at line 3, which a regular script calls."
+        ))
+    }
+
+    @Test
+    fun `should report call of declaration moved out of the script body resolved to its overload instead of the more specific local one`() = runTest {
+        // given
+        val script = """
+            val p = "!".trim()
+            fun show(x: Int) = "int${'$'}p"
+            fun show(x: Any) = "any"
+            sealed interface S
+            class T : S { fun f() = show(1) }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:5:25: error: 'show' does not refer to the function of the script body declared at line 2, which is not visible in 'T'.
+                  | class T : S { fun f() = <error>show</error>(1) }
+                  hint: 'T' is compiled outside of the script body, where 'show' (line 2) is not visible - pass it as a parameter, or declare it within 'T'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should execute calls of overloads split by moving some of them out of the script body when they resolve as in a regular script`() = runTest {
+        // given
+        val scripts = listOf(
+            // the local overload does not apply
+            "val p = \"!\".trim()\nfun show(x: Any) = \"any${'$'}p\"\nfun show(x: Int) = \"int\"\nsealed interface S\nclass T : S { fun f() = show(1) }\nshow(\"a\") + T().f()",
+            // the local overload is the most specific one
+            "val p = \"!\".trim()\nfun show(x: Int) = \"int${'$'}p\"\nfun show(x: Any) = \"any\"\nsealed interface S\nclass T : S { fun f() = show(\"a\") }\nshow(1) + show(\"a\") + T().f()",
+            // the moved overload is the most specific one for the moved declaration
+            "val p = \"!\".trim()\nfun show(x: Any) = \"any${'$'}p\"\nfun show(x: Int) = \"int\"\nsealed interface S\nclass T : S { fun f() = show(1) }\nT().f()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("any!int", "int!anyany", "int"))
+    }
+
+
+    @Test
+    fun `should execute calls of local overloads of inferred types which a regular script prefers to the moved overloads of declared types`() = runTest {
+        // given
+        val scripts = listOf(
+            "val p = \"!\".trim()\nfun show(x: Int): String = \"int\"\nfun show(x: Any) = \"any${'$'}p\"\nsealed interface S\nclass T : S { fun f(): String = show(1) }\nfun h() = show(1)\nh() + T().f()",
+            "val p = \"!\".trim()\nfun show(x: Int): String = \"int\"\nfun show(x: Any) = \"any${'$'}p\"\nsealed interface S\nclass T : S { fun f(): String = show(1) }\nval r = show(1)\nr + T().f()",
+            "val p = \"!\".trim()\nfun show(x: Int): String = \"int\"\nfun show(x: Any) = \"any${'$'}p\"\nsealed interface S\nclass T : S { fun f(): String = show(1) }\nshow(1) + T().f()",
+            "val p = \"!\".trim()\nfun show(x: Int): Int = 1\nfun show(x: Any) = \"any${'$'}p\"\nsealed interface S\nclass T : S { fun f(): String = show(1).toString() }\nshow(\"a\") + show(2).toString() + T().f()",
+            // the local overload of a declared type within a declaration of a declared type
+            "val p = \"!\".trim()\nfun show(x: Int): String = \"int${'$'}p\"\nfun show(x: Any) = \"any\"\nsealed interface S\nclass T : S { fun f() = show(\"a\") }\nfun h(): String = show(1)\nh() + T().f()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("any!int", "any!int", "any!int", "any!any!1", "int!any"))
+    }
+
+    @Test
+    fun `should report calls of local overloads where a regular script prefers the moved overloads within declarations of declared or inferred types`() = runTest {
+        // given
+        val scripts = listOf(
+            "val p = \"!\".trim()\nfun show(x: Int): String = \"int\"\nfun show(x: Any) = \"any${'$'}p\"\nsealed interface S\nclass T : S { fun f(): String = show(1) }\nval r: String = show(1)\nr + T().f()",
+            "val p = \"!\".trim()\nfun show(x: Int): String = \"int\"\nfun show(x: Any) = \"any${'$'}p\"\nsealed interface S\nclass T : S { fun f(): String = show(1) }\nfun h(): String = show(1)\nh() + T().f()",
+            // the moved overload of an inferred type within declarations of inferred types
+            "val p = \"!\".trim()\nfun show(x: Int): String = \"int${'$'}p\"\nfun show(x: Any) = \"any\"\nsealed interface S\nclass T : S { fun f() = show(\"a\") }\nfun h() = show(1)\nh() + T().f()",
+            "val p = \"!\".trim()\nfun show(x: Int): String = \"int${'$'}p\"\nfun show(x: Any) = \"any\"\nsealed interface S\nclass T : S { fun f() = show(\"a\") }\nclass U { fun k() = show(1) }\nU().k() + T().f()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.firstOrNull()?.substringBefore(": error") } == listOf(
+            "script.kts:6:17", "script.kts:6:19", "script.kts:6:11", "script.kts:6:21"
+        ))
+    }
+
+    @Test
+    fun `should report calls of local overloads within init blocks, constructors and default values where a regular script calls the moved overloads`() = runTest {
+        // given
+        val declarations = listOf(
+            "class U { val v: String; init { v = show(1) } }\nU().v",
+            "class U(val v: String = show(1))\nU().v",
+            "class U { val v: String; constructor() { v = show(1) } }\nU().v"
+        )
+        val scripts = declarations.map { declaration ->
+            "val p = \"!\".trim()\nfun show(x: Int): String = \"int\"\nfun show(x: Any) = \"any${'$'}p\"\nsealed interface S\nclass T : S { fun f(): String = show(1) }\n$declaration + T().f()"
+        }
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.message?.lines()?.firstOrNull()?.substringBefore(": error") } == listOf(
+            "script.kts:6:37", "script.kts:6:25", "script.kts:6:46"
+        ))
+    }
+
+    @Test
+    fun `should report call resolved to local overload naming the overloads of the script body and the moved one a regular script calls`() = runTest {
+        // given
+        val script = """
+            val p = "!".trim()
+            fun show(x: String) = "str${'$'}p"
+            fun show(x: Double) = "dbl"
+            fun show(x: Any) = "any${'$'}p"
+            fun show(x: Int) = "int"
+            sealed interface S
+            class T : S { fun f() = show(1) + show(1.0) }
+            show(1) + T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:8:1: error: 'show' refers to one of the functions of the script body declared at lines 2, 4, instead of its overload declared at line 5, which a regular script calls.
+                  | <error>show</error>(1) + T().f()
+                  hint: 'show' (line 5) is compiled outside of the script body, unlike its overloads declared at lines 2, 4, which hide it there - rename one of them.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report call resolved to the coroutine scope instead of moved function overloaded by local function once`() = runTest {
+        // given
+        val script = """
+            val p = "!".trim()
+            fun launch(block: () -> Unit): String = "mine"
+            fun launch(x: Int) = "${'$'}p"
+            sealed interface S
+            class T : S { fun f() = launch { } }
+            launch { }
+            "done"
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert(result is ScriptResult.Error && result.message.lines().filter { it.startsWith("script.kts:") } == listOf(
+            "script.kts:6:1: error: 'launch' refers to the coroutine scope of the script body, instead of the function declared at line 2, which is compiled outside of the script body."
+        ))
     }
 
 }

@@ -116,16 +116,27 @@ internal class ScriptErrorReporter(
         }
     }.trimEnd()
 
-    /** The [references] of the script body to the local properties instead of the functions, see [ScriptSource.shadowedFunctionCandidates]. */
+    /** The [references] of the script body to the local declarations instead of the functions, see [ScriptSource.shadowedFunctionCandidates]. */
     fun toShadowedFunctionMessage(
-        references: List<Triple<ScriptReference, Int, Int>>
-    ): String = references.joinToString(separator = "\n") { (reference, property, function) ->
+        references: List<ShadowedFunctionReference>
+    ): String = references.joinToString(separator = "\n") { shadowed ->
+        val reference = shadowed.reference
+        val function = shadowed.functionLine + 1
         buildString {
             appendPosition(reference.start)
-            +"error: '${reference.name}' refers to the property of the script body declared at line ${property + 1}, "
-            +"instead of the function declared at line ${function + 1}, which a regular script calls.\n"
+            val lines = shadowed.lines.map { it + 1 }
+            val local = if (lines.size == 1) "the ${shadowed.kind} of the script body declared at line ${lines.single()}"
+                else "one of the functions of the script body declared at lines ${lines.joinToString()}"
+            +"error: '${reference.name}' refers to $local, "
+            +"instead of ${if (shadowed.isFunction) "its overload" else "the function"} declared at line $function, which a regular script calls.\n"
             appendSourceLines(reference.start, reference.end)
-            +"  hint: rename the property or the function.\n"
+            if (shadowed.isFunction) {
+                val overloads = if (lines.size == 1) "its overload declared at line ${lines.single()}, which hides"
+                    else "its overloads declared at lines ${lines.joinToString()}, which hide"
+                +"  hint: '${reference.name}' (line $function) is compiled outside of the script body, unlike $overloads it there - rename one of them.\n"
+            } else {
+                +"  hint: rename the property or the function.\n"
+            }
         }
     }.trimEnd()
 
