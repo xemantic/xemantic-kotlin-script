@@ -27,6 +27,7 @@ import org.jetbrains.kotlin.cli.jvm.compiler.KotlinCoreEnvironment
 import org.jetbrains.kotlin.com.intellij.openapi.util.Disposer
 import org.jetbrains.kotlin.com.intellij.psi.PsiComment
 import org.jetbrains.kotlin.com.intellij.psi.PsiElement
+import org.jetbrains.kotlin.com.intellij.psi.PsiErrorElement
 import org.jetbrains.kotlin.com.intellij.psi.PsiWhiteSpace
 import org.jetbrains.kotlin.com.intellij.psi.tree.IElementType
 import org.jetbrains.kotlin.compiler.plugin.CompilerPluginRegistrar
@@ -1783,10 +1784,22 @@ private class ScriptStructure(
         val nameIdentifier = (declaration as? KtNamedDeclaration)?.nameIdentifier
         // e.g. an anonymous function, which is an expression
         if (nameIdentifier == null && declaration !is KtDestructuringDeclaration) return null
-        // unlike in the script, the local property in the script block has no accessors,
-        // so `get` and `set` starting a line, which is not indented, are the statements following it
-        val accessors = (declaration as? KtProperty)?.accessors.orEmpty().takeWhile {
-            !isOnNewLine(it.startOffset) || columnOf(it.startOffset) > columnOf(declaration.startOffsetSkippingComments)
+        // like in the script, also the accessors starting a line, which is not indented more than the property, are its part,
+        // moved or blanked out with it, as the local property in the script block has none, so they would be the statements following it,
+        // unless they do nothing, like `get()`, or do not parse, like `get(3)` or `get("/") { }`, being rather the calls following it
+        val accessors = (declaration as? KtProperty)?.accessors.orEmpty().let { parsed ->
+            fun KtPropertyAccessor.isUnindented() = isOnNewLine(startOffset)
+                    && columnOf(startOffset) <= columnOf(declaration.startOffsetSkippingComments)
+            val errorOffsets = if (parsed.any { it.isUnindented() }) {
+                declaration.collectDescendantsOfType<PsiErrorElement>().map { it.startOffset }
+            } else {
+                emptyList()
+            }
+            val wellFormed = parsed.takeWhile { accessor ->
+                !accessor.isUnindented() || errorOffsets.none { it >= accessor.startOffset }
+            }
+            // a bare `set` preceding a getter with a body is still the part of the property
+            wellFormed.take(wellFormed.indexOfLast { !it.isUnindented() || it.hasBody() || it.modifierList != null } + 1)
         }
         val end = (declaration as? KtProperty)?.accessors?.getOrNull(accessors.size)?.let { firstOmitted ->
             declaration.allChildren.toList().last {
