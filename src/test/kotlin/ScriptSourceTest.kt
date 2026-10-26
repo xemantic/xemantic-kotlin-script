@@ -321,6 +321,14 @@ class ScriptSourceTest {
             "import kotlin.let\nval items = listOf(1, 2)\nval t get() = items.size.toString() + let { 1 }\nt",
             "import kotlin.jvm.javaClass\nval items = listOf(1, 2)\nval t get() = items.size.toString() + javaClass.name\nt",
             "fun let(x: Int) = x\nval items = listOf(1, 2)\nval t get() = items.size.toString() + let { it::class.simpleName }\nt",
+            // imported under an alias
+            "import kotlin.let as myLet\nval items = listOf(1, 2)\nval t get() = items.size.toString() + myLet { it::class.simpleName }\nt",
+            "import kotlinx.coroutines.launch as go\nval items = mutableListOf(1, 2)\nval t: Int\n    get() { go { items += 5 }; return items.size }\nt",
+            // called, while a local property declared before cannot be invoked
+            "val items = listOf(1, 2)\nval let = items.size + 1\nval t get() = items.size.toString() + let { it::class.simpleName }\nt",
+            // resolved on the receiver of a lambda before the local property, unlike the script
+            "class User(val name: String)\nval name = \"local\"\nval items = listOf(1)\nval t get() = items.size.toString() + with(User(\"u\")) { name }\nt",
+            "class User(val name: String)\nfun name() = \"local\"\nval items = listOf(1)\nval t get() = items.size.toString() + listOf(1).map { User(\"u\").run { name } }\nt",
             // not visible in the accessors, if declared after them, unlike in the script
             "val items = listOf(1)\nval t get() = items.size.toString() + isActive\nval isActive = \"mine\"\nt",
             "val items = listOf(1)\nval t get() = items.size.toString() + javaClass\nval javaClass = \"mine\"\nt",
@@ -338,6 +346,24 @@ class ScriptSourceTest {
             assert("get()" in moved || "set(value)" in moved)
             assert(" by object " !in body)
         }
+    }
+
+    @Test
+    fun `should keep property with accessor reading local properties within lambdas without receiver as delegated property`() {
+        // given
+        val script = """
+            val threshold = listOf(1).first()
+            val items = listOf(1, 2, 3)
+            val n get() = items.count { it > threshold }.toString() + items.map { x -> listOf(x).sumOf { it * threshold } }.sum()
+            n
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        assert("get()" !in moved && " by object " in body)
     }
 
     @Test
@@ -411,7 +437,9 @@ class ScriptSourceTest {
             "val log = mutableListOf<String>()\ninline fun status() = log.size.toString() + suffix\nval suffix = \"!\"\nstatus()",
             "val log = mutableListOf<String>()\ninline fun logged() { helper() }\nfun helper() { log += \"h\" }\nlogged()\nlog",
             "class User(val name: String)\nval name = \"script\"\nval log = mutableListOf<String>()\ninline fun g() = log.size.toString() + User(\"u\").run { name }\ng()",
-            "val log = mutableListOf<String>()\ninline fun status() = log.size.toString() + isActive\nstatus()"
+            "val log = mutableListOf<String>()\ninline fun status() = log.size.toString() + isActive\nstatus()",
+            "import kotlin.let as myLet\nval log = mutableListOf<String>()\ninline fun status() = log.size.toString() + myLet { 1 }\nstatus()",
+            "val log = mutableListOf<String>()\nval let = log.size + 1\ninline fun status() = log.size.toString() + let { 1 }\nstatus()"
         )
 
         // when

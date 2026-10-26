@@ -96,8 +96,10 @@ when (result) {
   which turns it into a local property delegated to an object having its accessors,
   as long as they do not use the backing `field`, nor `this`, nor the property itself, nor have the annotations or the modifiers, like `private set`,
   nor refer without a receiver to a name, which is not declared by the script, the dependencies or the explicit (not star) imports,
-  nor to a name, which might be resolved on the receivers of the script body instead, like `let { }` or `isActive`,
-  unless it is a local value declared before, nor to a property declared after,
+  nor to a name, which might be resolved on the receivers of the script body instead, like `let { }` or `isActive`, also when imported under an alias,
+  unless it is a local value declared before, and not called, nor to a property declared after,
+  nor refer within a lambda to a name declared by the script, which might be resolved on its receiver instead, like `name` in `with(user) { name }`,
+  unless the lambda is passed to a function of the standard library known to take a lambda without a receiver, like `items.map { it * factor }`,
   and it is not an extension property, nor referred to by a callable reference.
   It is still compiled outside of the script body, when it reads the local values only through the local functions,
   or only the values initialized with a literal, or a local value named `field`,
@@ -110,7 +112,8 @@ when (result) {
   no annotations but `@Suppress`, no modifiers but the visibility and `suspend`, does not refer to `this` or `super`,
   is not called before its declaration, nor where a receiver might resolve the call instead, like `run` in `class A { fun go() = run { } }`,
   does not refer within a lambda to a name declared by the script, which might be resolved on its receiver instead, like `name` in `user.run { name }`,
-  nor to a name, which might be resolved on the receivers of the script body instead, like `isActive`, unless it is a local value declared before,
+  nor to a name, which might be resolved on the receivers of the script body instead, like `isActive`, also when imported under an alias,
+  unless it is a local value declared before, and not called,
   nor to a property or a function declared after,
   and the lambdas passed to it do not return, break or continue to outside of them, like `return` in `fun first(): Int { logged { return 1 }; return 0 }`.
   Unlike when inlined, these lambdas cannot call the suspending functions, which is reported as an error with a hint,

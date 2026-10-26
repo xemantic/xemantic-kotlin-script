@@ -2015,7 +2015,9 @@ class ScriptExecutorTest {
             "val items = mutableListOf(1, 2)\n/** The sum. */\n@Suppress(\"unused\")\nval total: Int get() = items.sum() // the sum\nitems += 3\ntotal",
             "import kotlin.math.max\nval items = mutableListOf(1, 5)\nval top get() = items.fold(0) { a, b -> max(a, b) } + listOf(1).size + Pair(1, 2).first + items.map { it }.size\ntop",
             // named like the parameters of the operators of the object
-            "val _property = \"local\"\nval _thisRef = \"!\"\nval items = listOf(1)\nval t get() = _property + _thisRef + items.size\nt"
+            "val _property = \"local\"\nval _thisRef = \"!\"\nval items = listOf(1)\nval t get() = _property + _thisRef + items.size\nt",
+            // within the lambdas without a receiver
+            "val threshold = listOf(1).first()\nval items = listOf(1, 2, 3)\nval n get() = items.count { it > threshold }.toString() + items.map { it * threshold }.sum()\nn"
         )
         val executor = ScriptExecutor()
 
@@ -2023,7 +2025,20 @@ class ScriptExecutorTest {
         val results = scripts.map { executor.execute(it) }
 
         // then
-        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("[20, 2]20", "[10, 2]10", 12, "total: 6", 6, 6, 9, "local!1"))
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("[20, 2]20", "[10, 2]10", 12, "total: 6", 6, 6, 9, "local!1", "26"))
+    }
+
+    @Test
+    fun `should not resolve name within lambda with receiver of property accessor reading local properties to local property`() = runTest {
+        // given
+        val script = "class User(val name: String)\nval name = \"local\"\nval items = listOf(1)\nval t get() = items.size.toString() + with(User(\"u\")) { name }\nt"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert((result as? ScriptResult.Error)?.phase == ExecutionPhase.COMPILATION)
     }
 
     @Test
@@ -2039,6 +2054,9 @@ class ScriptExecutorTest {
             "import kotlin.let\nval items = listOf(1, 2)\nval t get() = items.size.toString() + let { 1 }\nt",
             "import kotlin.jvm.javaClass\nval items = listOf(1, 2)\nval t get() = items.size.toString() + javaClass.name\nt",
             "fun let(x: Int) = x\nval items = listOf(1, 2)\nval t get() = items.size.toString() + let { it::class.simpleName }\nt",
+            "import kotlin.let as myLet\nval items = listOf(1, 2)\nval t get() = items.size.toString() + myLet { it::class.simpleName }\nt",
+            "import kotlinx.coroutines.launch as go\nval items = mutableListOf(1, 2)\nval t: Int\n    get() { go { items += 5 }; return items.size }\nt",
+            "val items = listOf(1, 2)\nval let = items.size + 1\nval t get() = items.size.toString() + let { it::class.simpleName }\nt",
             "val items = listOf(1)\nval t get() = items.size.toString() + isActive\nval isActive = \"mine\"\nt",
             "val items = listOf(1)\nval t get() = items.size.toString() + javaClass\nval javaClass = \"mine\"\nt",
             "val items = listOf(1)\nval t get() = items.size.toString() + coroutineContext\nval coroutineContext = \"mine\"\nt",
