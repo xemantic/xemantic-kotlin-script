@@ -391,12 +391,15 @@ internal class DefaultScriptExecutor(
             val hidden = hiddenWarnings.mapNotNullTo(HashSet()) { (start, end, message) ->
                 hiddenCandidates.filter { candidate ->
                     start in candidate.reference && hiddenLocalFunctionMessage(candidate.reference.name) in message
-                            // the compiler reports the operators as unresolved, misleading, so they are hinted at as well
-                            && (candidate.isOperator || start !in errors)
                 }.let { matching ->
-                    matching.firstOrNull { it.reference.end == end } ?: matching.minByOrNull {
-                        (it.reference.end.line - it.reference.start.line) * 100_000 + it.reference.end.column - it.reference.start.column
-                    }
+                    // the innermost one, nested ones start later, or at the same position, ending earlier
+                    matching.firstOrNull { it.reference.end == end } ?: matching.maxWithOrNull(
+                        compareBy<LaterDeclaredReference> { it.reference.start }.thenByDescending { it.reference.end }
+                    )
+                }?.takeIf { candidate ->
+                    // chosen first, so that the warning of a plain call, like `get(1)` in `m[get(1)]`, is not assigned to the enclosing operator,
+                    // the compiler reports the operators as unresolved, misleading, so they are hinted at as well
+                    candidate.isOperator || start !in errors
                 }
             }
             // the references not resolved to the moved declarations, unless already reported as errors
