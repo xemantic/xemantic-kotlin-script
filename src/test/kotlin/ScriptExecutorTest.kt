@@ -2707,6 +2707,155 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should report only syntax error of accessor following valid accessor without indentation`() = runTest {
+        // given
+        val script = "var v = 0\nget() = field + 1\nset(3)\nv"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:5: error: Syntax error: Expecting parameter name.
+                  | set(<error>3</error>)
+
+                script.kts:3:7: error: Syntax error: Expecting function body.
+                  | set(3)<error></error>
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report only syntax error in body of getter without indentation`() = runTest {
+        // given
+        val script = "val size: Int\nget() {\n  return listOf(1, 2).sum(\n}\nsize"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:1: error: Syntax error: Expecting an argument.
+                  | <error></error>}
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should execute bare setter following getter without indentation as part of property`() = runTest {
+        // given
+        val script = "var v = 0\nget() = field + 1\nset\nv"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 1)
+        }
+    }
+
+    @Test
+    fun `should execute call with trailing lambda spelled like setter as setter of preceding property`() = runTest {
+        // given
+        val script = "fun set(i: Int, b: () -> Int) = b()\nval v = 2\nvar x = 1\nset(v) { 6 }"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == Unit)
+        }
+    }
+
+    @Test
+    fun `should execute statements following function with expression body and semicolon on the same line`() = runTest {
+        // given
+        val scripts = listOf(
+            "fun a() = 1; val z = 5\na() + z",
+            "val a = 6; fun b() = a; b()",
+            "fun a() = 1; fun b() = 5; a() + b()",
+            "val f = fun() = 1; val z = 5\nf() + z",
+            "fun a() = 1 /* c */; /* d */ val z = 5\na() + z",
+            "fun a() = b(); val z = 4\nfun b() = 2\na() + z",
+            "inline fun a() = 1; val z = 5\na() + z",
+            "enum class E { A }; fun a() = 1; E.A.ordinal + a() + 5",
+            "fun a() = 1;\na() + 5",
+            "class C; val z = 6\nz",
+            "fun a() = 1; /* multi\nline */ val z = 5\na() + z"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == List(scripts.size) { 6 })
+    }
+
+    @Test
+    fun `should report error at its column of line split after function with expression body and semicolon`() = runTest {
+        // given
+        val script = "fun a() = 1; val z = q; fun b() = r; b()"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:22: error: Unresolved reference 'q'.
+                  | fun a() = 1; val z = <error>q</error>; fun b() = r; b()
+
+                script.kts:1:35: error: Unresolved reference 'r'.
+                  | fun a() = 1; val z = q; fun b() = <error>r</error>; b()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report exception thrown on line split after function with expression body and semicolon`() = runTest {
+        // given
+        val script = """
+            fun a(): Int = TODO(); val z = 1
+            z + a()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs $$"""
+                kotlin.NotImplementedError: An operation is not implemented.
+                  at a(script.kts:1)
+                  | fun a(): Int = TODO(); val z = 1
+                  at <script body>(script.kts:2)
+                  | z + a()
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should execute calls of get and set on the lines after properties without indentation`() = runTest {
         // given
         val scripts = listOf(
@@ -3326,6 +3475,127 @@ class ScriptExecutorTest {
             be<ScriptResult.Value>()
             have(value == true)
             have(warnings == null)
+        }
+    }
+
+    @Test
+    fun `should report this in local function referring to the coroutine scope of the script body`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            fun tag() = "${'$'}this".substringBefore("@") + "/" + log.size
+            fun hash() = run { this.hashCode() }
+            fun size() = with(log) { this.size }
+            "${'$'}{tag()} ${'$'}{hash()} ${'$'}{size()}"
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:15: error: 'this' refers to the coroutine scope of the script body, while in a function of a regular script it refers to the script instance.
+                  | fun tag() = "${'$'}<error>this</error>".substringBefore("@") + "/" + log.size
+                  hint: refer to the coroutine scope as 'this@_script' instead.
+
+                script.kts:3:20: error: 'this' refers to the coroutine scope of the script body, while in a function of a regular script it refers to the script instance.
+                  | fun hash() = run { <error>this</error>.hashCode() }
+                  hint: refer to the coroutine scope as 'this@_script' instead.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report this in local function outside of the body of local class referring to the coroutine scope`() = runTest {
+        // given
+        val script = """
+            open class B(val v: Any)
+            fun f(): Any { class C(val s: Any = this); return C().s }
+            fun g() = object : B(this) { }.v
+            "${'$'}{f()} ${'$'}{g()}"
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:37: error: 'this' refers to the coroutine scope of the script body, while in a function of a regular script it refers to the script instance.
+                  | fun f(): Any { class C(val s: Any = <error>this</error>); return C().s }
+                  hint: refer to the coroutine scope as 'this@_script' instead.
+
+                script.kts:3:22: error: 'this' refers to the coroutine scope of the script body, while in a function of a regular script it refers to the script instance.
+                  | fun g() = object : B(<error>this</error>) { }.v
+                  hint: refer to the coroutine scope as 'this@_script' instead.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report members of Any called in local function without receiver on the coroutine scope`() = runTest {
+        // given
+        val script = """
+            fun name() = toString()
+            fun copy() = apply { }
+            fun self() = with(this) { this }
+            fun length() = with("abc") { toString().length }
+            fun active() = isActive && launch { }.isActive
+            "${'$'}{name()} ${'$'}{copy()} ${'$'}{self()} ${'$'}{length()} ${'$'}{active()}"
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:14: error: 'toString' is resolved on the coroutine scope of the script body, while in a function of a regular script it is resolved on the script instance.
+                  | fun name() = <error>toString</error>()
+                  hint: refer to the coroutine scope as 'this@_script' instead.
+
+                script.kts:2:14: error: 'apply' is resolved on the coroutine scope of the script body, while in a function of a regular script it is resolved on the script instance.
+                  | fun copy() = <error>apply</error> { }
+                  hint: refer to the coroutine scope as 'this@_script' instead.
+
+                script.kts:3:19: error: 'this' refers to the coroutine scope of the script body, while in a function of a regular script it refers to the script instance.
+                  | fun self() = with(<error>this</error>) { this }
+                  hint: refer to the coroutine scope as 'this@_script' instead.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should execute this in local function referring to other receivers`() = runTest {
+        // given
+        val script = """
+            fun a() = with(5) { this + 1 }
+            fun Int.b() = this + 1
+            fun c() = object { val v = 1; fun d() = this.v }.d()
+            fun e(): Int { class F(val v: Int) { fun g() = this.v }; return F(2).g() }
+            fun h() = this@_script.isActive
+            val i = fun Int.() = this + 1
+            a() + 5.b() + c() + e() + (if (h()) 1 else 0) + 2.i() + "${'$'}this".length * 0
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 6 + 6 + 1 + 2 + 1 + 3)
         }
     }
 
