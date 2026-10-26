@@ -267,6 +267,10 @@ internal class DefaultScriptExecutor(
                 || compilation.shadowedFunctionReferences.isNotEmpty()
                 || compilation.coroutineScopeReferences.isNotEmpty()
             ) {
+                // like `No value passed for parameter 'p1'` of `log()`, see ScriptSource.calledInsteadDependencies
+                val calledInstead = compilation.hiddenLocalFunctionReferences.filter {
+                    it.reference.name in source.calledInsteadDependencies
+                }.mapTo(HashSet()) { it.reference.start }
                 val failureMessage = listOfNotNull(
                     compilation.coroutineScopeReferences.takeIf { it.isNotEmpty() }?.let {
                         reporter.toCoroutineScopeMessage(it)
@@ -280,8 +284,14 @@ internal class DefaultScriptExecutor(
                     compilation.laterDeclaredDependencyReferences.takeIf { it.isNotEmpty() }?.let {
                         reporter.toLaterDeclaredDependencyMessage(it)
                     },
-                    // explained by the reference to the dependency
-                    (compilationResult as? Failure)?.let { reporter.toFailureMessage(it.reports.filterNonIgnorable()) }
+                    // explained by the reference to the dependency, like the errors of the calls resolved to the dependency instead, omitted
+                    (compilationResult as? Failure)?.reports?.filterNonIgnorable()?.filterNot { diagnostic ->
+                        diagnostic.severity == ScriptDiagnostic.Severity.ERROR && diagnostic.location?.start?.let { start ->
+                            source.toScriptPosition(start.line, start.col) in calledInstead
+                        } == true
+                    }?.takeIf { reports -> reports.any { it.severity == ScriptDiagnostic.Severity.ERROR } }?.let {
+                        reporter.toFailureMessage(it)
+                    }
                 ).joinToString(separator = "\n\n")
                 return compilationFailure(failureMessage)
             }
@@ -393,6 +403,8 @@ internal class DefaultScriptExecutor(
             val hidden = hiddenWarnings.mapNotNullTo(HashSet()) { (start, end, message) ->
                 hiddenCandidates.filter { candidate ->
                     start in candidate.reference && hiddenLocalFunctionMessage(candidate.reference.name) in message
+                            // like a delegate convention, not of a call of the same name within it
+                            && candidate.inner.none { start in it }
                 }.let { matching ->
                     // the innermost one, nested ones start later, or at the same position, ending earlier
                     matching.firstOrNull { it.reference.end == end } ?: matching.maxWithOrNull(
@@ -400,8 +412,9 @@ internal class DefaultScriptExecutor(
                     )
                 }?.takeIf { candidate ->
                     // chosen first, so that the warning of a plain call, like `get(1)` in `m[get(1)]`, is not assigned to the enclosing operator,
-                    // the compiler reports the operators as unresolved, misleading, so they are hinted at as well
-                    candidate.isOperator || start !in errors
+                    // the compiler reports the operators as unresolved, misleading, so they are hinted at as well,
+                    // like the calls failing as resolved to the dependency of the same name, see ScriptSource.calledInsteadDependencies
+                    candidate.isOperator || start !in errors || candidate.reference.name in source.calledInsteadDependencies
                 }
             }
             // the references not resolved to the moved declarations, unless already reported as errors

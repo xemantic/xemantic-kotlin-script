@@ -55,12 +55,15 @@ import org.jetbrains.kotlin.psi.KtLabelReferenceExpression
 import org.jetbrains.kotlin.psi.KtNamedDeclaration
 import org.jetbrains.kotlin.psi.KtNamedFunction
 import org.jetbrains.kotlin.psi.KtObjectDeclaration
+import org.jetbrains.kotlin.psi.KtOperationExpression
 import org.jetbrains.kotlin.psi.KtParameter
 import org.jetbrains.kotlin.psi.KtParenthesizedExpression
 import org.jetbrains.kotlin.psi.KtPrefixExpression
 import org.jetbrains.kotlin.psi.KtProperty
 import org.jetbrains.kotlin.psi.KtPropertyDelegate
 import org.jetbrains.kotlin.psi.KtPropertyAccessor
+import org.jetbrains.kotlin.psi.KtPsiUtil
+import org.jetbrains.kotlin.psi.KtQualifiedExpression
 import org.jetbrains.kotlin.psi.KtPsiFactory
 import org.jetbrains.kotlin.psi.KtSimpleNameExpression
 import org.jetbrains.kotlin.psi.KtStringTemplateExpression
@@ -123,7 +126,9 @@ internal class LaterDeclaredReference(
     /** Whether it refers to the declaration as a function, like `::foo`, which might be resolved to a property instead. */
     val isCallableReference: Boolean = false,
     /** Whether it is an operator, or a convention, like `[]` of `get`, sharing its position with other ones, like `set`. */
-    val isOperator: Boolean = false
+    val isOperator: Boolean = false,
+    /** The references of its name within it, the warnings at which are of them, see [Reference.inner]. */
+    val inner: List<ScriptReference> = emptyList()
 ) {
     val kind: String get() = if (isFunction) "function" else "property"
 }
@@ -141,6 +146,14 @@ internal const val HIDDEN_LOCAL_FUNCTION = "xemantic-kotlin-script: hidden local
 internal fun hiddenLocalFunctionMessage(
     name: String
 ): String = "$HIDDEN_LOCAL_FUNCTION: $name;"
+
+/**
+ * The string literal of this [value], escaping the characters ending it, or starting an escape, or a template,
+ * which a backticked name can contain, like `` `say "hi"` `` or `` `$x` ``.
+ */
+private fun stringLiteral(
+    value: String
+): String = "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"").replace("$", "\\$") + "\""
 
 /** The deprecation message of the copies of the moved functions, see [ScriptSource.shadowedFunctionCandidates]. */
 internal const val SHADOWED_FUNCTION = "xemantic-kotlin-script: shadowed function"
@@ -217,6 +230,7 @@ internal const val SCRIPT_BLOCK_END = "} }"
  * as in the script they refer to the local declaration,
  * while the script body refers to it as the member of the outer receiver of the script block,
  * the inner one being the coroutine scope of the caller.
+ * A callable dependency shadowed by a local function only is declared there nevertheless, see [calledInsteadDependencies].
  *
  * Declarations are moved by blanking them out with spaces in one copy of their lines,
  * and everything else in the other, so the columns of the script are retained,
@@ -306,6 +320,14 @@ internal class ScriptSource(
      */
     val hiddenLocalFunctionCandidates: List<LaterDeclaredReference>
 
+    /**
+     * The names of the callable dependencies visible to the declarations moved out of the script body, even though local functions have their names,
+     * so the moved declarations refer to them as values, like `map(log)`, and call them, when the local functions do not apply, as in the script,
+     * while the [hiddenLocalFunctionCandidates] calling the local functions in the script call the dependencies instead,
+     * or fail, when the dependencies do not apply, rather than being unresolved.
+     */
+    val calledInsteadDependencies: Set<String>
+
     private val lineStarts: List<Int>
 
     /** For each line of the [text], the line of the script, or `null` for the lines of the block and the preamble. */
@@ -338,7 +360,8 @@ internal class ScriptSource(
         }
         fun Reference.toScriptReference() = ScriptReference(name, position(offset), position(offset + length))
         fun Triple<Reference, Int, Boolean>.toLaterDeclaredReference() = LaterDeclaredReference(
-            first.toScriptReference(), position(second).line, third, first.isCallableReference, first.isOperator
+            first.toScriptReference(), position(second).line, third, first.isCallableReference, first.isOperator,
+            first.inner.map { ScriptReference(first.name, position(it.first), position(it.last + 1)) }
         )
         laterDeclaredDependencyCandidates = structure.laterDeclaredDependencyCandidates.map { it.toLaterDeclaredReference() }
         hiddenLocalFunctionCandidates = structure.hiddenLocalFunctionCandidates.map { it.toLaterDeclaredReference() }
@@ -386,7 +409,7 @@ internal class ScriptSource(
         ) {
             preambleDependencies[lines.size] = dependency.name
             lines += if (dependency.name in deprecatedDependencies) {
-                "@kotlin.Deprecated(\"$LATER_DECLARED_DEPENDENCY\") ${dependency.accessor}"
+                "@kotlin.Deprecated(${stringLiteral(LATER_DECLARED_DEPENDENCY)}) ${dependency.accessor}"
             } else {
                 dependency.accessor
             }
@@ -395,18 +418,21 @@ internal class ScriptSource(
         if (confirming) {
             // named in the message, as the operators of the same position refer to different functions, like `get` and `set`
             structure.hiddenLocalFunctionCopies.forEach { (name, declaration) ->
-                lines += "@kotlin.Deprecated(\"${hiddenLocalFunctionMessage(name)}\") $declaration"
+                lines += "@kotlin.Deprecated(${stringLiteral(hiddenLocalFunctionMessage(name))}) $declaration"
                 mapping += null
             }
             // the deprecation of the local functions, like the copies in the script block, is not reported, unlike their opt-in
             listOf(LATER_DECLARED_FUNCTION, SHADOWED_FUNCTION, SHADOWED_ORIGINAL, COROUTINE_SCOPE_ORIGINAL, COROUTINE_SCOPE_FUNCTION).forEach { message ->
-                lines += "@kotlin.RequiresOptIn(\"$message\", level = RequiresOptIn.Level.WARNING) annotation class ${optInMarker(message)}"
+                lines += "@kotlin.RequiresOptIn(${stringLiteral(message)}, level = RequiresOptIn.Level.WARNING) annotation class ${optInMarker(message)}"
                 mapping += null
             }
         }
+        // a callable one is visible to the moved declarations referring to it as a value, like `map(log)`, as in the script,
+        // while their calls, which in the script call the local function, if it applies, are confirmed, see hiddenLocalFunctionCandidates
         val (shadowed, visible) = dependencies.partition {
-            it.name in structure.localProperties || (it.isCallable && it.name in structure.localFunctions)
+            it.name in structure.localProperties || (it.isCallable && it.name in structure.unconfirmedLocalFunctions)
         }
+        calledInsteadDependencies = visible.filter { it.isCallable && it.name in structure.localFunctions }.mapTo(HashSet()) { it.name }
         visible.forEach { addAccessor(it) }
         lines += "class $DEPENDENCIES_CLASS {"
         mapping += null
@@ -755,7 +781,13 @@ private class Reference(
     /** Whether it is an operator, or a convention, like `+`, referring to the operator functions only, like `plus`. */
     val isOperator: Boolean = false,
     /** Whether it is within a lambda, which might have a receiver, so its resolution is not known without compiling. */
-    val isInLambda: Boolean = false
+    val isInLambda: Boolean = false,
+    /**
+     * The ranges of the references of its [name] within it, unless the compiler reports it at one of them,
+     * like `getValue` of `by lazy { "a".getValue(null, p) }`, the warnings at which are of them,
+     * even if not candidates themselves, like when bound by name to a member, which does not apply.
+     */
+    val inner: List<IntRange> = emptyList()
 ) {
 
     /** Whether it might refer to one of the local declarations of the script body of these [names]. */
@@ -829,7 +861,8 @@ private fun PsiElement.operatorReferences(
         names: List<String>,
         element: PsiElement,
         offset: Int = element.startOffset,
-        length: Int = element.textLength
+        length: Int = element.textLength,
+        inner: (String) -> List<IntRange> = { emptyList() }
     ) {
         val canAccessScriptMembers = canAccessScriptMembers(element, scope)
         names.forEach { name ->
@@ -843,7 +876,8 @@ private fun PsiElement.operatorReferences(
                     isCall = true,
                     isCallableReference = false,
                     canAccessScriptMembers = canAccessScriptMembers,
-                    isOperator = true
+                    isOperator = true,
+                    inner = inner(name)
                 )
             )
         }
@@ -877,10 +911,26 @@ private fun PsiElement.operatorReferences(
                 val arguments = element.valueArgumentList ?: element.lambdaArguments.firstOrNull() ?: element
                 add(listOf("invoke"), element, arguments.startOffset, arguments.textLength)
             }
-            is KtPropertyDelegate -> add(listOf("getValue", "setValue", "provideDelegate"), element)
+            // the compiler reports the calls on the delegate expression, or at its callee, like `let` of `by Cfg().let { it }`,
+            // which might be a reference of the same name, like in `by map.getValue("a")`
+            is KtPropertyDelegate -> {
+                val callee = element.expression?.reportedCallee()
+                val names = element.collectDescendantsOfType<KtSimpleNameExpression> { it !== callee }.groupBy { it.getReferencedName() }
+                add(listOf("getValue", "setValue", "provideDelegate"), element) { name ->
+                    names[name].orEmpty().map { it.startOffset until it.endOffset }
+                }
+            }
             else -> {}
         }
     }
+}
+
+/** The callee reported as the position of the call of this expression, like `let` of `Cfg().let { it }`, or `+` of `a + b`. */
+private fun KtExpression.reportedCallee(): KtExpression? = when (val expression = KtPsiUtil.safeDeparenthesize(this)) {
+    is KtQualifiedExpression -> expression.selectorExpression?.reportedCallee()
+    is KtCallExpression -> expression.calleeExpression?.reportedCallee()
+    is KtOperationExpression -> expression.operationReference
+    else -> expression
 }
 
 /** Whether the [expression] is within a lambda, which might have a receiver, within the [scope], exclusive. */
@@ -1031,6 +1081,15 @@ private class ScriptStructure(
 
     /** The names of the functions moved out of the script body. */
     val movedFunctions: Set<String>
+
+    /**
+     * The names of the [localFunctions], which the references of the moved declarations cannot be confirmed to refer to,
+     * see [ScriptSource.hiddenLocalFunctionCandidates], as they cannot be copied, like the ones referring to the local classes or the type aliases,
+     * or as they are referred to as functions, like `::log`, which would be resolved to the dependency of the same name instead,
+     * or as their names are bound within the moved declarations, which are not candidates.
+     * Only the ones named like the dependencies are checked for the copies.
+     */
+    val unconfirmedLocalFunctions: Set<String>
 
     /** See [ScriptSource.hiddenLocalFunctionCandidates], with the offsets of the first local declarations, and whether they are functions. */
     val hiddenLocalFunctionCandidates: List<Triple<Reference, Int, Boolean>>
@@ -1190,6 +1249,16 @@ private class ScriptStructure(
                     else -> null
                 }?.let { (local, isFunction) -> Triple(reference, local.line(), isFunction) }
             }
+        }
+        // the copies precede the type aliases, which are not visible before their declarations
+        val uncopiedTypes = localClassNames + declarations.mapNotNull { (it.psi as? KtTypeAlias)?.name }
+        unconfirmedLocalFunctions = localFunctionsByName.filter { (name, functions) ->
+            name in dependencyNames && functions.any { it.refersToTypes(uncopiedTypes) || it.signature() == null }
+        }.keys + hiddenLocalFunctionCandidates.filter { (reference) ->
+            reference.isCallableReference && reference.refersToLocal(localFunctions)
+        }.map { it.first.name } + moved.flatMap { declaration ->
+            // like `log("x")` of `fun f(log: Int)`, calling the local function in the script, if the inner declaration does not apply
+            declaration.references.filter { it.isBound && it.isCall && !it.isQualified && it.name in localFunctions && it.name in dependencyNames }.map { it.name }
         }
         hiddenLocalFunctionCopies = if (!confirming) emptyList() else {
             hiddenLocalFunctionCandidates.mapTo(LinkedHashSet()) { it.first.name }.flatMap { name ->

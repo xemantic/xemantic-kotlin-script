@@ -3057,7 +3057,7 @@ class ScriptExecutorTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                script.kts:4:34: error: Unresolved reference 'log'.
+                script.kts:4:34: error: 'log' does not refer to the function of the script body declared at line 2, which is not visible in 'Below'.
                   | class Below : Check { fun ok() = <error>log</error>("hi") }
                   hint: 'Below' is compiled outside of the script body, where 'log' (line 2) is not visible - pass it as a parameter, or declare it within 'Below'.
             """.trimIndent()
@@ -3331,11 +3331,135 @@ class ScriptExecutorTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                script.kts:4:25: error: Unresolved reference 'log'.
+                script.kts:4:25: error: 'log' does not refer to the function of the script body declared at line 2, which is not visible in 'T'.
                   | class T : S { fun f() = <error>log</error>("hi") }
                   hint: 'T' is compiled outside of the script body, where 'log' (line 2) is not visible - pass it as a parameter, or declare it within 'T'.
             """.trimIndent()
         }
+    }
+
+    @Test
+    fun `should refer to callable dependency as value from declaration moved out of the script body when local function has its name`() = runTest {
+        // given
+        val script = """
+            val k = 1
+            fun log() = k
+            sealed interface S
+            class T : S { fun f() = listOf("a").map(log) }
+            T().f() + log()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<(String) -> String>("log") { "dep:$it" }))
+
+        // then
+        assert(result.valueOrMessage == listOf("dep:a", 1))
+    }
+
+    @Test
+    fun `should call callable dependency from declaration moved out of the script body when local function of its name does not apply`() = runTest {
+        // given
+        val script = """
+            val k = 1
+            fun log() = k
+            sealed interface S
+            class T : S { fun f() = log("x") }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<(String) -> String>("log") { "dep:$it" }))
+
+        // then
+        assert(result.valueOrMessage == "dep:x")
+    }
+
+    @Test
+    fun `should report error at declaration moved out of the script body calling local function instead of callable dependency of its name`() = runTest {
+        // given
+        val script = """
+            val k = 1
+            fun log() = k
+            sealed interface S
+            class T : S { fun f() = log() }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency<(String) -> String>("log") { "dep:$it" }))
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:25: error: 'log' does not refer to the function of the script body declared at line 2, which is not visible in 'T'.
+                  | class T : S { fun f() = <error>log</error>() }
+                  hint: 'T' is compiled outside of the script body, where 'log' (line 2) is not visible - pass it as a parameter, or declare it within 'T'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not call callable dependency instead of local function from declaration moved out of the script body binding its name or referring to type alias`() = runTest {
+        // given
+        val local = "val k = 1\nfun log(s: String) = \"local:\$s\$k\"\nsealed interface S\n"
+        val scripts = listOf(
+            // the calls which the inner declarations do not apply to call the local function in the script
+            local + "class T : S { fun log(i: Int) = i; fun f() = log(\"x\") }\nT().f()",
+            local + "class T : S { val log = 1; fun f() = log(\"x\") }\nT().f()",
+            local + "class T : S { fun f(log: Int) = log(\"x\") }\nT().f(1)",
+            local + "class T : S { fun f(): String { val log = 1; return log(\"x\") } }\nT().f()",
+            local + "class T : S { fun f() = listOf(1).map { log -> log(\"x\") } }\nT().f()",
+            // the copies of the local functions referring to the type aliases are not compiled
+            "val k = 1\ntypealias N = String\nfun log(n: N) = \"local:\$n\$k\"\nsealed interface S\nclass T : S { fun f() = log(\"x\") }\nT().f()",
+            "val k = 1\ntypealias L<X> = List<X>\nfun log(l: L<String>) = \"local:\$l\$k\"\nsealed interface S\nclass T : S { fun f() = log(listOf(\"x\")) }\nT().f()",
+            "val k = 1\ntypealias Fn = () -> String\nfun log(f: Fn) = \"local:\${f()}\$k\"\nsealed interface S\nclass T : S { fun f() = log { \"x\" } }\nT().f()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, listOf(dependency<(Any?) -> String>("log") { "dep:$it" })) }
+
+        // then
+        assert(results.map { it.valueOrMessage.toString() }.none { "dep:" in it })
+        assert(results.all { it is ScriptResult.Error })
+        assert(results.map { it.valueOrMessage.toString().lines().first() } == listOf(
+            "script.kts:4:50: error: Argument type mismatch: actual type is 'String', but 'Int' was expected.",
+            "script.kts:4:38: error: Cannot infer type for type parameter 'T'. Specify it explicitly.",
+            "script.kts:4:33: error: Cannot infer type for type parameter 'T'. Specify it explicitly.",
+            "script.kts:4:53: error: Cannot infer type for type parameter 'T'. Specify it explicitly.",
+            "script.kts:4:35: error: Cannot infer type for type parameter 'R'. Specify it explicitly.",
+            "script.kts:5:25: error: Unresolved reference 'log'.",
+            "script.kts:5:25: error: Unresolved reference 'log'.",
+            "script.kts:5:25: error: Unresolved reference 'log'."
+        ))
+        // as the dependency is not visible in 'T', like the local function
+        assert(results.takeLast(3).all { "hint: 'T' is compiled outside of the script body, where 'log' (line 3) is not visible" in it.valueOrMessage.toString() })
+    }
+
+    @Test
+    fun `should not resolve callable dependency from declaration moved out of the script body when local function of its name cannot be confirmed`() = runTest {
+        // given
+        val scripts = listOf(
+            // referred to as a function
+            "val k = 1\nfun log() = k\nsealed interface S\nclass T : S { fun f(): () -> Int = ::log }\nT().f()()",
+            // referring to the local class, so it cannot be copied
+            "val k = 1\nclass L { val v = k }\nfun log(l: L) = l.v\nsealed interface S\nclass T : S { fun f() = listOf(\"a\").map(log) }\nT().f()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it, listOf(dependency<(String) -> String>("log") { "dep:$it" })) }
+
+        // then
+        assert(results.all { result ->
+            result is ScriptResult.Error && "Unresolved reference 'log'" in result.message
+                    && "where 'log' (line" in result.message
+        })
     }
 
     @Test
@@ -3421,7 +3545,7 @@ class ScriptExecutorTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                script.kts:6:25: error: Unresolved reference 'log'.
+                script.kts:6:25: error: 'log' does not refer to the function of the script body declared at line 4, which is not visible in 'T'.
                   | class T : S { fun f() = <error>log</error>(1.seconds) }
                   hint: 'T' is compiled outside of the script body, where 'log' (line 4) is not visible - pass it as a parameter, or declare it within 'T'.
             """.trimIndent()
@@ -3848,6 +3972,63 @@ class ScriptExecutorTest {
                 script.kts:4:25: error: 'check' does not refer to the function of the script body declared at line 2, which is not visible in 'T'.
                   | class T : S { fun f() = <error>check</error>(false) }
                   hint: 'T' is compiled outside of the script body, where 'check' (line 2) is not visible - pass it as a parameter, or declare it within 'T'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at declaration moved out of the script body calling local function with dollar in name named like imported function`() = runTest {
+        // given
+        // the name is pasted into the string literal of the deprecation message of its copy
+        val script = """
+            import com.xemantic.kotlin.script.names.*
+            val strict = true
+            fun `say${'$'}hi`(flag: Boolean) { if (strict && !flag) throw IllegalStateException("strict") }
+            sealed interface S
+            class T : S { fun f() = `say${'$'}hi`(false) }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:5:25: error: 'say${'$'}hi' does not refer to the function of the script body declared at line 3, which is not visible in 'T'.
+                  | class T : S { fun f() = <error>`say${'$'}hi`</error>(false) }
+                  hint: 'T' is compiled outside of the script body, where 'say${'$'}hi' (line 3) is not visible - pass it as a parameter, or declare it within 'T'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report error at declaration moved out of the script body calling local function with quotes in name named like imported function`() = runTest {
+        // given
+        val script = """
+            import com.xemantic.kotlin.script.names.*
+            val strict = true
+            fun `say"hi"`(flag: Boolean) { if (strict && !flag) throw IllegalStateException("strict") }
+            sealed interface S
+            class T : S { fun f() = `say"hi"`(false) }
+            T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:5:25: error: 'say"hi"' does not refer to the function of the script body declared at line 3, which is not visible in 'T'.
+                  | class T : S { fun f() = <error>`say"hi"`</error>(false) }
+                  hint: 'T' is compiled outside of the script body, where 'say"hi"' (line 3) is not visible - pass it as a parameter, or declare it within 'T'.
             """.trimIndent()
         }
     }
@@ -4355,6 +4536,74 @@ class ScriptExecutorTest {
         assert(results.zip(scripts).all { (result, script) ->
             result is ScriptResult.Error && "'${script.second}' does not refer to the function of the script body" in result.message
         })
+    }
+
+    @Test
+    fun `should report invisible delegate conventions of any delegate expression`() = runTest {
+        // given
+        val members = "operator fun plus(o: Cfg) = this; operator fun unaryMinus() = this; operator fun not() = this; " +
+                "infix fun with(o: Cfg) = this; operator fun rangeTo(o: Cfg) = this; operator fun invoke() = this"
+        val declarations = "import kotlin.reflect.KProperty\nval scale = listOf(10).first()\nclass Cfg { $members }\n" +
+                "class D(val n: Int) { operator fun getValue(t: Any?, p: KProperty<*>) = n }\nfun mk(block: () -> Unit) = Cfg()\nfun mkf(c: Cfg) = { c }\n"
+        val operators = mapOf(
+            "getValue" to "operator fun Cfg.getValue(t: Any?, p: KProperty<*>): Int = scale\n",
+            "provideDelegate" to "operator fun Cfg.provideDelegate(t: Any?, p: KProperty<*>) = D(scale)\n"
+        )
+        val delegates = listOf(
+            "cfg", "Cfg()", "(Cfg())", "Cfg().let { it }", "listOf(Cfg()).first()", "if (cfg is Cfg) Cfg() else cfg", "mk { }",
+            "Cfg()!!", "cfg as Cfg", "null ?: cfg", "when { cfg is Cfg -> cfg else -> Cfg() }", "@Deprecated(\"x\") cfg", "l@ cfg", "mkf(cfg)()",
+            "cfg + cfg", "-cfg", "!cfg", "cfg with cfg", "cfg..cfg", "(cfg)()", "(mkf(cfg))()", "@Suppress(\"x\") Cfg()",
+            // the call of the same name, bound by name to the member of the enum class
+            "mapOf(1 to cfg).getValue(1)", "l@ (mapOf(1 to cfg)).getValue(1)"
+        )
+        val scripts = operators.flatMap { (name, operator) ->
+            delegates.map { delegate ->
+                "$declarations${operator}enum class E { A; fun getValue() = 0; fun f(): Int { val cfg = Cfg(); val v: Int by $delegate; return v } }\nE.A.f()" to name
+            }
+        } + delegates.map { delegate ->
+            val variable = "class Cfg { $members; operator fun getValue(t: Any?, p: KProperty<*>) = 1 }\n" +
+                    "operator fun Cfg.setValue(t: Any?, p: KProperty<*>, v: Int) { println(scale) }\n"
+            "${declarations.replace("class Cfg { $members }\n", variable)}enum class E { A; fun getValue() = 0; fun f(): Int { val cfg = Cfg(); var v: Int by $delegate; v = 2; return v } }\nE.A.f()" to "setValue"
+        }
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { (script) -> executor.execute(script) }
+
+        // then
+        assert(results.zip(scripts).filterNot { (result, script) ->
+            result is ScriptResult.Error && "'${script.second}' does not refer to the function of the script body" in result.message
+        }.map { (_, script) -> script.second to script.first.substringAfter(" by ").substringBefore(";") }.isEmpty())
+    }
+
+    @Test
+    fun `should not hint at delegate convention enclosing unresolved call of the same name`() = runTest {
+        // given
+        val call = "lazy { \"a\".getValue(null, Foo::v) }"
+        val delegates = listOf(
+            call, "$call!!", "$call as Lazy<Int>", "null ?: $call", "($call)", "if (scale > 0) $call else lazy { 1 }",
+            "when { scale > 0 -> $call else -> lazy { 1 } }", "@Deprecated(\"x\") $call", "l@ $call", "mk(\"a\".getValue(null, Foo::v))()"
+        )
+        val scripts = delegates.map { delegate ->
+            """
+                import kotlin.reflect.KProperty
+                val scale = listOf(10).first()
+                operator fun String.getValue(t: Any?, p: KProperty<*>): Int = scale
+                fun mk(n: Int) = { lazy { n } }
+                object Foo {
+                    fun getValue(n: Int) = n
+                    val v: Int by $delegate
+                }
+                Foo.v
+            """.trimIndent()
+        }
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.all { it is ScriptResult.Error && "does not refer to the function" !in it.message })
     }
 
     @Test
