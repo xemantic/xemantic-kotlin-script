@@ -56,6 +56,7 @@ import kotlin.script.experimental.jvm.jvm
 import kotlin.script.experimental.jvm.jvmTarget
 import kotlin.script.experimental.jvm.loadDependencies
 import kotlin.script.experimental.jvmhost.BasicJvmScriptingHost
+import kotlin.script.experimental.jvmhost.JvmScriptCompiler
 import kotlin.time.measureTimedValue
 
 /**
@@ -82,7 +83,9 @@ public class ScriptBody internal constructor(
  */
 internal class DefaultScriptExecutor(
     private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
-    compilationCacheSize: Int = 0
+    compilationCacheSize: Int = 0,
+    /** Replaced only by the tests of the internal failures of the compiler. */
+    compiler: JvmScriptCompiler = JvmScriptCompiler()
 ) : ScriptExecutor {
 
     private val logger = KotlinLogging.logger {}
@@ -114,7 +117,7 @@ internal class DefaultScriptExecutor(
         null
     }
 
-    private val scriptingHost = BasicJvmScriptingHost()
+    private val scriptingHost = BasicJvmScriptingHost(compiler = compiler)
 
     /**
      * The class loader the script is compiled against, also evaluating it,
@@ -213,6 +216,16 @@ internal class DefaultScriptExecutor(
                 // thrown by parsing the script, while the compiler reports it as a diagnostic
                 return ScriptResult.Error(
                     "error: The script is nested too deeply to be parsed.",
+                    ExecutionPhase.COMPILATION
+                )
+            } catch (e: Throwable) {
+                e.rethrowIfCancelledOrFatal()
+                // the internal failure of the parser, or of the compiler, shared by the callers waiting in the cache
+                logger.warn(e) { "Script[$scriptId]: Compilation (1/2) failed internally" }
+                return ScriptResult.Error(
+                    "error: The script could not be compiled because of an internal failure of the compiler: "
+                            // the callers waiting in the cache receive the copy recovered by kotlinx.coroutines
+                            + e.unwrapRecoveredCopy().let { listOfNotNull(it, it.cause) }.joinToString(", caused by: "),
                     ExecutionPhase.COMPILATION
                 )
             }
@@ -489,10 +502,7 @@ internal class DefaultScriptExecutor(
                     // the scripting host sets it only while constructing the script, which just returns the block
                     Result.success(withContext(ContextClassLoader(block::class.java.classLoader)) { block() })
                 } catch (e: Throwable) {
-                    // the cancellation of the caller is not a failure of the script
-                    if (e is CancellationException) currentCoroutineContext().ensureActive()
-                    // unlike after the StackOverflowError, the JVM might not be able to continue
-                    if (e is VirtualMachineError && e !is StackOverflowError) throw e
+                    e.rethrowIfCancelledOrFatal()
                     Result.failure(e.unwrapRecoveredCopy())
                 }
                 returned.fold(
@@ -582,6 +592,16 @@ private class ContextClassLoader(
         Thread.currentThread().contextClassLoader = oldState
     }
 
+}
+
+/**
+ * Rethrows this exception, unless it is a failure of the script, or of its compilation:
+ * the cancellation of the caller, or a [VirtualMachineError], after which, unlike after the [StackOverflowError],
+ * the JVM might not be able to continue.
+ */
+private suspend fun Throwable.rethrowIfCancelledOrFatal() {
+    if (this is CancellationException) currentCoroutineContext().ensureActive()
+    if (this is VirtualMachineError && this !is StackOverflowError) throw this
 }
 
 /**
