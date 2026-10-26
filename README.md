@@ -70,11 +70,6 @@ when (result) {
   e.g. `Dispatchers.IO.limitedParallelism(4)` to bound the threads used by scripts,
   or `StandardTestDispatcher(testScheduler)` to run scripts in the virtual time of `runTest`.
 * Dependencies are exposed to the script as properties of the given name and type.
-  Where this document compares the script with a regular `.kts` file,
-  the dependencies are the members of an abstract base class of that script (`baseClass` of the scripting host), not provided properties (`providedProperties`),
-  so a function of the script shadows a callable dependency of its name:
-  `x()` calls `fun x(): Int = 10` of the script, also when preceding it, while a regular script would prefer a provided property `x`
-  ([#101](https://github.com/xemantic/xemantic-kotlin-script/issues/101)).
   The type is inferred from the value, including its type arguments,
   or can be given explicitly, e.g. `provide<String?>("name", null)` or `provide<Clock>("clock", fixedClock)`,
   to make the dependency nullable, or to expose it only as its supertype.
@@ -84,6 +79,11 @@ when (result) {
   a name which the script body would resolve on its `CoroutineScope` receiver instead, like `coroutineContext` or `javaClass`,
   or such a function name, like `launch` or `let`, for a dependency which can be called,
   or a type which the script cannot refer to, like a private or a local class.
+  Where this document compares the script with a regular `.kts` file,
+  the dependencies are the members of an abstract base class of that script (`baseClass` of the scripting host), not provided properties (`providedProperties`),
+  so a function of the script shadows a callable dependency of its name:
+  `x()` calls `fun x(): Int = 10` of the script, also when the call precedes the function, while a regular script would prefer a provided property `x`
+  ([#101](https://github.com/xemantic/xemantic-kotlin-script/issues/101)).
 * A reference to a dependency preceding the declaration of a local property of the same name, like `x` in `fun show() = x` followed by `val x = 2`,
   or a call preceding the declaration of a local function of the same name,
   or of a local class, like `Foo(2)` followed by `class Foo(val v: Int)`, which constructs it, if a constructor applies

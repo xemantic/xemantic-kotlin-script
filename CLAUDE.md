@@ -67,9 +67,8 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 - The script compilation does not resolve a backticked import alias, not even a plain one like ``import kotlin.check as `verify` `` (`Unresolved reference`), while the same alias without backticks works —
   so a test needing a library function of a name with special characters, like `` `say$hi` ``, declares it in the test sources, see `StringLiteralNames.kt`, and star-imports its package.
 
-- When probing a regular `.kts` with `BasicJvmScriptingHost` to compare the behaviour, declare the dependencies as members of an abstract `baseClass`, the reference model of the README:
-  as `providedProperties`, they beat the script functions of their names (#101).
-  A provided property declared as `KotlinType(typeOf<(String) -> String>())` loses its type arguments, and as `KotlinType("(String) -> String")` is unresolved —
+- When deliberately probing the `providedProperties` model of a regular `.kts` with `BasicJvmScriptingHost` (not the reference one, see #101),
+  a provided property declared as `KotlinType(typeOf<(String) -> String>())` loses its type arguments, and as `KotlinType("(String) -> String")` is unresolved —
   provide an instance of a class implementing the function type, declared as `KotlinType(ThatClass::class)`.
 - In a regular `.kts`, a callable reference to a function of the script from a class of the script, like `::log`, crashes the compiler backend ("No mapping for symbol"), so there is no reference behaviour to match.
 
@@ -77,13 +76,9 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   so a test of a reference resolved to the coroutine scope instead needs the declared type.
 
 - A regular script does not always call the most specific overload (K2, probed with `BasicJvmScriptingHost`):
-  a script function whose return type is inferred from its expression body is preferred to the overloads of declared types (or block bodies),
-  even more specific ones, by the calls within a top-level statement, or within a script declaration of an inferred type, including the lambdas and local declarations within it —
-  `show(1)`, `val r = show(1)`, `fun h() = show(1)`, `class T { fun f() = show(1) }`, `val r = run { val x: String = show(1); x }` —
-  but not within a declaration of a declared type, like `val r: String = run { show(1) }`, or `fun h(): String { val x = show(1); return x }`,
-  nor within an `init` block, a constructor, or a default value of a constructor parameter, which behave like declared types.
-  It is also preferred to a member of an implicit receiver, like `show` in `B().run { show(1) }`, even within `fun h(): String`.
-  Local functions are always resolved by the specification, see `ScriptSource.overloadingFunctionCopies` for how the confirming compilations cope with it.
+  a script function whose return type is inferred from its expression body is preferred to the other overloads, even more specific ones, within the inferred contexts (see `isInDeclaredType` for which ones),
+  and to a member of an implicit receiver, like `show` in `B().run { show(1) }`, even within `fun h(): String`.
+  A default value of a parameter of a function behaves like a declared type, while `isInDeclaredType` classifies it by the function, a known difference (#102), like local functions resolved by the specification (#100).
 - In a regular script, a constructor of a script class ranks below the receivers of the lambdas, including the script instance in `run { Foo(2) }`, and above the dependencies,
   while a local function of the block ranks above them all, see `ScriptSource.laterDeclaredClassCandidates`.
 

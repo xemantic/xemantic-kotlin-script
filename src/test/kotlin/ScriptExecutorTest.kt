@@ -7109,7 +7109,7 @@ class ScriptExecutorTest {
     }
 
     @Test
-    fun `should call local overload from default value of parameter of function of inferred type, while a regular script calls the moved one`() = runTest {
+    fun `should call local overload from default value of parameter of function of inferred type, while a regular script calls the most specific one`() = runTest {
         // given
         val script = """
             val p = "!".trim()
@@ -7131,7 +7131,59 @@ class ScriptExecutorTest {
     }
 
     @Test
-    fun `should report call resolved to local overload naming the overloads of the script body and the moved one a regular script calls`() = runTest {
+    fun `should report call resolved to local overload naming only the overload of the script body it calls`() = runTest {
+        // given
+        val script = """
+            val p = "!".trim()
+            fun show(x: String) = "str${'$'}p"
+            fun show(x: Any) = "any${'$'}p"
+            fun show(x: Int): String = "int"
+            sealed interface S
+            class T : S { fun f(): String = show(1) }
+            fun h(): String = show(1)
+            h() + T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:7:19: error: 'show' refers to the function of the script body declared at line 3, instead of its overload declared at line 4, which a regular script calls.
+                  | fun h(): String = <error>show</error>(1)
+                  hint: 'show' (line 4) is compiled outside of the script body, unlike its overload declared at line 3, which hides it there - rename one of them.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report call resolved to local overload naming all the overloads of the script body when the one it calls is not known`() = runTest {
+        // given
+        val script = """
+            val p = "!".trim(); fun show(x: String) = "str${'$'}p"
+            fun show(x: Int): String = "int"
+            1; fun show(x: Any) = "any${'$'}p"
+            sealed interface S
+            class T : S { fun f(): String = show(1) }
+            fun h(): String = show(1)
+            h() + T().f()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert((result as? ScriptResult.Error)?.message?.lines()?.firstOrNull() ==
+                "script.kts:6:19: error: 'show' refers to one of the functions of the script body declared at lines 1, 3, instead of its overload declared at line 2, which a regular script calls.")
+    }
+
+    @Test
+    fun `should report call resolved to local overload naming the overload of the script body it calls and the moved one a regular script calls`() = runTest {
         // given
         val script = """
             val p = "!".trim()
@@ -7153,9 +7205,9 @@ class ScriptExecutorTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
             message sameAs """
-                script.kts:8:1: error: 'show' refers to one of the functions of the script body declared at lines 2, 4, instead of its overload declared at line 5, which a regular script calls.
+                script.kts:8:1: error: 'show' refers to the function of the script body declared at line 4, instead of its overload declared at line 5, which a regular script calls.
                   | <error>show</error>(1) + T().f()
-                  hint: 'show' (line 5) is compiled outside of the script body, unlike its overloads declared at lines 2, 4, which hide it there - rename one of them.
+                  hint: 'show' (line 5) is compiled outside of the script body, unlike its overload declared at line 4, which hides it there - rename one of them.
             """.trimIndent()
         }
     }

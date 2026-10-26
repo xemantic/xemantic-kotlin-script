@@ -341,6 +341,20 @@ private fun shadowedFunctionMessage(
 /** The offset in the message of [shadowedFunctionMessage]. */
 private val shadowedFunctionOffset = Regex("${Regex.escape(SHADOWED_FUNCTION)} at (\\d+);")
 
+/**
+ * The opt-in message of the local functions, one of which the [ScriptSource.shadowedFunctionCandidates] call, telling which one,
+ * declared at the offset of the script, see [ScriptSource.shadowingFunctionLine].
+ */
+internal const val SHADOWING_FUNCTION = "xemantic-kotlin-script: shadowing function"
+
+/** The opt-in message of the local function declared at the [offset] of the script, see [SHADOWING_FUNCTION]. */
+private fun shadowingFunctionMessage(
+    offset: Int
+): String = "$SHADOWING_FUNCTION at $offset;"
+
+/** The offset in the message of [shadowingFunctionMessage]. */
+private val shadowingFunctionOffset = Regex("${Regex.escape(SHADOWING_FUNCTION)} at (\\d+);")
+
 /** The first of the letters replacing the names of the local functions overloading the moved ones, see [ScriptSource.overloadingFunctionCopies]. */
 private const val RENAMED_CHARS = '\u4E00'
 
@@ -763,8 +777,11 @@ internal class ScriptSource private constructor(
         // the confirming compilation reports the deprecations, even if suppressed by the script
         val unsuppressed = BooleanArray(script.length)
         if (confirming || propertyTypeProbes) structure.suppressions.forEach { unsuppressed.fill(true, it.first, it.last + 1) }
-        val renamed = CharArray(script.length)
-        if (overloadingFunctionCopies) structure.renamedRanges.forEach { (range, char) -> renamed.fill(char, range.first, range.last + 1) }
+        val renamed = if (overloadingFunctionCopies && structure.renamedRanges.isNotEmpty()) {
+            CharArray(script.length).also { renamed -> structure.renamedRanges.forEach { (range, char) -> renamed.fill(char, range.first, range.last + 1) } }
+        } else {
+            null
+        }
         fun addLines(
             range: IntRange,
             keep: (offset: Int) -> Boolean
@@ -772,7 +789,7 @@ internal class ScriptSource private constructor(
             val bounds = lineBounds[line]
             lines += buildString {
                 bounds.forEach { offset ->
-                    +(if (keep(offset) && !unsuppressed[offset]) (if (renamed[offset] != '\u0000') renamed[offset] else script[offset]) else ' ')
+                    +(if (keep(offset) && !unsuppressed[offset]) (renamed?.get(offset)?.takeIf { it != '\u0000' } ?: script[offset]) else ' ')
                 }
             }
             mapping += line
@@ -919,6 +936,18 @@ internal class ScriptSource private constructor(
             lines += "}"
             repeat(structure.coroutineScopeMembers.size + structure.scopeFunctionCopies.size + 2) { mapping += null }
         }
+        // each marked on the line preceding it, telling which one is called, see SHADOWING_FUNCTION
+        val shadowingMessagesByLine = if (markedOriginals) {
+            structure.shadowingFunctions.filterKeys { !excluded[it] && !hoisted[it] }.entries.associate { (start, offset) ->
+                lineOf(start) to shadowingFunctionMessage(offset)
+            }
+        } else {
+            emptyMap()
+        }
+        shadowingMessagesByLine.values.forEach { message ->
+            lines += "@kotlin.RequiresOptIn(${stringLiteral(message)}, level = RequiresOptIn.Level.WARNING) annotation class ${optInMarker(message)}"
+            mapping += null
+        }
         // qualified, as the script might declare a function of its name
         lines += if (coroutineScopeCopies) "$SCRIPT_BLOCK_START kotlin.with(this as $BODY_SCOPE_CLASS) {" else SCRIPT_BLOCK_START
         mapping += null
@@ -953,6 +982,10 @@ internal class ScriptSource private constructor(
             }
             blockCopiesByLine[line]?.flatten()?.forEach { (messages, declaration) ->
                 lines += messages.joinToString(separator = " ", postfix = " ") { "@${optInMarker(it)}" } + declaration
+                mapping += null
+            }
+            shadowingMessagesByLine[line]?.let { message ->
+                lines += "@${optInMarker(message)}"
                 mapping += null
             }
             addLines(line..line) { offset ->
@@ -1059,6 +1092,12 @@ internal class ScriptSource private constructor(
     )?.let {
         position(it.first) to position(it.last + 1)
     }
+
+    /** The 0-based line of the local function named in this opt-in [message], see [SHADOWING_FUNCTION]. */
+    fun shadowingFunctionLine(
+        message: String
+    ): Int? = shadowingFunctionOffset.find(message)?.groupValues?.get(1)?.toInt()
+        ?.let { position(it).line }
 
     /** The 0-based line of the moved function, or of its copy, named in this opt-in [message], see [shadowedFunctionCopies]. */
     fun shadowedFunctionLine(
@@ -1347,7 +1386,8 @@ private fun KtNamedFunction.signature(
     +")"
     // keeping the type of the call, which might be an argument of another one, inferred if it is inferred from the expression,
     // as the compiler prefers the script functions of the inferred types to the other ones, see CLAUDE.md,
-    // so the confirming compilation reports that the inferred `Nothing` should be declared, an error ignored there
+    // so the confirming compilation reports that the inferred `Nothing` should be declared, an error ignored there,
+    // as declaring it would lose this preference, while `Nothing` applies wherever the type of the original might be expected
     when {
         typeReference != null -> +": ${typeReference!!.singleLineText(renamed)}"
         !isOfInferredType() || !keepsInferredType -> +": Nothing"
@@ -2146,6 +2186,9 @@ private class ScriptStructure(
     /** The names of the local functions overloading the [overloadedFunctions], renamed with these letters, see [ScriptSource.overloadingFunctionCopies]. */
     val renamedRanges: List<Pair<IntRange, Char>>
 
+    /** The offsets of the names of the local functions, which the [shadowedFunctionCandidates] might call, marked by the confirming compilation, by their starts, see [SHADOWING_FUNCTION]. */
+    val shadowingFunctions: Map<Int, Int>
+
     /** See [ScriptSource.coroutineScopeCandidates]. */
     val coroutineScopeCandidates: List<CoroutineScopeCandidate>
 
@@ -2489,6 +2532,11 @@ private class ScriptStructure(
                 }
             }
         }
+        // the local overloads, one of which the candidates call, starting their lines, so that they can be marked on the lines preceding them
+        val ambiguousNames = shadowedFunctionCandidates.filter { it.isFunction && it.locals.size > 1 }.mapTo(HashSet()) { it.reference.name }
+        shadowingFunctions = overloadingFunctions.filterKeys { it in ambiguousNames }.values.flatten().map { it.second }.filter { function ->
+            script.substring(script.lastIndexOf('\n', function.start - 1) + 1, function.start).isBlank()
+        }.associate { it.start to it.line() }
         // unlike the extension properties, which do not apply without their receivers
         val coroutineScopeDeclarations = moved.filter {
             (it.kind == DeclarationKind.FUNCTION || (it.kind == DeclarationKind.PROPERTY && (it.psi as? KtProperty)?.receiverTypeReference == null))
