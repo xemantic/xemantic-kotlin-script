@@ -19,8 +19,20 @@
 package com.xemantic.kotlin.script
 
 import com.xemantic.kotlin.core.text.unaryPlus
+import org.jetbrains.org.objectweb.asm.ClassReader
+import org.jetbrains.org.objectweb.asm.ClassVisitor
+import org.jetbrains.org.objectweb.asm.Label
+import org.jetbrains.org.objectweb.asm.MethodVisitor
+import org.jetbrains.org.objectweb.asm.Opcodes
 import java.util.Collections
 import java.util.IdentityHashMap
+import kotlin.reflect.KFunction
+import kotlin.reflect.KMutableProperty
+import kotlin.reflect.KProperty
+import kotlin.reflect.full.declaredMembers
+import kotlin.reflect.jvm.javaGetter
+import kotlin.reflect.jvm.javaMethod
+import kotlin.reflect.jvm.javaSetter
 import kotlin.script.experimental.api.ScriptDiagnostic
 
 /** The longest sequence of frames recognized as repeated, e.g. in mutual recursion. */
@@ -31,17 +43,40 @@ private const val MAX_REPORTED_EXCEPTIONS = 32
 
 private val unresolvedReference = Regex("Unresolved reference '(.+)'\\.")
 
+/** The compile-time constant required, like an annotation argument, or the default value of an annotation parameter, reported differently for the members. */
+private val constantRequired = Regex(".* must be a compile-time constant\\.|Only 'const val' can be used in constant expressions\\.")
+
 /** Reported without a location, e.g. for an object accessing the dependencies, which are the members of the script class. */
-private val declarationCapturingScript = Regex("(Object|Enum class|Enum entry|Interface|Nested class) '(.+)' captures the script class instance\\..*")
+private val declarationCapturingScript = Regex(
+    "(${CapturingClassKind.entries.joinToString("|") { it.label }}) '(.+)' captures the script class instance\\..*"
+)
 
 /**
  * The first line of the failure of the compiler backend, reported without a location, followed by the intermediate representation of the code,
- * with the name of the generated function, if it is one, and the path of the declaration containing it within the script class, if any, like `T.I`.
+ * with the name of the generated function, if it is one, and the path of the declaration containing it within the script class, if any, like `T.I`,
+ * in the wording of the compiler, which might change with its version, so the other failures of the backend are recognized by their exceptions,
+ * and reported without a location, see [isBackendCrash].
  */
 private val backendCrash = Regex("Exception while generating code for (?:.* fun (\\S+) .*|.*) declared in (.+):")
 
-/** A part of a binary or canonical class name, like `$Lid` of `_$Box$Lid`, possibly empty, like in `_$$$result$1$1$Dog`. */
-private val classNamePart = Regex("([.$])([\\p{L}\\p{N}_]*)")
+/** The package of the compiler backend, throwing the exceptions of its failures, or failing in its frames. */
+private const val BACKEND_PACKAGE = "org.jetbrains.kotlin.backend."
+
+/** The accessor of a property, like `<get-x>`, named so by the compiler in the failures of its backend. */
+private val accessorFunction = Regex("<[gs]et-(.+)>")
+
+/** The longest name of a class of the script looked up in a text resembling one. */
+private const val MAX_CLASS_NAME_LENGTH = 256
+
+/** The most names of the classes of the script looked up in vain, like in a long message resembling them. */
+private const val MAX_MISSING_CLASSES = 256
+
+/** The superclasses of the classes of the Kotlin lambdas, not compiled with `invokedynamic`, like the suspend ones. */
+private val lambdaSuperclasses = setOf(
+    "kotlin.jvm.internal.Lambda",
+    "kotlin.coroutines.jvm.internal.SuspendLambda",
+    "kotlin.coroutines.jvm.internal.RestrictedSuspendLambda"
+)
 
 internal fun Iterable<ScriptDiagnostic>.filterNonIgnorable() = filterNot { diagnostic ->
     diagnostic.severity == ScriptDiagnostic.Severity.DEBUG && listOf(
@@ -57,29 +92,40 @@ internal fun Iterable<ScriptDiagnostic>.filterNonIgnorable() = filterNot { diagn
  *   to strip it from the names of the classes declared in the script.
  * @param blockClassName the binary name of the class of the script block,
  *   to tell the frames of the script body.
+ * @param classLoader the class loader of the script class,
+ *   resolving the names of the classes declared in the script, in the exception messages, and their methods in the frames.
  */
 internal class ScriptErrorReporter(
     private val source: ScriptSource,
     private val scriptClassName: String? = null,
-    private val blockClassName: String? = null
+    private val blockClassName: String? = null,
+    private val classLoader: ClassLoader? = null
 ) {
 
     /**
      * The name of a class qualified by the script class, like `_.Color` of `Enum.valueOf`, or `_$Box$Lid` of `ClassCastException`,
      * and of the default string representation, as long as the binary name continues, not preceded by a part of another name,
-     * matching the parts with a single character class, as a repeated group would overflow the stack on a long message.
+     * matching it with a single character class, as a repeated group would overflow the stack on a long message,
+     * followed by the address of a lambda, if any, like `/0x000071a8` of `_$$$result$1$1$$Lambda/0x000071a8`.
      */
     private val scriptQualifiedName = scriptClassName?.let {
         // also the element class of an array, like `[L_$Circle;`
-        Regex("(?:(?<=\\[L)|(?<![\\p{L}\\p{N}_.$]))${Regex.escape(it)}([.$][\\p{L}\\p{N}_.$]*)")
+        Regex("(?:(?<=\\[L)|(?<![\\p{L}\\p{N}_.$]))${Regex.escape(it)}([.$][\\p{L}\\p{N}_.$]*)(/0x\\p{XDigit}+)?")
     }
 
-    /** The names qualified by the script class written in the string literals of the script, like `_.Color`, which are kept. */
-    private val writtenQualifiedNames by lazy {
-        source.stringLiterals.flatMapTo(HashSet()) { literal ->
-            scriptQualifiedName?.findAll(literal)?.mapNotNull { it.toDeclaredClassName()?.first }.orEmpty()
-        }
+    /** The constant parts of the string literals of the script resembling the names qualified by the script class, like `_.Color`, which are kept. */
+    private val writtenNames by lazy {
+        source.stringLiterals.filter { literal -> scriptQualifiedName?.containsMatchIn(literal) == true }
     }
+
+    /** The classes of the script by their binary names, or `null`, if there is no such class. */
+    private val scriptClasses = HashMap<String, Class<*>?>()
+
+    /** See [kotlinMethodNames]. */
+    private val kotlinMethodNames = HashMap<Class<*>, Map<String, String>>()
+
+    /** The number of the names of the classes looked up in vain, see [scriptClass]. */
+    private var missingClassCount = 0
 
     fun toFailureMessage(
         diagnostics: List<ScriptDiagnostic>
@@ -112,11 +158,20 @@ internal class ScriptErrorReporter(
         }
         val counts = capturingClasses.filterNotNull().groupingBy { it }.eachCount()
         val indices = HashMap<List<String>, Int>()
+        val unresolved = if (any { constantRequired.matches(it.message) }) {
+            mapNotNullTo(HashSet()) { diagnostic ->
+                diagnostic.location?.takeIf { unresolvedReference.matches(diagnostic.message) }?.let {
+                    source.toScriptPosition(it.start.line, it.start.col)
+                }
+            }
+        } else {
+            emptySet()
+        }
         return mapIndexed { index, diagnostic ->
             val occurrence = capturingClasses[index]?.let { kindAndName ->
                 indices.merge(kindAndName, 1, Int::plus)!! - 1 to counts.getValue(kindAndName)
             }
-            buildString { appendDiagnostic(diagnostic, occurrence) }
+            buildString { appendDiagnostic(diagnostic, occurrence, unresolved) }
         }.distinct()
     }
 
@@ -251,48 +306,295 @@ internal class ScriptErrorReporter(
     /**
      * The names of the classes declared in the script qualified by the script class, like `_.Color.BLUE`, as named in the script, like `Color.BLUE`,
      * also without the synthetic names of the classes enclosing a local class, like `_$$$result$1$1$Dog`,
-     * but not the names written in the string literals of the script.
-     * The text built at runtime to look like such a name, like `"_" + ".Color"`, cannot be told from it, and is rewritten as well.
+     * and the anonymous objects and the lambdas like the frames, as `<anonymous object>` and `<lambda>`,
+     * the classes told by the class loader of the script, unless a constant part of a string literal of the script contains the whole name there,
+     * so the text written by the script is kept, like `"_.Color"`, while the text built at runtime to look like such a name, like `"_" + ".Color"`,
+     * cannot be told from it, and is rewritten as well.
+     * The classes generated by the compiler, like `$WhenMappings`, or by this library, like the one of the dependencies, are kept, as the script does not declare them.
      */
-    private fun String.withoutScriptClassName(): String = scriptQualifiedName?.replace(this) { match ->
-        match.toDeclaredClassName()?.takeIf { (qualified) -> qualified !in writtenQualifiedNames }?.second ?: match.value
-    } ?: this
-
-    /**
-     * The name qualified by the script class up to the classes declared in the script, like `_.Color` of `_.Color.BLUE`,
-     * and the name as in the script, like `Color.BLUE`, or `null`, if it does not name a class declared in the script.
-     * A canonical name, separated by dots, starts with the declared class, while a binary name might start with the synthetic names,
-     * like `$$result$1$1$make`, which might be named like a class of the script as well, so the last sequence of the declared classes is taken.
-     */
-    private fun MatchResult.toDeclaredClassName(): Pair<String, String>? {
-        val parts = classNamePart.findAll(groupValues[1]).map { it.groupValues[1] to it.groupValues[2] }.toList()
-        val classNames = source.classNames
-        val enclosingClassNames = source.enclosingClassNames
-        val first = if (parts.first().first == ".") {
-            0.takeIf { parts.first().second in classNames } ?: return null
-        } else {
-            val last = parts.indexOfLast { (_, name) -> name in classNames }.takeIf { it != -1 } ?: return null
-            // unlike e.g. a function named like a class, enclosing a local class
-            generateSequence(last) { index -> (index - 1).takeIf { it >= 0 && parts[it].second in enclosingClassNames } }.last().takeIf { start ->
-                // the synthetic names are separated by dollars only
-                parts.subList(1, start + 1).none { (separator) -> separator == "." }
-            } ?: return null
+    private fun String.withoutScriptClassName(): String {
+        val regex = scriptQualifiedName ?: return this
+        val message = this
+        val prefixLength = scriptClassName!!.length
+        val written by lazy { message.writtenEnds() }
+        return buildString {
+            var index = 0
+            while (true) {
+                val match = regex.find(message, index) ?: break
+                append(message, index, match.range.first)
+                val start = match.range.first
+                val nameStart = start + prefixLength
+                val nameEnd = match.groups[1]!!.range.last + 1
+                val (name, end) = if (match.groupValues[1].contains("$\$Lambda")) {
+                    // a lambda compiled with `invokedynamic`, as a hidden class, which cannot be looked up
+                    "<lambda>" to match.range.last + 1
+                } else {
+                    // the text following the class is matched again, as it might name other classes, like `_$Box$foo` of `_$Box$foo$_$Lid`
+                    message.scriptClassAt(nameStart, nameEnd)?.let { (declared, classEnd) ->
+                        declared.takeUnless { it.isGenerated() }?.className() to classEnd
+                    } ?: (null to nameEnd)
+                }
+                index = end
+                if (name == null || written[start] >= maxOf(nameEnd, end)) {
+                    append(message, start, end)
+                } else {
+                    +name
+                }
+            }
+            append(message, index, message.length)
         }
-        var last = first
-        while (parts[last].second in enclosingClassNames && parts.getOrNull(last + 1)?.second in classNames) last++
-        fun List<Pair<String, String>>.join() = joinToString("") { (separator, name) -> separator + name }
-        return scriptClassName + parts.take(last + 1).join() to
-                parts.subList(first, last + 1).joinToString(".") { it.second } + parts.drop(last + 1).join()
     }
 
-    private fun Class<*>.className(): String = when {
-        // the synthetic name, like `Script$result$1$fail$1`, would not tell anything
-        isAnonymousClass -> "<anonymous ${superclass.className()}>"
-        // e.g. the classes declared in the script body
-        isLocalClass -> simpleName
-        scriptClassName != null && name.startsWith("$scriptClassName$") ->
-            name.removePrefix("$scriptClassName$").replace('$', '.')
-        else -> name
+    /**
+     * For each position of this text, the furthest end of the constant parts of the string literals of the script found in it,
+     * which start at the position or before it, or `-1`, so the text from a position to an end is written by the script,
+     * if the end is not further, the occurrences of each one found in linear time.
+     */
+    private fun String.writtenEnds(): IntArray {
+        val ends = IntArray(length + 1) { -1 }
+        writtenNames.forEach { written ->
+            occurrences(written).forEach { start -> ends[start] = maxOf(ends[start], start + written.length) }
+        }
+        for (index in 1..length) ends[index] = maxOf(ends[index], ends[index - 1])
+        return ends
+    }
+
+    /** The starts of the occurrences of the [pattern] in this text, with the Knuth-Morris-Pratt algorithm. */
+    private fun String.occurrences(
+        pattern: String
+    ): List<Int> {
+        val prefixes = IntArray(pattern.length)
+        var matched = 0
+        for (index in 1 until pattern.length) {
+            while (matched > 0 && pattern[index] != pattern[matched]) matched = prefixes[matched - 1]
+            if (pattern[index] == pattern[matched]) matched++
+            prefixes[index] = matched
+        }
+        val starts = mutableListOf<Int>()
+        matched = 0
+        for (index in indices) {
+            while (matched > 0 && this[index] != pattern[matched]) matched = prefixes[matched - 1]
+            if (this[index] == pattern[matched]) matched++
+            if (matched == pattern.length) {
+                starts += index - pattern.length + 1
+                matched = prefixes[matched - 1]
+            }
+        }
+        return starts
+    }
+
+    /**
+     * The class of the script of the longest binary or canonical name, like `_$Box` of `_$Box$foo`, or `_$Color` of `_.Color.RED`,
+     * following the name of the script class at the [start] of this text, up to the [end] of the name, or continued by a backticked name,
+     * like `My Box`, and the end of its name, or `null`, if there is no such class.
+     */
+    private fun String.scriptClassAt(
+        start: Int,
+        end: Int
+    ): Pair<Class<*>, Int>? {
+        val loader = classLoader ?: return null
+        val limit = minOf(end, start + MAX_CLASS_NAME_LENGTH)
+        val separators = (start until limit).filter { this[it] == '.' || this[it] == '$' }
+        val ends = separators.drop(1) + listOfNotNull(end.takeIf { it == limit }) + separators.flatMap { separator ->
+            source.backtickedClassNames.filter { startsWith(it, separator + 1) }.map { separator + 1 + it.length }
+        }
+        return ends.distinct().sortedDescending().firstNotNullOfOrNull { classEnd ->
+            scriptClass(scriptClassName + substring(start, classEnd).replace('.', '$'), loader, inMessage = true)?.let { it to classEnd }
+        }
+    }
+
+    /**
+     * The class of the script of this binary [name], or `null`, if there is no such class, also remembered,
+     * while no further classes named [inMessage] are looked up after too many were not found, like in a long message resembling their names,
+     * unlike the classes of the frames.
+     */
+    private fun scriptClass(
+        name: String,
+        loader: ClassLoader,
+        inMessage: Boolean = false
+    ): Class<*>? {
+        if (name in scriptClasses) return scriptClasses[name]
+        if (inMessage && missingClassCount >= MAX_MISSING_CLASSES) return null
+        val type = try {
+            Class.forName(name, false, loader)
+        } catch (e: Throwable) {
+            if (e is VirtualMachineError) throw e
+            null
+        }
+        if (type == null && inMessage) missingClassCount++
+        scriptClasses[name] = type
+        return type
+    }
+
+    /** Whether it is generated by the compiler, like `$WhenMappings`, or by this library, like the class of the dependencies, not declared in the script. */
+    private fun Class<*>.isGenerated(): Boolean = try {
+        isSynthetic || (simpleName == DEPENDENCIES_CLASS_NAME && declaringClass?.name == scriptClassName)
+    } catch (e: Throwable) {
+        if (e is VirtualMachineError) throw e
+        false
+    }
+
+    /**
+     * The names of the functions and the property accessors, like `<get-x>`, by the names of their JVM methods, as declared in the Kotlin metadata of the [Class],
+     * like `getX`, `getX$main` of an internal one, suffixed with the module name, or the one given with `@JvmName`.
+     */
+    private fun Class<*>.kotlinMethodNames(): Map<String, String> = kotlinMethodNames.getOrPut(this) {
+        try {
+            kotlin.declaredMembers.flatMap { member ->
+                when (member) {
+                    is KProperty<*> -> listOfNotNull(
+                        member.javaGetter?.let { it.name to "<get-${member.name}>" },
+                        (member as? KMutableProperty<*>)?.javaSetter?.let { it.name to "<set-${member.name}>" }
+                    )
+                    is KFunction<*> -> listOfNotNull(member.javaMethod?.let { it.name to member.name })
+                    else -> emptyList()
+                }
+            }.toMap()
+        } catch (e: Throwable) {
+            if (e is VirtualMachineError) throw e
+            // like a synthetic class of a lambda, without the Kotlin metadata
+            emptyMap()
+        }
+    }
+
+    /**
+     * Whether the frame at the [index] of the [stackTrace] is generated by the compiler, without a counterpart in the script,
+     * like a synthetic accessor, `access$getX`, calling a private member, a method of a class calling the default method of its interface,
+     * or a bridge of a generic override, like `getX` returning `Object`, calling the method of the same name of the frame above,
+     * told by the lines of the bridges, which are the ones of their class, also of the method itself, if it is declared in the same line,
+     * then only if the frame below the bridge calls the method by the descriptor of the bridge, and not by its own one, like through the interface.
+     */
+    private fun isGenerated(
+        stackTrace: List<StackTraceElement>,
+        index: Int
+    ): Boolean {
+        val element = stackTrace[index]
+        if (index == 0 || element.fileName != source.locationId || element.className == blockClassName) return false
+        val methods = element.methods()?.get(element.methodName) ?: return false
+        if (methods.all { it.isBridge || (it.isSynthetic && it.name.startsWith("access$")) }) return true
+        val bridges = methods.filter { it.isBridge }
+        val above = stackTrace[index - 1]
+        if (bridges.isEmpty() || above.className != element.className || above.methodName != element.methodName) return false
+        if (bridges.none { element.lineNumber in it.lines }) return false
+        if (methods.none { !it.isBridge && element.lineNumber in it.lines }) return true
+        // declared in the line of its class, so told by the call of the method of the frame below, which contains its line
+        val calls = stackTrace.getOrNull(index + 1)?.let { caller ->
+            caller.methods()?.get(caller.methodName)?.filter { caller.lineNumber in it.lines }?.flatMap { it.calls[caller.lineNumber].orEmpty() }
+        }.orEmpty().filter { it.name == element.methodName }
+        val owner = element.className.replace('.', '/')
+        val bridgeDescriptors = bridges.mapTo(HashSet()) { it.descriptor }
+        return calls.any { it.descriptor in bridgeDescriptors }
+                && calls.none { call -> call.owner == owner && methods.any { !it.isBridge && it.descriptor == call.descriptor } }
+    }
+
+    /** A method of a class of the script, as compiled. */
+    private class Method(
+        val name: String,
+        val descriptor: String,
+        val isBridge: Boolean,
+        val isSynthetic: Boolean,
+        /** The lines of its code. */
+        val lines: Set<Int>,
+        /** The methods it calls, by the lines of the calls. */
+        val calls: Map<Int, List<Call>>
+    )
+
+    /** A call of the method of the [name] and the [descriptor] declared by the [owner], like `C` or `I`, by its internal name. */
+    private class Call(
+        val owner: String,
+        val name: String,
+        val descriptor: String
+    )
+
+    /** See [methods]. */
+    private val methods = HashMap<String, Map<String, List<Method>>?>()
+
+    /**
+     * The methods of the class of this frame by their names, read from its bytecode once,
+     * or `null`, if it is not a class of the script, or it cannot be read.
+     */
+    private fun StackTraceElement.methods(): Map<String, List<Method>>? =
+        if (className in methods) methods[className] else readMethods(className).also { methods[className] = it }
+
+    private fun readMethods(
+        className: String
+    ): Map<String, List<Method>>? {
+        val loader = classLoader ?: return null
+        return try {
+            val type = scriptClass(className, loader) ?: return null
+            val bytes = type.classLoader?.getResourceAsStream(className.replace('.', '/') + ".class")?.use { it.readBytes() } ?: return null
+            val methods = mutableListOf<Method>()
+            ClassReader(bytes).accept(object : ClassVisitor(Opcodes.API_VERSION) {
+                override fun visitMethod(
+                    access: Int,
+                    name: String,
+                    descriptor: String,
+                    signature: String?,
+                    exceptions: Array<out String>?
+                ): MethodVisitor {
+                    val lines = HashSet<Int>()
+                    val calls = HashMap<Int, MutableList<Call>>()
+                    var line = -1
+                    return object : MethodVisitor(Opcodes.API_VERSION) {
+                        override fun visitLineNumber(
+                            number: Int,
+                            start: Label
+                        ) {
+                            line = number
+                            lines += number
+                        }
+
+                        override fun visitMethodInsn(
+                            opcode: Int,
+                            owner: String,
+                            name: String,
+                            descriptor: String,
+                            isInterface: Boolean
+                        ) {
+                            calls.getOrPut(line) { mutableListOf() } += Call(owner, name, descriptor)
+                        }
+
+                        override fun visitEnd() {
+                            methods += Method(
+                                name = name,
+                                descriptor = descriptor,
+                                isBridge = access and Opcodes.ACC_BRIDGE != 0,
+                                isSynthetic = access and Opcodes.ACC_SYNTHETIC != 0,
+                                lines = lines,
+                                calls = calls
+                            )
+                        }
+                    }
+                }
+            }, ClassReader.SKIP_FRAMES)
+            methods.groupBy { it.name }
+        } catch (e: Throwable) {
+            if (e is VirtualMachineError) throw e
+            null
+        }
+    }
+
+    /**
+     * The name of the class in terms of the script, like `Box.Lid` of `_$Box$Lid`, `Dog` of the local class `_$$$result$1$1$Dog`,
+     * `<anonymous java.lang.Runnable>` of an object literal, or `<lambda>`, while the name of a class of the script itself is qualified by the script class.
+     */
+    private fun Class<*>.className(): String = try {
+        when {
+            // the synthetic name, like `Script$result$1$fail$1`, would not tell anything
+            isAnonymousClass -> when {
+                superclass?.name in lambdaSuperclasses -> "<lambda>"
+                superclass == Any::class.java -> interfaces.firstOrNull()?.let { "<anonymous ${it.className()}>" } ?: "<anonymous object>"
+                else -> "<anonymous ${superclass.className()}>"
+            }
+            // e.g. the classes declared in the script body
+            isLocalClass -> simpleName
+            scriptClassName == null || !name.startsWith("$scriptClassName$") -> name
+            else -> declaringClass?.takeIf { it.name != scriptClassName }?.let { "${it.className()}.$simpleName" } ?: simpleName
+        }
+    } catch (e: Throwable) {
+        if (e is VirtualMachineError) throw e
+        // like a malformed name of a class not compiled by Kotlin
+        name
     }
 
     private class Frame(
@@ -304,7 +606,7 @@ internal class ScriptErrorReporter(
         stackTrace: List<StackTraceElement>,
         indent: String
     ) {
-        val frames = stackTrace.withIndex().mapNotNull { (index, element) ->
+        val frames = stackTrace.filterIndexed { index, _ -> !isGenerated(stackTrace, index) }.withIndex().mapNotNull { (index, element) ->
             // frames of other scripts, e.g. the one executing this script, are not this script's;
             // synthetic frames of the script block carry no line number
             val scriptLine = if (element.fileName == source.locationId && element.lineNumber > 0) {
@@ -314,7 +616,7 @@ internal class ScriptErrorReporter(
             }
             when {
                 scriptLine != null -> Frame(
-                    location = "${element.functionName(scriptLine)}(script.kts:${scriptLine + 1})",
+                    location = "${element.functionName()}(script.kts:${scriptLine + 1})",
                     sourceLine = source.scriptLines[scriptLine]
                 )
                 // like a static initializer of an object declared in the script
@@ -349,11 +651,9 @@ internal class ScriptErrorReporter(
     /**
      * The name of the function of this script frame, in terms of the script,
      * e.g. `Checker.check`, `<script body>`, `<lambda>` or `<get-x>` of a property accessor,
-     * the accessors told by the 0-based [scriptLine] of the frame, if any.
+     * the functions and the accessors told by the Kotlin metadata of their classes, see [kotlinMethodNames].
      */
-    private fun StackTraceElement.functionName(
-        scriptLine: Int? = null
-    ): String {
+    private fun StackTraceElement.functionName(): String {
         val owner = when {
             className == blockClassName || className == scriptClassName -> ""
             blockClassName != null && className.startsWith("$blockClassName$") ->
@@ -373,9 +673,9 @@ internal class ScriptErrorReporter(
             isLambda || (type != null && type.all { it.isDigit() }) -> "<lambda>"
             type == null && className == blockClassName && methodParts == listOf("invokeSuspend") -> "<script body>"
             else -> {
-                // the local functions of an accessor are named after it, like `getX$inner`
-                val function = scriptLine?.takeIf { methodParts.size == 1 }?.let { line ->
-                    this@ScriptErrorReporter.source.accessorName(methodParts.single(), owner, line)
+                // the local functions are named after the functions or the accessors, like `getX$inner`, unlike the internal ones, like `getX$main`
+                val function = classLoader?.takeIf { className != blockClassName }?.let { loader ->
+                    scriptClass(className, loader)?.kotlinMethodNames()?.get(methodName.removeSuffix("\$default"))
                 } ?: methodParts.last()
                 if (type == null) function else "$type.$function"
             }
@@ -414,10 +714,12 @@ internal class ScriptErrorReporter(
      *
      * @param capturingOccurrence the index of the diagnostic of the class capturing the script class instance reported without a location,
      *   among the ones of the same kind and name, and their count.
+     * @param unresolved the positions of all the unresolved references reported.
      */
     private fun StringBuilder.appendDiagnostic(
         diagnostic: ScriptDiagnostic,
-        capturingOccurrence: Pair<Int, Int>?
+        capturingOccurrence: Pair<Int, Int>?,
+        unresolved: Set<ScriptPosition>
     ) {
         val location = diagnostic.location
         location?.let { source.preambleDependencyAt(it.start.line) }?.let { dependency ->
@@ -427,13 +729,23 @@ internal class ScriptErrorReporter(
         }
         if (location == null) {
             val firstLine = diagnostic.message.lineSequence().first()
-            backendCrash.matchEntire(firstLine)?.let { match ->
-                // qualified by the package of the script, or by `<root>`, followed by the script class
-                val qualifiedPath = match.groupValues[2]
-                val path = listOf("<root>.", "${source.packageName}.").firstOrNull { qualifiedPath.startsWith(it) }?.let {
-                    qualifiedPath.removePrefix(it).split('.').drop(1)
-                }.orEmpty()
-                appendBackendCrash(diagnostic, firstLine.removeSuffix(":"), match.groupValues[1], path)
+            val match = backendCrash.matchEntire(firstLine)
+            if (match != null || diagnostic.isBackendCrash()) {
+                // qualified by the package of the script, or by `<root>`, followed by the script class, unless it is a declaration of a library
+                val qualifiedPath = match?.groupValues?.get(2)
+                val scriptPath = qualifiedPath?.let { path ->
+                    listOf("<root>.", "${source.packageName}.").firstOrNull { path.startsWith(it) }?.let { prefix ->
+                        val names = path.removePrefix(prefix).split('.')
+                        prefix + names.first() to names.drop(1)
+                    }
+                }
+                appendBackendCrash(
+                    diagnostic = diagnostic,
+                    message = firstLine.removeSuffix(":"),
+                    function = match?.groupValues?.get(1).orEmpty(),
+                    scriptClass = scriptPath?.first,
+                    path = scriptPath?.second
+                )
                 return
             }
         }
@@ -443,13 +755,11 @@ internal class ScriptErrorReporter(
             val start = source.toScriptPosition(location.start.line, location.start.col)
             val end = location.end?.let {
                 source.toScriptPosition(it.line, it.col)
-            }?.takeIf {
-                (it.line > start.line) || (it.line == start.line && it.column >= start.column)
-            } ?: start
+            }?.takeIf { it >= start } ?: start
             start to end
         } else {
-            capturingDeclaration?.let { name ->
-                capturingOccurrence?.let { (index, count) -> source.movedClassName(name, index, count) }
+            capturing?.let { (_, kind, name) ->
+                capturingOccurrence?.let { (index, count) -> source.movedClassName(kind, name, index, count) }
             }?.let { (declared, start, end) ->
                 // like `Factory`, which the compiler calls `Companion`
                 capturingDeclaration = declared
@@ -464,6 +774,13 @@ internal class ScriptErrorReporter(
         unresolvedReference.matchEntire(diagnostic.message)?.let { match ->
             appendHint(name = match.groupValues[1], position = start)
         }
+        if (constantRequired.matches(diagnostic.message)) {
+            // e.g. not visible in an object, already hinted at
+            source.propertiesReferredIn(start, end, excluded = unresolved).forEach { (name, line) ->
+                +"  hint: '$name' (line ${line + 1}) is a property of the script body, which cannot be 'const', like a top-level property of a regular script"
+                +" - inline its value, or declare it as a 'const val' in an object, if it is a primitive or a string.\n"
+            }
+        }
         if (capturing != null) {
             val kind = capturing[1].lowercase()
             val article = if (kind[0] in "aeiou") "an" else "a"
@@ -474,20 +791,51 @@ internal class ScriptErrorReporter(
     }
 
     /**
-     * The crash of the compiler backend while generating the [function] within the declaration of this [path], if any,
-     * explained by the callable references of all the classes moved out of the script body to the members of the script class,
-     * if the declaration moved out of the script body containing the code has any,
-     * as the compiler stops at the first crash, otherwise by the first line of the [message] and of its root cause,
-     * without the intermediate representation of the code, at the innermost declaration of the [path] found in the script.
+     * Whether it is a failure of the compiler backend, reported without a location, in the wording not recognized by [backendCrash],
+     * like `Backend Internal error: Exception during IR lowering`, told by its exceptions thrown by the backend.
+     */
+    private fun ScriptDiagnostic.isBackendCrash(): Boolean = location == null && exceptionChain().any { exception ->
+        exception.javaClass.name.startsWith(BACKEND_PACKAGE)
+                || exception.read(emptyList()) { stackTrace.filterNotNull() }.any { it.className.startsWith(BACKEND_PACKAGE) }
+    }
+
+    /** The exception of the diagnostic, followed by its causes. */
+    private fun ScriptDiagnostic.exceptionChain(): List<Throwable> = generateSequence(exception) { cause ->
+        cause.read(null) { this.cause }?.takeIf { it !== cause }
+    }.take(MAX_REPORTED_EXCEPTIONS).toList()
+
+    /**
+     * The crash of the compiler backend while generating the [function], within the declaration of this [path] within the [scriptClass],
+     * qualified like `<root>._`, if known, explained by the callable references of all the classes moved out of the script body to the members of the script class,
+     * as the compiler stops at the first crash, if its root cause is the instance of the script class not available in the declaration moved out of the script body,
+     * which has such references, or, if the declaration is not known, if it failed generating a callable reference.
+     * Otherwise it is reported by the first line of the [message] and the first paragraph of the message of its root cause,
+     * without the intermediate representation of the code, at the innermost declaration of the [path] found in the script, if any.
      */
     private fun StringBuilder.appendBackendCrash(
         diagnostic: ScriptDiagnostic,
         message: String,
         function: String,
-        path: List<String>
+        scriptClass: String?,
+        path: List<String>?
     ) {
+        val chain = diagnostic.exceptionChain()
+        val rootCause = chain.lastOrNull()
+        val rootCauseMessage = rootCause?.read(null) { this.message }?.substringBefore("\n\n")?.trimEnd()
         val references = source.scriptMemberCallableReferences
-        if (references.any { (reference) -> source.movedDeclarationAt(reference.start) == path.firstOrNull() }) {
+        val explained = references.isNotEmpty() && if (path != null && scriptClass != null) {
+            // like `Non-mapped local declaration: VALUE_PARAMETER INSTANCE_RECEIVER ... type:<root>._`
+            references.any { (reference) -> source.movedDeclarationAt(reference.start) == path.firstOrNull() }
+                    && rootCauseMessage?.let { Regex("${Regex.escape(scriptClass)}(?![\\w.$])").containsMatchIn(it) } == true
+        } else {
+            // like the lowering of a bound callable reference, like `"a"::up`, naming no declaration
+            chain.any { exception ->
+                exception.read(emptyList()) { stackTrace.filterNotNull() }.any {
+                    it.className.startsWith(BACKEND_PACKAGE) && "Reference" in it.className.substringAfterLast('.')
+                }
+            }
+        }
+        if (explained) {
             references.forEachIndexed { index, (reference, text) ->
                 val start = reference.start
                 val end = reference.end
@@ -503,12 +851,15 @@ internal class ScriptErrorReporter(
             }
             return
         }
-        val range = source.movedDeclarationPath(path.ifEmpty { listOf(function) })
-        val rootCause = generateSequence(diagnostic.exception) { cause ->
-            cause.read(null) { this.cause }?.takeIf { it !== cause }
-        }.take(MAX_REPORTED_EXCEPTIONS).lastOrNull()
-        val causeLine = rootCause?.let { cause ->
-            listOfNotNull(cause.javaClass.name, cause.read(null) { this.message }?.lineSequence()?.first()).joinToString(": ")
+        val range = when {
+            path == null -> null
+            // like the accessor `<get-x>` of the property `x`
+            path.isEmpty() -> source.movedDeclarationPath(listOf(accessorFunction.matchEntire(function)?.groupValues?.get(1) ?: function))
+            else -> source.movedDeclarationPath(path)
+        }
+        // the exception without a cause repeats the message, followed by the intermediate representation of the code
+        val causeLine = rootCause?.takeIf { chain.size > 1 }?.let { cause ->
+            listOfNotNull(cause.javaClass.name, rootCauseMessage).joinToString(": ")
         }
         range?.let { appendPosition(it.first) }
         appendSeverityAndMessage(

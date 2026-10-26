@@ -50,9 +50,11 @@ import kotlin.script.experimental.api.ScriptDiagnostic
 import kotlin.script.experimental.api.ScriptEvaluationConfiguration
 import kotlin.script.experimental.api.defaultImports
 import kotlin.script.experimental.api.providedProperties
+import kotlin.script.experimental.api.valueOrNull
 import kotlin.script.experimental.jvm.baseClassLoader
 import kotlin.script.experimental.jvm.dependenciesFromClassloader
 import kotlin.script.experimental.jvm.jvm
+import kotlin.script.experimental.jvm.impl.KJvmCompiledScript
 import kotlin.script.experimental.jvm.jvmTarget
 import kotlin.script.experimental.jvm.loadDependencies
 import kotlin.script.experimental.jvmhost.BasicJvmScriptingHost
@@ -446,10 +448,11 @@ internal class DefaultScriptExecutor(
 
             logger.debug { "Script[$scriptId]: Evaluating (2/2)" }
 
+            val evaluationConfig = evaluationConfig()
             val (evaluationResult, duration) = measureTimedValue {
                 scriptingHost.evaluator(
                     compiledScript = compiledScript,
-                    scriptEvaluationConfiguration = evaluationConfig()
+                    scriptEvaluationConfiguration = evaluationConfig
                 )
             }
 
@@ -458,8 +461,12 @@ internal class DefaultScriptExecutor(
                     evaluationResult.value.returnValue.toScriptResult(warnings)
                 }
                 is Failure -> {
-                    // in practice, this never happens
-                    val failureMessage = ScriptErrorReporter(source).toFailureMessage(
+                    // in practice, this never happens, while the script class might not even load, if it is the failure
+                    val scriptClass = compiledScript.getClass(evaluationConfig).valueOrNull()?.java
+                    val failureMessage = reporter(
+                        scriptClassName = scriptClass?.name ?: (compiledScript as? KJvmCompiledScript)?.scriptClassFQName,
+                        classLoader = scriptClass?.classLoader
+                    ).toFailureMessage(
                         evaluationResult.reports.filterNonIgnorable()
                     )
                     ScriptResult.Error(failureMessage, ExecutionPhase.EVALUATION)
@@ -526,12 +533,24 @@ internal class DefaultScriptExecutor(
             warnings: List<ScriptDiagnostic>,
             blockClassName: String?
         ) = ScriptResult.Error(
-            ScriptErrorReporter(
-                source = source,
+            reporter(
                 scriptClassName = scriptClass?.java?.name,
+                classLoader = scriptClass?.java?.classLoader,
                 blockClassName = blockClassName
             ).toFailureMessage(throwable, warnings),
             ExecutionPhase.EVALUATION
+        )
+
+        /** Describing the failures of the evaluation in terms of the script, with the classes declared in it told by the [classLoader] of the script class. */
+        private fun reporter(
+            scriptClassName: String?,
+            classLoader: ClassLoader?,
+            blockClassName: String? = null
+        ) = ScriptErrorReporter(
+            source = source,
+            scriptClassName = scriptClassName,
+            blockClassName = blockClassName,
+            classLoader = classLoader
         )
 
         private fun evaluationConfig() = ScriptEvaluationConfiguration {
