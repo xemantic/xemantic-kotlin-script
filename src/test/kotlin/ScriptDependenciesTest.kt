@@ -18,6 +18,8 @@
 
 package com.xemantic.kotlin.script
 
+import RootConfig
+import `is`
 import com.xemantic.kotlin.test.assert
 import com.xemantic.kotlin.test.be
 import com.xemantic.kotlin.test.have
@@ -158,6 +160,128 @@ class ScriptDependenciesTest {
             message sameAs """
                 script.kts:1:6: error: Unresolved reference 'uppercase' on receiver of type 'CharSequence'.
                   | text.<error>uppercase</error>()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not report warnings of dependency accessor of type with redundant projection`() = runTest {
+        // given
+        val script = """
+            c.compareTo("a")
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            provide<Comparable<in String>>("c", "b")
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 1)
+            have(warnings == null)
+        }
+    }
+
+    @Test
+    fun `should not report warnings of dependency accessor shadowed by local property`() = runTest {
+        // given
+        val script = """
+            val numbers = numbers.size
+            numbers
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            provide<List<out Number>>("numbers", listOf(1, 2.0))
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+            have(warnings == null)
+        }
+    }
+
+    @Test
+    fun `should not report warnings of dependency accessor in compilation error`() = runTest {
+        // given
+        val script = """
+            c.compareTo(42)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            provide<Comparable<in String>>("c", "b")
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:1:13: error: Argument type mismatch: actual type is 'Int', but 'CapturedType(in String)' was expected.
+                  | c.compareTo(<error>42</error>)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not report warnings of dependency accessor together with runtime exception`() = runTest {
+        // given
+        val script = """
+            val text = c as String
+            error(text)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            provide<Comparable<in String>>("c", "b")
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IllegalStateException: b
+                  at <script body>(script.kts:2)
+                  | error(text)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report warnings of header and declarations moved out of the script body together with dependency accessors`() = runTest {
+        // given
+        val script = """
+            @file:OptIn()
+            fun twice(x: Int) = x as Int * 2
+            twice(c.compareTo("a"))
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            provide<Comparable<in String>>("c", "b")
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+            warnings sameAs """
+                script.kts:1:1: warning: '@OptIn' without any arguments has no effect.
+                  | <error>@file:OptIn()</error>
+
+                script.kts:2:23: warning: Cast is redundant.
+                  | fun twice(x: Int) = x <error>as Int</error> * 2
             """.trimIndent()
         }
     }
@@ -411,6 +535,260 @@ class ScriptDependenciesTest {
         result should {
             be<ScriptResult.Value>()
             have(value == "mail alice")
+        }
+    }
+
+    @Test
+    fun `should provide dependency of root package type to script referring to it`() = runTest {
+        // given
+        val script = """
+            RootConfig(1).v + cfg.v
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "cfg" provides RootConfig(41)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+        }
+    }
+
+    @Test
+    fun `should provide dependencies of root package types to script with package directive`() = runTest {
+        // given
+        val script = """
+            package foo
+
+            cfg.v + configs.getValue("a").sumOf { it?.v ?: 0 } + entries.single().config.v
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "cfg" provides RootConfig(1)
+            "configs" provides mapOf("a" to listOf(RootConfig(39), null, RootConfig(1)))
+            "entries" provides arrayOf(RootConfig.Entry(RootConfig(1)))
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+        }
+    }
+
+    @Test
+    fun `should provide dependency of root package type to script with package directive declaring class of the same name`() = runTest {
+        // given
+        val script = """
+            package foo
+
+            enum class RootConfig { A, B }
+            cfg.v + RootConfig.B.ordinal
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "cfg" provides RootConfig(41)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+        }
+    }
+
+    @Test
+    fun `should provide dependency of root package type named like keyword in projected type`() = runTest {
+        // given
+        val script = """
+            package foo
+
+            sink.add(item)
+            sink.size + item.v
+        """.trimIndent()
+        val executor = ScriptExecutor()
+        val sink = mutableListOf<Any>()
+
+        // when
+        val result = executor.execute(script) {
+            provide<MutableList<in `is`>>("sink", sink)
+            "item" provides `is`(41)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+        }
+        assert(sink.single() is `is`)
+    }
+
+    @Test
+    fun `should provide dependency of root package type to script importing class of the same name`() = runTest {
+        // given
+        val script = """
+            import `in`.xemantic.RootConfig
+
+            RootConfig("x").name + cfg.v
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "cfg" provides RootConfig(42)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "x42")
+        }
+    }
+
+    @Test
+    fun `should provide dependency of root package type to script importing it under alias`() = runTest {
+        // given
+        val script = """
+            import RootConfig as Config
+
+            Config(1).v + cfg.v
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "cfg" provides RootConfig(41)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+        }
+    }
+
+    @Test
+    fun `should provide dependency of root package type to script importing function under its name`() = runTest {
+        // given
+        val script = """
+            import kotlin.collections.listOf as RootConfig
+
+            val x: RootConfig = cfg
+            RootConfig(x).single().v
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "cfg" provides RootConfig(42)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+        }
+    }
+
+    @Test
+    fun `should provide dependency of root package type to script importing built-in class under its name`() = runTest {
+        // given
+        val script = """
+            import kotlin.String as RootConfig
+
+            val text: RootConfig = "x"
+            text + cfg.v
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "cfg" provides RootConfig(42)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "x42")
+        }
+    }
+
+    @Test
+    fun `should provide dependency of root package type to script naming its import alias`() = runTest {
+        // given
+        val script = """
+            package foo
+
+            import kotlin.String as _root_RootConfig
+
+            val text: _root_RootConfig = "x"
+            text + cfg.v
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "cfg" provides RootConfig(42)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "x42")
+        }
+    }
+
+    @Test
+    fun `should run script declaring class shadowing root package type of dependency it does not refer to`() = runTest {
+        // given
+        val script = """
+            enum class RootConfig { A, B }
+            RootConfig.B.ordinal
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "cfg" provides RootConfig(42)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 1)
+        }
+    }
+
+    @Test
+    fun `should report dependency of root package type shadowed by script class like regular script`() = runTest {
+        // given
+        val script = """
+            enum class RootConfig { A }
+            cfg.v
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script) {
+            "cfg" provides RootConfig(42)
+        }
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:5: error: Unresolved reference 'v' on receiver of type 'RootConfig'.
+                  | cfg.<error>v</error>
+            """.trimIndent()
         }
     }
 

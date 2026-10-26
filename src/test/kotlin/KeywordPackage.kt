@@ -20,3 +20,6 @@ package `in`.xemantic
 
 /** In a package starting with a Kotlin keyword, like the ones of the `in` domain. */
 class Box<T>(val value: T)
+
+/** Named like the class of the root package. */
+class RootConfig(val name: String)
