@@ -58,6 +58,22 @@ private val suspensionOutsideCoroutine = Regex(
     "Suspension functions can only be called within coroutine body\\..*|Suspend function .+ can only be called from a coroutine or another suspend function\\..*"
 )
 
+/**
+ * Reported for a call of an inline function kept local, the extension of the outer receiver of the script block,
+ * see [ScriptSource], on another receiver, like `"a".logged { }`, which is unresolved in the script.
+ */
+private val outerReceiverMismatch = Regex(
+    "Candidate 'fun (?:<[^']*> )?`?$DEPENDENCIES_CLASS_NAME`?\\.`?([^`(]+)`?\\(.*' is inapplicable because of a receiver type mismatch\\."
+)
+
+/** Reported together with the [outerReceiverMismatch] of a generic function. */
+private val typeParameterNotInferred = Regex("Cannot infer type for type parameter '.+'\\..*")
+
+/** The [message][ScriptDiagnostic.message] without the internal names of the outer receiver of the script block, see [outerReceiverMismatch]. */
+private val ScriptDiagnostic.scriptMessage: String get() = outerReceiverMismatch.matchEntire(message)?.let {
+    "Unresolved reference '${it.groupValues[1]}'."
+} ?: message.replace("`$DEPENDENCIES_CLASS_NAME`.", "").replace("$DEPENDENCIES_CLASS_NAME.", "")
+
 /** Reported without a location, e.g. for an object accessing the dependencies, which are the members of the script class. */
 private val declarationCapturingScript = Regex(
     "(${CapturingClassKind.entries.joinToString("|") { it.label }}) '(.+)' captures the script class instance\\..*"
@@ -203,26 +219,31 @@ internal class ScriptErrorReporter(
         }
     }.trimEnd()
 
-    /** The descriptions of the diagnostics, without the repeated ones, e.g. of the same type used twice in an accessor. */
+    /**
+     * The descriptions of the diagnostics, without the repeated ones, e.g. of the same type used twice in an accessor,
+     * nor the type arguments not inferred for the calls reported as unresolved, see [outerReceiverMismatch].
+     */
     private fun List<ScriptDiagnostic>.describe(
         compilation: Boolean = false
     ): List<String> {
+        val unresolvedCalls = filter { outerReceiverMismatch.matches(it.message) }.mapTo(HashSet()) { it.location?.start }
+        val diagnostics = filterNot { it.location?.start in unresolvedCalls && typeParameterNotInferred.matches(it.message) }
         // reported without a location, the classes of the same name, like the companion objects, are told by their order
-        val capturingClasses = map { diagnostic ->
+        val capturingClasses = diagnostics.map { diagnostic ->
             diagnostic.takeIf { it.location == null }?.let { declarationCapturingScript.matchEntire(it.message)?.groupValues?.subList(1, 3) }
         }
         val counts = capturingClasses.filterNotNull().groupingBy { it }.eachCount()
         val indices = HashMap<List<String>, Int>()
-        val unresolved = if (any { constantRequired.matches(it.message) }) {
-            mapNotNullTo(HashSet()) { diagnostic ->
-                diagnostic.location?.takeIf { unresolvedReference.matches(diagnostic.message) }?.let {
+        val unresolved = if (diagnostics.any { constantRequired.matches(it.message) }) {
+            diagnostics.mapNotNullTo(HashSet()) { diagnostic ->
+                diagnostic.location?.takeIf { unresolvedReference.matches(diagnostic.scriptMessage) }?.let {
                     source.toScriptPosition(it.start.line, it.start.col)
                 }
             }
         } else {
             emptySet()
         }
-        return mapIndexed { index, diagnostic ->
+        return diagnostics.mapIndexed { index, diagnostic ->
             val occurrence = capturingClasses[index]?.let { kindAndName ->
                 indices.merge(kindAndName, 1, Int::plus)!! - 1 to counts.getValue(kindAndName)
             }
@@ -365,7 +386,7 @@ internal class ScriptErrorReporter(
             appendPosition(reference.start)
             +"error: '${reference.name}' does not refer to the $kind of the script body declared at line ${hidden.line + 1}, which is not visible in '$declaration'.\n"
             appendSourceLines(reference.start, reference.end)
-            appendNotVisibleHint(declaration, reference.name, hidden.line, source.isMovedInlineFunction(declaration))
+            appendNotVisibleHint(declaration, reference.name, hidden.line, source.isMovedInlineFunctionAt(reference.start))
         }
     }.trimEnd()
 
@@ -903,7 +924,7 @@ internal class ScriptErrorReporter(
                 return
             }
         }
-        val capturing = declarationCapturingScript.matchEntire(diagnostic.message)?.groupValues
+        val capturing = declarationCapturingScript.matchEntire(diagnostic.scriptMessage)?.groupValues
         var capturingDeclaration = capturing?.get(2)
         val range = if (location != null) {
             val start = source.toScriptPosition(location.start.line, location.start.col)
@@ -936,7 +957,7 @@ internal class ScriptErrorReporter(
         if (range == null) return
         val (start, end) = range
         appendSourceLines(start, end)
-        unresolvedReference.matchEntire(diagnostic.message)?.let { match ->
+        unresolvedReference.matchEntire(diagnostic.scriptMessage)?.let { match ->
             appendHint(name = match.groupValues[1], position = start)
         }
         if (constantRequired.matches(diagnostic.message)) {
@@ -946,9 +967,9 @@ internal class ScriptErrorReporter(
                 +" - inline its value, or declare it as a 'const val' in an object, if it is a primitive or a string.\n"
             }
         }
-        if (suspensionOutsideCoroutine.matches(diagnostic.message)) {
+        if (suspensionOutsideCoroutine.matches(diagnostic.scriptMessage)) {
             // the innermost one, if nested
-            source.localInlineFunctionArguments.lastOrNull { start in it }?.let { argument ->
+            source.localInlineFunctionArguments.lastOrNull { start in it.lambda }?.takeIf { it.mightSuspendAt(start) }?.lambda?.let { argument ->
                 +"  hint: '${argument.name}' is compiled without 'inline', as it reads the local values of the script body, so its lambdas cannot suspend"
                 +" - pass the local values to '${argument.name}' as parameters to keep it inline.\n"
             }
@@ -1057,7 +1078,7 @@ internal class ScriptErrorReporter(
     ) {
         +diagnostic.severity.name.lowercase()
         +": "
-        diagnostic.message.trimEnd().lines().joinTo(this, "\n  ")
+        diagnostic.scriptMessage.trimEnd().lines().joinTo(this, "\n  ")
         +'\n'
         // e.g. of the failure to instantiate the script class
         diagnostic.exception?.let {
@@ -1098,7 +1119,7 @@ internal class ScriptErrorReporter(
         val (line, kind) = source.bodyDeclarationLine(name, position) ?: return
         val declaration = source.movedDeclarationAt(position)
         if (declaration != null) {
-            appendNotVisibleHint(declaration, name, line, source.isMovedInlineFunction(declaration))
+            appendNotVisibleHint(declaration, name, line, source.isMovedInlineFunctionAt(position))
         } else if (line > position.line) {
             // which cannot be declared preceding the calling one, see ScriptSource.Parsed.hoisted
             val calledBack = if (kind == FUNCTION) source.callsBack(name, position) else null
