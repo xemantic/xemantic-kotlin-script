@@ -49,6 +49,9 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 - An `object`, an `enum class` or a nested class declared in a test script cannot access the dependencies, nor call the functions moved out of the script body, which are the members of the script instance ("captures the script class instance") —
   to test a moved declaration accessing them, use a top-level class instead, moved e.g. by making it refer to an enum, or implement a sealed interface.
   Moving a top-level property along with them does not help, not even a constant one: it becomes a member of the script instance too, and `const val` is rejected there — a plain `.kts` fails the same way.
+- A test script needing a function to stay local to the script body, while it is called before its declaration, or by a declaration which cannot be local,
+  must make it read a property which is not initialized with a literal, like `val p = "1".toInt()` —
+  a `val p = 1` is a constant, which does not keep such a function local, but is moved together with it (#38).
 - To test a hint about an unresolved local class, refer to it in the script body before its declaration —
   a moved declaration referring to a local class moves the class along, so it never meets it unresolved.
   A local `val` and a local `class` of the same name conflict, unlike a local `fun` and a `class`.
@@ -66,6 +69,13 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   This hides bugs of the exception reporting which only show in production: test them with an exception class the recovery cannot copy, i.e. without a `(String)`, `(String, Throwable)` or `(Throwable)` constructor.
   An exception whose `getStackTrace()` contains `null` crashes the recovery itself, so such a case can only be tested by calling `ScriptErrorReporter` directly.
   The same applies to a compilation failure shared through the compilation cache: the waiters receive such a copy, while the compiling caller gets the original, so a message built from its `cause` differs between them unless unwrapped.
+
+- When comparing a script with a regular `.kts` evaluated by `BasicJvmScriptingHost`, remember that its body cannot call suspending functions, unlike the script block,
+  and that the compiler reports such a call there with another message ("Suspend function '…' can only be called from a coroutine…") than within a non-inline lambda of the block ("Suspension functions can only be called within coroutine body.").
+- In a regular `.kts`, a call before a function's declaration ranks it after the receivers everywhere, but only if the compiler resolves that call to it, not `append` of `buildString { append("x") }` — see `ScriptStructure.forwardReferencedFunctions`.
+- A local function of the script block takes precedence over the members and the extensions of every implicit receiver, even over the own member of a local class calling it.
+  So does a function of a regular `.kts` (K2) in its statements and in the bodies of its functions, but not within a declaration of an inferred type, like `val x = …` or `fun f() = …`, nor in the last expression (unless e.g. a string template, an equality or a `while` loop, but not a `for` loop), where it ranks after them, like a local extension of the outermost receiver — see `Reference.isInInferredType`.
+  The properties of a regular `.kts` rank after the receivers everywhere.
 
 - The script compilation does not resolve a backticked import alias, not even a plain one like ``import kotlin.check as `verify` `` (`Unresolved reference`), while the same alias without backticks works —
   so a test needing a library function of a name with special characters, like `` `say$hi` ``, declares it in the test sources, see `StringLiteralNames.kt`, and star-imports its package.

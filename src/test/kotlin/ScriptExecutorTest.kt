@@ -2128,7 +2128,7 @@ class ScriptExecutorTest {
     fun `should call function accessing local declarations of the script body before its declaration`() = runTest {
         // given
         val script = """
-            val prefix = ">"
+            val prefix = ">".trim()
             val formatted = format("x")
             fun format(text: String) = prefix + text
             formatted
@@ -2150,7 +2150,7 @@ class ScriptExecutorTest {
         // given
         val script = """
             val formatted = format("x")
-            val prefix = ">"
+            val prefix = ">".trim()
             fun format(text: String) = prefix + text
             formatted
         """.trimIndent()
@@ -2270,7 +2270,7 @@ class ScriptExecutorTest {
     fun `should hint that mutually recursive functions accessing local declarations of the script body cannot call each other`() = runTest {
         // given
         val script = """
-            val limit = 10
+            val limit = "10".toInt()
             fun even(n: Int): Boolean = if (n >= limit) true else odd(n + 1)
             fun odd(n: Int): Boolean = if (n >= limit) false else even(n + 1)
             even(0)
@@ -2324,7 +2324,7 @@ class ScriptExecutorTest {
     fun `should not call function accessing local declarations before its declaration when local class declared in between calls constructor property of its name`() = runTest {
         // given
         val script = $$"""
-            val factor = 2
+            val factor = "2".toInt()
             fun a() = b()
             class C(val b: () -> String) { fun x() = b() }
             fun b() = "local $factor"
@@ -2351,7 +2351,7 @@ class ScriptExecutorTest {
     fun `should not call function accessing local declarations before its declaration when it calls member of lambda receiver named like function declared in between`() = runTest {
         // given
         val script = $$"""
-            val factor = 2
+            val factor = "2".toInt()
             class Obj { fun b() = "member" }
             fun a() = c()
             fun b() = "local $factor"
@@ -2418,7 +2418,7 @@ class ScriptExecutorTest {
     fun `should not call function accessing local declarations before its declaration when it calls function declared in between`() = runTest {
         // given
         val script = $$"""
-            val factor = 2
+            val factor = "2".toInt()
             fun main() = report()
             fun format(x: Int) = "${x * factor}"
             fun report() = format(1)
@@ -2445,7 +2445,7 @@ class ScriptExecutorTest {
     fun `should not call function accessing local declarations before its declaration when it calls other function than the local one of its name declared later`() = runTest {
         // given
         val script = $$"""
-            val factor = 2
+            val factor = "2".toInt()
             fun a() = b()
             fun b() = print(factor)
             fun print(x: Any) = "printed $x $factor"
@@ -2476,7 +2476,7 @@ class ScriptExecutorTest {
     fun `should not call function of inferred type accessing local declarations before its declaration when it calls function within lambda with receiver`() = runTest {
         // given
         val script = $$"""
-            val factor = 2
+            val factor = "2".toInt()
             class Obj { fun b() = "member" }
             fun b() = "local $factor"
             fun a() = c()
@@ -2533,7 +2533,7 @@ class ScriptExecutorTest {
     fun `should not hint that function calls back the one calling it when it only binds a value of its name`() = runTest {
         // given
         val script = $$"""
-            val k = "!"
+            val k = "!".trim()
             fun format(x: Int) = render(x)
             fun render(x: Int) = listOf(x).joinToString { format -> "$format$k" }
             format(1)
@@ -3249,6 +3249,199 @@ class ScriptExecutorTest {
     }
 
     @Test
+    fun `should execute script with property getter reading local property`() = runTest {
+        // given
+        val script = """
+            val items = mutableListOf(1, 2)
+            val total: Int get() = items.sum()
+            items += 3
+            total
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 6)
+        }
+    }
+
+    @Test
+    fun `should execute scripts with property accessors reading local properties`() = runTest {
+        // given
+        val scripts = listOf(
+            "val items = mutableListOf(1, 2)\nvar first: Int\n    get() = items.first()\n    set(v) { items[0] = v * 2 }\nfirst = 10\nitems.toString() + first",
+            "val items = mutableListOf(1, 2)\nvar first: Int\n    set(value: Int) { items[0] = value }\n    get(): Int { return items.first() }\nfirst = 10\nitems.toString() + first",
+            "val items = mutableListOf(1, 2)\nval total get() = items.sum()\nval double get() = total * 2\nitems += 3\ndouble",
+            "val items = mutableListOf(1, 2)\nval total: Int get() = items.sum()\nfun show() = \"total: \$total\"\nitems += 3\nshow()",
+            "val items = mutableListOf(1, 2)\nprivate val total get(): Int = items.sum(); items += 3; total",
+            "val items = mutableListOf(1, 2)\n/** The sum. */\n@Suppress(\"unused\")\nval total: Int get() = items.sum() // the sum\nitems += 3\ntotal",
+            "import kotlin.math.max\nval items = mutableListOf(1, 5)\nval top get() = items.fold(0) { a, b -> max(a, b) } + listOf(1).size + Pair(1, 2).first + items.map { it }.size\ntop",
+            // named like the parameters of the operators of the object
+            "val _property = \"local\"\nval _thisRef = \"!\"\nval items = listOf(1)\nval t get() = _property + _thisRef + items.size\nt",
+            // named like a member of the receivers, though declared before
+            "val items = listOf(1)\nval isActive get() = items.isEmpty()\nval t get() = items.size.toString() + isActive\nt",
+            // within the lambdas without a receiver
+            "val threshold = listOf(1).first()\nval items = listOf(1, 2, 3)\nval n get() = items.count { it > threshold }.toString() + items.map { it * threshold }.sum()\nn",
+            "val factor = listOf(2).first()\nval items = listOf(1, 2)\nval t get() = items.zip(items) { a, b -> a + b * factor }.sum()\nt",
+            "fun <T> twice(block: () -> T) = listOf(block(), block())\nval factor = listOf(2).first()\nval items = listOf(1, 2)\nval t get() = items.map label@{ it * factor }.sum() + twice { factor }.sum()\nt",
+            "class Box { fun g() = \"box\" }\n@JvmName(\"gg\") fun g() = \"script\"\nval items = listOf(1)\nval t get() = items.size.toString() + with(Box()) { g() }\nt",
+            // with the annotations applicable to a local variable
+            "val items = listOf(1)\n@OptIn(ExperimentalStdlibApi::class)\nval t get() = items.size\nt"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("[20, 2]20", "[10, 2]10", 12, "total: 6", 6, 6, 9, "local!1", "1false", "26", 9, 10, "1script", 1))
+    }
+
+    @Test
+    fun `should report property with accessor reading local property and annotation not applicable to local variable as compiled outside of script body`() = runTest {
+        // given
+        val script = "val items = listOf(1)\n@Deprecated(\"x\")\nval total get() = items.size\ntotal"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        val message = (result as ScriptResult.Error).message
+        assert("'total' is compiled outside of the script body, where 'items' (line 1) is not visible" in message)
+        assert("not applicable to target" !in message)
+    }
+
+    @Test
+    fun `should not resolve name within lambda with receiver of property accessor reading local properties to local property`() = runTest {
+        // given
+        val script = "class User(val name: String)\nval name = \"local\"\nval items = listOf(1)\nval t get() = items.size.toString() + with(User(\"u\")) { name }\nt"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            have("'t' is compiled outside of the script body, where 'items' (line 3) is not visible" in message)
+        }
+    }
+
+    @Test
+    fun `should not resolve calls of property accessors reading local properties on the implicit receivers of the script body`() = runTest {
+        // given
+        val scripts = listOf(
+            "val items = listOf(1, 2)\nval t get() = items.size.toString() + javaClass.name\nt",
+            "val items = listOf(1, 2)\nval t get() = items.size.toString() + let { it::class.simpleName }\nt",
+            "val items = listOf(1, 2)\nval t get() = items.isEmpty() || isActive\nt",
+            "val items = listOf(1, 2)\nval t get() = items.size.also { launch { } }\nt",
+            "import kotlinx.coroutines.launch\nval items = mutableListOf(1, 2)\nval t: Int\n    get() { launch { items += 5 }; return items.size }\nt",
+            "import kotlinx.coroutines.isActive\nval items = listOf(1, 2)\nval t get() = items.isEmpty() || isActive\nt",
+            "import kotlin.let\nval items = listOf(1, 2)\nval t get() = items.size.toString() + let { 1 }\nt",
+            "import kotlin.jvm.javaClass\nval items = listOf(1, 2)\nval t get() = items.size.toString() + javaClass.name\nt",
+            "fun let(x: Int) = x\nval items = listOf(1, 2)\nval t get() = items.size.toString() + let { it::class.simpleName }\nt",
+            "import kotlin.let as myLet\nval items = listOf(1, 2)\nval t get() = items.size.toString() + myLet { it::class.simpleName }\nt",
+            "import kotlinx.coroutines.launch as go\nval items = mutableListOf(1, 2)\nval t: Int\n    get() { go { items += 5 }; return items.size }\nt",
+            "val items = listOf(1, 2)\nval let = items.size + 1\nval t get() = items.size.toString() + let { it::class.simpleName }\nt",
+            "val items = listOf(1)\nval t get() = items.size.toString() + isActive\nval isActive = \"mine\"\nt",
+            "val items = listOf(1)\nval t get() = items.size.toString() + javaClass\nval javaClass = \"mine\"\nt",
+            "val items = listOf(1)\nval t get() = items.size.toString() + coroutineContext\nval coroutineContext = \"mine\"\nt",
+            "val items = listOf(1)\nval t get() = items.size.toString() + ensureActive()\nfun ensureActive() = \"mine\"\nt"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) } +
+                executor.execute(scripts[1], listOf(dependency("let", 1)))
+
+        // then
+        assert(results.all { (it as? ScriptResult.Error)?.phase == ExecutionPhase.COMPILATION })
+    }
+
+    @Test
+    fun `should execute script with property getter reading local property and referring to names resolved by the script`() = runTest {
+        // given
+        val script = """
+            fun double(x: Int) = x * 2
+            val items = listOf(listOf(1, 2), listOf(3))
+            val isActive = 10
+            val total get() = maxOf(items.size, 1) + listOf(bonus).sum() + double(items.sumOf { it.count { it > 1 } }) + isActive
+            total
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("bonus", 100)))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2 + 100 + 4 + 10)
+        }
+    }
+
+    @Test
+    fun `should report exception thrown by property getter reading local property at the lines of the script`() = runTest {
+        // given
+        val script = """
+            val items = mutableListOf<Int>()
+            @Suppress("unused")
+            val first: Int
+                get() {
+                    val offset = 1
+                    return items.first() + offset
+                }
+            first
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        val lines = (result as ScriptResult.Error).message.lines()
+        assert(lines.first() == "java.util.NoSuchElementException: List is empty.")
+        assert(lines.drop(2) == listOf(
+            "  at <lambda>(script.kts:6)",
+            "  |         return items.first() + offset",
+            "  at <lambda>(script.kts:3)",
+            "  | val first: Int",
+            "  at <script body>(script.kts:8)",
+            "  | first"
+        ))
+    }
+
+    @Test
+    fun `should report error at property getter reading local property`() = runTest {
+        // given
+        val script = """
+            val items = mutableListOf(1, 2)
+            val total: String get() = items.sum()
+            total
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:27: error: Return type mismatch: expected 'String', actual 'Int'.
+                  | val total: String get() = <error>items.sum()</error>
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should execute statement following star import in the script body`() = runTest {
         // given
         val script = """
@@ -3310,6 +3503,54 @@ class ScriptExecutorTest {
         result should {
             be<ScriptResult.Value>()
             have(value == 1)
+        }
+    }
+
+    @Test
+    fun `should not treat locally bound name as reference to function declared later`() = runTest {
+        // given
+        val script = """
+            import kotlinx.coroutines.launch
+            val sizes = listOf("ab").map { work -> work.length }
+            var total = 0
+            for (work in sizes) total += work
+            fun work() = launch { }
+            work()
+            sizes + total
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == listOf(2, 2))
+        }
+    }
+
+    @Test
+    fun `should refer to class declared later by name of local function or member extension property before it`() = runTest {
+        // given
+        val check = "Regex::class.java.declaredMethods.any { it.name == \"mine\" }"
+        val bindings = listOf(
+            "val found = run {\n    fun Regex() = 1\n    $check\n}",
+            "class Box {\n    fun Regex() = 2\n    val found = $check\n}\nval found = Box().found",
+            "class Box {\n    val Int.Regex get() = 3\n    val found = $check\n}\nval found = Box().found"
+        )
+        val scripts = bindings.map { "$it\nclass Regex { fun mine() = 4 }\nfound" }
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        results.forEach { result ->
+            result should {
+                be<ScriptResult.Value>()
+                have(value == true)
+            }
         }
     }
 
@@ -4432,7 +4673,7 @@ class ScriptExecutorTest {
     fun `should hint to declare class before its use when it accesses local declarations of the script body`() = runTest {
         // given
         val script = """
-            val base = 10
+            val base = "10".toInt()
             val scaled = Scaler().scale(2)
             class Scaler { fun scale(x: Int) = x * base }
             scaled
@@ -5876,8 +6117,8 @@ class ScriptExecutorTest {
         // given
         val script = $$"""
             val prefix = "local"
-            val greeting get() = "$prefix!"
-            greeting
+            val Int.greeting get() = "$prefix!"
+            1.greeting
         """.trimIndent()
         val executor = ScriptExecutor()
 
@@ -5889,10 +6130,30 @@ class ScriptExecutorTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
             message sameAs $$"""
-                script.kts:2:24: error: Unresolved reference 'prefix'.
-                  | val greeting get() = "$<error>prefix</error>!"
+                script.kts:2:28: error: Unresolved reference 'prefix'.
+                  | val Int.greeting get() = "$<error>prefix</error>!"
                   hint: 'greeting' is compiled outside of the script body, where 'prefix' (line 1) is not visible - pass it as a parameter, or declare it within 'greeting'.
             """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should execute script with property accessor reading local property shadowing dependency`() = runTest {
+        // given
+        val script = $$"""
+            val prefix = "local"
+            val greeting get() = "$prefix!"
+            greeting
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("prefix", "dep")))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "local!")
         }
     }
 
@@ -5918,7 +6179,7 @@ class ScriptExecutorTest {
     fun `should report error at declaration moved out of the script body referring to dependency shadowed by local function`() = runTest {
         // given
         val script = """
-            val prefix = "local:"
+            val prefix = "local:".trim()
             fun log(message: String) = prefix + message
             sealed interface Check
             class Below : Check { fun ok() = log("hi") }
@@ -6726,7 +6987,7 @@ class ScriptExecutorTest {
     fun `should report error at declaration moved out of the script body calling dependency with invoke operator shadowed by local function`() = runTest {
         // given
         val script = """
-            val prefix = ">"
+            val prefix = ">".trim()
             fun log(message: String) = prefix + message
             sealed interface S
             class T : S { fun f() = log("hi") }
@@ -6791,7 +7052,7 @@ class ScriptExecutorTest {
     fun `should report error at declaration moved out of the script body calling local function instead of callable dependency of its name`() = runTest {
         // given
         val script = """
-            val k = 1
+            val k = "1".toInt()
             fun log() = k
             sealed interface S
             class T : S { fun f() = log() }
@@ -6817,7 +7078,7 @@ class ScriptExecutorTest {
     @Test
     fun `should not call callable dependency instead of local function from declaration moved out of the script body binding its name or referring to type alias`() = runTest {
         // given
-        val local = "val k = 1\nfun log(s: String) = \"local:\$s\$k\"\nsealed interface S\n"
+        val local = "val k = \"1\".toInt()\nfun log(s: String) = \"local:\$s\$k\"\nsealed interface S\n"
         val scripts = listOf(
             // the calls which the inner declarations do not apply to call the local function in the script
             local + "class T : S { fun log(i: Int) = i; fun f() = log(\"x\") }\nT().f()",
@@ -6826,9 +7087,9 @@ class ScriptExecutorTest {
             local + "class T : S { fun f(): String { val log = 1; return log(\"x\") } }\nT().f()",
             local + "class T : S { fun f() = listOf(1).map { log -> log(\"x\") } }\nT().f()",
             // the copies of the local functions referring to the type aliases follow them
-            "val k = 1\ntypealias N = String\nfun log(n: N) = \"local:\$n\$k\"\nsealed interface S\nclass T : S { fun f() = log(\"x\") }\nT().f()",
-            "val k = 1\ntypealias L<X> = List<X>\nfun log(l: L<String>) = \"local:\$l\$k\"\nsealed interface S\nclass T : S { fun f() = log(listOf(\"x\")) }\nT().f()",
-            "val k = 1\ntypealias Fn = () -> String\nfun log(f: Fn) = \"local:\${f()}\$k\"\nsealed interface S\nclass T : S { fun f() = log { \"x\" } }\nT().f()"
+            "val k = \"1\".toInt()\ntypealias N = String\nfun log(n: N) = \"local:\$n\$k\"\nsealed interface S\nclass T : S { fun f() = log(\"x\") }\nT().f()",
+            "val k = \"1\".toInt()\ntypealias L<X> = List<X>\nfun log(l: L<String>) = \"local:\$l\$k\"\nsealed interface S\nclass T : S { fun f() = log(listOf(\"x\")) }\nT().f()",
+            "val k = \"1\".toInt()\ntypealias Fn = () -> String\nfun log(f: Fn) = \"local:\${f()}\$k\"\nsealed interface S\nclass T : S { fun f() = log { \"x\" } }\nT().f()"
         )
         val executor = ScriptExecutor()
 
@@ -6856,9 +7117,9 @@ class ScriptExecutorTest {
         // given
         val scripts = listOf(
             // referred to as a function
-            "val k = 1\nfun log() = k\nsealed interface S\nclass T : S { fun f(): () -> Int = ::log }\nT().f()()",
+            "val k = \"1\".toInt()\nfun log() = k\nsealed interface S\nclass T : S { fun f(): () -> Int = ::log }\nT().f()()",
             // referring to the local class, so it cannot be copied
-            "val k = 1\nclass L { val v = k }\nfun log(l: L) = l.v\nsealed interface S\nclass T : S { fun f() = listOf(\"a\").map(log) }\nT().f()"
+            "val k = \"1\".toInt()\nclass L { val v = k }\nfun log(l: L) = l.v\nsealed interface S\nclass T : S { fun f() = listOf(\"a\").map(log) }\nT().f()"
         )
         val executor = ScriptExecutor()
 
@@ -7139,7 +7400,7 @@ class ScriptExecutorTest {
         val script = """
             import kotlin.time.Duration
             import kotlin.time.Duration.Companion.seconds
-            val prefix = ">"
+            val prefix = ">".trim()
             fun log(duration: Duration) = prefix + duration
             sealed interface S
             class T : S { fun f() = log(1.seconds) }
@@ -7166,7 +7427,7 @@ class ScriptExecutorTest {
     fun `should hint to declare function before its use when called after elvis operator`() = runTest {
         // given
         val script = """
-            val base: Int? = 1
+            val base = "1".toIntOrNull()
             val r = base ?: compute()
             val compute = 2
             fun compute() = base
@@ -7355,7 +7616,7 @@ class ScriptExecutorTest {
     fun `should report error at call of dependency before local function of the same name declared later`() = runTest {
         // given
         val script = """
-            val p = 1
+            val p = "1".toInt()
             val r = x()
             fun x() = p + 10
             r
@@ -7382,11 +7643,11 @@ class ScriptExecutorTest {
         // given
         // the script instance is the receiver of these lambdas in a regular script, declaring the dependency, which takes precedence there
         val scripts = listOf(
-            "val p = \"!\"\nval a = f(1)\nclass P\nval b = run { f(null) }\nfun f(x: P?) = \"local\" + p\na + b",
-            "val p = \"!\"\nval b = run { f(null) }\nfun f(x: String?) = \"local\" + p\nb",
-            "val p = \"!\"\nclass P\nval b = run { f(null) }\nfun f(x: P?) = \"local\" + p\nb",
-            "val p = \"!\"\nval b = apply { f(null) }.let { runCatching { f(null) }.getOrThrow() } + with(this) { f(null) }\nfun f(x: String?) = \"local\" + p\nb",
-            "val p = \"!\"\nfun g() = run { f(null) }\nfun f(x: String?) = \"local\" + p\ng()"
+            "val p = \"!\".trim()\nval a = f(1)\nclass P\nval b = run { f(null) }\nfun f(x: P?) = \"local\" + p\na + b",
+            "val p = \"!\".trim()\nval b = run { f(null) }\nfun f(x: String?) = \"local\" + p\nb",
+            "val p = \"!\".trim()\nclass P\nval b = run { f(null) }\nfun f(x: P?) = \"local\" + p\nb",
+            "val p = \"!\".trim()\nval b = apply { f(null) }.let { runCatching { f(null) }.getOrThrow() } + with(this) { f(null) }\nfun f(x: String?) = \"local\" + p\nb",
+            "val p = \"!\".trim()\nfun g() = run { f(null) }\nfun f(x: String?) = \"local\" + p\ng()"
         )
         val executor = ScriptExecutor()
 
@@ -7401,11 +7662,11 @@ class ScriptExecutorTest {
     fun `should report calls of dependency within lambdas of scope functions of other receivers before local function of the same name`() = runTest {
         // given
         val scripts = listOf(
-            "val p = \"!\"\nclass Bar { fun m() = run { f(null) } }\nfun f(x: String?) = \"local\" + p\nBar().m()",
-            "val p = \"!\"\nfun Int.h() = run { f(null) }\nfun f(x: String?) = \"local\" + p\n2.h()",
-            "val p = \"!\"\nval b = with(\"a\") { run { f(null) } }\nfun f(x: String?) = \"local\" + p\nb",
-            "val p = \"!\"\nval b = run<String> { f(null) }\nfun f(x: String?) = \"local\" + p\nb",
-            "val p = \"!\"\nval b = listOf(1).map { f(null) }\nfun f(x: String?) = \"local\" + p\nb"
+            "val p = \"!\".trim()\nclass Bar { fun m() = run { f(null) } }\nfun f(x: String?) = \"local\" + p\nBar().m()",
+            "val p = \"!\".trim()\nfun Int.h() = run { f(null) }\nfun f(x: String?) = \"local\" + p\n2.h()",
+            "val p = \"!\".trim()\nval b = with(\"a\") { run { f(null) } }\nfun f(x: String?) = \"local\" + p\nb",
+            "val p = \"!\".trim()\nval b = run<String> { f(null) }\nfun f(x: String?) = \"local\" + p\nb",
+            "val p = \"!\".trim()\nval b = listOf(1).map { f(null) }\nfun f(x: String?) = \"local\" + p\nb"
         )
         val executor = ScriptExecutor()
 
@@ -7738,7 +7999,7 @@ class ScriptExecutorTest {
     fun `should report error at call of dependency before local function of the same name referring to local class declared later`() = runTest {
         // given
         val script = """
-            val p = "!"
+            val p = "!".trim()
             val r = f(emptyList())
             class P
             fun f(xs: List<P>) = "local" + p
@@ -7766,29 +8027,29 @@ class ScriptExecutorTest {
         // given
         val scripts = listOf(
             // within the supertype of the class
-            "val p = \"!\"\nval a = f(1)\nabstract class S { fun g() = f(null) }\nclass P : S() { val q = p }\nfun f(x: P?) = \"local\" + p\na + P().g()",
+            "val p = \"!\".trim()\nval a = f(1)\nabstract class S { fun g() = f(null) }\nclass P : S() { val q = p }\nfun f(x: P?) = \"local\" + p\na + P().g()",
             // following the class, preceded by a call the function does not apply to
-            "val p = \"!\"\nval a = f(1)\nclass P\nval c = f(emptyList())\nfun f(xs: List<P>) = \"local\" + p\na + c",
-            "val p = \"!\"\nval a = f(listOf(1))\nclass P\nval r = f(null)\nfun f(x: P?) = \"local\" + p\na + r",
-            "val p = \"!\"\nval a = f(listOf(1))\nclass P\nval r = f(mutableListOf(P()))\nfun f(xs: MutableList<P>) = \"local\" + p\na + r",
+            "val p = \"!\".trim()\nval a = f(1)\nclass P\nval c = f(emptyList())\nfun f(xs: List<P>) = \"local\" + p\na + c",
+            "val p = \"!\".trim()\nval a = f(listOf(1))\nclass P\nval r = f(null)\nfun f(x: P?) = \"local\" + p\na + r",
+            "val p = \"!\".trim()\nval a = f(listOf(1))\nclass P\nval r = f(mutableListOf(P()))\nfun f(xs: MutableList<P>) = \"local\" + p\na + r",
             // preceding and following it, also another class
-            "val p = \"!\"\nval a = f(null)\nclass P\nval b = f(null)\nval c = f(P())\nfun f(x: P?) = \"local\" + p\na + b + c",
-            "val p = \"!\"\nval a = f(null)\nclass X { val q = p }\nval b = f(null)\nclass P { val q = p }\nfun f(x: P?) = \"local\" + p\na + b",
-            "val p = \"!\"\nval a = f(1)\nclass P { val q = p }\nval b = f(P(), null)\nclass R { val q = p }\nfun f(x: P?, y: R?) = \"local\" + p\na + b",
+            "val p = \"!\".trim()\nval a = f(null)\nclass P\nval b = f(null)\nval c = f(P())\nfun f(x: P?) = \"local\" + p\na + b + c",
+            "val p = \"!\".trim()\nval a = f(null)\nclass X { val q = p }\nval b = f(null)\nclass P { val q = p }\nfun f(x: P?) = \"local\" + p\na + b",
+            "val p = \"!\".trim()\nval a = f(1)\nclass P { val q = p }\nval b = f(P(), null)\nclass R { val q = p }\nfun f(x: P?, y: R?) = \"local\" + p\na + b",
             // applying through the supertypes of the class, declared before the call, or later
-            "val p = \"!\"\nval c = Comparator<Runnable> { _, _ -> 0 }\nval r = f(c)\nclass P(val v: Int) : Runnable { override fun run() {} }\nfun f(c: Comparator<in P>) = \"local\" + p\nr",
-            "val p = \"!\"\nopen class Base\nval c = Comparator<Base> { _, _ -> 0 }\nval a = f(c)\nclass P : Base() { val q = p }\nfun f(c: Comparator<in P>) = \"local\" + p\na",
-            "val p = \"!\"\nval c = Comparator<Runnable> { _, _ -> 0 }\nval a = f(c)\nabstract class S : Runnable\nclass P : S() { override fun run() {} }\nfun f(c: Comparator<in P>) = \"local\" + p\na",
+            "val p = \"!\".trim()\nval c = Comparator<Runnable> { _, _ -> 0 }\nval r = f(c)\nclass P(val v: Int) : Runnable { override fun run() {} }\nfun f(c: Comparator<in P>) = \"local\" + p\nr",
+            "val p = \"!\".trim()\nopen class Base\nval c = Comparator<Base> { _, _ -> 0 }\nval a = f(c)\nclass P : Base() { val q = p }\nfun f(c: Comparator<in P>) = \"local\" + p\na",
+            "val p = \"!\".trim()\nval c = Comparator<Runnable> { _, _ -> 0 }\nval a = f(c)\nabstract class S : Runnable\nclass P : S() { override fun run() {} }\nfun f(c: Comparator<in P>) = \"local\" + p\na",
             // of the type parameters, or the bound of the type parameter of the function
-            "val p = \"!\"\nval a = f(emptyList())\nclass P<out T : Number>(val t: T)\nfun f(xs: List<P<Int>>) = \"local\" + p\na",
-            "val p = \"!\"\nval a = f(null)\nclass P { val q = p }\nfun <T : P> f(x: T?) = \"local\" + p\na",
+            "val p = \"!\".trim()\nval a = f(emptyList())\nclass P<out T : Number>(val t: T)\nfun f(xs: List<P<Int>>) = \"local\" + p\na",
+            "val p = \"!\".trim()\nval a = f(null)\nclass P { val q = p }\nfun <T : P> f(x: T?) = \"local\" + p\na",
             // the overloads declared before the class compete with the ones following it, as in the script
-            "val p = \"!\"\nfun h(x: Int): Int = 1 + p.length\nval a = f(\"x\")\nclass P { val q = p }\nfun h(x: Any): String = \"s\" + p\nval b = f(h(1))\nfun f(xs: List<P>) = \"localP\" + p\nfun f(n: Int) = \"localInt\" + p\na + b",
+            "val p = \"!\".trim()\nfun h(x: Int): Int = 1 + p.length\nval a = f(\"x\")\nclass P { val q = p }\nfun h(x: Any): String = \"s\" + p\nval b = f(h(1))\nfun f(xs: List<P>) = \"localP\" + p\nfun f(n: Int) = \"localInt\" + p\na + b",
             // with a multiline literal
-            "val p = \"!\"\nval r = f(null)\nclass P(val s: String = \"\"\"a\nb\"\"\") { val t = p }\nval c = x\nfun f(x: P?) = \"local\" + p\nval x = \"localx\"\nr + c",
+            "val p = \"!\".trim()\nval r = f(null)\nclass P(val s: String = \"\"\"a\nb\"\"\") { val t = p }\nval c = x\nfun f(x: P?) = \"local\" + p\nval x = \"localx\"\nr + c",
             // within the class, or following it on the same line, without a value of the class
-            "val p = \"!\"\nval a = f(1)\nclass P { val q = p; fun g() = f(null) }\nfun f(x: P?) = \"local\" + p\na + P().g()",
-            "val p = \"!\"\nval a = f(1)\nclass P { val q = p }; val b = f(null)\nfun f(x: P?) = \"local\" + p\na + b"
+            "val p = \"!\".trim()\nval a = f(1)\nclass P { val q = p; fun g() = f(null) }\nfun f(x: P?) = \"local\" + p\na + P().g()",
+            "val p = \"!\".trim()\nval a = f(1)\nclass P { val q = p }; val b = f(null)\nfun f(x: P?) = \"local\" + p\na + b"
         )
         val dependencies = listOf(
             dependency<(Any?) -> String>("f") { "dep" }, dependency<(Any?) -> String>("g") { "depg" }, dependency("x", "depx")
@@ -7843,8 +8104,8 @@ class ScriptExecutorTest {
     fun `should call dependency within local class which local function of the same name declared later refers to when passing value of the class`() = runTest {
         // given
         val scripts = listOf(
-            "val p = \"!\"\nval a = f(1)\nclass P { val q = p; fun g() = f(P()) }\nfun f(x: P) = \"local\" + p\na + P().g()",
-            "val p = \"!\"\nval a = f(1)\nclass P { val q = p }; val b = f(P())\nfun f(x: P) = \"local\" + p\na + b"
+            "val p = \"!\".trim()\nval a = f(1)\nclass P { val q = p; fun g() = f(P()) }\nfun f(x: P) = \"local\" + p\na + P().g()",
+            "val p = \"!\".trim()\nval a = f(1)\nclass P { val q = p }; val b = f(P())\nfun f(x: P) = \"local\" + p\na + b"
         )
         val executor = ScriptExecutor()
 
@@ -7861,27 +8122,27 @@ class ScriptExecutorTest {
         // given
         val scripts = listOf(
             // the local declarations between the call and the class, and the calls of the other dependencies within the class
-            "val p = \"!\"\nval a = f(1)\nclass R { fun f(x: Int) = \"recv\" }\nclass P { val q = p; fun g() = with(R()) { f(2) } }\nfun f(x: P?) = \"local\" + p\na + P().g()",
-            "val p = \"!\"\nval a = f(1)\nclass P { val q = p; fun h() = g(2) }\nfun f(x: P?) = \"local\" + p\nfun g(s: String) = \"localg\" + p\na + P().h()",
-            "val p = \"!\"\nval r = f(listOf(1))\nclass P\nfun f(xs: List<P>) = \"local\" + p\nr",
-            "val p = \"!\"\nval a = f(listOf(1))\nclass P\nval r = f(listOf(2))\nfun f(xs: List<P>) = \"local\" + p\na + r",
-            "val p = \"!\"\nval c = Comparator<Runnable> { _, _ -> 0 }\nval r = f(c)\nclass P(val v: Int)\nfun f(c: Comparator<in P>) = \"local\" + p\nr",
+            "val p = \"!\".trim()\nval a = f(1)\nclass R { fun f(x: Int) = \"recv\" }\nclass P { val q = p; fun g() = with(R()) { f(2) } }\nfun f(x: P?) = \"local\" + p\na + P().g()",
+            "val p = \"!\".trim()\nval a = f(1)\nclass P { val q = p; fun h() = g(2) }\nfun f(x: P?) = \"local\" + p\nfun g(s: String) = \"localg\" + p\na + P().h()",
+            "val p = \"!\".trim()\nval r = f(listOf(1))\nclass P\nfun f(xs: List<P>) = \"local\" + p\nr",
+            "val p = \"!\".trim()\nval a = f(listOf(1))\nclass P\nval r = f(listOf(2))\nfun f(xs: List<P>) = \"local\" + p\na + r",
+            "val p = \"!\".trim()\nval c = Comparator<Runnable> { _, _ -> 0 }\nval r = f(c)\nclass P(val v: Int)\nfun f(c: Comparator<in P>) = \"local\" + p\nr",
             // within the classes, which the function refers to through the other ones, or not at all, or following them on another line
-            "val p = \"!\"\nval a = f(1)\nclass Q { val q = p; fun h() = f(2) }\nclass P(val q: Q)\nfun f(xs: List<P>) = \"local\" + p\na + Q().h()",
-            "val p = \"!\"\nval a = f(1)\nabstract class S { fun g() = f(listOf(2)) }\nclass P : S() { val q = p }\nfun f(x: P?) = \"local\" + p\na + P().g()",
-            "val p = \"!\"\nval a = f(\"s\")\nclass P { val q = p; fun g() = f(\"t\") }\nfun <P : Number> f(x: P) = \"local\" + p\na + P().g()",
-            "val p = \"!\"\nval a = f(1)\nclass P { val q = p }; val b = listOf(\n  1); val c = f(3)\nfun f(xs: List<P>) = \"local\" + p\na + c",
+            "val p = \"!\".trim()\nval a = f(1)\nclass Q { val q = p; fun h() = f(2) }\nclass P(val q: Q)\nfun f(xs: List<P>) = \"local\" + p\na + Q().h()",
+            "val p = \"!\".trim()\nval a = f(1)\nabstract class S { fun g() = f(listOf(2)) }\nclass P : S() { val q = p }\nfun f(x: P?) = \"local\" + p\na + P().g()",
+            "val p = \"!\".trim()\nval a = f(\"s\")\nclass P { val q = p; fun g() = f(\"t\") }\nfun <P : Number> f(x: P) = \"local\" + p\na + P().g()",
+            "val p = \"!\".trim()\nval a = f(1)\nclass P { val q = p }; val b = listOf(\n  1); val c = f(3)\nfun f(xs: List<P>) = \"local\" + p\na + c",
             // referring also to the local classes declared before the calls
-            "val p = \"!\"\nclass Q { val q = p }\nval a = f(\"s\")\nclass P { val q = p }\nfun f(q: Q?, xs: List<P>? = null) = \"local\" + p\na",
-            "val p = \"!\"\nclass Q { val q = p }\nval a = f(1)\nclass P { val q = p }\nfun f(q: Q, xs: List<P>? = null) = \"local\" + p\na",
-            "val p = \"!\"\nclass Q { val q = p }\nval a = f(listOf(\"s\"))\nclass P { val q = p }\nfun f(xs: List<Q>, ys: List<P>? = null) = \"local\" + p\na",
-            "val p = \"!\"\nclass Q { val q = p }\nval a = f(1)\nclass P { val q = p }\nfun f(q: Q) = \"localQ\" + p\nfun f(x: P) = \"localP\" + p\na",
+            "val p = \"!\".trim()\nclass Q { val q = p }\nval a = f(\"s\")\nclass P { val q = p }\nfun f(q: Q?, xs: List<P>? = null) = \"local\" + p\na",
+            "val p = \"!\".trim()\nclass Q { val q = p }\nval a = f(1)\nclass P { val q = p }\nfun f(q: Q, xs: List<P>? = null) = \"local\" + p\na",
+            "val p = \"!\".trim()\nclass Q { val q = p }\nval a = f(listOf(\"s\"))\nclass P { val q = p }\nfun f(xs: List<Q>, ys: List<P>? = null) = \"local\" + p\na",
+            "val p = \"!\".trim()\nclass Q { val q = p }\nval a = f(1)\nclass P { val q = p }\nfun f(q: Q) = \"localQ\" + p\nfun f(x: P) = \"localP\" + p\na",
             // a qualified type named like a local class, and a call within the class resolved to its member
-            "val p = \"!\"\nval a = f(1)\nclass Pair { val q = p; fun g() = f(2) }\nfun f(x: kotlin.Pair<Int, Int>) = \"local\" + p\na + Pair().g()",
-            "val p = \"!\"\nval a = f(1)\nabstract class S { fun f(x: Int) = \"member\" }\nclass P : S() { val q = p; fun g() = f(2) }\nfun f(xs: List<P>) = \"local\" + p\na + P().g()",
+            "val p = \"!\".trim()\nval a = f(1)\nclass Pair { val q = p; fun g() = f(2) }\nfun f(x: kotlin.Pair<Int, Int>) = \"local\" + p\na + Pair().g()",
+            "val p = \"!\".trim()\nval a = f(1)\nabstract class S { fun f(x: Int) = \"member\" }\nclass P : S() { val q = p; fun g() = f(2) }\nfun f(xs: List<P>) = \"local\" + p\na + P().g()",
             // within the lambdas of the scope functions of the script instance, declaring the dependency
-            "val p = \"!\"\nval a = run { f(null) }\nclass P\nfun f(x: P?) = \"local\" + p\na",
-            "val p = \"!\"\nval b = run { f(null) }\nclass P\nval c = run { f(null) }\nfun f(x: P?) = \"local\" + p\nb + c"
+            "val p = \"!\".trim()\nval a = run { f(null) }\nclass P\nfun f(x: P?) = \"local\" + p\na",
+            "val p = \"!\".trim()\nval b = run { f(null) }\nclass P\nval c = run { f(null) }\nfun f(x: P?) = \"local\" + p\nb + c"
         )
         val dependencies = listOf(
             dependency<(Any?) -> String>("f") { "dep" }, dependency<(Any?) -> String>("g") { "depg" }, dependency("x", "depx")
@@ -7902,7 +8163,7 @@ class ScriptExecutorTest {
     fun `should report error at call of dependency before local class of the same name declared later`() = runTest {
         // given
         val script = """
-            val p = 1
+            val p = "1".toInt()
             val r = Foo(2)
             class Foo(val v: Int) { fun g() = v + p }
             r
@@ -7928,40 +8189,40 @@ class ScriptExecutorTest {
     fun `should report calls of dependency before constructors of local class of the same name declared later`() = runTest {
         // given
         val scripts = listOf(
-            "val p = 1\nval r = Foo(2)\nclass Foo(val s: String) { constructor(i: Int) : this(\"i\$i\"); fun g() = s + p }\nr",
-            "val p = 1\nval r = Foo(2)\nclass Foo { val v: Int; constructor(i: Int) { v = i }; fun g() = v + p }\nr",
-            "val p = 1\nval r = Foo()\nclass Foo { fun g() = p }\nr",
-            "val p = 1\nval r = Foo<Int>(2)\nclass Foo<T>(val v: T) { fun g() = p }\nr",
-            "val p = 1\nval r = Foo(2)\ndata class Foo(val v: Int) { fun g() = v + p }\nr",
-            "val p = 1\nval r = Foo(2)\nclass Foo(val v: Int, val w: Int = 3) { fun g() = v + p }\nr",
-            "val p = 1\nval r = Foo(2)\nclass Foo(vararg val v: Int) { fun g() = p }\nr",
-            "val p = 1\nval r = Foo(2)\nabstract class Foo(val v: Int) { fun g() = v + p }\nr",
-            "val p = 1\nval r: Any = Foo(v = 2)\nclass Foo(val v: Int) { constructor(o: Foo) : this(o.v); fun g() = v + p }\nr",
-            "val p = 1\nval f = { Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nf()",
-            "val p = 1\nfun h() = listOf(1).map { Foo(it) }\nclass Foo(val v: Int) { fun g() = v + p }\nh()",
-            "val p = 1\nval r = \"a\".run { Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
-            "val p = 1\nclass Bar { fun make() = Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nBar().make()",
+            "val p = \"1\".toInt()\nval r = Foo(2)\nclass Foo(val s: String) { constructor(i: Int) : this(\"i\$i\"); fun g() = s + p }\nr",
+            "val p = \"1\".toInt()\nval r = Foo(2)\nclass Foo { val v: Int; constructor(i: Int) { v = i }; fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nval r = Foo()\nclass Foo { fun g() = p }\nr",
+            "val p = \"1\".toInt()\nval r = Foo<Int>(2)\nclass Foo<T>(val v: T) { fun g() = p }\nr",
+            "val p = \"1\".toInt()\nval r = Foo(2)\ndata class Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nval r = Foo(2)\nclass Foo(val v: Int, val w: Int = 3) { fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nval r = Foo(2)\nclass Foo(vararg val v: Int) { fun g() = p }\nr",
+            "val p = \"1\".toInt()\nval r = Foo(2)\nabstract class Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nval r: Any = Foo(v = 2)\nclass Foo(val v: Int) { constructor(o: Foo) : this(o.v); fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nval f = { Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nf()",
+            "val p = \"1\".toInt()\nfun h() = listOf(1).map { Foo(it) }\nclass Foo(val v: Int) { fun g() = v + p }\nh()",
+            "val p = \"1\".toInt()\nval r = \"a\".run { Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nclass Bar { fun make() = Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nBar().make()",
             // within the lambdas of the scope functions, the receivers of which are not the script instance in a regular script
-            "val p = 1\nclass Bar { fun m() = run { Foo(2) } }\nclass Foo(val v: Int) { fun g() = v + p }\nBar().m()",
-            "val p = 1\nclass Bar { val x = run { Foo(2) } }\nclass Foo(val v: Int) { fun g() = v + p }\nBar().x",
-            "val p = 1\nclass Bar { fun m() = apply { Foo(2) }.let { with(this) { Foo(3) } } }\nclass Foo(val v: Int) { fun g() = v + p }\nBar().m()",
-            "val p = 1\nclass Bar { fun m() = this@Bar.run { Foo(2) } }\nclass Foo(val v: Int) { fun g() = v + p }\nBar().m()",
-            "val p = 1\nfun Int.h() = run { Foo(this) }\nclass Foo(val v: Int) { fun g() = v + p }\n2.h()",
-            "val p = 1\nval r = buildString { append(run { Foo(2) }) }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
-            "val p = 1\nval r = with(\"a\") { run { Foo(2) } }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
-            "val p = 1\nval r = \"a\".run { this.run { Foo(2) } }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
-            "val p = 1\nval r = object { val x = run { Foo(2) } }.x\nclass Foo(val v: Int) { fun g() = v + p }\nr",
-            "val p = 1\nval r = kotlinx.coroutines.coroutineScope { run { Foo(2) } }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nclass Bar { fun m() = run { Foo(2) } }\nclass Foo(val v: Int) { fun g() = v + p }\nBar().m()",
+            "val p = \"1\".toInt()\nclass Bar { val x = run { Foo(2) } }\nclass Foo(val v: Int) { fun g() = v + p }\nBar().x",
+            "val p = \"1\".toInt()\nclass Bar { fun m() = apply { Foo(2) }.let { with(this) { Foo(3) } } }\nclass Foo(val v: Int) { fun g() = v + p }\nBar().m()",
+            "val p = \"1\".toInt()\nclass Bar { fun m() = this@Bar.run { Foo(2) } }\nclass Foo(val v: Int) { fun g() = v + p }\nBar().m()",
+            "val p = \"1\".toInt()\nfun Int.h() = run { Foo(this) }\nclass Foo(val v: Int) { fun g() = v + p }\n2.h()",
+            "val p = \"1\".toInt()\nval r = buildString { append(run { Foo(2) }) }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nval r = with(\"a\") { run { Foo(2) } }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nval r = \"a\".run { this.run { Foo(2) } }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nval r = object { val x = run { Foo(2) } }.x\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nval r = kotlinx.coroutines.coroutineScope { run { Foo(2) } }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
             // with the parameters of the type of the class itself
-            "val p = 1\nval r = Foo(2)\nclass Foo(val v: Int, val next: Foo? = null) { fun g() = v + p }\nr",
-            "val p = 1\nval r = Foo(2)\nclass Foo(val v: Int, val children: List<Foo> = emptyList()) { fun g() = v + p }\nr",
-            "val p = 1\nval r = Foo(2)\nclass Foo<T>(val v: T, val next: Foo<T>? = null) { fun g() = p }\nr",
-            "val p = 1\nval r = Foo<Nothing?>(2)\nclass Foo<T : Foo<T>?>(val v: Int) { fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nval r = Foo(2)\nclass Foo(val v: Int, val next: Foo? = null) { fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nval r = Foo(2)\nclass Foo(val v: Int, val children: List<Foo> = emptyList()) { fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nval r = Foo(2)\nclass Foo<T>(val v: T, val next: Foo<T>? = null) { fun g() = p }\nr",
+            "val p = \"1\".toInt()\nval r = Foo<Nothing?>(2)\nclass Foo<T : Foo<T>?>(val v: Int) { fun g() = v + p }\nr",
             // within the lambdas of the scope functions, of other receivers than the script instance, or without receivers
-            "val p = 1\nval r = run<Any> { Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
-            "val p = 1\nval r = runCatching<Any> { Foo(2) }.getOrThrow()\nclass Foo(val v: Int) { fun g() = v + p }\nr",
-            "val p = 1\nval r = run<Any, Any> { Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
-            "val p = 1\nval r = with<Any, Any>(this) { Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nr"
+            "val p = \"1\".toInt()\nval r = run<Any> { Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nval r = runCatching<Any> { Foo(2) }.getOrThrow()\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nval r = run<Any, Any> { Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nval r = with<Any, Any>(this) { Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nr"
         )
         val executor = ScriptExecutor()
 
@@ -8008,24 +8269,24 @@ class ScriptExecutorTest {
         // given
         val scripts = listOf(
             // the arguments of other types, or of the bounds of the type parameters
-            "val p = 1\nval r = Foo(\"x\")\nclass Foo(val v: Int) { fun g() = v + p }\nr",
-            "val p = 1\nval r = Foo(2)\nclass Foo<T : CharSequence>(val v: T) { fun g() = p }\nr",
+            "val p = \"1\".toInt()\nval r = Foo(\"x\")\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nval r = Foo(2)\nclass Foo<T : CharSequence>(val v: T) { fun g() = p }\nr",
             // not visible to the script body
-            "val p = 1\nval r = Foo(2)\nclass Foo private constructor(val v: Int) { fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nval r = Foo(2)\nclass Foo private constructor(val v: Int) { fun g() = v + p }\nr",
             // within the lambda of the receiver, which is the script instance declaring the dependency in a regular script
-            "val p = 1\nval r = run { Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
-            "val p = 1\nval r = with(this) { Foo(2) } + this.run { Foo(1) }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
-            "val p = 1\nval r = listOf(1).map { run { Foo(it) } }.single() + run { \"a\".run { Foo(1) } }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nval r = run { Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nval r = with(this) { Foo(2) } + this.run { Foo(1) }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nval r = listOf(1).map { run { Foo(it) } }.single() + run { \"a\".run { Foo(1) } }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
             // the members of the receivers, which take precedence over the constructors
-            "val p = 1\nclass M { fun Foo(i: Int) = i + 198 }\nval r = with(M()) { Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
-            "val p = 1\nopen class B { fun Foo(i: Int) = i + 198 }\nclass C : B() { fun make() = Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nC().make()",
+            "val p = \"1\".toInt()\nclass M { fun Foo(i: Int) = i + 198 }\nval r = with(M()) { Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nopen class B { fun Foo(i: Int) = i + 198 }\nclass C : B() { fun make() = Foo(2) }\nclass Foo(val v: Int) { fun g() = v + p }\nC().make()",
             // a value of the local class declared later cannot precede it
-            "val p = 1\nval r = Foo(2)\nclass Foo(val next: Foo?) { fun g() = p }\nr",
+            "val p = \"1\".toInt()\nval r = Foo(2)\nclass Foo(val next: Foo?) { fun g() = p }\nr",
             // within the lambdas of the scope functions of the script instance
-            "val p = 1\nvar y = 0\napply { y = Foo(1) }\nval r = runCatching { Foo(2) }.getOrThrow() + y\nclass Foo(val v: Int) { fun g() = v + p }\nr",
-            "val p = 1\nval r = Foo(2)\nclass Bar(val q: Int) { fun g() = q + p }\nclass Foo(val b: Bar) { fun g() = p }\nr",
+            "val p = \"1\".toInt()\nvar y = 0\napply { y = Foo(1) }\nval r = runCatching { Foo(2) }.getOrThrow() + y\nclass Foo(val v: Int) { fun g() = v + p }\nr",
+            "val p = \"1\".toInt()\nval r = Foo(2)\nclass Bar(val q: Int) { fun g() = q + p }\nclass Foo(val b: Bar) { fun g() = p }\nr",
             // followed by a call of the constructor
-            "val p = 1\nval r = Foo(\"x\")\nclass Foo(val v: Int) { fun g() = v + p }\nclass Foo2(val v: Int) { fun g() = Foo(v).g() }\nr + Foo2(1).g()"
+            "val p = \"1\".toInt()\nval r = Foo(\"x\")\nclass Foo(val v: Int) { fun g() = v + p }\nclass Foo2(val v: Int) { fun g() = Foo(v).g() }\nr + Foo2(1).g()"
         )
         val executor = ScriptExecutor()
 
@@ -8156,7 +8417,7 @@ class ScriptExecutorTest {
     fun `should report error at declaration moved out of the script body calling local function named like library function`() = runTest {
         // given
         val script = """
-            val strict = true
+            val strict = "true".toBoolean()
             fun check(flag: Boolean) { if (strict && !flag) throw IllegalStateException("strict") }
             sealed interface S
             class T : S { fun f() = check(false) }
@@ -8185,7 +8446,7 @@ class ScriptExecutorTest {
         // the type alias is moved out of the script body, and visible only to the declarations following it there
         val script = """
             typealias N = Boolean
-            val k = 1
+            val k = "1".toInt()
             fun check(n: N) = "local:${'$'}n${'$'}k"
             sealed interface S
             class T : S { fun f() = check(true) }
@@ -8212,8 +8473,8 @@ class ScriptExecutorTest {
     fun `should report error at declaration moved out of the script body calling local function referring to type aliases of type arguments or function types`() = runTest {
         // given
         val scripts = listOf(
-            "val k = 1\ntypealias L<X> = List<X>\ntypealias N = Boolean\nfun check(l: L<N>) = \"local:\$l\$k\"\nsealed interface S\nclass T : S { fun f() = check(listOf(true)) }\nT().f()",
-            "val k = 1\ntypealias Fn = () -> Boolean\nfun check(f: Fn): String = \"local:\${f()}\$k\"\nsealed interface S\nclass T : S { fun f() = check { true } }\nT().f()"
+            "val k = \"1\".toInt()\ntypealias L<X> = List<X>\ntypealias N = Boolean\nfun check(l: L<N>) = \"local:\$l\$k\"\nsealed interface S\nclass T : S { fun f() = check(listOf(true)) }\nT().f()",
+            "val k = \"1\".toInt()\ntypealias Fn = () -> Boolean\nfun check(f: Fn): String = \"local:\${f()}\$k\"\nsealed interface S\nclass T : S { fun f() = check { true } }\nT().f()"
         )
         val executor = ScriptExecutor()
 
@@ -8267,7 +8528,7 @@ class ScriptExecutorTest {
         // the name is pasted into the string literal of the deprecation message of its copy
         val script = """
             import com.xemantic.kotlin.script.names.*
-            val strict = true
+            val strict = "true".toBoolean()
             fun `say${'$'}hi`(flag: Boolean) { if (strict && !flag) throw IllegalStateException("strict") }
             sealed interface S
             class T : S { fun f() = `say${'$'}hi`(false) }
@@ -8295,7 +8556,7 @@ class ScriptExecutorTest {
         // given
         val script = """
             import com.xemantic.kotlin.script.names.*
-            val strict = true
+            val strict = "true".toBoolean()
             fun `say"hi"`(flag: Boolean) { if (strict && !flag) throw IllegalStateException("strict") }
             sealed interface S
             class T : S { fun f() = `say"hi"`(false) }
@@ -8346,7 +8607,7 @@ class ScriptExecutorTest {
     fun `should report error at declaration moved out of the script body calling local function named like function of companion object`() = runTest {
         // given
         val script = """
-            val k = 1
+            val k = "1".toInt()
             fun log(msg: String) = msg + k
             sealed interface S
             class T : S {
@@ -8405,13 +8666,13 @@ class ScriptExecutorTest {
             // suppressed in another letter case
             "@Suppress(\"deprecation_error\") fun show() = x\nval x = 2\nshow()" to listOf(dependency("x", 1)),
             // parameter type spanning lines
-            "val strict = true\nfun check(flag: Boolean, cb: (\n String\n) -> Unit = {}) { if (strict && !flag) throw IllegalStateException() }\nsealed interface S\nclass T : S { fun f() = check(false) }\nT().f()" to emptyList(),
+            "val strict = \"true\".toBoolean()\nfun check(flag: Boolean, cb: (\n String\n) -> Unit = {}) { if (strict && !flag) throw IllegalStateException() }\nsealed interface S\nclass T : S { fun f() = check(false) }\nT().f()" to emptyList(),
             // local function which does not apply
             "fun greet(n: Int) = n\nval r = greet(\"Joe\")\nval greet = { s: String -> \"Hi ${'$'}s\" }\nr" to listOf(dependency<(String) -> String>("greet") { "DEP ${'$'}it" }),
             // local property of function type
             "val log = mutableListOf<String>()\nval print = { m: Any? -> log += m.toString() }\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()\nlog" to emptyList(),
             // local extension function
-            "val factor = 10\nfun List<Int>.sum(): Int = fold(0) { a, b -> a + b * factor }\nsealed class Shape { fun total() = listOf(1, 2).sum() }\nclass Circle : Shape()\nCircle().total()" to emptyList()
+            "val factor = \"10\".toInt()\nfun List<Int>.sum(): Int = fold(0) { a, b -> a + b * factor }\nsealed class Shape { fun total() = listOf(1, 2).sum() }\nclass Circle : Shape()\nCircle().total()" to emptyList()
         )
         val executor = ScriptExecutor()
 
@@ -8449,12 +8710,12 @@ class ScriptExecutorTest {
         // given
         val scripts = listOf(
             "val log = mutableListOf<Any?>()\nfun println(x: Any?) { log += x }\nsealed interface S\nclass T : S { fun f() = listOf(1, 2).forEach(::println) }\nT().f()\nlog" to emptyList(),
-            "val k = 0\ninfix fun Int.until(to: Int) = listOf(this, to, k)\nsealed class S { fun f() = 0 until 20 }\nclass T : S()\nT().f()" to emptyList(),
+            "val k = \"0\".toInt()\ninfix fun Int.until(to: Int) = listOf(this, to, k)\nsealed class S { fun f() = 0 until 20 }\nclass T : S()\nT().f()" to emptyList(),
             "val log = mutableListOf<String>()\nval repeat = { n: Int, block: (Int) -> Unit -> log += \"local\"; block(n) }\nsealed class Shape { fun show() = repeat(2) { } }\nclass Circle : Shape()\nCircle().show()\nlog" to emptyList(),
             "val suffix = \"!\"\nval trim: String.() -> String = { \"local\" + suffix }\nsealed class Shape { fun t() = \" a \".trim() }\nclass Circle : Shape()\nCircle().t()" to emptyList(),
             "typealias Q = Suppress\n@Q(\"DEPRECATION_ERROR\") fun show() = x\nval x = 2\nshow()" to listOf(dependency("x", 1)),
             "@[Suppress(\"UNUSED\")] fun show() = x\nval x = 2\nshow()" to listOf(dependency("x", 1)),
-            "val p = \"!\"\nfun <T> greet(t: T): String where T : CharSequence, T : Comparable<T> = \"local\" + t + p\nsealed interface S\nclass Q : S { fun f() = greet(StringBuilder(\"x\")) }\nfun greet(t: Any) = \"moved\" + t\nQ().f()" to emptyList(),
+            "val p = \"!\".trim()\nfun <T> greet(t: T): String where T : CharSequence, T : Comparable<T> = \"local\" + t + p\nsealed interface S\nclass Q : S { fun f() = greet(StringBuilder(\"x\")) }\nfun greet(t: Any) = \"moved\" + t\nQ().f()" to emptyList(),
             "val f = { x: Int -> \"lambda\" }\nsealed class S\nclass T : S() { fun h() = f(1) }\nfun f(x: Int) = \"function\"\nf(1)" to emptyList()
         )
         val executor = ScriptExecutor()
@@ -8486,7 +8747,7 @@ class ScriptExecutorTest {
     @Test
     fun `should report wrongly resolved callable references and resolve the moved constants`() = runTest {
         // given
-        val callableReference = "val p = 1\nval g = ::x\nfun x() = p + 10\ng()"
+        val callableReference = "val p = \"1\".toInt()\nval g = ::x\nfun x() = p + 10\ng()"
         val constants = listOf(
             "import kotlin.math.*\nval E = 2.0\nsealed interface S\nclass T : S { fun f() = E }\nT().f()",
             "import kotlin.math.PI\nval PI = 3.0\nsealed interface S\nclass T : S { fun f() = PI }\nT().f()"
@@ -8523,9 +8784,9 @@ class ScriptExecutorTest {
     fun `should report wrongly resolved repeated calls, split overloads, untyped function properties and later declared classes`() = runTest {
         // given
         val scripts = listOf(
-            "val p = \"!\"\nval a = x(1)\nval b = x(\"a\")\nfun x(s: String) = \"local\" + s + p\na + b" to listOf(dependency<(Any) -> String>("x") { "dep$it" }),
+            "val p = \"!\".trim()\nval a = x(1)\nval b = x(\"a\")\nfun x(s: String) = \"local\" + s + p\na + b" to listOf(dependency<(Any) -> String>("x") { "dep$it" }),
             "val f = { s: String -> \"prop\" }\nval a = { f(1) }\nval b = f(\"a\")\nfun f(x: Int) = \"fun-int\"\nfun f(s: String) = \"fun-str\"\nb" to emptyList(),
-            "val p = \"!\"\nval r = show(1)\nfun show(x: Any) = \"any${'$'}p\"\nfun show(x: Int) = \"int\"\nr + show(1)" to emptyList(),
+            "val p = \"!\".trim()\nval r = show(1)\nfun show(x: Any) = \"any${'$'}p\"\nfun show(x: Int) = \"int\"\nr + show(1)" to emptyList(),
             "val log = mutableListOf<String>()\nval print = fun(m: Any?) { log += m.toString() }\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()\nlog" to emptyList(),
             "val log = mutableListOf<String>()\nfun rec(m: Any?) { log += m.toString() }\nval print = ::rec\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()\nlog" to emptyList()
         )
@@ -8730,7 +8991,7 @@ class ScriptExecutorTest {
     @Test
     fun `should report calls of declarations moved out of the script body on values made callable by hidden local invoke operator`() = runTest {
         // given
-        val invoke = "val p = \"!\"\noperator fun Int.invoke(x: Any?): String = \"int:${'$'}x${'$'}p\"\n"
+        val invoke = "val p = \"!\".trim()\noperator fun Int.invoke(x: Any?): String = \"int:${'$'}x${'$'}p\"\n"
         val scripts = listOf(
             // failing as resolved to `kotlin.io.print` instead, of the constant moved with the class
             "${invoke}val print: Int = 3\nsealed class S { fun show(): String = print(\"\") }\nclass T : S()\nT().show()",
@@ -8752,7 +9013,7 @@ class ScriptExecutorTest {
     fun `should report call of declaration moved out of the script body failing as resolved to another function than the local one`() = runTest {
         // given
         val script = """
-            val p = "!"
+            val p = "!".trim()
             fun print(x: Int): String = "n${'$'}x${'$'}p"
             sealed class S { fun f(): String = print(1) }
             class T : S()
@@ -8795,7 +9056,7 @@ class ScriptExecutorTest {
     @Test
     fun `should report call of dependency before local class of the same name together with calls of local properties of inferred types named as invalid types`() = runTest {
         // given
-        val script = "val p = 1\nval delay = java.util.Collections.emptyList<String>()\nsealed class Task { suspend fun go(): String { delay(1); return \"done\" } }\nclass Job1 : Task()\nval r = Foo(2)\nclass Foo(val v: Int) { fun g() = v + p }\nJob1().go() + r"
+        val script = "val p = \"1\".toInt()\nval delay = java.util.Collections.emptyList<String>()\nsealed class Task { suspend fun go(): String { delay(1); return \"done\" } }\nclass Job1 : Task()\nval r = Foo(2)\nclass Foo(val v: Int) { fun g() = v + p }\nJob1().go() + r"
         val executor = ScriptExecutor()
 
         // when
@@ -8860,7 +9121,7 @@ class ScriptExecutorTest {
     fun `should report wrongly resolved references after comments, of aliased function types and destructured names`() = runTest {
         // given
         val scripts = listOf(
-            "val p = \"!\"\nval log = mutableListOf<String>()\n/* note\n */ log += x(\"a\")\nfun x(s: String) = \"local\" + s + p\nlog" to listOf(dependency<(Any) -> String>("x") { "dep$it" }),
+            "val p = \"!\".trim()\nval log = mutableListOf<String>()\n/* note\n */ log += x(\"a\")\nfun x(s: String) = \"local\" + s + p\nlog" to listOf(dependency<(Any) -> String>("x") { "dep$it" }),
             "val log = mutableListOf<String>()\ntypealias Printer = (Any?) -> Unit\nval print: Printer = { log += it.toString() }\nsealed class Shape { fun show() = print(\"shape\") }\nclass Circle : Shape()\nCircle().show()\nlog" to emptyList(),
             "import kotlin.math.*\nval (E, F) = 2.0 to 3.0\nsealed interface S\nclass T : S { fun f() = E }\nT().f()" to emptyList()
         )
@@ -8908,6 +9169,405 @@ class ScriptExecutorTest {
 
         // then
         assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(13.0, "2cm", 15.0, "user alice"))
+    }
+
+    @Test
+    fun `should execute function reading only constants called by declarations moved out of the script body`() = runTest {
+        // given
+        val script = """
+            val RATE = 0.2
+            fun tax(x: Double) = x * RATE
+            sealed class Item { abstract val price: Double; fun total() = price + tax(price) }
+            class Book(override val price: Double) : Item()
+            Book(10.0).total()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert((result as? ScriptResult.Value)?.value == 12.0)
+    }
+
+    @Test
+    fun `should execute functions and classes reading only constants called before their declaration, or by declarations moved out of the script body, like in the script`() = runTest {
+        // given
+        val scripts = listOf(
+            "val prefix = \">\"\nval formatted = format(\"x\")\nfun format(text: String) = prefix + text\nformatted" to emptyList(),
+            "val base = 10\nval scaled = Scaler().scale(2)\nclass Scaler { fun scale(x: Int) = x * base }\nscaled" to emptyList(),
+            "val base: Int? = 1\nval r = base ?: compute()\nval compute = 2\nfun compute() = base\nr" to emptyList(),
+            "val p = \"!\"\nval log = mutableListOf<String>()\nlog += x(\"a\")\nfun x(s: String) = \"local\" + s + p\nlog" to listOf(dependency<(Any) -> String>("x") { "dep$it" }),
+            "val p = 1\nval g = ::x\nfun x() = p + 10\ng()" to listOf(dependency<() -> Int>("x") { 2 }),
+            "val prefix = \"local:\"\nfun log(message: String) = prefix + message\nsealed interface Check\nclass Below : Check { fun ok() = log(\"hi\") }\nBelow().ok()" to listOf(dependency<(String) -> String>("log") { "dep:$it" }),
+            "val prefix = \">\"\nfun log(message: String) = prefix + message\nsealed interface S\nclass T : S { fun f() = log(\"hi\") }\nT().f()" to listOf(dependency("log", Logger())),
+            "val factor = 10\nfun List<Int>.sum(): Int = fold(0) { a, b -> a + b * factor }\nsealed class Shape { fun total() = listOf(1, 2).sum() }\nclass Circle : Shape()\nCircle().total()" to emptyList(),
+            "val k = 0\ninfix fun Int.until(to: Int) = listOf(this, to, k)\nsealed class S { fun f() = 0 until 20 }\nclass T : S()\nT().f()" to emptyList()
+        )
+        val libraryFunction = "val strict = true\nfun check(flag: Boolean) { if (strict && !flag) throw IllegalStateException(\"strict\") }\nsealed interface S\nclass T : S { fun f() = check(false) }\nT().f()"
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { (script, dependencies) -> executor.execute(script, dependencies) }
+        val libraryFunctionResult = executor.execute(libraryFunction)
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(">x", 20, 1, listOf("locala!"), 11, "local:hi", ">hi", 30, listOf(0, 20, 0)))
+        // the function of the script, not the library one
+        assert((libraryFunctionResult as? ScriptResult.Error)?.message?.lines()?.first() == "java.lang.IllegalStateException: strict")
+    }
+
+    @Test
+    fun `should resolve overloads called before their declaration, also reading a constant, differently than the script`() = runTest {
+        // given
+        val scripts = listOf(
+            "val p = \"!\"\nval r = show(1)\nfun show(x: Any) = \"any${'$'}p\"\nfun show(x: Int) = \"int\"\nr + show(1)",
+            "val r = show(1)\nfun show(x: Any) = \"any\"\nfun show(x: Int) = \"int\"\nr + show(1)"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // the overloads called before their declaration are moved, also when reading a constant, like without it,
+        // while a regular script returns "intany!" and "intany"
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("intint", "intint"))
+    }
+
+    @Test
+    fun `should not run function reading constant called before declaration of the constant`() = runTest {
+        // given
+        val scripts = listOf(
+            "val r = f()\nval k = 5\nfun f() = k\nr",
+            "val r = run { f() }\nval k = 5\nfun f() = k\nr",
+            "val r = listOf(1).map { g(it) }\nval k = 5\nfun g(i: Int) = i + k\nr",
+            "val s = buildString { append(f()) }\nval k = \"5\"\nfun f() = k\ns",
+            // through a local function
+            "fun h() = f()\nval r = h()\nval k = 5\nfun f() = k\nr"
+        )
+        val declaredBefore = "val k = 5\nval r = run { f() }\nfun f() = k\nr"
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+        val declaredBeforeResult = executor.execute(declaredBefore)
+
+        // then
+        // not reading the initialized constant, while a regular script reads 0 or null
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+        assert((declaredBeforeResult as? ScriptResult.Value)?.value == 5)
+    }
+
+    @Test
+    fun `should execute declarations moved out of the script body reading constants of types of local classes moved as well`() = runTest {
+        // given
+        val scripts = listOf(
+            "class Foo\nval x: Foo? = null\nsealed interface S\nclass T : S { fun f() = x; fun g() = Foo() }\nT().f()",
+            "class Foo\nval x: Foo? = null\nsealed class S { fun g(): Foo? = x }\nclass T : S()\nT().g()",
+            "data class Foo(val a: Int)\nval x: Foo? = null\nsealed class S { fun g() = \"g\" + x + h() }\nclass T : S()\nfun h() = Foo(1)\nT().g()",
+            "class Foo\ntypealias F = Foo\nval x: F? = null\nsealed class S { fun g(): F? = x }\nclass T : S()\nT().g()",
+            // a qualified type named like a local class
+            "class Result\nval x: kotlin.Result<Int>? = null\nsealed class S { fun f() = x }\nclass T : S()\nT().f()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value.toString() } == listOf("null", "null", "gnullFoo(a=1)", "null", "null"))
+        assert(results.all { it is ScriptResult.Value })
+    }
+
+    @Test
+    fun `should declare function reading constant of type of local class preceding statement calling it`() = runTest {
+        // given
+        val script = """
+            class Foo
+            val x: Foo? = null
+            val s = describe()
+            fun describe() = "d" + x
+            s
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        // staying local with the constant, as the class is not visible to them otherwise, so hoisted, see ScriptSource.Parsed.hoisted
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "dnull")
+        }
+    }
+
+    @Test
+    fun `should resolve calls preceding function reading constant on receivers of lambdas like in the script`() = runTest {
+        // given
+        val scripts = listOf(
+            "val k = \"!\"\nval s = buildString { append(\"x\") }\nfun append(t: String) = t + k\nappend(s)",
+            "val k = 10\nval r = with(listOf(1, 2)) { sum() }\nfun sum() = k\nr",
+            "val k = \"!\"\nval sb = StringBuilder().apply { append(\"x\") }\nfun append(t: String) = t + k\nsb.toString()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("x!", 3, "x"))
+    }
+
+    @Test
+    fun `should resolve calls on receivers before functions moved out of the script body referred to before their declarations like in the script`() = runTest {
+        // given
+        val scripts = listOf(
+            "val s = buildString { append(\"x\") }\nfun append(t: String) = t + \"!\"\nappend(s)",
+            // an extension of the receiver
+            "val r = with(listOf(1, 2)) { sum() }\nfun sum() = 10\nr",
+            // within a local function declared before
+            "fun g() = buildString { append(\"x\") }\nfun append(t: String) = t + \"!\"\ng()",
+            // nested in a lambda without a receiver
+            "val s = buildString { listOf(1).forEach { append(\"x\") } }\nfun append(t: String) = t + \"!\"\nappend(s)",
+            // an inherited member of a local class
+            "open class Base { fun tag(t: String) = \"base\" + t }\nclass A : Base() { fun f() = tag(\"x\") }\nfun tag(t: String) = t + \"!\"\nA().f()",
+            // overloads
+            "val s = buildString { append(\"x\") }\nfun append(i: Int) = \"\$i?\"\nfun append(t: String) = t + \"!\"\ns",
+            // also after the declaration, once referred to before it, with an inferred or a declared type
+            "val first = append(\"a\")\nfun append(t: String) = t + \"!\"\nfirst + \"|\" + buildString { append(\"x\") }",
+            "val first = append(\"a\")\nfun append(t: String): String = t + \"!\"\nfirst + \"|\" + buildString { append(\"x\") }",
+            // within a function referred to before its declaration
+            "val r = g()\nfun append(t: String) = t + \"!\"\nfun g() = buildString { append(\"x\") }\nr",
+            // also called by a declaration which cannot be local
+            "val s = buildString { append(\"x\") }\nfun append(t: String) = t + \"!\"\nsealed class S { fun f() = append(\"y\") }\nclass T : S()\ns + T().f()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // like in a regular script
+        assert(
+            results.map { (it as? ScriptResult.Value)?.value } == listOf("x!", 3, "x", "x!", "basex", "x", "a!|x", "a!|x", "x", "xy!")
+        )
+    }
+
+    @Test
+    fun `should resolve calls on receivers before functions moved out of the script body referred to before their declarations by other moved functions like in the script`() = runTest {
+        // given
+        val scripts = listOf(
+            "val z = f()\nfun f() = append(\"a\")\nfun append(t: String) = t + \"!\"\nval s = buildString { append(\"x\") }\nz + \"|\" + s",
+            // transitively
+            "val z = f()\nfun f() = g()\nfun g() = append(\"a\")\nfun append(t: String) = t + \"!\"\nval s = buildString { append(\"x\") }\nz + \"|\" + s"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // like in a regular script
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("a!|x", "a!|x"))
+    }
+
+    @Test
+    fun `should execute nested calls of overloads of functions moved out of the script body within lambdas`() = runTest {
+        // given
+        val scripts = listOf(
+            "val r = listOf(1, 2).map { pick(twice(it)) }\nfun twice(i: Int) = i * 2\nfun pick(i: Int) = \"i\$i\"\nfun pick(s: String) = \"s\$s\"\nr",
+            "val r = listOf(1, 2).map { describe(wrap(it)) }\nfun wrap(i: Int) = listOf(i)\nfun describe(i: Int) = \"i\$i\"\nfun describe(l: List<Int>) = \"l\$l\"\nr"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(listOf("i2", "i4"), listOf("l[1]", "l[2]")))
+    }
+
+    @Test
+    fun `should execute calls within lambdas preceding functions moved out of the script body where no receiver resolves them`() = runTest {
+        // given
+        val scripts = listOf(
+            "val s = buildString { append(foo()) }\nfun foo() = \"f\"\ns",
+            "val l = mutableListOf<String>()\nlistOf(1, 2).forEach { l += show(it) }\nfun show(i: Int) = \"n\$i\"\nl",
+            // not applicable, so resolved on the receiver also when moved
+            "val s = buildString { append(1) }\nfun append(t: String) = t + \"!\"\ns",
+            "val r = run { twice(3) }\nfun twice(i: Int) = i * 2\nr",
+            // a property of the receiver, which cannot be called
+            "val r = with(listOf(1, 2)) { size() }\nfun size() = 10\nr",
+            // declared before, also in a regular script resolved before the receiver
+            "fun append(t: String) = t + \"!\"\nval s = buildString { append(\"x\") }\nappend(s)",
+            "class A { fun f() = describe(1) }\nfun describe(i: Int) = \"n\$i\"\nA().f()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // like in a regular script
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("f", listOf("n1", "n2"), "1", 6, 10, "!", "n1"))
+    }
+
+    @Test
+    fun `should execute function reading constant called before its declaration where receiver might resolve it like in the script`() = runTest {
+        // given
+        val scripts = listOf(
+            // within lambdas without a receiver
+            "val k = 2\nval r = run { twice(3) }\nfun twice(i: Int) = i * k\nr",
+            "val k = \"!\"\nval r = listOf(1).map { describe(it) }\nfun describe(i: Int) = \"n${'$'}i${'$'}k\"\nr",
+            "val factor = 2\nval r = listOf(1, 2).map { scale(it) }\nfun scale(i: Int) = i * factor\nr + scale(3)",
+            // also called after its declaration where a receiver resolves the call, local like in the script
+            "val k = \"!\"\nval s = buildString { append(\"x\") }\nfun append(t: String) = t + k\nval u = buildString { append(\"y\") }\ns + \"|\" + u",
+            "val k = 10\nval a = with(listOf(1, 2)) { sum() }\nfun sum() = k\nval b = with(listOf(5)) { sum() }\n\"${'$'}a|${'$'}b\"",
+            // also after its declaration within classes without members of the same name
+            "val k = \"!\"\nval s = buildString { append(\"x\") }\nfun append(t: String) = t + k\nsealed class S { fun f() = append(\"y\") }\nclass T : S()\ns + T().f()",
+            "val k = 1\nval r = run { twice(3) }\nfun twice(i: Int) = i * k\nsealed class S { fun h() = twice(1) }\nclass T : S()\nr + T().h()",
+            // inheriting a member of the same name from a class of the script
+            "val k = \"!\"\nval s = buildString { append(\"x\") }\nfun append(t: String) = t + k\nopen class B { fun append(t: String) = \"b\" + t }\nclass C : B() { fun f() = append(\"y\") }\ns + C().f()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // like in a regular script
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(6, listOf("n1!"), listOf(2, 4, 6), "x|", "3|10", "xy!", 4, "xy!"))
+    }
+
+    @Test
+    fun `should resolve calls of members of classes named like functions declared after them like in the script`() = runTest {
+        // given
+        val scripts = listOf(
+            // reading a constant, kept local
+            "val k = 10\nclass A { fun f() = g(); fun g() = 1 }\nfun g() = k\nA().f() + g()",
+            // also called after the declaration where a receiver resolves the call
+            "class A { fun f() = g(); fun g() = 1 }\nfun g() = \"s\"\nval r = with(A()) { g() }\nr",
+            "class A { fun f() = g(); fun g() = 1 }\nfun g() = \"s\"\nval r = A().run { g() }\nr",
+            "class A { fun f() = g(); fun g() = 1 }\nfun g() = \"s\"\nfun A.h() = g()\nA().h()",
+            "val k = 10\nclass A { fun f() = g(); fun g() = 1 }\nfun g() = k\nval r = with(A()) { g() }\nA().f() + r",
+            "val k = \"!\"\nclass A { fun f() = append(\"q\"); fun append(t: String) = t }\nfun append(t: String) = t + k\nval u = buildString { append(\"y\") }\nu + \"|\" + A().f()",
+            // not applicable, so resolved to the function
+            "class A { fun f() = tag(1); fun tag(t: String) = \"member\" + t }\nfun tag(t: Int) = \"${'$'}t!\"\nA().f() + tag(2)",
+            // also after the declaration within classes without members of the same name
+            "class A { fun f() = g(); fun g() = 1 }\nfun g() = \"s\"\nsealed class S { fun h() = g() }\nclass T : S()\nT().h()",
+            "class A { fun f() = g(); fun g() = 1 }\nfun g() = \"s\"\nsealed class S\nclass T : S() { fun t() = g() }\nT().t()",
+            // or with members of the same name, declared before the function
+            "class A { fun f() = g(); fun g() = 1 }\nfun g() = \"s\"\nsealed class S { fun g() = \"c\"; fun h() = g() }\nclass T : S()\nT().h()",
+            // with a declared return type, resolved after the receivers also after the declaration
+            "class A { fun f() = g(); fun g() = 1 }\nfun g(): String = \"s\"\nval r = with(A()) { g() }\nr",
+            "class A { fun f() = g(); fun g() = 1 }\nfun g(): Int = 10\nval r = with(A()) { g() }\nA().f() + r",
+            "class A { fun f() = g(); fun g() = 1 }\nfun g(): String = \"s\"\nfun A.h() = g()\nA().h()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // like in a regular script
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(11, "s", "s", "s", 11, "|q", "1!2!", "s", "s", "s", 1, 2, 1))
+    }
+
+    @Test
+    fun `should resolve calls of members of classes named like functions declared after them and moved out of the script body differently than the script`() = runTest {
+        // given
+        val scripts = listOf(
+            "class A { fun f() = g(); fun g() = 1 }\nfun g() = 10\nA().f() + g()",
+            "class A { fun f() = g(); fun g() = 1 }\nfun g() = 10\nval r = with(A()) { g() }\nA().f() + r",
+            "class A { fun f() = tag(\"x\"); fun tag(t: String) = \"member\" + t }\nfun tag(t: String) = t + \"!\"\nA().f() + tag(\"y\")"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // the member calls resolved to the functions, as no placement of the functions matches the script for all the calls,
+        // while a regular script returns 11, 11 and "memberxy!"
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(20, 20, "x!y!"))
+    }
+
+    @Test
+    fun `should keep function reading constant local when called before its declaration where receiver might resolve it, also when called by declaration moved out of the script body`() = runTest {
+        // given
+        val scripts = listOf(
+            // the supertype might declare `append`
+            "val k = \"!\"\nval s = buildString { append(\"x\") }\nfun append(t: String) = t + k\nsealed class S : Comparable<S> { fun f() = append(\"y\") }\nclass T : S() { override fun compareTo(other: S) = 0 }\ns + T().f()",
+            // called as a member before
+            "val k = 10\nclass A { fun f() = g(); fun g() = 1 }\nfun g() = k\nsealed class S { fun h() = g() }\nclass T : S()\nA().f() + T().h()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // not resolving the calls differently than the script, which returns "xy!" and 11
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+    }
+
+    @Test
+    fun `should execute function reading constant called before its declaration by declarations moved out of the script body`() = runTest {
+        // given
+        val scripts = listOf(
+            "val k = \"!\"\nsealed class S { fun f() = tax(1) }\nclass T : S()\nfun tax(x: Int) = x.toString() + k\nT().f()",
+            "val k = \"!\"\nsealed class S { fun f() = buildString { append(\"x\") } }\nclass T : S()\nfun append(t: String) = t + k\nT().f()",
+            "val k = \"!\"\nopen class Base { fun tag(t: String) = \"base\" + t }\nsealed class S : Base() { fun f() = tag(\"x\") }\nclass T : S()\nfun tag(t: String) = t + k\nT().f()"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        // like in the script, the receivers resolve the calls preceding the declarations
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("1!", "x", "basex"))
+    }
+
+    @Test
+    fun `should execute function reading constant of type of local class`() = runTest {
+        // given
+        val script = """
+            class Foo
+            val x: Foo? = null
+            val s = buildString { append("x") }
+            fun append(t: String) = t + x
+            append(s)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert((result as? ScriptResult.Value)?.value == "xnull")
+    }
+
+    @Test
+    fun `should not move function reading variable reassigned by the script body`() = runTest {
+        // given
+        val script = """
+            var rate = 0.2
+            fun tax(x: Double) = x * rate
+            sealed class Item { fun total() = tax(10.0) }
+            class Book : Item()
+            rate = 0.5
+            Book().total()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        assert((result as? ScriptResult.Error)?.message?.lines()?.first() == "script.kts:3:35: error: Unresolved reference 'tax'.")
     }
 
     @Test
@@ -9340,7 +10000,9 @@ class ScriptExecutorTest {
         // given
         val scripts = listOf(
             "val r = cancel(\"too late\")\nfun cancel(reason: String) = \"cancelled: \" + reason\nr",
-            "val isActive = false\nval status get() = if (isActive) \"on\" else \"off\"\nstatus + isActive"
+            "val isActive = false\ninline fun <reified T> status() = if (isActive) \"on\" else \"off\"\nstatus<Int>() + isActive",
+            "val isActive = false\nval status get() = if (isActive) \"on\" else \"off\"\nstatus + isActive",
+            "val isActive = false\ninline fun status() = if (isActive) \"on\" else \"off\"\nstatus() + isActive"
         )
         val executor = ScriptExecutor()
 
@@ -9350,7 +10012,474 @@ class ScriptExecutorTest {
         // then
         assert((results[0] as? ScriptResult.Value)?.value == "cancelled: too late")
         // not moved, unlike other constants, as the script body would refer to its coroutine scope instead, so not visible to the getter
-        assert((results[1] as? ScriptResult.Error)?.message?.lines()?.first() == "script.kts:2:24: error: Unresolved reference 'isActive'.")
+        assert("script.kts:2:39: error: Unresolved reference 'isActive'." in (results[1] as ScriptResult.Error).message.lines())
+        // unless the property, or the inline function, stays local, see `should execute scripts with property accessors reading local properties`
+        assert(results.drop(2).map { (it as? ScriptResult.Value)?.value } == listOf("offfalse", "offfalse"))
+    }
+
+    @Test
+    fun `should execute script with inline function reading local property`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            inline fun logged(block: () -> Unit) { log += "start"; block() }
+            logged { }
+            log
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == listOf("start"))
+        }
+    }
+
+    @Test
+    fun `should execute scripts with inline functions reading local properties`() = runTest {
+        // given
+        val scripts = listOf(
+            "val log = mutableListOf<String>()\nfun helper() { log += \"h\" }\ninline fun logged(block: () -> Unit) { helper(); block() }\nlogged { }\nlog",
+            "val log = mutableListOf<String>()\ninline fun <T> logged(name: String, crossinline block: () -> T, noinline after: () -> Unit = { }): T {\n    log += name\n    return block().also { after() }\n}\n" +
+                    "val r = logged(\"a\", { for (i in 1..5) { if (i == 2) break }; if (log.size > 5) return@logged 0; 7 }) { log += \"after\" }\nr.toString() + log",
+            "val items = mutableListOf(1, 2)\n@Suppress(\"NOTHING_TO_INLINE\") private inline fun total() = items.sum()\nitems += 3\ntotal()",
+            "val log = mutableListOf<String>()\nsuspend inline fun step(block: suspend () -> Unit) { log += \"s\"; block() }\nstep { kotlinx.coroutines.delay(1) }\nlog",
+            // called within the lambdas without a receiver
+            "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"a\"; block() }\nlistOf(1).forEach { logged { } }\nlog",
+            "val log = mutableListOf<Int>()\nvar x = 1\ninline fun i(block: () -> Unit) { block(); log += x }\nfun h() { log += x }\ninline fun j(block: () -> Unit) { block(); h() }\ni { j { } }\nx = 2\ni { j { } }\nlog",
+            // reading the local property only within a lambda without a receiver
+            "val log = mutableListOf<String>()\ninline fun logAll(items: List<Int>, block: () -> Unit) { items.forEach { log += it.toString() }; block() }\nlogAll(listOf(1)) { }\nlog"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(listOf("h"), "7[a, after]", 6, listOf("s"), listOf("a"), listOf(1, 1, 2, 2), listOf("1")))
+    }
+
+    @Test
+    fun `should report inline functions reading local property which would be resolved differently if local`() = runTest {
+        // given
+        val scripts = listOf(
+            // `this` of the script block, the coroutine
+            "val log = mutableListOf<String>()\ninline fun tag() = \"\$this\" + log.size\ntag()",
+            // the overload staying local would hide the moved one
+            "val log = mutableListOf<String>()\ninline fun f(x: Any): String { log += \"any\"; return \"any\" }\ninline fun f(x: String): String = \"string\"\nf(\"a\") + log",
+            // called before its declaration, resolved to the function of the coroutine scope instead
+            "val log = mutableListOf<String>()\nval r = run { \"std\" }\ninline fun run(block: () -> String): String { log += \"mine\"; return block() }\nr + log",
+            // called where a receiver resolves it in the script, like `run` of the class
+            "val log = mutableListOf<String>()\ninline fun run(block: () -> String): String { log += \"mine\"; return block() }\nclass A { fun go() = run { \"a\" } }\nA().go() + log",
+            // an inline function cannot be recursive
+            "val log = mutableListOf<String>()\ninline fun count(n: Int): Int = if (n == 0) log.size else count(n - 1)\ncount(2)",
+            // reading the local property only within a lambda, which might have a receiver resolving it instead
+            "val log = mutableListOf<String>()\ninline fun logAll(items: List<Int>, block: () -> Unit) { with(items) { log += size.toString() }; block() }\nlogAll(listOf(1)) { }\nlog"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+    }
+
+    @Test
+    fun `should report inline function reading local property which cannot be local`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            inline fun logged(block: () -> Unit) { log += "start"; block() }
+            fun outer(): Int { logged { return 5 }; return 1 }
+            outer()
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:40: error: Unresolved reference 'log'.
+                  | inline fun logged(block: () -> Unit) { <error>log</error> += "start"; block() }
+                  hint: 'logged' is an inline function compiled outside of the script body, where 'log' (line 1) is not visible - pass it as a parameter, or declare it within 'logged'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report suspending call in lambda of inline function reading local property`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            inline fun logged(block: () -> Unit) { log += "start"; block() }
+            logged { kotlinx.coroutines.delay(1) }
+            log
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:29: error: Suspension functions can only be called within coroutine body.
+                  | logged { kotlinx.coroutines.<error>delay</error>(1) }
+                  hint: 'logged' is compiled without 'inline', as it reads the local values of the script body, so its lambdas cannot suspend - pass the local values to 'logged' as parameters to keep it inline.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should execute scripts calling inline functions reading local properties where receivers might resolve the calls`() = runTest {
+        // given
+        val logged = "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"start\"; block() }\n"
+        val member = "class R { fun logged(block: () -> Unit) { log += \"member\"; block() } }\n"
+        val scripts = listOf(
+            "${logged}listOf(1, 2).forEach { logged { } }\nlog",
+            "${logged}repeat(1) { logged { } }\nlog",
+            "${logged}fun Int.go() = logged { }\n3.go()\nlog",
+            "${logged}class B { fun go() = logged { } }\nB().go()\nlog",
+            "${logged}val s = buildString { logged { append(\"x\") } }\ns + log",
+            "${logged}inline fun twice(block: () -> Unit) { listOf(1, 2).forEach { logged(block) } }\ntwice { }\nlog",
+            "${logged}logged(({ return@logged }))\nlog",
+            // a regular script resolves the function before the members of the receivers in the statements,
+            "${logged}${member}with(R()) { logged { } }\nlog",
+            "${logged}${member}listOf(1).forEach { with(R()) { logged { } } }\nlog",
+            "${logged}${member}if (log.isEmpty()) with(R()) { logged { } }\nlog",
+            "${logged}${member}class C { fun go() { with(R()) { logged { } } } }\nC().go()\nlog",
+            "${logged}class B { fun logged(block: () -> Unit) { log += \"member\"; block() }; fun go() { logged { } } }\nB().go()\nlog",
+            "val log = mutableListOf<String>()\ninline fun append(block: () -> Unit): StringBuilder { log += \"start\"; block(); return StringBuilder() }\n" +
+                    "val sb = StringBuilder()\nsb.apply { append { } }\nlog + sb.length",
+            "val log = mutableListOf<String>()\ninline fun trim(block: () -> Unit): String { log += \"start\"; block(); return \"mine\" }\n" +
+                    "with(\" a \") { log += trim { } }\nlog",
+            // and after them within the declarations of the inferred types, and the last expression
+            "${logged}${member}fun h() = with(R()) { logged { } }\nh()\nlog",
+            "${logged}${member}val y = run { with(R()) { logged { } }; 1 }\nlog",
+            "${logged}${member}with(R()) { logged { }; log.toList() }",
+            "${logged}class B { fun logged(block: () -> Unit) { log += \"member\"; block() }; fun go() = logged { } }\nB().go()\nlogged { }\nlog",
+            "${logged}class A { fun logged(block: suspend () -> Unit) = 1; fun go() = logged { kotlinx.coroutines.delay(1) } }\nlogged { }\nA().go().toString() + log",
+            // calling the function moved out of the script body, as referred to before its declaration
+            "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"start\"; helper(); block() }\nfun helper() = 1\nlogged { }\nlog"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(
+            results.map { (it as? ScriptResult.Value)?.value } == listOf(
+                listOf("start", "start"),
+                listOf("start"),
+                listOf("start"),
+                listOf("start"),
+                "x[start]",
+                listOf("start", "start"),
+                listOf("start"),
+                listOf("start"),
+                listOf("start"),
+                listOf("start"),
+                listOf("start"),
+                listOf("start"),
+                listOf("start", 0),
+                listOf("start", "mine"),
+                listOf("member"),
+                listOf("member"),
+                listOf("member"),
+                listOf("member", "start"),
+                "1[start]",
+                listOf("start")
+            )
+        )
+    }
+
+    @Test
+    fun `should report inline function reading local property called where receivers resolve the calls of a regular script differently`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            inline fun logged(block: () -> Unit) { log += "start"; block() }
+            class R { fun logged(block: () -> Unit) { log += "member"; block() } }
+            with(R()) { logged { } }
+            val y = with(R()) { logged { }; 1 }
+            log
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:40: error: Unresolved reference 'log'.
+                  | inline fun logged(block: () -> Unit) { <error>log</error> += "start"; block() }
+                  hint: 'logged' is an inline function compiled outside of the script body, where 'log' (line 1) is not visible - pass it as a parameter, or declare it within 'logged'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report call of inline function kept local on other receiver without internal names`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            inline fun logged(block: () -> Unit) { log += "start"; block() }
+            fun h() = buildString { logged { } }
+            "a".logged { }
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        val message = (result as ScriptResult.Error).message
+        assert("_ScriptDependencies" !in message && "script.kts:4:5: error: Unresolved reference 'logged'" in message)
+    }
+
+    @Test
+    fun `should report call of generic inline function kept local on other receiver as unresolved reference`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            inline fun <T> logged(block: () -> T): T { log += "start"; return block() }
+            fun h() = buildString { logged { } }
+            "a".logged { 1 }
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:5: error: Unresolved reference 'logged'.
+                  | "a".<error>logged</error> { 1 }
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should resolve calls of inline functions reading local properties in the last expression like a regular script`() = runTest {
+        // given
+        val prefix = "val log = mutableListOf<String>()\nvar x = \"\"\n" +
+                "inline fun logged(block: () -> Unit): String { log += \"start\"; block(); throw IllegalStateException(\"start\") }\n" +
+                "class R { fun logged(block: () -> Unit): String = throw IllegalStateException(\"member\") }\n"
+        val call = "with(R()) { logged { } }"
+        // the last expressions of the types known without resolving them, where a regular script resolves its functions before the receivers
+        val beforeReceivers = listOf(
+            "\"${'$'}{$call}\"", "\"a${'$'}{$call}\"", "\"a\" + \"${'$'}{$call}\"", "\"${'$'}{$call}\" + \"\"\"a\"\"\"",
+            "$call == \"\"", "$call != \"\"", "$call === \"\"", "$call !== \"\"", "$call < \"\"", "$call >= \"\"",
+            "($call == \"\")", "@Suppress(\"X\") ($call == \"\")", "$call.compareTo(\"\") == 0",
+            "x = $call", "x += $call", "while (log.isEmpty()) $call", "do { $call } while (false)",
+            "throw Exception($call)"
+        )
+        // and the other ones, where it resolves them after the receivers
+        val afterReceivers = listOf(
+            call, "($call)", "$call + \"\"", "\"a\" + $call", "\"${'$'}{$call}\" + x", "(\"${'$'}{$call}\") + \"\"", "\"${'$'}{$call}\".length",
+            "$call == \"\" || true", "!($call == \"\")", "$call is String", "if (true) $call else \"\"",
+            "for (i in 1..1) $call", "for (i in 1..1) { $call }", "for (c in $call) { }"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val calls = (beforeReceivers + afterReceivers).map { last ->
+            // the function called, as the value of the last expression might not reveal it
+            (executor.execute("$prefix$last") as? ScriptResult.Error)?.message?.lines()?.first()
+        }
+
+        // then
+        assert(
+            calls == beforeReceivers.map { "java.lang.IllegalStateException: start" } +
+                    afterReceivers.map { "java.lang.IllegalStateException: member" }
+        )
+    }
+
+    @Test
+    fun `should report inline function reading local property called by class member of the same name`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            inline fun run(block: () -> String): String { log += "mine"; return block() }
+            class A { fun run(block: () -> String) = "member"; fun go() = run { "a" } }
+            A().go() + run { "b" } + log
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:12: error: 'run' refers to the coroutine scope of the script body, instead of the function declared at line 2, which is compiled outside of the script body.
+                  | A().go() + <error>run</error> { "b" } + log
+                  hint: rename the function.
+
+                script.kts:2:47: error: Unresolved reference 'log'.
+                  | inline fun run(block: () -> String): String { <error>log</error> += "mine"; return block() }
+                  hint: 'run' is an inline function compiled outside of the script body, where 'log' (line 1) is not visible - pass it as a parameter, or declare it within 'run'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report suspending calls in parenthesized annotated and nested lambdas of inline function reading local property`() = runTest {
+        // given
+        val logged = "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"start\"; block() }\n"
+        val scripts = listOf(
+            "${logged}logged(({ kotlinx.coroutines.delay(1) }))",
+            "${logged}logged(@Suppress(\"UNUSED\") { kotlinx.coroutines.delay(1) })",
+            // inlined, if the function was inline
+            "${logged}logged { listOf(1).forEach { kotlinx.coroutines.delay(1) } }",
+            "${logged}logged { List(2) { kotlinx.coroutines.delay(1); it } }",
+            "${logged}class A { fun logged(x: Int) = x; suspend fun go() = logged { kotlinx.coroutines.delay(1) } }"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.all { (it as? ScriptResult.Error)?.message?.contains("hint: 'logged' is compiled without 'inline'") == true })
+    }
+
+    @Test
+    fun `should not hint at inline function for suspending calls which cannot suspend when inlined`() = runTest {
+        // given
+        val logged = "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { log += \"start\"; block() }\n"
+        val scripts = listOf(
+            "${logged}logged { Runnable { kotlinx.coroutines.delay(1) }.run() }",
+            "${logged}logged { fun nested() { kotlinx.coroutines.delay(1) }; nested() }",
+            "${logged}logged { val f = { kotlinx.coroutines.delay(1) }; f() }",
+            // not suspending, even if inline
+            "${logged}fun f() { logged { kotlinx.coroutines.delay(1) } }",
+            "${logged}logged { val f = { logged { kotlinx.coroutines.delay(1) } }; f() }"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Error)?.phase } == List(scripts.size) { ExecutionPhase.COMPILATION })
+        assert(results.none { (it as ScriptResult.Error).message.contains("hint: 'logged' is compiled without 'inline'") })
+    }
+
+    @Test
+    fun `should report inline function with contract reading local property`() = runTest {
+        // given
+        val script = """
+            @file:OptIn(kotlin.contracts.ExperimentalContracts::class)
+            import kotlin.contracts.*
+            val log = mutableListOf<String>()
+            inline fun logged(block: () -> Unit) { contract { callsInPlace(block, InvocationKind.AT_LEAST_ONCE) }; log += "s"; block() }
+            logged { }
+            log
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:4:104: error: Unresolved reference 'log'.
+                  | inline fun logged(block: () -> Unit) { contract { callsInPlace(block, InvocationKind.AT_LEAST_ONCE) }; <error>log</error> += "s"; block() }
+                  hint: 'logged' is an inline function compiled outside of the script body, where 'log' (line 3) is not visible - pass it as a parameter, or declare it within 'logged'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not hint at inline function for moved overload which is not inline`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            @JvmName("tagInt") fun tag(x: Int) = log.size + x
+            inline fun tag(block: () -> Unit) { block() }
+            tag(1)
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:2:38: error: Unresolved reference 'log'.
+                  | @JvmName("tagInt") fun tag(x: Int) = <error>log</error>.size + x
+                  hint: 'tag' is compiled outside of the script body, where 'log' (line 1) is not visible - pass it as a parameter, or declare it within 'tag'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should execute script with moved declaration having parameter named like class reading local property`() = runTest {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            enum class E { A; fun f(Box: Int) = Box + 1 }
+            class Box { fun add() { log += "box" } }
+            Box().add()
+            E.A.f(1).toString() + log
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "2[box]")
+        }
+    }
+
+    @Test
+    fun `should execute script with loop variable named like moved property of coroutine scope`() = runTest {
+        // given
+        val script = """
+            val isActive get() = "mine"
+            val r = mutableListOf<String>()
+            for (isActive in listOf("loop")) r += isActive
+            r
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == listOf("loop"))
+        }
     }
 
     @Test
@@ -10219,6 +11348,411 @@ class ScriptExecutorTest {
         assert(result is ScriptResult.Error && result.message.lines().filter { it.startsWith("script.kts:") } == listOf(
             "script.kts:6:1: error: 'launch' refers to the coroutine scope of the script body, instead of the function declared at line 2, which is compiled outside of the script body."
         ))
+    }
+
+    @Test
+    fun `should report property of script body referred to instead of member of implicit receiver`() = runTest {
+        // given
+        val script = """
+            val name = "script"
+            data class User(val name: String)
+            User("alice").run { name }
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                script.kts:3:21: error: 'name' refers to the property of the script body declared at line 1, instead of the member of an implicit receiver, which a regular script refers to.
+                  | User("alice").run { <error>name</error> }
+                  hint: rename the property, or qualify the member with its receiver, like 'this.name', or with the label of an outer receiver, like 'this@label.name'.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report properties of script body referred to instead of members of extension receivers, superclasses and extensions`() = runTest {
+        // given
+        val scripts = listOf(
+            "val name = \"script\"\ndata class User(val name: String)\nfun User.describe() = \"user \" + name\nUser(\"alice\").describe()",
+            "open class Base { val name = \"base\" }\nval name = \"script\"\nclass Derived : Base() { fun f() = name }\nDerived().f()",
+            "open class Base { val name = \"base\" }\nval name = \"script\"\nobject : Base() { fun f() = name }.f()",
+            "val length = 7\nbuildString { append(length) }",
+            "val javaClass = 5\n\"abc\".run { javaClass }",
+            "var name = \"a\"\nclass Box { var name = \"b\" }\nval box = Box().apply { name = \"c\" }\nname + box.name",
+            "val (size, other) = 3 to 4\nlistOf(1, 2).run { size + other }",
+            "var (b, length) = 2 to 7\nlength = 8\n\"x\".run { length + b }",
+            // the receiver declaring the property in the probe follows the comment of its line
+            "val name = \"script\" // the name\nclass User(val name: String)\nUser(\"alice\").run { name }",
+            "val `the name` = \"script\"\nclass User(val `the name`: String)\nUser(\"alice\").run { `the name` }",
+            // also referred to preceding the receiver declaring the property in the probe
+            "val name = \"x\"; println(name)\nclass User(val name: String)\nUser(\"alice\").run { name }",
+            // a nearer receiver
+            "val name = \"script\"\nclass User(val name: String)\nUser(\"a\").run { \"x\".run { name } }"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        val errorLines = results.map { result ->
+            (result as? ScriptResult.Error)?.message?.lines()?.filter { it.startsWith("script.kts:") }?.map { it.substringBefore(": error") }
+        }
+        assert(errorLines == listOf(
+            listOf("script.kts:3:33"),
+            listOf("script.kts:3:36"),
+            listOf("script.kts:3:29"),
+            listOf("script.kts:2:22"),
+            listOf("script.kts:2:13"),
+            listOf("script.kts:3:25"),
+            listOf("script.kts:2:20"),
+            listOf("script.kts:3:11"),
+            listOf("script.kts:3:21"),
+            listOf("script.kts:3:21"),
+            listOf("script.kts:3:21"),
+            listOf("script.kts:3:27")
+        ))
+    }
+
+    @Test
+    fun `should keep properties of script body referred to within receivers without members of their names`() = runTest {
+        // given
+        val scripts = listOf(
+            "val name = \"script\"\nlistOf(1).map { name + it }.first()",
+            "val name = \"script\"\n\"abc\".run { name + length }",
+            "val prefix = \">\"\nbuildString { append(prefix); append(length) }",
+            // resolved to the coroutine scope of the script body otherwise
+            "val isActive = 3\nrun { isActive }",
+            "val name = \"script\"\nclass Greeter { fun greet() = \"hi \" + name }\nGreeter().greet()",
+            "val name = \"script\"\nfun String.describe() = this + \" \" + name\n\"abc\".describe()",
+            "@file:Suppress(\"DEPRECATION\")\nval name = \"script\"\n\"abc\".run { name }",
+            // resolved to the receiver also in the script body, as the property cannot be called
+            "val first = 10\nval list = listOf(1, 2)\nwith(list) { first() + first }"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(
+            "script1", "script3", ">1", 3, "hi script", "abc script", "script", 11
+        ))
+    }
+
+    @Test
+    fun `should report properties of script body referred to instead of own members of local classes and objects`() = runTest {
+        // given
+        val scripts = listOf(
+            "val n = 10\nval other = 1\nclass A { val n = 2; fun f() = n + other }\nA().f()",
+            "val name = \"script\"\ndata class User(val name: String) { fun greet() = \"hi \" + name }\nUser(\"alice\").greet()",
+            "val name = \"script\"\nval o = object { val name = \"obj\"; fun f() = name }\no.f()",
+            // resolved to the property, not to the parameter, by the initializer
+            "val name = \"s\"\nclass U(val name: String) { val upper = name.uppercase() }\nU(\"a\").upper + name"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        val errorLines = results.map { result ->
+            (result as? ScriptResult.Error)?.message?.lines()?.filter { it.startsWith("script.kts:") }?.map { it.substringBefore(": error") }
+        }
+        assert(errorLines == listOf(
+            listOf("script.kts:3:32"),
+            listOf("script.kts:2:59"),
+            listOf("script.kts:2:46"),
+            listOf("script.kts:2:41")
+        ))
+    }
+
+    @Test
+    fun `should hint at qualifying members of receivers of properties of script body referred to instead of them`() = runTest {
+        // given
+        val scripts = listOf(
+            "val length = 7\nbuildString { append(length) }",
+            "val name = \"script\"\ndata class User(val name: String)\nfun User.describe() = \"user \" + name\nUser(\"alice\").describe()",
+            "open class Base { val name = \"base\" }\nval name = \"script\"\nclass Derived : Base() { fun f() = name }\nDerived().f()",
+            "val length = 7\nval f: String.() -> Int = { length }\n\"abc\".f()",
+            // the lambda of `map` has no receiver, so `this@map` would not compile
+            "val name = \"script\"\nclass User(val name: String)\nUser(\"a\").run { listOf(1).map { name } }"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        val hints = results.map { result -> (result as? ScriptResult.Error)?.message?.lines()?.filter { "hint:" in it }?.map { it.trim() } }
+        assert(hints == listOf(
+            listOf("hint: rename the property, or qualify the member with its receiver, like 'this.length', or with the label of an outer receiver, like 'this@label.length'."),
+            listOf("hint: rename the property, or qualify the member with its receiver, like 'this.name', or with the label of an outer receiver, like 'this@label.name'."),
+            listOf("hint: rename the property, or qualify the member with its receiver, like 'this.name', or with the label of an outer receiver, like 'this@label.name'."),
+            listOf("hint: rename the property, or qualify the member with its receiver, like 'this.length', or with the label of an outer receiver, like 'this@label.length'."),
+            listOf("hint: rename the property, or qualify the member with its receiver, like 'this.name', or with the label of an outer receiver, like 'this@label.name'.")
+        ))
+    }
+
+    @Test
+    fun `should report properties of script body referred to instead of members of implicit receivers after bound callable references and calls`() = runTest {
+        // given
+        val scripts = listOf(
+            "val name = \"x\"\nprintln(name::class.simpleName)\nclass User(val name: String)\nUser(\"a\").run { name }",
+            "val name = \"x\"\nval n = name::length.get()\nclass User(val name: String)\nUser(\"a\").run { name }",
+            "val name = { \"script\" }\nval a = run { name() }\nclass User(val name: String)\nUser(\"a\").run { name }",
+            // resolved to the receiver also in the script body, as the property cannot be called
+            "val first = 10\nval list = listOf(1, 2)\nval a = list.run { first() }\nclass Box(val first: Int)\nBox(3).run { first + a }",
+            // in the line ending the declaration of the property
+            "val name = \"x\"; println(name::class.simpleName)\nclass User(val name: String)\nUser(\"a\").run { name }",
+            // a value initialized, and a variable smart cast, within the statements following the receiver in the probe
+            "val x: Int\nval name = \"script\"\nclass User(val name: String)\nval u = User(\"a\").run { name }; x = 1\nu + x",
+            "var s: String? = null\nval name = \"script\"\nclass User(val name: String)\nval u = User(\"a\").run { name }; s = \"q\"\nu + s.length"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        val errorLines = results.map { result ->
+            (result as? ScriptResult.Error)?.message?.lines()?.filter { it.startsWith("script.kts:") }?.map { it.substringBefore(": error") }
+        }
+        assert(errorLines == listOf(
+            listOf("script.kts:4:17"),
+            listOf("script.kts:4:17"),
+            listOf("script.kts:4:17"),
+            listOf("script.kts:5:14"),
+            listOf("script.kts:3:17"),
+            listOf("script.kts:4:25"),
+            listOf("script.kts:4:25")
+        ))
+    }
+
+    @Test
+    fun `should report properties of script body called instead of members of implicit receivers`() = runTest {
+        // given
+        val scripts = listOf(
+            "val name = { \"script\" }\nclass U { fun name() = \"member\" }\nU().run { name() }",
+            "val name: () -> String = { \"script\" }\nclass U { val name = { \"member\" } }\nU().run { name() }",
+            "val name = fun() = \"script\"\nclass U { fun name() = \"member\" }\nU().run { name() }",
+            "val name = { -> \"script\" }\nclass U\nfun U.name() = \"ext\"\nU().run { name() }",
+            // the property applying to the arguments is recognized by compiling
+            "val name = { a: Int -> \"script${'$'}a\" }\nclass U { fun name(a: Int) = \"member${'$'}a\" }\nU().run { name(1) }",
+            "val name = \"script\"\nfun String.name() = this\nclass U(val name: String)\nU(\"a\").run { name.name() + name }"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        val errorLines = results.map { result ->
+            (result as? ScriptResult.Error)?.message?.lines()?.filter { it.startsWith("script.kts:") }?.map { it.substringBefore(": error") }
+        }
+        assert(errorLines == listOf(
+            listOf("script.kts:3:11"),
+            listOf("script.kts:3:11"),
+            listOf("script.kts:3:11"),
+            listOf("script.kts:4:11"),
+            listOf("script.kts:3:11"),
+            listOf("script.kts:4:14", "script.kts:4:28")
+        ))
+    }
+
+    @Test
+    fun `should keep properties of script body called within receivers without applicable members of their names`() = runTest {
+        // given
+        val scripts = listOf(
+            // the member cannot be called, so the property is called also in a regular script
+            "val name = { \"script\" }\nclass U(val name: String)\nU(\"a\").run { name() }",
+            // the property cannot be called, so the member is called also in the script body
+            "val name = \"script\"\nclass U { fun name() = \"member\" }\nU().run { name() }",
+            "val name = { a: Int -> \"script${'$'}a\" }\nclass U { fun name(a: String) = \"member${'$'}a\" }\nU().run { name(\"x\") }",
+            "val name = { \"script\" }\nlistOf(1).map { name() }.first()",
+            // the properties requiring a context, or a receiver, do not apply without them
+            "class Ctx\nval name: context(Ctx) () -> String = { \"s\" }\nclass U { fun name() = \"m\" }\nU().run { name() }",
+            "class Ctx\nval name = context(c: Ctx) fun(): String = \"s\"\nclass U { fun name() = \"m\" }\nU().run { name() }",
+            "val name: String.() -> String = { \"s\" }\nclass U { fun name() = \"m\" }\nU().run { name() }"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf("script", "member", "memberx", "script", "m", "m", "m"))
+    }
+
+    @Test
+    fun `should report properties of script body referred to in the line ending their declarations`() = runTest {
+        // given
+        val scripts = listOf(
+            "val name = \"script\"; class U(val name: String); U(\"a\").run { name }",
+            "class U(val name: String)\nval name = \"script\"; val n = U(\"a\").run { name }\nn",
+            // the statement preceding the receiver is split
+            "class U(val name: String)\nval name = \"script\"; val a = 1; val n = U(\"a\").run { name } + a\nn"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        val errorLines = results.map { result ->
+            (result as? ScriptResult.Error)?.message?.lines()?.filter { it.startsWith("script.kts:") }?.map { it.substringBefore(": error") }
+        }
+        assert(errorLines == listOf(
+            listOf("script.kts:1:62"),
+            listOf("script.kts:2:43"),
+            listOf("script.kts:2:54")
+        ))
+    }
+
+    @Test
+    fun `should report property of script body referred to instead of member after more receivers than nested in one compilation`() = runTest {
+        // given
+        val script = (1..100).joinToString(separator = "\n") {
+            "val p$it = $it\nval r$it = run { p$it }"
+        } + "\nclass U(val p1: Int, val p100: Int)\nU(7, 8).run { p1 + p100 }"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(message.lines().filter { it.startsWith("script.kts:") }.map { it.substringBefore(": error") } == listOf(
+                "script.kts:202:15",
+                "script.kts:202:20"
+            ))
+        }
+    }
+
+    @Test
+    fun `should confirm receiver members of many properties by one compilation at a time besides the one of the script`() = runTest {
+        // given
+        val script = (1..100).joinToString(separator = "\n") {
+            "val p$it = $it\nval r$it = run { p$it }"
+        } + "\nclass U(val p1: Int, val p100: Int)\nU(7, 8).run { p1 + p100 }"
+        val executor = DefaultScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(message.lines().filter { it.startsWith("script.kts:") }.map { it.substringBefore(": error") } == listOf(
+                "script.kts:202:15",
+                "script.kts:202:20"
+            ))
+        }
+        assert(executor.peakConcurrentCompilations <= 2)
+    }
+
+    @Test
+    fun `should not confirm further receiver members when compilation of script fails`() = runTest {
+        // given
+        val script = (1..100).joinToString(separator = "\n") {
+            "val p$it = $it\nval r$it = run { p$it }"
+        } + "\nclass U(val p1: Int, val p100: Int)\nU(7, 8).run { p1 + p100 + undefined }"
+        val executor = DefaultScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have("Unresolved reference 'undefined'" in message)
+        }
+        // the script, and the first of the compilations confirming the receiver members, run in parallel with it
+        assert(executor.compilationCount == 2)
+    }
+
+    @Test
+    fun `should keep loop variables, implicit declarations and types named like properties of script body`() = runTest {
+        // given
+        val scripts = listOf(
+            "val i = 10\nlistOf(1).map { var s = 0; for (i in 1..3) { s += i }; s }",
+            "val k = 1\nval m = mapOf(2 to 3)\nm.map { var s = 0; for ((k, v) in m) s += k + v; s }",
+            "val it = 5\nlistOf(1, 2).map { it }",
+            "val field = 1\nclass A { var x = 0; set(v) { field = v } }\nA().apply { x = 3 }.x",
+            "val T = 1\nclass Box<T>(val x: T)\nBox(T).x",
+            "val String = 1\nlistOf<Any>(\"a\").map { (it as String).length + String }",
+            "val name = \"script\"\nval other = 1\nclass A { context(name: String) fun f() = name + other }\nwith(\"ctx\") { A().f() }"
+        )
+        val executor = ScriptExecutor()
+
+        // when
+        val results = scripts.map { executor.execute(it) }
+
+        // then
+        assert(results.map { (it as? ScriptResult.Value)?.value } == listOf(
+            listOf(6), listOf(5), listOf(1, 2), 3, 1, listOf(2), "ctx1"
+        ))
+    }
+
+    @Test
+    fun `should keep property of script body named with special characters referred to within receiver`() = runTest {
+        // given
+        val script = """
+            val `a${'$'}b"c` = "s"
+            listOf(1).map { `a${'$'}b"c` }
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == listOf("s"))
+        }
+    }
+
+    @Test
+    fun `should keep many properties of script body referred to within receivers`() = runTest {
+        // given
+        val script = (1..150).joinToString(separator = "\n") { "val p$it = $it\nval r$it = run { p$it }" } + "\nr150"
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 150)
+        }
+    }
+
+    @Test
+    fun `should keep property of script body shadowing dependency referred to within receiver`() = runTest {
+        // given
+        val script = """
+            val name = "script"
+            "abc".run { name }
+        """.trimIndent()
+        val executor = ScriptExecutor()
+
+        // when
+        val result = executor.execute(script, listOf(dependency("name", "dependency")))
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "script")
+        }
     }
 
 }

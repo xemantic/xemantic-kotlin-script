@@ -141,6 +141,26 @@ class ScriptCompilationCacheTest {
     }
 
     @Test
+    fun `should compile the script calling functions before their declarations within lambdas, classes and extension functions once`() = runTest {
+        // given
+        val scripts = listOf(
+            // without referring to a local property within a lambda, which a receiver might declare, see ScriptSource.receiverMemberCandidates
+            "listOf(1, 2).forEach { println(show(it)) }\nfun show(i: Int) = \"n\$i\"\n1",
+            "val r = listOf(1, 2).map { format(it) }.filter { valid(it) }\nfun format(i: Int) = \"#\$i\"\nfun valid(s: String) = s.isNotEmpty()\nr",
+            "val s = buildString { append(\"x\") }\nfun append(t: String) = t + \"!\"\nappend(s)",
+            "class A { fun f() = describe(1) }\nfun describe(i: Int) = \"n\$i\"\nA().f()",
+            "fun Int.twice() = double(this)\nfun double(i: Int) = i * 2\n3.twice()"
+        )
+        val executor = DefaultScriptExecutor()
+
+        // when
+        scripts.forEach { executor.execute(it) }
+
+        // then
+        assert(executor.compilationCount == scripts.size)
+    }
+
+    @Test
     fun `should compile the script on every execution by default`() = runTest {
         // given
         val script = """
@@ -257,7 +277,7 @@ class ScriptCompilationCacheTest {
         // given
         val scripts = listOf(
             // hidden local function
-            "val strict = true\nfun check(flag: Boolean) { if (strict && !flag) throw IllegalStateException(\"strict\") }\nsealed interface S\nclass T : S { fun f() = check(false) }\nT().f()",
+            "val strict = \"true\".toBoolean()\nfun check(flag: Boolean) { if (strict && !flag) throw IllegalStateException(\"strict\") }\nsealed interface S\nclass T : S { fun f() = check(false) }\nT().f()",
             // resolved to the coroutine scope
             "cancel()\nfun cancel() { println(\"order cancelled\") }\n\"done\"",
             "val isActive get() = false\nisActive",
