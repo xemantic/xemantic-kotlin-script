@@ -155,21 +155,39 @@ when (result) {
   unless it reads the local values of the script body outside of a lambda, which might have a receiver, directly or through the local functions,
   like `inline fun logged(block: () -> Unit) { log += "start"; block() }`,
   which compiles it as a local function without the `inline`, `noinline` and `crossinline` modifiers,
-  as long as it is not an extension function, nor overloaded, nor recursive, has no reified type parameters, no context parameters,
+  as long as it is not an extension function, nor overloaded, nor recursive, has no reified type parameters, no context parameters, no contract,
   no annotations but `@Suppress`, no modifiers but the visibility and `suspend`, does not refer to `this` or `super`,
-  is not called before its declaration, nor where a receiver might resolve the call instead, like `run` in `class A { fun go() = run { } }`,
-  does not refer within a lambda, which might have a receiver, to a property or a local function declared by the script, which might be resolved on the receiver instead, like `name` in `user.run { name }`,
+  is not called before its declaration,
+  does not refer within a lambda, which might have a receiver, to a value declared by the script body staying there, which might be resolved on its receiver instead, like `name` in `user.run { name }`,
+  so also not when reading a local value only within a lambda, like `log` in `with(items) { log += size }`,
+  nor call there such a function, when its own return type is inferred, like `inline fun twice(block: () -> Unit) = listOf(1).forEach { helper() }`,
   nor to a name, which might be resolved on the receivers of the script body instead, like `isActive`, also when imported under an alias,
   unless it is a local value declared before, and not called,
-  nor to a property or a function declared after,
+  nor to a property or a function declared after, which stays in the script body, unlike a function compiled outside of it, like `helper` in `fun helper() = 1`,
   and the lambdas passed to it do not return, break or continue to outside of them, like `return` in `fun first(): Int { logged { return 1 }; return 0 }`.
+  Where a receiver might resolve a call of a function of the script, like within a lambda, a class, or an extension function,
+  a regular script resolves the function before the members and the extensions of the receivers, like a local function, like `logged` in `with(r) { logged { } }`,
+  except within a declaration of an inferred type, like `val x = …` or `fun f() = …`, also a member of a class, or within the last expression of the script,
+  unless it is of a type known without resolving it, like a string template, an equality, a comparison, an assignment, a `while` loop or `throw`, unlike a `for` loop,
+  where it resolves the function after them, like `logged` in `val x = with(r) { logged { } }`.
+  Such an inline function is resolved like that as well, while it is compiled outside of the script body, when it has both of these calls,
+  or when it is named like a function of the coroutine scope of the script body, like `run`, or like a dependency, or referred to by a callable reference, like `::logged`,
+  and called where a receiver might resolve the call within a declaration of an inferred type, like `run` in `class A { fun go() = run { } }`.
   Unlike when inlined, these lambdas cannot call the suspending functions, which is reported as an error with a hint,
   and the warning of an inline function without parameters of function types is not reported.
   Therefore, they cannot refer to the local values of the script body, only to the dependencies,
   except the ones initialized with a literal, like `val taxRate = 0.2`, which are moved together with them,
   unless their type names a local class staying in the script body, like `val x: Foo? = null`,
   so a function reading only such values, like `fun tax(x: Double) = x * taxRate`, is moved together with them as well,
-  when they call it, or when it is called before its declaration, though not when called before its declaration where a receiver might resolve the call instead, like `append` in `buildString { append("x") }`,
+  when they call it, or when it is called before its declaration,
+  unless called before the declaration of such a value, like `f` in `val r = f()` followed by `val k = 5` and `fun f() = k`,
+  which a regular script reads before it is initialized, as `0` or `null`,
+  reported also when such a call is only stored, like `{ f() }` or `::f`, or never made, like `if (false) f()`,
+  or when its return type is inferred, and it is called before its declaration only where a receiver might resolve the call instead, like `append` in `buildString { append("x") }`,
+  and also after it, where a receiver might resolve the call, like in a following `buildString { append("y") }`, within a lambda, an extension function,
+  or a class, which might have a member of the same name,
+  or when it is called before its declaration within a class having a member of the same name, like `g` in `class A { fun f() = g(); fun g() = 1 }`,
+  as no placement outside of the script body resolves all these calls like a regular script (see the known limitations below),
   and referring to a local value or function of the same name as a dependency is reported as unresolved, instead of using the dependency,
   while an object, an enum class, an interface or a nested class cannot refer even to the dependencies,
   as they are the members of the script instance.
@@ -205,9 +223,22 @@ Most of these cases are reported as errors, while the following ones still resol
   like `f(null, null)` following `f(1, 1)` and `class P`, followed by `class R` and `fun f(p: P?, r: R?)` ([#33](https://github.com/xemantic/xemantic-kotlin-script/issues/33)),
 * a call preceding a local function, which compiles, when another local function of its name is visible already,
   or when it is within a lambda, a class, or an extension function, while the local function refers to a local class, or is named like a function of its `CoroutineScope`, like `run { V(1) + V(2) }` calling another `plus` before `operator fun V.plus(o: V)` ([#51](https://github.com/xemantic/xemantic-kotlin-script/issues/51)),
-* a call within a lambda to a property compiled outside of the script body, named like a function of its `CoroutineScope`, whose function type is known only to the compiler, like `val launch get() = launcher()` ([#44](https://github.com/xemantic/xemantic-kotlin-script/issues/44)).
+* a call within a lambda to a property compiled outside of the script body, named like a function of its `CoroutineScope`, whose function type is known only to the compiler, like `val launch get() = launcher()` ([#44](https://github.com/xemantic/xemantic-kotlin-script/issues/44)),
+* a call where a receiver might resolve it, like within a lambda, following the declaration of a function, which is called before its declaration only where the receivers resolve the calls instead,
+  like the second `append` in `buildString { append("x") }`, `fun append(t: String) = t + "!"`, `fun g() = buildString { append("y") }`,
+  as the function is resolved after the receivers, like when called before its declaration, while a regular script resolves it before them,
+  when its return type is inferred, unlike a declared one, like `fun append(t: String): String`
+  ([#73](https://github.com/xemantic/xemantic-kotlin-script/issues/73)), unless the function reads the values initialized with a literal, which keeps it in the script body,
+  where a call within a declaration compiled outside of the script body is resolved to a member of the same name of its class, while a regular script resolves it to the function,
+* a call within a class to its own member, preceding the declaration of a function of the same name with an inferred return type, which is compiled outside of the script body,
+  like `g` in `class A { fun f() = g(); fun g() = 1 }` followed by `fun g() = 10`, as the call is resolved to the function, while a regular script resolves it to the member
+  ([#75](https://github.com/xemantic/xemantic-kotlin-script/issues/75)), unless the function reads the values initialized with a literal, which keeps it in the script body.
 
 Giving the declarations and the dependencies distinct names avoids them.
+
+A function called by the script body before its declaration is compiled after it,
+so the raw JVM line numbers of its frames, seen only by a script inspecting its own stack trace, differ from the ones of the script,
+while the messages of the errors refer to the lines of the script.
 
 ### Error reporting
 

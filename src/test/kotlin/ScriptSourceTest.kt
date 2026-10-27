@@ -47,6 +47,38 @@ class ScriptSourceTest {
     }
 
     @Test
+    fun `should recognize classes without members named like function called before its declaration within many members and supertypes`() {
+        // given
+        val count = 20_000
+        val members = buildString {
+            appendLine("val k = \"!\"")
+            appendLine("val s = buildString { append(\"x\") }")
+            appendLine("fun append(t: String) = t + k")
+            appendLine("class A {")
+            (0 until count).forEach { appendLine("    fun m$it() = append(\"$it\")") }
+            appendLine("}")
+            append("A().m0()")
+        }
+        val supertypes = buildString {
+            appendLine("val k = \"!\"")
+            appendLine("val s = buildString { append(\"x\") }")
+            appendLine("fun append(t: String) = t + k")
+            appendLine("open class C0 { fun c0() = append(\"0\") }")
+            (1 until count).forEach { appendLine("open class C$it : C${it - 1}() { fun c$it() = append(\"$it\") }") }
+            append("C${count - 1}().c0()")
+        }
+
+        // when
+        val sources = listOf(members, supertypes).map { ScriptSource(it) }
+
+        // then
+        // not kept local, as no class has a member named `append`
+        sources.forEach { source ->
+            assert("fun append" in source.text.substringAfter("\n$SCRIPT_BLOCK_END\n"))
+        }
+    }
+
+    @Test
     fun `should move many classes accessing local property referred to by declaration which cannot be local`() {
         // given
         val count = 50_000
@@ -61,9 +93,9 @@ class ScriptSourceTest {
         val source = ScriptSource(script)
 
         // then
-        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        val (moved, body) = source.movedAndBody()
         assert("class C0 { fun v() = x }" in moved && "class C${count - 1} { fun v() = x }" in moved)
-        assert(body.removeSuffix(SCRIPT_BLOCK_END).lines().filter { it.isNotBlank() } == listOf("var x = 1", "All.A.all()"))
+        assert(body.lines().filter { it.isNotBlank() } == listOf("var x = 1", "All.A.all()"))
     }
 
     @Test
@@ -81,9 +113,9 @@ class ScriptSourceTest {
         val source = ScriptSource(script)
 
         // then
-        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        val (moved, body) = source.movedAndBody()
         assert("fun describe()" in moved && "class Counter" in moved)
-        assert(body.removeSuffix(SCRIPT_BLOCK_END).lines().filter { it.isNotBlank() } == listOf("var x = 1", "All.A.all()"))
+        assert(body.lines().filter { it.isNotBlank() } == listOf("var x = 1", "All.A.all()"))
     }
 
     @Test
@@ -101,7 +133,7 @@ class ScriptSourceTest {
         val source = ScriptSource(script)
 
         // then
-        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        val (moved, body) = source.movedAndBody()
         assert("fun b${count - 1}() = ${count - 1}" in moved && "fun a0() = x" in body)
     }
 
@@ -413,9 +445,9 @@ class ScriptSourceTest {
         val source = ScriptSource(script)
 
         // then
-        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        val (moved, body) = source.movedAndBody()
         assert("val RATE = 0.2" in moved && "fun tax(x: Double) = x * RATE" in moved)
-        assert(body.removeSuffix(SCRIPT_BLOCK_END).trim() == "Book(10.0).total()")
+        assert(body.trim() == "Book(10.0).total()")
     }
 
     @Test
@@ -431,7 +463,7 @@ class ScriptSourceTest {
 
         // then
         sources.forEach { source ->
-            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            val (moved, body) = source.movedAndBody()
             assert("fun tax(x: Double)" !in moved && "fun tax(x: Double)" in body)
         }
     }
@@ -451,7 +483,7 @@ class ScriptSourceTest {
         val source = ScriptSource(script)
 
         // then
-        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        val (moved, body) = source.movedAndBody()
         assert("class Foo" in body && "val x: Foo? = null" in body && "fun describe()" in body)
         assert("class Foo" !in moved && "val x: Foo? = null" !in moved && "fun describe()" !in moved)
     }
@@ -469,13 +501,13 @@ class ScriptSourceTest {
 
         // then
         sources.forEach { source ->
-            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            val (moved, body) = source.movedAndBody()
             assert("class Foo" in moved && "val x: Foo? = null" in moved && "val x" !in body)
         }
     }
 
     @Test
-    fun `should not move function reading constant called before its declaration only where receiver might resolve it`() {
+    fun `should move function reading constant called before its declaration where receiver might resolve it after the script block`() {
         // given
         val scripts = listOf(
             "val k = \"!\"\nval s = buildString { append(\"x\") }\nfun append(t: String) = t + k\nappend(s)",
@@ -488,9 +520,11 @@ class ScriptSourceTest {
         val sources = scripts.map { ScriptSource(it) }
 
         // then
-        sources.forEach { source ->
-            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
-            assert("val k" !in moved && "val k" in body)
+        // like in the script, resolved after the receivers
+        sources.zip(listOf("fun append", "fun sum", "fun describe", "fun scale")).forEach { (source, function) ->
+            val (moved, body) = source.movedAndBody()
+            assert("val k" in moved && "val k" !in body)
+            assert(function in source.text.substringAfter("\n$SCRIPT_BLOCK_END\n"))
         }
     }
 
@@ -513,7 +547,7 @@ class ScriptSourceTest {
 
         // then
         sources.forEach { source ->
-            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            val (moved, body) = source.movedAndBody()
             assert("fun format()" !in moved && "fun format()" in body)
         }
     }
@@ -537,7 +571,7 @@ class ScriptSourceTest {
 
         // then
         sources.forEach { (source, declaration) ->
-            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            val (moved, body) = source.movedAndBody()
             assert(declaration in moved && declaration !in body)
         }
     }
@@ -557,7 +591,7 @@ class ScriptSourceTest {
         val source = ScriptSource(script)
 
         // then
-        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        val (moved, body) = source.movedAndBody()
         assert("items" !in moved)
         val lines = body.lines()
         // the accessors retain their columns, like the copies of the types, mapped to their lines
@@ -582,7 +616,7 @@ class ScriptSourceTest {
         val source = ScriptSource(script)
 
         // then
-        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        val (moved, body) = source.movedAndBody()
         assert("val p" !in moved)
         assert(body.lines().count { it == " by object {" } == count)
     }
@@ -676,7 +710,7 @@ class ScriptSourceTest {
 
         // then
         sources.forEach { source ->
-            val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+            val (moved, body) = source.movedAndBody()
             assert("get()" in moved || "set(value)" in moved)
             assert(" by object " !in body)
         }
@@ -743,7 +777,7 @@ class ScriptSourceTest {
         val source = ScriptSource(script, listOf(PreambleDependency("let", { _, _ -> "val let: Int = 1" })))
 
         // then
-        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        val (moved, body) = source.movedAndBody()
         assert("get()" in moved && " by object " !in body)
     }
 
@@ -760,10 +794,32 @@ class ScriptSourceTest {
         val source = ScriptSource(script)
 
         // then
-        val (moved, body) = source.text.split(SCRIPT_BLOCK_START)
+        val (moved, body) = source.movedAndBody()
         assert("logged" !in moved)
         // the rest keeps its columns
         assert(" ".repeat(7) + "fun logged(" + " ".repeat(12) + "block: () -> Unit, " + " ".repeat(9) + "after: () -> Unit)" in body)
+    }
+
+    @Test
+    fun `should keep inline function called within declaration of inferred type as extension of outer receiver`() {
+        // given
+        val script = """
+            val log = mutableListOf<String>()
+            inline fun logged(crossinline block: () -> Unit, noinline after: () -> Unit) { log += "start"; block(); after() }
+            fun h() = buildString { logged({ }) { } }
+        """.trimIndent()
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.movedAndBody()
+        assert("logged" !in moved)
+        // split at the name, while the rest keeps its columns
+        assert(
+            " ".repeat(7) + "fun \n`_ScriptDependencies`.\n" + " ".repeat(11) + "logged(" +
+                    " ".repeat(12) + "block: () -> Unit, " + " ".repeat(9) + "after: () -> Unit)" in body
+        )
     }
 
     @Test
@@ -781,7 +837,7 @@ class ScriptSourceTest {
         val source = ScriptSource(script)
 
         // then
-        assert(source.localInlineFunctionArguments.map { it.start.line } == listOf(3))
+        assert(source.localInlineFunctionArguments.map { it.lambda.start.line } == listOf(3))
     }
 
     @Test
@@ -815,7 +871,7 @@ class ScriptSourceTest {
 
         // then
         sources.forEach { source ->
-            val (moved, _) = source.text.split(SCRIPT_BLOCK_START)
+            val (moved, _) = source.movedAndBody()
             assert("inline fun" in moved)
         }
     }
@@ -1221,4 +1277,61 @@ class ScriptSourceTest {
         assert(source.scriptMemberCallableReferences.map { it.second } == listOf("List<Int>::total"))
     }
 
+    @Test
+    fun `should not move function named like property read before its declaration`() {
+        // given
+        val script = "val work = 1\nval y = work + 1\nfun work() = 2\ny + work()"
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.movedAndBody()
+        assert("fun work()" !in moved && "fun work()" in body)
+    }
+
+    @Test
+    fun `should not move class named like parameter of moved declaration`() {
+        // given
+        val script = "val n = 1\nenum class E { A; fun f(Box: Int) = Box + 1 }\nclass Box { fun size() = n }\nE.A.f(Box().size())"
+
+        // when
+        val source = ScriptSource(script)
+
+        // then
+        val (moved, body) = source.movedAndBody()
+        assert("class Box" !in moved && "class Box" in body)
+    }
+
+    @Test
+    fun `should not recognize loop variables named like local properties as reading them`() {
+        // given
+        val scripts = listOf(
+            "val items = listOf(1, 2)\nval total: Int get() { var s = 0; for (items in listOf(5)) s += items; return s }\ntotal",
+            "val log = mutableListOf<String>()\ninline fun logged(block: () -> Unit) { for (log in listOf(\"a\")) println(log); block() }\nlogged { }"
+        )
+
+        // when
+        val sources = scripts.map { ScriptSource(it) }
+
+        // then
+        val (getterMoved, getterBody) = sources[0].movedAndBody()
+        assert("get()" in getterMoved && " by object " !in getterBody)
+        val (inlineMoved) = sources[1].movedAndBody()
+        assert("inline fun logged" in inlineMoved)
+    }
+
+}
+
+/**
+ * The declarations moved out of the script body, also the ones following the script block, and the script body,
+ * assuming that no line of the script ends like the script block.
+ */
+private fun ScriptSource.movedAndBody(): List<String> {
+    val start = text.indexOf(SCRIPT_BLOCK_START)
+    val end = text.lastIndexOf("\n$SCRIPT_BLOCK_END")
+    return listOf(
+        text.substring(0, start) + text.substring(end + SCRIPT_BLOCK_END.length + 1),
+        text.substring(start + SCRIPT_BLOCK_START.length, end)
+    )
 }
