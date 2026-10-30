@@ -18,49 +18,34 @@
 
 package com.xemantic.kotlin.script
 
-import org.intellij.lang.annotations.Language
-
 @DslMarker
 public annotation class ScriptDependenciesDsl
 
 /**
- * The builder of the dependencies provided to the script.
+ * The builder of the dependencies provided to a [ScriptSession].
  *
  * The type of a dependency is the reified type argument, inferred from the value by default.
  * It can be given explicitly, to make the dependency nullable,
- * or to expose it to the script only as its supertype.
+ * or to expose it to the snippets only as its supertype.
  */
 @ScriptDependenciesDsl
 public class ScriptDependencies @PublishedApi internal constructor() {
 
     @PublishedApi
-    internal val dependencies: MutableList<ScriptExecutor.Dependency<*>> = mutableListOf()
+    internal val dependencies: MutableList<ScriptDependency<*>> = mutableListOf()
 
     /**
-     * Provides the [value] to the script as the property of the given [name] and of the type [T].
+     * Provides the [value] to the snippets as the property of the given [name] and of the type [T].
      */
     public inline fun <reified T> provide(name: String, value: T) {
         dependencies += dependency(name, value)
     }
 
     /**
-     * Provides the [value] to the script as the property of this name and of the type [T].
+     * Provides the [value] to the snippets as the property of this name and of the type [T].
      */
     public inline infix fun <reified T> String.provides(value: T) {
         provide(this, value)
     }
 
 }
-
-/**
- * Executes the [script] with the dependencies defined by the [dependencies] builder.
- *
- * @see ScriptExecutor.execute
- */
-public suspend inline fun ScriptExecutor.execute(
-    @Language("kotlin") script: String,
-    dependencies: ScriptDependencies.() -> Unit
-): ScriptResult = execute(
-    script,
-    ScriptDependencies().apply(dependencies).dependencies
-)

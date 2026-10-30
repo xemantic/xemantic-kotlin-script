@@ -70,7 +70,8 @@ dependencies {
     implementation(libs.kotlin.scripting.common)
     implementation(libs.kotlin.scripting.jvm)
     implementation(libs.kotlin.scripting.jvm.host)
-    // the parser, to tell the declarations of the script from its statements
+    // the K2 REPL compiler, keeping the state of the session between the snippets
+    implementation(libs.kotlin.scripting.compiler.embeddable)
     implementation(libs.kotlin.compiler.embeddable)
     // the compiler brings kotlin-reflect 1.6.10, which mutates final fields, deprecated since JDK 26
     implementation(libs.kotlin.reflect)

@@ -16,8 +16,29 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-package com.xemantic.kotlin.script.literal
 
-/** Making the values of a literal type callable, for the scripts importing it. */
-@Suppress("unused")
-operator fun Int.invoke(x: Any?): String = "invoked $this with $x"
+package com.xemantic.kotlin.script
+
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * The values of the dependencies of the open sessions,
+ * read by the declarations of the dependencies preceding the snippets of a session, see [ScriptDependency].
+ */
+public object ScriptDependencyValues {
+
+    private val sessions = ConcurrentHashMap<Int, Map<String, Any?>>()
+
+    /** The value of the dependency of this [name] provided to the [session]. */
+    public fun get(session: Int, name: String): Any? =
+        checkNotNull(sessions[session]) { "The session is closed" }[name]
+
+    internal fun register(session: Int, values: Map<String, Any?>) {
+        sessions[session] = values
+    }
+
+    internal fun unregister(session: Int) {
+        sessions.remove(session)
+    }
+
+}

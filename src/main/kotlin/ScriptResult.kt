@@ -19,7 +19,7 @@
 package com.xemantic.kotlin.script
 
 /**
- * The phase of the script execution, in which an error occurred.
+ * The phase of the snippet execution, in which an error occurred.
  */
 public enum class ExecutionPhase {
     COMPILATION,
@@ -27,15 +27,15 @@ public enum class ExecutionPhase {
 }
 
 /**
- * The result of [ScriptExecutor.execute].
+ * The result of [ScriptSession.execute].
  */
 public sealed interface ScriptResult {
 
     /**
-     * The script failed to compile, or threw an exception.
+     * The snippet failed to compile, or threw an exception.
      *
      * @property message the LLM-friendly description of the failure,
-     *   pointing to the offending lines of the script.
+     *   pointing to the offending lines of the snippets.
      * @property phase the phase of the execution, in which the failure occurred.
      */
     public class Error(
@@ -44,12 +44,12 @@ public sealed interface ScriptResult {
     ) : ScriptResult
 
     /**
-     * The script was executed.
+     * The snippet was executed.
      *
-     * @property value the value of the last expression of the script,
-     *   or [Unit] if the script does not end with an expression.
-     * @property warnings the compiler warnings, pointing to the offending lines of the script,
-     *   or `null` if there are none. They might reveal a bug, even if the script succeeded.
+     * @property value the value of the last expression of the snippet,
+     *   or [Unit] if the snippet does not end with an expression.
+     * @property warnings the compiler warnings, pointing to the offending lines of the snippet,
+     *   or `null` if there are none. They might reveal a bug, even if the snippet succeeded.
      */
     public class Value(
         public val value: Any?,
