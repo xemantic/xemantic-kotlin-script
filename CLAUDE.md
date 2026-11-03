@@ -75,7 +75,7 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   see `SnippetDependencyResolver.takeDependencies`.
   The classpath added by a refinement stays with the compiler even if the snippet fails to compile.
 - Known compiler bugs, each with a test pinning the hint: a class of an earlier snippet is unresolved in a declaration of an inferred type calling it,
-  a value class property or function of an earlier snippet is called by a mangled name, which is not declared (the dependencies work around it with `@get:JvmName`),
+  a value class property or function of an earlier snippet is called by a mangled name, which is not declared (the provided properties work around it with `@get:JvmName`),
   an `inline` declaration cannot be called across snippets.
   Re-probe them after every Kotlin upgrade — the workarounds and hints might become obsolete.
 

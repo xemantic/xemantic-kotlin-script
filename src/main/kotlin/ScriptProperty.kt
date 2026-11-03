@@ -43,10 +43,10 @@ import kotlin.reflect.typeOf
  *   where all the classes must be accessible to the snippets, i.e. public and not local.
  *   It cannot be a type parameter, or a platform type, like the types of the Java members obtained by reflection.
  *   Note that [typeOf] does not retain the receiver of a function type,
- *   so a dependency of type `Int.() -> Int` is seen by the snippets as `(Int) -> Int`.
+ *   so a property of type `Int.() -> Int` is seen by the snippets as `(Int) -> Int`.
  * @param value the value of the property, of the [type].
  */
-public class ScriptDependency<T>(
+public class ScriptProperty<T>(
     public val name: String,
     public val type: KType,
     public val value: T
@@ -54,32 +54,32 @@ public class ScriptDependency<T>(
 
     init {
         require(name.matches(identifier) && name.any { it != '_' }) {
-            "Dependency name is not a Kotlin identifier: '$name'"
+            "Property name is not a Kotlin identifier: '$name'"
         }
         require(name !in hardKeywords) {
-            "Dependency name is a Kotlin keyword: '$name'"
+            "Property name is a Kotlin keyword: '$name'"
         }
         type.typeParameter()?.let {
             throw IllegalArgumentException(
-                "Dependency '$name' is of type ${it.name}, which is a type parameter - provide it as a concrete type"
+                "Property '$name' is of type ${it.name}, which is a type parameter - provide it as a concrete type"
             )
         }
         // rendered in the source of the session, where it would not compile, like `(Mutable)List<String!>!`
         require('!' !in type.toString()) {
-            "Dependency '$name' is of platform type $type, which the snippets cannot refer to - provide it as a Kotlin type, e.g. with typeOf"
+            "Property '$name' is of platform type $type, which the snippets cannot refer to - provide it as a Kotlin type, e.g. with typeOf"
         }
         type.inaccessibleClass()?.let {
             throw IllegalArgumentException(
-                "Dependency '$name' is of type ${it.name}, which is not accessible to the snippets - provide it as a public type"
+                "Property '$name' is of type ${it.name}, which is not accessible to the snippets - provide it as a public type"
             )
         }
         if (value == null) {
             require(type.isMarkedNullable) {
-                "Dependency '$name' is null, while its type is not nullable: $type"
+                "Property '$name' is null, while its type is not nullable: $type"
             }
         } else {
             require((type.classifier as? KClass<*>)?.isInstance(value) ?: true) {
-                "Dependency '$name' of type $type has a value of class ${value::class.java.name}"
+                "Property '$name' of type $type has a value of class ${value::class.java.name}"
             }
         }
     }
@@ -87,23 +87,23 @@ public class ScriptDependency<T>(
 }
 
 /**
- * Creates a [ScriptDependency] of the reified type [T].
+ * Creates a [ScriptProperty] of the reified type [T].
  */
-public inline fun <reified T> dependency(
+public inline fun <reified T> property(
     name: String,
     value: T
-): ScriptDependency<T> = ScriptDependency(
+): ScriptProperty<T> = ScriptProperty(
     name, typeOf<T>(), value
 )
 
 /**
- * The declaration of this dependency in the snippet preceding the ones of the [session].
+ * The declaration of this property in the snippet preceding the ones of the [session].
  *
  * The getter of a property of a value class type is named explicitly, like `getTimeout-UwyO8pc`,
  * as the K2 REPL compiler calls such a property declared in another snippet by the mangled name of its getter,
  * while it compiles the getter without mangling it, like `getTimeout`.
  */
-internal fun ScriptDependency<*>.declaration(session: Int): String {
+internal fun ScriptProperty<*>.declaration(session: Int): String {
     val type = this.type.toSource()
     val kClass = this.type.classifier as KClass<*>
     val jvmName = if (kClass.isValue) {
@@ -120,11 +120,11 @@ internal fun ScriptDependency<*>.declaration(session: Int): String {
     } else {
         ""
     }
-    return "${jvmName}val ${name.quoted()}: $type = ${ScriptDependencyValues::class.qualifiedName}.get($session, \"$name\") as $type"
+    return "${jvmName}val ${name.quoted()}: $type = ${ScriptPropertyValues::class.qualifiedName}.get($session, \"$name\") as $type"
 }
 
-/** The JVM name of the getter of the property of this dependency, like `getName`, or `isActive` of `isActive`. */
-private fun ScriptDependency<*>.getterName(): String =
+/** The JVM name of the getter of this property, like `getName`, or `isActive` of `isActive`. */
+private fun ScriptProperty<*>.getterName(): String =
     if (name.length > 2 && name.startsWith("is") && !name[2].isLowerCase()) name
     else "get" + name.replaceFirstChar { it.titlecase() }
 

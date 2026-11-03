@@ -22,14 +22,14 @@ package com.xemantic.kotlin.script
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * The values of the dependencies of the open sessions,
- * read by the declarations of the dependencies preceding the snippets of a session, see [ScriptDependency].
+ * The values of the properties of the open sessions,
+ * read by the declarations of the properties preceding the snippets of a session, see [ScriptProperty].
  */
-public object ScriptDependencyValues {
+public object ScriptPropertyValues {
 
     private val sessions = ConcurrentHashMap<Int, Map<String, Any?>>()
 
-    /** The value of the dependency of this [name] provided to the [session]. */
+    /** The value of the property of this [name] provided to the [session]. */
     public fun get(session: Int, name: String): Any? =
         checkNotNull(sessions[session]) { "The session is closed" }[name]
 

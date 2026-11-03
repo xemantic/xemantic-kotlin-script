@@ -42,10 +42,10 @@ class Outer {
     class Box<T>(val items: List<T>)
 }
 
-class ScriptDependenciesTest {
+class ScriptPropertiesTest {
 
     @Test
-    fun `should provide dependencies of inferred types`() = runTest {
+    fun `should provide properties of inferred types`() = runTest {
         ScriptSession {
             "greeting" provides "Hello"
             "names" provides listOf("foo", "bar")
@@ -64,7 +64,7 @@ class ScriptDependenciesTest {
     }
 
     @Test
-    fun `should keep dependencies in all snippets of the session`() = runTest {
+    fun `should keep properties in all snippets of the session`() = runTest {
         ScriptSession {
             "base" provides 10
         }.use { session ->
@@ -83,8 +83,8 @@ class ScriptDependenciesTest {
     }
 
     @Test
-    fun `should provide dependencies from the list`() = runTest {
-        ScriptSession(listOf(ScriptDependency("injected", typeOf<String>(), "foo"))).use { session ->
+    fun `should provide properties from the list`() = runTest {
+        ScriptSession(listOf(ScriptProperty("injected", typeOf<String>(), "foo"))).use { session ->
             // when
             val result = session.execute("injected.uppercase()")
 
@@ -97,7 +97,7 @@ class ScriptDependenciesTest {
     }
 
     @Test
-    fun `should provide dependency of nullable type`() = runTest {
+    fun `should provide property of nullable type`() = runTest {
         ScriptSession {
             provide<String?>("name", null)
         }.use { session ->
@@ -113,7 +113,7 @@ class ScriptDependenciesTest {
     }
 
     @Test
-    fun `should provide dependency of function type`() = runTest {
+    fun `should provide property of function type`() = runTest {
         ScriptSession {
             "twice" provides { x: Int -> x * 2 }
         }.use { session ->
@@ -129,8 +129,8 @@ class ScriptDependenciesTest {
     }
 
     @Test
-    fun `should provide dependency of generic nested class`() = runTest {
-        ScriptSession(listOf(dependency("box", Outer.Box(listOf(1, 2))))).use { session ->
+    fun `should provide property of generic nested class`() = runTest {
+        ScriptSession(listOf(property("box", Outer.Box(listOf(1, 2))))).use { session ->
             // when
             val result = session.execute("box.items.size")
 
@@ -143,7 +143,7 @@ class ScriptDependenciesTest {
     }
 
     @Test
-    fun `should provide dependency of generic nested interface with projection`() = runTest {
+    fun `should provide property of generic nested interface with projection`() = runTest {
         ScriptSession {
             provide<Map.Entry<String, Int>>("entry", mapOf("foo" to 42).entries.first())
             provide<MutableList<out Number>>("numbers", mutableListOf(1, 2.5))
@@ -161,7 +161,7 @@ class ScriptDependenciesTest {
     }
 
     @Test
-    fun `should provide dependency as its supertype`() = runTest {
+    fun `should provide property as its supertype`() = runTest {
         ScriptSession {
             provide<CharSequence>("text", "foo")
         }.use { session ->
@@ -181,7 +181,7 @@ class ScriptDependenciesTest {
     }
 
     @Test
-    fun `should provide dependencies of value class types`() = runTest {
+    fun `should provide properties of value class types`() = runTest {
         ScriptSession {
             "timeout" provides 5.seconds
             "count" provides 5u
@@ -202,7 +202,7 @@ class ScriptDependenciesTest {
     }
 
     @Test
-    fun `should provide dependencies of value class types to functions of later snippets`() = runTest {
+    fun `should provide properties of value class types to functions of later snippets`() = runTest {
         ScriptSession {
             "timeout" provides 5.seconds
         }.use { session ->
@@ -221,7 +221,7 @@ class ScriptDependenciesTest {
     }
 
     @Test
-    fun `should provide dependencies of types named like keywords and in the root package`() = runTest {
+    fun `should provide properties of types named like keywords and in the root package`() = runTest {
         ScriptSession {
             "box" provides Box(1)
             "config" provides RootConfig.Entry(RootConfig(2))
@@ -239,7 +239,7 @@ class ScriptDependenciesTest {
     }
 
     @Test
-    fun `should provide dependency named like hard keyword in backticks`() = runTest {
+    fun `should provide property named like hard keyword in backticks`() = runTest {
         ScriptSession {
             "get" provides 1
             "żółw" provides 2
@@ -256,9 +256,9 @@ class ScriptDependenciesTest {
     }
 
     @Test
-    fun `should let snippet redeclare dependency`() = runTest {
+    fun `should let snippet redeclare property`() = runTest {
         ScriptSession {
-            "name" provides "dependency"
+            "name" provides "property"
         }.use { session ->
             // given
             session.execute("val name = \"snippet\"")
@@ -275,7 +275,7 @@ class ScriptDependenciesTest {
     }
 
     @Test
-    fun `should reject duplicate dependency name`() {
+    fun `should reject duplicate property name`() {
         // when
         val exception = assertFailsWith<IllegalArgumentException> {
             ScriptSession {
@@ -285,143 +285,143 @@ class ScriptDependenciesTest {
         }
 
         // then
-        assert(exception.message == "Duplicate dependency name: foo")
+        assert(exception.message == "Duplicate property name: foo")
     }
 
     @Test
-    fun `should reject dependency names of the members of the script scope`() {
+    fun `should reject property names of the members of the script scope`() {
         // when
         val exceptions = listOf("coroutineContext", "await").map { name ->
             assertFailsWith<IllegalArgumentException> {
-                ScriptSession(listOf(dependency(name, 1)))
+                ScriptSession(listOf(property(name, 1)))
             }
         }
 
         // then
         assert(exceptions.map { it.message } == listOf("coroutineContext", "await").map {
-            "Reserved dependency name: $it - it is a member of the ScriptScope receiving the snippets"
+            "Reserved property name: $it - it is a member of the ScriptScope receiving the snippets"
         })
     }
 
     @Test
-    fun `should reject dependency name which is not an identifier`() {
+    fun `should reject property name which is not an identifier`() {
         // when
         val exceptions = listOf("foo`bar", "foo bar", "1foo", "").map { name ->
             assertFailsWith<IllegalArgumentException> {
-                dependency(name, listOf(1))
+                property(name, listOf(1))
             }
         }
 
         // then
         assert(exceptions.map { it.message } == listOf(
-            "Dependency name is not a Kotlin identifier: 'foo`bar'",
-            "Dependency name is not a Kotlin identifier: 'foo bar'",
-            "Dependency name is not a Kotlin identifier: '1foo'",
-            "Dependency name is not a Kotlin identifier: ''"
+            "Property name is not a Kotlin identifier: 'foo`bar'",
+            "Property name is not a Kotlin identifier: 'foo bar'",
+            "Property name is not a Kotlin identifier: '1foo'",
+            "Property name is not a Kotlin identifier: ''"
         ))
     }
 
     @Test
-    fun `should reject dependency name which is a hard keyword`() {
+    fun `should reject property name which is a hard keyword`() {
         // when
         val exceptions = listOf("in", "class", "null").map { name ->
             assertFailsWith<IllegalArgumentException> {
-                dependency(name, 1)
+                property(name, 1)
             }
         }
 
         // then
         assert(exceptions.map { it.message } == listOf(
-            "Dependency name is a Kotlin keyword: 'in'",
-            "Dependency name is a Kotlin keyword: 'class'",
-            "Dependency name is a Kotlin keyword: 'null'"
+            "Property name is a Kotlin keyword: 'in'",
+            "Property name is a Kotlin keyword: 'class'",
+            "Property name is a Kotlin keyword: 'null'"
         ))
     }
 
     @Test
-    fun `should reject dependency of local class`() {
+    fun `should reject property of local class`() {
         // given
         class Local
 
         // when
         val exception = assertFailsWith<IllegalArgumentException> {
-            dependency("foo", listOf(Local()))
+            property("foo", listOf(Local()))
         }
 
         // then
-        assert(exception.message == "Dependency 'foo' is of type ${Local::class.java.name}, which is not accessible to the snippets - provide it as a public type")
+        assert(exception.message == "Property 'foo' is of type ${Local::class.java.name}, which is not accessible to the snippets - provide it as a public type")
     }
 
     @Test
-    fun `should reject dependency of private class`() {
+    fun `should reject property of private class`() {
         // when
         val exception = assertFailsWith<IllegalArgumentException> {
-            dependency("foo", Hidden())
+            property("foo", Hidden())
         }
 
         // then
-        assert(exception.message == "Dependency 'foo' is of type com.xemantic.kotlin.script.Hidden, which is not accessible to the snippets - provide it as a public type")
+        assert(exception.message == "Property 'foo' is of type com.xemantic.kotlin.script.Hidden, which is not accessible to the snippets - provide it as a public type")
     }
 
     @Test
-    fun `should reject dependency of internal class`() {
+    fun `should reject property of internal class`() {
         // when
         val exception = assertFailsWith<IllegalArgumentException> {
-            dependency("foo", listOf(Internal()))
+            property("foo", listOf(Internal()))
         }
 
         // then
-        assert(exception.message == "Dependency 'foo' is of type com.xemantic.kotlin.script.Internal, which is not accessible to the snippets - provide it as a public type")
+        assert(exception.message == "Property 'foo' is of type com.xemantic.kotlin.script.Internal, which is not accessible to the snippets - provide it as a public type")
     }
 
     @Test
-    fun `should reject null dependency of non-nullable type`() {
+    fun `should reject null property of non-nullable type`() {
         // when
         val exception = assertFailsWith<IllegalArgumentException> {
-            ScriptDependency("foo", typeOf<String>(), null)
+            ScriptProperty("foo", typeOf<String>(), null)
         }
 
         // then
-        assert(exception.message == "Dependency 'foo' is null, while its type is not nullable: kotlin.String")
+        assert(exception.message == "Property 'foo' is null, while its type is not nullable: kotlin.String")
     }
 
     @Test
-    fun `should reject dependency value which is not of its type`() {
+    fun `should reject property value which is not of its type`() {
         // when
         val exception = assertFailsWith<IllegalArgumentException> {
-            ScriptDependency("foo", typeOf<String>(), 42)
+            ScriptProperty("foo", typeOf<String>(), 42)
         }
 
         // then
-        assert(exception.message == "Dependency 'foo' of type kotlin.String has a value of class java.lang.Integer")
+        assert(exception.message == "Property 'foo' of type kotlin.String has a value of class java.lang.Integer")
     }
 
     @Test
-    fun `should reject dependency of type parameter`() {
+    fun `should reject property of type parameter`() {
         // given
         val type = Pair<*, *>::first.returnType
 
         // when
         val exception = assertFailsWith<IllegalArgumentException> {
-            ScriptDependency("foo", type, "bar")
+            ScriptProperty("foo", type, "bar")
         }
 
         // then
-        assert(exception.message == "Dependency 'foo' is of type A, which is a type parameter - provide it as a concrete type")
+        assert(exception.message == "Property 'foo' is of type A, which is a type parameter - provide it as a concrete type")
     }
 
     @Test
-    fun `should reject dependency of platform type`() {
+    fun `should reject property of platform type`() {
         // given
         val type = Thread::getAllStackTraces.returnType
 
         // when
         val exception = assertFailsWith<IllegalArgumentException> {
-            ScriptDependency("foo", type, Thread.getAllStackTraces())
+            ScriptProperty("foo", type, Thread.getAllStackTraces())
         }
 
         // then
-        assert(exception.message == "Dependency 'foo' is of platform type $type, which the snippets cannot refer to - provide it as a Kotlin type, e.g. with typeOf")
+        assert(exception.message == "Property 'foo' is of platform type $type, which the snippets cannot refer to - provide it as a Kotlin type, e.g. with typeOf")
     }
 
 }

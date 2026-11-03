@@ -93,12 +93,12 @@ ScriptSession {
   A snippet being compiled when the caller is cancelled is compiled and evaluated nevertheless,
   as the compiler cannot be interrupted, and would evaluate it before the next snippet anyway.
 * Closing the session cancels the coroutines launched by its snippets and releases its compiler and thread.
-* Dependencies are exposed to the snippets as properties of the session of the given name and type.
+* Properties of the given name and type are provided to the snippets of the session, like `"greeting" provides "Hello"`.
   The type is inferred from the value, including its type arguments,
   or can be given explicitly, e.g. `provide<String?>("name", null)` or `provide<Clock>("clock", fixedClock)`,
-  to make the dependency nullable, or to expose it only as its supertype.
-  A dependency list built dynamically can be passed instead, as `ScriptSession(listOf(dependency("greeting", "Hello")))`.
-  Invalid dependencies are rejected with `IllegalArgumentException`:
+  to make the property nullable, or to expose it only as its supertype.
+  A property list built dynamically can be passed instead, as `ScriptSession(listOf(property("greeting", "Hello")))`.
+  Invalid properties are rejected with `IllegalArgumentException`:
   a name which is not a Kotlin identifier, a duplicate name, a value which is not of the type,
   a name of a member of the `ScriptScope`, like `await` or `coroutineContext`,
   or a type which the snippets cannot refer to, like a private or a local class.
@@ -144,7 +144,7 @@ The K2 REPL compiler is still experimental, and these of its bugs are reported t
 * A property, or a function, of a value class type, like `Duration` or `UInt`, declared in an earlier snippet,
   fails with `NoSuchMethodError` when called from another snippet,
   as the compiler calls it by its mangled name, like `getTimeout-UwyO8pc`, while it declares it without mangling.
-  The dependencies of value class types are not affected, as their getters are declared with the mangled names.
+  The provided properties of value class types are not affected, as their getters are declared with the mangled names.
 * An `inline` function, or property, declared in an earlier snippet cannot be called from another snippet,
   and the one referring to the `ScriptScope`, like `coroutineContext`, cannot be compiled at all,
   reported as an internal failure of the compiler.
@@ -210,7 +210,7 @@ so it can do whatever the host can:
 read and write files, open network connections, read the environment variables and system properties,
 access the classes and singletons of the host through reflection,
 start processes, or terminate the JVM with `System.exit`.
-The dependencies limit what the script is given, not what it can reach.
+The provided properties limit what the script is given, not what it can reach.
 
 A script written by an LLM should be treated as untrusted code,
 as it might be the result of a prompt injection, or just a hallucination.

@@ -19,26 +19,26 @@
 package com.xemantic.kotlin.script
 
 @DslMarker
-public annotation class ScriptDependenciesDsl
+public annotation class ScriptPropertiesDsl
 
 /**
- * The builder of the dependencies provided to a [ScriptSession].
+ * The builder of the properties provided to a [ScriptSession].
  *
- * The type of a dependency is the reified type argument, inferred from the value by default.
- * It can be given explicitly, to make the dependency nullable,
+ * The type of a property is the reified type argument, inferred from the value by default.
+ * It can be given explicitly, to make the property nullable,
  * or to expose it to the snippets only as its supertype.
  */
-@ScriptDependenciesDsl
-public class ScriptDependencies @PublishedApi internal constructor() {
+@ScriptPropertiesDsl
+public class ScriptProperties @PublishedApi internal constructor() {
 
     @PublishedApi
-    internal val dependencies: MutableList<ScriptDependency<*>> = mutableListOf()
+    internal val properties: MutableList<ScriptProperty<*>> = mutableListOf()
 
     /**
      * Provides the [value] to the snippets as the property of the given [name] and of the type [T].
      */
     public inline fun <reified T> provide(name: String, value: T) {
-        dependencies += dependency(name, value)
+        properties += property(name, value)
     }
 
     /**

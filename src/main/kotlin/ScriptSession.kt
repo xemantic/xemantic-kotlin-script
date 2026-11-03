@@ -115,28 +115,28 @@ public interface ScriptSession : AutoCloseable {
 /**
  * Creates a [ScriptSession].
  *
- * @param dependencies the values provided to the snippets as the properties of the session.
+ * @param properties the values provided to the snippets as the properties of the session.
  * @param dispatcher the dispatcher of the coroutines launched by the snippets, see [ScriptScope].
- * @throws IllegalArgumentException if the [dependencies] have duplicate, or reserved, names.
+ * @throws IllegalArgumentException if the [properties] have duplicate, or reserved, names.
  */
 public fun ScriptSession(
-    dependencies: List<ScriptDependency<*>> = emptyList(),
+    properties: List<ScriptProperty<*>> = emptyList(),
     dispatcher: CoroutineDispatcher = Dispatchers.Default
-): ScriptSession = DefaultScriptSession(dependencies, dispatcher)
+): ScriptSession = DefaultScriptSession(properties, dispatcher)
 
-/** The names of the members of the [ScriptScope], which the dependencies would shadow. */
+/** The names of the members of the [ScriptScope], which the properties would shadow. */
 private val reservedNames = setOf("coroutineContext", "await")
 
 internal class DefaultScriptSession(
-    private val dependencies: List<ScriptDependency<*>>,
+    private val properties: List<ScriptProperty<*>>,
     dispatcher: CoroutineDispatcher
 ) : ScriptSession {
 
     init {
-        dependencies.groupBy { it.name }.forEach { (name, sameName) ->
-            require(sameName.size == 1) { "Duplicate dependency name: $name" }
+        properties.groupBy { it.name }.forEach { (name, sameName) ->
+            require(sameName.size == 1) { "Duplicate property name: $name" }
             require(name !in reservedNames) {
-                "Reserved dependency name: $name - it is a member of the ScriptScope receiving the snippets"
+                "Reserved property name: $name - it is a member of the ScriptScope receiving the snippets"
             }
         }
     }
@@ -158,7 +158,7 @@ internal class DefaultScriptSession(
     )
 
     init {
-        ScriptDependencyValues.register(id, dependencies.associate { it.name to it.value })
+        ScriptPropertyValues.register(id, properties.associate { it.name to it.value })
     }
 
     private val mutex = Mutex()
@@ -280,7 +280,7 @@ internal class DefaultScriptSession(
         val result = withContext(sessionDispatcher + NonCancellable) {
             val repl = repl ?: Repl().also {
                 repl = it
-                declareDependencies(it)
+                declareProperties(it)
             }
             val name = "snippet${++snippetCount}.kts"
             snippets[name] = snippet.lines()
@@ -304,18 +304,18 @@ internal class DefaultScriptSession(
         result
     }
 
-    /** Declares the [dependencies] in the snippet preceding the ones of the session. */
-    private suspend fun declareDependencies(repl: Repl) {
-        if (dependencies.isEmpty()) return
-        val name = "dependencies.kts"
-        val source = dependencies.joinToString("\n") { it.declaration(id) }
+    /** Declares the [properties] in the snippet preceding the ones of the session. */
+    private suspend fun declareProperties(repl: Repl) {
+        if (properties.isEmpty()) return
+        val name = "properties.kts"
+        val source = properties.joinToString("\n") { it.declaration(id) }
         snippets[name] = source.lines()
         val compilation = repl.compile(source, name).result
         val evaluation = compilation.valueOrNull()?.let {
             repl.evaluator.eval(it, repl.evaluationConfiguration).valueOrNull()?.get()?.result
         }
         check(evaluation != null && evaluation !is ResultValue.Error) {
-            "The dependencies cannot be declared:\n" + if (compilation is ResultWithDiagnostics.Failure) {
+            "The properties cannot be declared:\n" + if (compilation is ResultWithDiagnostics.Failure) {
                 reporter.describe(compilation.reports)
             } else {
                 (evaluation as? ResultValue.Error)?.let { reporter.describe(it.error) } ?: "evaluation failed"
@@ -363,7 +363,7 @@ internal class DefaultScriptSession(
         if (closed) return
         closed = true
         job.cancel()
-        ScriptDependencyValues.unregister(id)
+        ScriptPropertyValues.unregister(id)
         thread.execute {
             Disposer.dispose(disposable)
             dependencyResolver.close()
@@ -382,10 +382,10 @@ internal fun scriptJvmTarget(
 ): String = (JvmTarget.fromString(javaSpecificationVersion) ?: JvmTarget.supportedValues().last()).description
 
 /**
- * Creates a [ScriptSession] with the dependencies defined by the [dependencies] builder.
+ * Creates a [ScriptSession] with the properties defined by the [properties] builder.
  */
 public inline fun ScriptSession(
-    dependencies: ScriptDependencies.() -> Unit
+    properties: ScriptProperties.() -> Unit
 ): ScriptSession = ScriptSession(
-    ScriptDependencies().apply(dependencies).dependencies
+    ScriptProperties().apply(properties).properties
 )
