@@ -32,6 +32,7 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.coroutines.startCoroutine
@@ -1018,7 +1019,8 @@ class ScriptSessionTest {
         })
 
         // then
-        execution.get().getOrThrow() should {
+        // bounded, so a deadlock fails the test instead of hanging the build
+        execution.get(1, TimeUnit.MINUTES).getOrThrow() should {
             be<ScriptResult.Value>()
             have(value == 42)
         }
