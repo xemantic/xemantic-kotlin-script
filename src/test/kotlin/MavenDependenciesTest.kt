@@ -19,6 +19,7 @@
 package com.xemantic.kotlin.script
 
 import com.xemantic.kotlin.script.test.MavenRepository
+import com.xemantic.kotlin.script.test.MavenRepositoryServer
 import com.xemantic.kotlin.script.test.collectGarbageUntilCleared
 import com.xemantic.kotlin.test.assert
 import com.xemantic.kotlin.test.be
@@ -265,6 +266,47 @@ class MavenDependenciesTest {
             be<ScriptResult.Value>()
             have(value == "Hi Alice")
             have(resolvedVersions == mapOf("com.xemantic.fixture:greeter" to "1.10"))
+        }
+    }
+
+    @Test
+    fun `should resolve latest version of dependency declared without version with repository credentials`() = runTest {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // when
+            val result = session.execute("""
+                @file:Repository("${server.url}", options = ["username=alice", "password=secret"])
+                @file:DependsOn("com.xemantic.fixture:greeter")
+                fixture.greeter.Greeter.greet("Alice")
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == "Hi Alice")
+                have(resolvedVersions == mapOf("com.xemantic.fixture:greeter" to "1.10"))
+            }
+        }
+    }
+
+    @Test
+    fun `should report unresolved dependency declared without version in repository without its credentials`() = runTest {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // when
+            val result = session.execute("""
+                @file:Repository("${server.url}")
+                @file:DependsOn("com.xemantic.fixture:greeter")
+                42
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Error>()
+                have(phase == ExecutionPhase.COMPILATION)
+                message sameAs """
+                    snippet1.kts:2:1: error: Unresolved dependency 'com.xemantic.fixture:greeter': Could not transfer metadata com.xemantic.fixture:greeter/maven-metadata.xml from/to ${server.url}: status code: 401, reason phrase: Unauthorized (401)
+                      | <error>@file:DependsOn("com.xemantic.fixture:greeter")</error>
+                """.trimIndent()
+            }
         }
     }
 

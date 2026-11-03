@@ -19,16 +19,37 @@
 
 package com.xemantic.kotlin.script
 
+import org.apache.maven.repository.internal.MavenRepositorySystemUtils
+import org.apache.maven.settings.Settings
+import org.eclipse.aether.RepositorySystem
+import org.eclipse.aether.RepositorySystemSession
+import org.eclipse.aether.artifact.DefaultArtifact
+import org.eclipse.aether.connector.basic.BasicRepositoryConnectorFactory
+import org.eclipse.aether.repository.LocalRepository
+import org.eclipse.aether.repository.Proxy
+import org.eclipse.aether.repository.RemoteRepository
+import org.eclipse.aether.resolution.VersionRangeRequest
+import org.eclipse.aether.spi.connector.RepositoryConnectorFactory
+import org.eclipse.aether.spi.connector.transport.TransporterFactory
+import org.eclipse.aether.transfer.MetadataNotFoundException
+import org.eclipse.aether.transport.file.FileTransporterFactory
+import org.eclipse.aether.transport.http.HttpTransporterFactory
+import org.eclipse.aether.util.repository.AuthenticationBuilder
+import org.eclipse.aether.util.repository.DefaultAuthenticationSelector
+import org.eclipse.aether.util.repository.DefaultMirrorSelector
+import org.eclipse.aether.util.repository.DefaultProxySelector
 import org.eclipse.aether.util.version.GenericVersionScheme
-import org.w3c.dom.Element
 import java.io.File
-import java.io.FileNotFoundException
-import java.net.URI
-import javax.xml.XMLConstants
-import javax.xml.parsers.DocumentBuilderFactory
-
-/** The repository of a dependency, when no other one is declared, like for `MavenDependenciesResolver`. */
-internal const val MAVEN_CENTRAL = "https://repo.maven.apache.org/maven2/"
+import java.nio.file.Path
+import kotlin.script.experimental.dependencies.ExternalDependenciesResolver
+import kotlin.script.experimental.dependencies.RepositoryCoordinates
+import kotlin.script.experimental.dependencies.impl.mavenRepoId
+import kotlin.script.experimental.dependencies.impl.password
+import kotlin.script.experimental.dependencies.impl.privateKeyFile
+import kotlin.script.experimental.dependencies.impl.privateKeyPassphrase
+import kotlin.script.experimental.dependencies.impl.toRepositoryUrlOrNull
+import kotlin.script.experimental.dependencies.impl.username
+import kotlin.script.experimental.dependencies.maven.impl.createMavenSettings
 
 /**
  * The latest [version] of a Maven artifact, which is [stable],
@@ -79,58 +100,132 @@ internal fun latestMavenVersion(
 }
 
 /**
- * The latest version of the artifact of the [groupId] and [artifactId],
- * among the versions listed by the `maven-metadata.xml` of any of the [repositories], a URL or a directory,
- * or `null`, if none lists any.
- *
- * @throws java.io.IOException if no repository lists any version, and some cannot be read.
+ * Looks up the latest version of a Maven artifact with Maven Resolver,
+ * set up like `MavenDependenciesResolver` resolves the artifact in the version found:
+ * with the local repository, the mirrors, the proxies and the server credentials of the Maven [settings],
+ * and also in their offline mode, which `MavenDependenciesResolver` does not honor.
  */
-internal fun latestMavenVersion(
-    groupId: String,
-    artifactId: String,
-    repositories: List<String>
-): LatestMavenVersion? {
-    val failures = mutableListOf<Exception>()
-    val versions = repositories.flatMap { repository ->
-        try {
-            metadataVersions(repository, groupId, artifactId)
-        } catch (e: FileNotFoundException) {
-            emptyList()
-        } catch (e: Exception) {
-            failures += e
-            emptyList()
+internal class MavenVersionLookup(
+    settingsFactory: () -> Settings = ::createMavenSettings
+) {
+
+    private val settings by lazy(settingsFactory)
+
+    private val system: RepositorySystem by lazy {
+        @Suppress("DEPRECATION")
+        MavenRepositorySystemUtils.newServiceLocator().apply {
+            addService(RepositoryConnectorFactory::class.java, BasicRepositoryConnectorFactory::class.java)
+            addService(TransporterFactory::class.java, HttpTransporterFactory::class.java)
+            addService(TransporterFactory::class.java, FileTransporterFactory::class.java)
+        }.getService(RepositorySystem::class.java)
+    }
+
+    private val session: RepositorySystemSession by lazy {
+        MavenRepositorySystemUtils.newSession().apply {
+            localRepositoryManager = system.newLocalRepositoryManager(this, LocalRepository(Path.of(settings.localRepository)))
+            isOffline = settings.isOffline
         }
     }
-    if (versions.isEmpty() && failures.isNotEmpty()) throw failures.first()
-    return latestMavenVersion(versions)
+
+    /**
+     * The latest version of the artifact of the [groupId] and [artifactId],
+     * among the versions listed by the `maven-metadata.xml` of any of the [repositories],
+     * as cached in the local repository, refreshed once a day, or installed into it,
+     * or, in the offline mode, if none lists any, among the versions present in the local repository,
+     * or `null`, if there is none, see [latestMavenVersion].
+     *
+     * @throws Exception if there is no version, and some repository cannot be read.
+     */
+    fun latestVersion(
+        groupId: String,
+        artifactId: String,
+        repositories: List<RemoteRepository>
+    ): LatestMavenVersion? {
+        val request = VersionRangeRequest(
+            DefaultArtifact(groupId, artifactId, "jar", "[0,)"),
+            repositories.mapNotNull { it.withSettings() },
+            null
+        )
+        val result = system.resolveVersionRange(session, request)
+        val versions = result.versions.map { it.toString() }.ifEmpty {
+            if (settings.isOffline) localVersions(groupId, artifactId) else emptyList()
+        }
+        val failure = result.exceptions.firstOrNull { it !is MetadataNotFoundException }
+        if (versions.isEmpty() && failure != null) throw failure
+        return latestMavenVersion(versions)
+    }
+
+    /** The versions of the artifact in the local repository, also these resolved without its `maven-metadata.xml`. */
+    private fun localVersions(groupId: String, artifactId: String): List<String> =
+        File(settings.localRepository, "${groupId.replace('.', '/')}/$artifactId").listFiles().orEmpty().filter {
+            File(it, "$artifactId-${it.name}.pom").isFile
+        }.map { it.name }
+
+    /**
+     * This repository, with the mirror, the proxy and the server credentials of the Maven settings applied,
+     * like `MavenDependenciesResolver` does, or `null`, if its protocol is neither HTTP(S), nor `file`.
+     */
+    private fun RemoteRepository.withSettings(): RemoteRepository? {
+        val proxied = settings.activeProxy?.let { proxy ->
+            val selector = DefaultProxySelector().add(
+                Proxy(
+                    proxy.protocol,
+                    proxy.host,
+                    proxy.port,
+                    AuthenticationBuilder().addUsername(proxy.username).addPassword(proxy.password).build()
+                ),
+                proxy.nonProxyHosts
+            )
+            RemoteRepository.Builder(this).setProxy(selector.getProxy(this)).build()
+        } ?: this
+        if (!proxied.protocol.matches(supportedProtocol)) return null
+        val mirrors = DefaultMirrorSelector().apply {
+            settings.mirrors.orEmpty().forEach {
+                add(it.id, it.url, it.layout, false, false, it.mirrorOf, it.mirrorOfLayouts)
+            }
+        }
+        val repository = mirrors.getMirror(proxied) ?: proxied
+        if (repository.authentication != null) return repository
+        val servers = DefaultAuthenticationSelector().apply {
+            settings.servers.orEmpty().filter { it.id != null }.forEach {
+                add(
+                    it.id,
+                    AuthenticationBuilder()
+                        .addUsername(it.username)
+                        .addPassword(it.password)
+                        .addPrivateKey(it.privateKey, it.passphrase)
+                        .build()
+                )
+            }
+        }
+        return RemoteRepository.Builder(repository).setAuthentication(servers.getAuthentication(repository)).build()
+    }
+
 }
 
-private fun metadataVersions(
-    repository: String,
-    groupId: String,
-    artifactId: String
-): List<String> {
-    val base = repository.toRepositoryUri().toString().removeSuffix("/")
-    val url = URI("$base/${groupId.replace('.', '/')}/$artifactId/maven-metadata.xml").toURL()
-    val connection = url.openConnection().apply {
-        connectTimeout = 10_000
-        readTimeout = 30_000
-    }
-    val document = connection.getInputStream().use { input ->
-        DocumentBuilderFactory.newInstance().apply {
-            setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
-            setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true)
-        }.newDocumentBuilder().parse(input)
-    }
-    val versionLists = document.getElementsByTagName("versions")
-    return (0 until versionLists.length).flatMap { index ->
-        val list = versionLists.item(index) as Element
-        val versions = list.getElementsByTagName("version")
-        (0 until versions.length).map { versions.item(it).textContent.trim() }
-    }.filter { it.isNotEmpty() }
+/** The protocols of the repositories supported by `MavenDependenciesResolver`. */
+private val supportedProtocol = Regex("https?|file")
+
+/**
+ * The repository declared with `@file:Repository` with these [coordinates] and [options],
+ * with the id and the credentials given by the options, like `MavenDependenciesResolver` declares it,
+ * or `null`, if they are not valid, which `MavenDependenciesResolver` reports itself.
+ */
+internal fun remoteRepository(
+    coordinates: RepositoryCoordinates,
+    options: ExternalDependenciesResolver.Options
+): RemoteRepository? {
+    val url = coordinates.toRepositoryUrlOrNull() ?: return null
+    // a value starting with `$` names an environment variable, which MavenDependenciesResolver requires to be set
+    fun String?.resolved(): String? = this?.let { if (it.startsWith("$")) System.getenv(it.substring(1)) else it }
+    val authentication = AuthenticationBuilder()
+        .addUsername(options.username.resolved())
+        .addPassword(options.password.resolved())
+        .addPrivateKey(options.privateKeyFile.resolved(), options.privateKeyPassphrase.resolved())
+        .build()
+    val id = options.mavenRepoId ?: coordinates.string.replace(forbiddenRepositoryIdChars, "_")
+    return RemoteRepository.Builder(id, "default", url.toString()).setAuthentication(authentication).build()
 }
 
-/** The URI of a repository declared with `@file:Repository`, a URL, or a directory. */
-private fun String.toRepositoryUri(): URI = runCatching { URI(this) }.getOrNull()?.takeIf {
-    it.scheme != null && it.scheme.length > 1 // not a Windows drive letter
-} ?: File(this).toURI()
+/** The characters replaced in a repository id derived from its URL, like `MavenDependenciesResolver` does. */
+private val forbiddenRepositoryIdChars = Regex("[/\\\\:<>\"|?*]")
