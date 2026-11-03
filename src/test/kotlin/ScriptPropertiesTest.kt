@@ -27,6 +27,9 @@ import com.xemantic.kotlin.test.be
 import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
+import java.net.URLClassLoader
+import kotlin.reflect.KTypeProjection
+import kotlin.reflect.full.createType
 import kotlin.reflect.typeOf
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
@@ -40,6 +43,21 @@ internal class Internal
 
 class Outer {
     class Box<T>(val items: List<T>)
+}
+
+class Isolated
+
+/**
+ * A property of the [Isolated] class loaded by another class loader, so the snippets see the class of the same name,
+ * loaded by the class loader of the session, which its value cannot be cast to.
+ */
+private fun isolatedProperty(): ScriptProperty<Any> {
+    val loader = URLClassLoader(
+        arrayOf(Isolated::class.java.protectionDomain.codeSource.location),
+        ClassLoader.getPlatformClassLoader()
+    )
+    val isolated = loader.loadClass(Isolated::class.java.name)
+    return ScriptProperty("isolated", isolated.kotlin.createType(), isolated.getDeclaredConstructor().newInstance())
 }
 
 class ScriptPropertiesTest {
@@ -270,6 +288,65 @@ class ScriptPropertiesTest {
             result should {
                 be<ScriptResult.Value>()
                 have(value == "snippet")
+            }
+        }
+    }
+
+    @Test
+    fun `should report property which fails to compile`() = runTest {
+        // given
+        // validated up front, while the compiler rejects the type argument out of the bounds of Enum<E : Enum<E>>
+        val type = Enum::class.createType(listOf(KTypeProjection.invariant(typeOf<String>())))
+        ScriptSession(listOf(ScriptProperty("level", type, DeprecationLevel.WARNING))).use { session ->
+            // when
+            val result = session.execute("42")
+
+            // then
+            result should {
+                be<ScriptResult.Error>()
+                have(phase == ExecutionPhase.COMPILATION)
+                have(message.startsWith("The properties cannot be declared:\nproperties.kts:1:"))
+                have("kotlin.Enum<kotlin.String>" in message)
+            }
+        }
+    }
+
+    @Test
+    fun `should report property which fails to evaluate`() = runTest {
+        ScriptSession(listOf(isolatedProperty())).use { session ->
+            // when
+            val result = session.execute("42")
+
+            // then
+            result should {
+                be<ScriptResult.Error>()
+                have(phase == ExecutionPhase.EVALUATION)
+                have(message.startsWith(
+                    "The properties cannot be declared:\n" +
+                            "java.lang.ClassCastException: class com.xemantic.kotlin.script.Isolated cannot be cast to class com.xemantic.kotlin.script.Isolated"
+                ))
+            }
+        }
+    }
+
+    @Test
+    fun `should report failed declaration of properties on every execution`() = runTest {
+        ScriptSession(listOf(isolatedProperty())).use { session ->
+            // given
+            val first = session.execute("isolated")
+
+            // when
+            val next = session.execute("isolated")
+
+            // then
+            first should {
+                be<ScriptResult.Error>()
+                have(message.startsWith("The properties cannot be declared:\n"))
+            }
+            next should {
+                be<ScriptResult.Error>()
+                have(phase == (first as ScriptResult.Error).phase)
+                have(message == first.message)
             }
         }
     }
