@@ -26,7 +26,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
@@ -38,8 +37,13 @@ import org.jetbrains.kotlin.config.JvmTarget
 import org.jetbrains.kotlin.scripting.compiler.plugin.impl.K2ReplCompiler
 import org.jetbrains.kotlin.scripting.compiler.plugin.impl.K2ReplEvaluator
 import org.jetbrains.kotlin.scripting.compiler.plugin.impl.ScriptDiagnosticsMessageCollector
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ThreadFactory
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.coroutines.CoroutineContext
 import kotlin.script.experimental.api.ResultValue
 import kotlin.script.experimental.api.ResultWithDiagnostics
 import kotlin.script.experimental.api.CompiledSnippet
@@ -103,7 +107,7 @@ public interface ScriptSession : AutoCloseable {
      * A failure of declaring the properties of the session, like a type the compiler rejects although it is valid,
      * is reported by every execution, in the phase in which it occurred, without executing the snippet.
      *
-     * @throws IllegalStateException if the session is closed.
+     * @throws IllegalStateException if the session is closed, also while the snippet waits for the ones executed concurrently.
      */
     public suspend fun execute(
         @Language("kotlin") snippet: String
@@ -113,6 +117,7 @@ public interface ScriptSession : AutoCloseable {
      * Closes the session, cancelling the coroutines launched by its snippets, and the evaluation of the snippet being executed, if any,
      * like a cancellation of its caller, see [execute],
      * and releasing the compiler and the thread, once that snippet ends.
+     * Closing a closed session, also concurrently, has no effect.
      */
     override fun close()
 
@@ -133,9 +138,13 @@ public fun ScriptSession(
 /** The names of the members of the [ScriptScope], which the properties would shadow. */
 private val reservedNames = setOf("coroutineContext", "await")
 
+/**
+ * The [ScriptSession], with the thread of its snippets run by the single thread [executor] created with the given thread factory.
+ */
 internal class DefaultScriptSession(
     private val properties: List<ScriptProperty<*>>,
-    dispatcher: CoroutineDispatcher
+    dispatcher: CoroutineDispatcher,
+    executor: (ThreadFactory) -> ExecutorService = Executors::newSingleThreadExecutor
 ) : ScriptSession {
 
     init {
@@ -151,11 +160,25 @@ internal class DefaultScriptSession(
 
     private val name = "script-session-$id"
 
-    private val thread = Executors.newSingleThreadExecutor { runnable ->
+    private val thread = executor { runnable ->
         Thread(runnable, name).apply { isDaemon = true }
     }
 
-    private val sessionDispatcher = thread.asCoroutineDispatcher()
+    /**
+     * Dispatches to the [thread], or, once it is shut down by [close], to [Dispatchers.IO],
+     * where the block of [execute] only fails the check of a closed session,
+     * unlike the dispatcher of `asCoroutineDispatcher`, which would cancel the rejected block,
+     * failing the execution with a [kotlinx.coroutines.CancellationException] instead.
+     */
+    private val sessionDispatcher = object : CoroutineDispatcher() {
+        override fun dispatch(context: CoroutineContext, block: Runnable) {
+            try {
+                thread.execute(block)
+            } catch (_: RejectedExecutionException) {
+                Dispatchers.IO.dispatch(context, block)
+            }
+        }
+    }
 
     private val job = SupervisorJob()
 
@@ -191,8 +214,7 @@ internal class DefaultScriptSession(
     /** The failure of declaring the [properties], reported by every execution, as the snippets would not see them. */
     private var propertiesFailure: ScriptResult.Error? = null
 
-    @Volatile
-    private var closed = false
+    private val closed = AtomicBoolean()
 
     private inner class Repl {
 
@@ -307,11 +329,15 @@ internal class DefaultScriptSession(
     override suspend fun execute(
         snippet: String
     ): ScriptResult = mutex.withLock {
-        check(!closed) { "The session is closed" }
+        check(!closed.get()) { "The session is closed" }
         // a caller without a job, like `suspend fun main`, cannot cancel the evaluation
         val callerJob = currentCoroutineContext()[Job] ?: Job()
         // a cancelled compilation would leave the compiled snippet to be evaluated before the next one
         val result = withContext(sessionDispatcher + NonCancellable) {
+            // checked again on the thread, as the session could be closed before the block was dispatched to it,
+            // and the block could run after the disposal of the compiler then, or on another thread, see sessionDispatcher,
+            // while a session closed later disposes the compiler only after this block, queued after it on the thread
+            check(!closed.get()) { "The session is closed" }
             // kept only once the properties are declared, or their failure is, so a fatal error,
             // like an OutOfMemoryError, cannot leave the session without them, while the next execution
             // declares them again in another compiler, not seeing the declaration which threw
@@ -391,8 +417,7 @@ internal class DefaultScriptSession(
     )
 
     override fun close() {
-        if (closed) return
-        closed = true
+        if (!closed.compareAndSet(false, true)) return
         job.cancel()
         ScriptPropertyValues.unregister(id)
         thread.execute {
