@@ -69,8 +69,11 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
             repositoryCoordinates, options, sourceCodeLocation
         ).also { result ->
             if (result.valueOrNull() == true) {
-                remoteRepository(repositoryCoordinates, options)?.let {
-                    repositories += repositoryCoordinates.string to it
+                remoteRepository(repositoryCoordinates, options)?.let { repository ->
+                    // a repository declared again by a later snippet is looked up once
+                    if (repositories.none { (_, it) -> it.id == repository.id && it.url == repository.url }) {
+                        repositories += repositoryCoordinates.string to repository
+                    }
                 }
             }
         }
@@ -220,7 +223,10 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
         val (groupId, artifactId) = coordinates.split(':')
         val searched = repositories.ifEmpty { listOf(mavenCentral.url to mavenCentral) }
         versionLookup.latestVersion(groupId, artifactId, searched.map { it.second })
-            ?: throw IllegalStateException("Could not find any version of it in ${searched.joinToString(", ") { it.first }}")
+            ?: throw IllegalStateException(
+                "Could not find any version of it in ${searched.joinToString(", ") { it.first }}" +
+                    if (versionLookup.offline) ", in the offline mode of the Maven settings" else ""
+            )
     }
 
     /**

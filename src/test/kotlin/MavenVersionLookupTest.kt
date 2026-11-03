@@ -198,6 +198,75 @@ class MavenVersionLookupTest {
     }
 
     @Test
+    fun `should look up latest version again after failure`() {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // given
+            val lookup = MavenVersionLookup { settings() }
+            val repository = remoteRepository(server.url, "username=alice", "password=secret")
+            server.failingRequests = 1
+            val failure = runCatching {
+                lookup.latestVersion("com.xemantic.fixture", "greeter", listOf(repository))
+            }.exceptionOrNull()
+
+            // when
+            val latest = lookup.latestVersion("com.xemantic.fixture", "greeter", listOf(repository))
+
+            // then
+            assert(failure?.message?.contains("500") == true)
+            assert(latest?.version == "1.10" && latest.stable)
+        }
+    }
+
+    @Test
+    fun `should look up latest version of artifact published after it was not found`() {
+        // given
+        val repository = createTempDirectory("maven-remote")
+        try {
+            val lookup = MavenVersionLookup { settings() }
+            val remote = listOf(remoteRepository(repository.toUri().toString()))
+            val notFound = lookup.latestVersion("com.xemantic.fixture", "published", remote)
+            repository.resolve("com/xemantic/fixture/published").createDirectories().resolve("maven-metadata.xml").writeText("""
+                <metadata>
+                  <groupId>com.xemantic.fixture</groupId>
+                  <artifactId>published</artifactId>
+                  <versioning>
+                    <versions>
+                      <version>1.0</version>
+                    </versions>
+                  </versioning>
+                </metadata>
+            """.trimIndent())
+
+            // when
+            val latest = lookup.latestVersion("com.xemantic.fixture", "published", remote)
+
+            // then
+            assert(notFound == null)
+            assert(latest?.version == "1.0" && latest.stable)
+        } finally {
+            repository.toFile().deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should look up latest version in file repository in offline mode`() {
+        // given
+        val lookup = MavenVersionLookup {
+            settings {
+                isOffline = true
+            }
+        }
+
+        // when
+        val latest = lookup.latestVersion(
+            "com.xemantic.fixture", "greeter", listOf(remoteRepository(MavenRepository.url))
+        )
+
+        // then
+        assert(latest?.version == "1.10" && latest.stable)
+    }
+
+    @Test
     fun `should not find any version of missing artifact`() {
         // given
         val lookup = MavenVersionLookup { settings() }

@@ -119,17 +119,24 @@ internal class MavenVersionLookup(
         }.getService(RepositorySystem::class.java)
     }
 
-    private val session: RepositorySystemSession by lazy {
-        MavenRepositorySystemUtils.newSession().apply {
-            // deprecated in Maven Resolver 2, but its Path constructor is missing from the 1.9 brought by Kotlin
-            @Suppress("DEPRECATION")
-            val localRepository = LocalRepository(File(settings.localRepository))
-            localRepositoryManager = system.newLocalRepositoryManager(this, localRepository)
-            isOffline = settings.isOffline
-            // bounding the compilation of a snippet when a repository stalls, unlike the defaults, 30 s and 30 min
-            setConfigProperty("aether.connector.connectTimeout", 10_000)
-            setConfigProperty("aether.connector.requestTimeout", 30_000)
-        }
+    /** Whether the Maven settings are in the offline mode. */
+    val offline: Boolean get() = settings.isOffline
+
+    /**
+     * A new session, for each lookup, like `MavenDependenciesResolver` does for each resolution,
+     * as a session remembers a failure, or a missing `maven-metadata.xml`, not to look it up again.
+     */
+    private fun newSession(): RepositorySystemSession = MavenRepositorySystemUtils.newSession().apply {
+        // deprecated in Maven Resolver 2, but its Path constructor is missing from the 1.9 brought by Kotlin
+        @Suppress("DEPRECATION")
+        val localRepository = LocalRepository(File(settings.localRepository))
+        localRepositoryManager = system.newLocalRepositoryManager(this, localRepository)
+        isOffline = settings.isOffline
+        // in the offline mode, the file repositories are still read, like by Maven itself
+        setConfigProperty("aether.offline.protocols", "file")
+        // the timeouts of a lookup before Maven Resolver, unlike its defaults, 10 s to connect, and 30 min to wait for data
+        setConfigProperty("aether.connector.connectTimeout", 10_000)
+        setConfigProperty("aether.connector.requestTimeout", 30_000)
     }
 
     /**
@@ -152,7 +159,7 @@ internal class MavenVersionLookup(
             repositories.mapNotNull { it.withSettings() },
             null
         )
-        val result = system.resolveVersionRange(session, request)
+        val result = system.resolveVersionRange(newSession(), request)
         val versions = result.versions.map { it.toString() }.ifEmpty {
             if (settings.isOffline) localVersions(groupId, artifactId) else emptyList()
         }
