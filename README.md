@@ -69,7 +69,11 @@ ScriptSession {
   while the functions of the earlier snippets keep calling the declarations they were compiled against,
   so after redeclaring `greet`, a `shout` calling it has to be redeclared as well to call the new one.
   A snippet which fails to compile leaves no declarations behind,
-  while a snippet throwing an exception keeps the ones it declared.
+  while a snippet throwing an exception keeps the ones it declared,
+  also the properties it did not initialize before throwing,
+  which hold `null` then, despite their type, or zero, or `false`, if it is a primitive one, like `Int`, or `Boolean`.
+  A `NullPointerException` reading such a property, like `s.length` after `val s: String = error("boom")`,
+  is reported with a hint that the property is declared by a snippet which failed in the evaluation, and should be declared again.
 * Each snippet is a regular Kotlin script, compiled by the K2 REPL compiler of the Kotlin scripting API,
   against the whole classpath of the host application,
   so any class available to the host can be imported by a snippet.

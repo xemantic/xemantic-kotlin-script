@@ -37,6 +37,7 @@ import org.jetbrains.kotlin.config.JvmTarget
 import org.jetbrains.kotlin.scripting.compiler.plugin.impl.K2ReplCompiler
 import org.jetbrains.kotlin.scripting.compiler.plugin.impl.K2ReplEvaluator
 import org.jetbrains.kotlin.scripting.compiler.plugin.impl.ScriptDiagnosticsMessageCollector
+import java.lang.reflect.Modifier
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
@@ -86,6 +87,9 @@ private val sessionIds = AtomicInteger()
  *
  * A failure of a snippet is reported as [ScriptResult.Error], with a message pointing to its offending lines,
  * and the session continues, without the declarations of a snippet which failed to compile.
+ * A snippet which failed in the evaluation keeps its declarations, also the properties it did not initialize,
+ * which hold `null` despite their type, or zero, or `false`, if it is a primitive one,
+ * and a [NullPointerException] reading such a property is reported with a hint to declare it again.
  */
 public interface ScriptSession : AutoCloseable {
 
@@ -104,6 +108,7 @@ public interface ScriptSession : AutoCloseable {
      * A failure of the compilation, even an internal one of the compiler, is reported as an [ExecutionPhase.COMPILATION] error,
      * an exception thrown by the snippet, as an [ExecutionPhase.EVALUATION] error,
      * except for a [VirtualMachineError] other than [StackOverflowError], which is thrown.
+     * The declarations of a snippet which threw stay visible to the next snippets, also the uninitialized properties, see [ScriptSession].
      * A failure of declaring the properties of the session, like a type the compiler rejects although it is valid,
      * is reported by every execution, in the phase in which it occurred, without executing the snippet.
      *
@@ -206,7 +211,10 @@ internal class DefaultScriptSession(
     /** The simple names of the classes declared by the evaluated snippets. */
     private val snippetClassNames = HashSet<String>()
 
-    private val reporter = ScriptErrorReporter(snippets, snippetClassNames)
+    /** The properties of the snippets which failed in the evaluation, `null` then, see [keepUninitializedProperties]. */
+    private val uninitializedProperties = HashMap<String, UninitializedProperty>()
+
+    private val reporter = ScriptErrorReporter(snippets, snippetClassNames, uninitializedProperties)
 
     private var snippetCount = 0
 
@@ -377,7 +385,7 @@ internal class DefaultScriptSession(
                 val evaluation = scope.evaluate(callerJob) {
                     evaluator.eval(result.value, evaluationConfiguration)
                 }
-                evaluation.toScriptResult(compilation)
+                evaluation.toScriptResult(compilation, name)
             }
         }
     }
@@ -399,14 +407,60 @@ internal class DefaultScriptSession(
         }
     }
 
+    /** The [ScriptResult] of evaluating the snippet of this [name]. */
     private fun ResultWithDiagnostics<*>.toScriptResult(
-        compilation: Compilation
+        compilation: Compilation,
+        name: String
     ): ScriptResult {
         @Suppress("UNCHECKED_CAST")
         val result = (valueOrNull() as? LinkedSnippet<KJvmEvaluatedSnippet>)
             ?.get()?.result
         result?.scriptClass?.java?.declaredClasses?.mapTo(snippetClassNames) { it.simpleName }
-        return reporter.scriptResult(result, reports, compilation.result.reports, compilation.dependencies)
+        return reporter.scriptResult(result, reports, compilation.result.reports, compilation.dependencies).also {
+            // after reporting it, as the snippet itself did not read them after it failed
+            if (result is ResultValue.Error) {
+                result.scriptClass?.java?.let { keepUninitializedProperties(it, name) }
+            }
+        }
+    }
+
+    /**
+     * Keeps the properties of the [scriptClass] of the snippet of this [name], which failed in the evaluation, which are `null`,
+     * most likely as the snippet failed before initializing them, while the later snippets still see them,
+     * so that a [NullPointerException] reading them is hinted at, see [ScriptErrorReporter].
+     *
+     * The properties of the snippet are the static fields of its class, read by the field or by the getter,
+     * like `Snippet1.s` or `Snippet1.getS()` in the message of the [NullPointerException],
+     * while a property of a primitive type is never `null`, it is left zero, or `false`, instead.
+     */
+    private fun keepUninitializedProperties(
+        scriptClass: Class<*>,
+        name: String
+    ) {
+        try {
+            val methods = scriptClass.declaredMethods.filter { it.parameterCount == 0 }.mapTo(HashSet()) { it.name }
+            scriptClass.declaredFields.filter { field ->
+                Modifier.isStatic(field.modifiers)
+                    && !field.type.isPrimitive
+                    // like the INSTANCE of the snippet, or the delegate of a property, `s$delegate`
+                    && field.type != scriptClass
+                    && '$' !in field.name
+                    && field.trySetAccessible()
+                    && field.get(null) == null
+            }.forEach { field ->
+                val property = UninitializedProperty(field.name, name)
+                uninitializedProperties["${scriptClass.name}.${field.name}"] = property
+                // like `getS`, or `isOk` of `val isOk`
+                val getter = if (field.name.startsWith("is")) field.name else "get${field.name.replaceFirstChar { it.uppercaseChar() }}"
+                if (getter in methods) {
+                    uninitializedProperties["${scriptClass.name}.$getter()"] = property
+                }
+            }
+        } catch (e: Exception) {
+            logger.debug(e) { "$name: cannot read the properties of the snippet which failed" }
+        } catch (e: LinkageError) {
+            logger.debug(e) { "$name: cannot read the properties of the snippet which failed" }
+        }
     }
 
     /**

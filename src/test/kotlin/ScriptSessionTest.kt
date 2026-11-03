@@ -492,6 +492,103 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should hint at uninitialized property of snippet which failed in the evaluation`() = runTest {
+        // given
+        session.execute("val s: String = error(\"boom\")")
+
+        // when
+        val result = session.execute("s.length")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.NullPointerException: Cannot invoke "String.length()" because the return value of "getS()" is null
+                  hint: 's' is declared in snippet1.kts, which failed in the evaluation, so it might be left uninitialized, null despite its type - declare it again.
+                  at <snippet body>(snippet2.kts:1)
+                  | s.length
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint at uninitialized property read by function of snippet which failed in the evaluation`() = runTest {
+        // given
+        session.execute("""
+            val name: String = error("boom")
+            fun greet() = "Hello, ${'$'}{name.uppercase()}"
+        """.trimIndent())
+
+        // when
+        val result = session.execute("greet()")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.NullPointerException: Cannot invoke "String.toUpperCase(java.util.Locale)" because "name" is null
+                  hint: 'name' is declared in snippet1.kts, which failed in the evaluation, so it might be left uninitialized, null despite its type - declare it again.
+                  at greet(snippet1.kts:2)
+                  | fun greet() = "Hello, ${'$'}{name.uppercase()}"
+                  at <snippet body>(snippet2.kts:1)
+                  | greet()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint at uninitialized property read by object of snippet which failed in the evaluation`() = runTest {
+        // given
+        session.execute("""
+            val s: String = error("boom")
+            object Config { val length = s.length }
+        """.trimIndent())
+
+        // when
+        val result = session.execute("Config.length")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.ExceptionInInitializerError
+                  at <snippet body>(snippet2.kts:1)
+                  | Config.length
+                Caused by: java.lang.NullPointerException: Cannot invoke "String.length()" because the return value of "getS()" is null
+                  hint: 's' is declared in snippet1.kts, which failed in the evaluation, so it might be left uninitialized, null despite its type - declare it again.
+                  at Config.<clinit>(snippet1.kts:2)
+                  | object Config { val length = s.length }
+                  at <snippet body>(snippet2.kts:1)
+                  | Config.length
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not hint at null property of snippet which did not fail in the evaluation`() = runTest {
+        // given
+        session.execute("val s: String = error(\"boom\")")
+        session.execute("val missing = System.getProperty(\"no.such.property\")")
+
+        // when
+        val result = session.execute("missing.length")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.NullPointerException: Cannot invoke "String.length()" because the return value of "getMissing()" is null
+                  at <snippet body>(snippet3.kts:1)
+                  | missing.length
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should continue the session after a failing snippet`() = runTest {
         // given
         session.execute("val x = 41")
