@@ -77,6 +77,49 @@ class LatestMavenVersionTest {
     }
 
     @Test
+    fun `should prefer release version to date-style version`() {
+        // given the versions of commons-collections, where Maven orders the old date-style versions last
+        val versions = listOf(
+            "1.0",
+            "2.0",
+            "2.1",
+            "2.1.1",
+            "3.0",
+            "3.1",
+            "3.2",
+            "3.2.1",
+            "3.2.2",
+            "20030418.083655",
+            "20031027.000000",
+            "20040102.233541",
+            "20040616"
+        )
+
+        // when
+        val latest = latestMavenVersion(versions)
+
+        // then
+        assert(latest?.version == "3.2.2" && latest.stable)
+    }
+
+    @Test
+    fun `should select highest date-style version without other stable one`() {
+        // given
+        val versions = listOf(
+            "20030418.083655",
+            "20040616",
+            "20031027.000000",
+            "2.0-RC1"
+        )
+
+        // when
+        val latest = latestMavenVersion(versions)
+
+        // then
+        assert(latest?.version == "20040616" && latest.stable)
+    }
+
+    @Test
     fun `should skip pre-release versions`() {
         // given
         val versions = listOf(
