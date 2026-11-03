@@ -223,6 +223,11 @@ internal class DefaultScriptSession(
         /** Collects the warnings, which the compilation does not return with the compiled snippet. */
         val messageCollector = ScriptDiagnosticsMessageCollector(null)
 
+        /** Disposed with the session, or on its own, if the properties cannot be declared, see [execute]. */
+        val disposable = Disposer.newDisposable("$name-repl").also {
+            Disposer.register(this@DefaultScriptSession.disposable, it)
+        }
+
         val compiler = K2ReplCompiler(
             K2ReplCompiler.createCompilationState(
                 messageCollector,
@@ -304,9 +309,17 @@ internal class DefaultScriptSession(
         val callerJob = currentCoroutineContext()[Job] ?: Job()
         // a cancelled compilation would leave the compiled snippet to be evaluated before the next one
         val result = withContext(sessionDispatcher + NonCancellable) {
-            val repl = repl ?: Repl().also {
-                repl = it
-                propertiesFailure = declareProperties(it)
+            // kept only once the properties are declared, or their failure is, so a fatal error,
+            // like an OutOfMemoryError, cannot leave the session without them, while the next execution
+            // declares them again in another compiler, not seeing the declaration which threw
+            val repl = repl ?: Repl().also { created ->
+                try {
+                    propertiesFailure = declareProperties(created)
+                } catch (e: Throwable) {
+                    runCatching { Disposer.dispose(created.disposable) }.exceptionOrNull()?.let(e::addSuppressed)
+                    throw e
+                }
+                repl = created
             }
             propertiesFailure ?: repl.execute(snippet, "snippet${++snippetCount}.kts", callerJob)
         }
