@@ -234,7 +234,9 @@ internal class DefaultScriptSession(
 
         /**
          * Compiles the [snippet] of this [name], keeping it in the history of the compiler only if it compiles,
-         * with an internal failure of the compiler reported as the failure of the compilation.
+         * with an internal failure of the compiler, also an [Error], like a [StackOverflowError] on a deeply nested expression,
+         * reported as the failure of the compilation,
+         * except for a [VirtualMachineError] other than [StackOverflowError], which is thrown.
          */
         suspend fun compile(
             snippet: String,
@@ -242,7 +244,15 @@ internal class DefaultScriptSession(
         ): Compilation {
             val result = try {
                 compiler.compile(listOf(snippet.toScriptSource(name)), compilationConfiguration)
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
+                if (e is VirtualMachineError && e !is StackOverflowError) {
+                    // otherwise the next snippet would see the declarations and the dependencies of this one
+                    runCatching {
+                        history.rollback()
+                        dependencyResolver.takeDependencies()
+                    }.exceptionOrNull()?.let(e::addSuppressed)
+                    throw e
+                }
                 ResultWithDiagnostics.Failure(
                     ScriptDiagnostic(
                         code = ScriptDiagnostic.unspecifiedError,

@@ -399,6 +399,41 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should report StackOverflowError of the compiler and continue the session without declarations of the snippet`() = runTest {
+        // given
+        session.execute("val x = 41")
+        // nested deep enough to overflow the stack of the parser at any thread stack size, in milliseconds
+        val depth = 100_000
+        val snippet = "val bad = 1\n" + "(".repeat(depth) + "1" + ")".repeat(depth)
+
+        // when
+        // a regression lets the StackOverflowError escape, which would abort the Gradle test executor
+        val result = runCatching { session.execute(snippet) }
+        val bad = session.execute("bad")
+        val next = session.execute("x + 1")
+
+        // then
+        assert(result.exceptionOrNull() == null)
+        result.getOrThrow() should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            have(message.startsWith("error: The compiler failed internally: java.lang.StackOverflowError\n"))
+        }
+        bad should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet3.kts:1:1: error: Unresolved reference 'bad'.
+                  | <error>bad</error>
+            """.trimIndent()
+        }
+        next should {
+            be<ScriptResult.Value>()
+            have(value == 42)
+        }
+    }
+
+    @Test
     fun `should hint declaring the type when class of earlier snippet is unresolved in declaration of inferred type`() = runTest {
         // given
         session.execute("class Plain")

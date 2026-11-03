@@ -64,7 +64,8 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   passing the plain `defaultJvmScriptingHostConfiguration` crashes the first snippet with an NPE in `Fir2IrReplSnippetConfiguratorExtensionImpl`.
 - Its own history provider keeps the snippets which failed to compile, so the next snippet resolves their declarations, and fails at runtime — see `ReplHistory`.
 - `compile` drops the warnings of a successful snippet (`asSuccess()` without reports), they are read from the message collector instead.
-- `compile` may throw instead of returning a failure, e.g. on a backend crash.
+- `compile` may throw instead of returning a failure, e.g. on a backend crash, also an `Error`, like a `StackOverflowError` of the parser on deeply nested parentheses.
+  The history provider gets the snippet only after its FIR resolution, so an overflow of the parser or of the resolution does not put it there.
 - `providedProperties` are not resolved by the K2 REPL — the dependencies are declared by a generated first snippet instead.
 - The evaluator evaluates every compiled snippet not evaluated yet before the given one, so a compiled snippet is always evaluated, even if the caller was cancelled meanwhile.
 - Never interrupt the thread while compiling: an interrupt closes any interruptible NIO channel in use (JDK behaviour), which the compiler's JAR reading might rely on — a precaution, not reproduced.
