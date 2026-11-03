@@ -19,6 +19,7 @@
 package com.xemantic.kotlin.script
 
 import com.xemantic.kotlin.script.test.MavenRepository
+import com.xemantic.kotlin.script.test.collectGarbageUntilCleared
 import com.xemantic.kotlin.test.assert
 import com.xemantic.kotlin.test.be
 import com.xemantic.kotlin.test.have
@@ -313,18 +314,6 @@ class MavenDependenciesTest {
         session.close()
         val classLoader = (result as ScriptResult.Value).value!!
         WeakReference<Any>(session) to WeakReference(classLoader)
-    }
-
-    /**
-     * Collects garbage until the [reference] is cleared, giving up after a while,
-     * as the thread of a closed session releases it only once it ends.
-     */
-    private fun collectGarbageUntilCleared(reference: WeakReference<*>) {
-        repeat(500) {
-            System.gc()
-            if (reference.get() == null) return
-            Thread.sleep(10)
-        }
     }
 
 }

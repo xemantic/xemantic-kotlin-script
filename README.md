@@ -92,7 +92,10 @@ ScriptSession {
   while a snippet which neither blocks interruptibly, nor awaits, runs to its end.
   A snippet being compiled when the caller is cancelled is compiled and evaluated nevertheless,
   as the compiler cannot be interrupted, and would evaluate it before the next snippet anyway.
-* Closing the session cancels the coroutines launched by its snippets and releases its compiler and thread.
+* Closing the session cancels the coroutines launched by its snippets,
+  and the snippet being evaluated, like cancelling its caller does, also a caller which cannot be cancelled, like `suspend fun main`,
+  so its `execute` returns an evaluation error.
+  Then it releases its compiler and thread, once that snippet ends.
 * Properties of the given name and type are provided to the snippets of the session, like `"greeting" provides "Hello"`.
   The type is inferred from the value, including its type arguments,
   or can be given explicitly, e.g. `provide<String?>("name", null)` or `provide<Clock>("clock", fixedClock)`,
