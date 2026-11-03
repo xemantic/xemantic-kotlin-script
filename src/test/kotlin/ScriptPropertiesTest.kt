@@ -62,8 +62,21 @@ private fun isolatedProperty(): ScriptProperty<Any> {
 
 typealias MutableItems = MutableList<String>
 
+typealias Items<T> = MutableList<T>
+
+typealias Transform = (Int) -> Int
+
 class IndexHolder {
     val index: MutableMap<String, List<Int>> = mutableMapOf()
+}
+
+/** The types of the members keep the typealiases, unlike the ones of [typeOf]. */
+class AliasHolder {
+    val items: MutableItems = mutableListOf()
+    val nested: List<MutableItems> = listOf()
+    val nullable: MutableItems? = null
+    val generic: Items<Transform> = mutableListOf()
+    val map: Map<Transform, MutableItems> = mapOf()
 }
 
 class ScriptPropertiesTest {
@@ -242,6 +255,47 @@ class ScriptPropertiesTest {
             "kotlin.Function1<kotlin.collections.MutableSet<kotlin.Int>, kotlin.collections.MutableIterator<kotlin.Int>>",
             "kotlin.collections.MutableList<kotlin.String>",
             "kotlin.collections.MutableMap<kotlin.String, kotlin.collections.List<kotlin.Int>>"
+        ))
+    }
+
+    @Test
+    fun `should provide property of typealiased mutable collection type`() = runTest {
+        ScriptSession(listOf(ScriptProperty("items", AliasHolder::items.returnType, mutableListOf<String>()))).use { session ->
+            // when
+            val result = session.execute("""
+                items.add("foo")
+                items
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == listOf("foo"))
+            }
+        }
+    }
+
+    @Test
+    fun `should render typealiased mutable collection types in source`() {
+        // given
+        val types = listOf(
+            AliasHolder::items.returnType,
+            AliasHolder::nested.returnType,
+            AliasHolder::nullable.returnType,
+            AliasHolder::generic.returnType,
+            AliasHolder::map.returnType
+        )
+
+        // when
+        val sources = types.map { it.toSource() }
+
+        // then
+        assert(sources == listOf(
+            "kotlin.collections.MutableList<kotlin.String>",
+            "kotlin.collections.List<kotlin.collections.MutableList<kotlin.String>>",
+            "kotlin.collections.MutableList<kotlin.String>?",
+            "kotlin.collections.MutableList<kotlin.Function1<kotlin.Int, kotlin.Int>>",
+            "kotlin.collections.Map<kotlin.Function1<kotlin.Int, kotlin.Int>, kotlin.collections.MutableList<kotlin.String>>"
         ))
     }
 
@@ -570,6 +624,32 @@ class ScriptPropertiesTest {
 
         // then
         assert(exception.message == "Property 'foo' of type kotlin.String has a value of class java.lang.Integer")
+    }
+
+    @Test
+    fun `should reject read-only collection value of mutable collection type`() {
+        // given
+        val properties = listOf(
+            Triple("list", typeOf<MutableList<String>>(), emptyList<String>()),
+            Triple("map", typeOf<MutableMap<String, Int>>(), emptyMap<String, Int>()),
+            Triple("collection", typeOf<MutableCollection<String>>(), emptySet<String>()),
+            Triple("aliased", AliasHolder::items.returnType, emptyList<String>())
+        )
+
+        // when
+        val messages = properties.map { (name, type, value) ->
+            assertFailsWith<IllegalArgumentException> {
+                ScriptProperty(name, type, value)
+            }.message
+        }
+
+        // then
+        assert(messages == listOf(
+            "Property 'list' of type kotlin.collections.MutableList<kotlin.String> has a value of class kotlin.collections.EmptyList",
+            "Property 'map' of type kotlin.collections.MutableMap<kotlin.String, kotlin.Int> has a value of class kotlin.collections.EmptyMap",
+            "Property 'collection' of type kotlin.collections.MutableCollection<kotlin.String> has a value of class kotlin.collections.EmptySet",
+            "Property 'aliased' of type com.xemantic.kotlin.script.MutableItems /* = kotlin.collections.MutableList<kotlin.String> */ has a value of class kotlin.collections.EmptyList"
+        ))
     }
 
     @Test

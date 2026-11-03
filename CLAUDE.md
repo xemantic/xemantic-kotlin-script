@@ -80,6 +80,13 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   an `inline` declaration cannot be called across snippets.
   Re-probe them after every Kotlin upgrade — the workarounds and hints might become obsolete.
 
+### Reflection
+
+- A `MutableList` and a `List` share the `KType.classifier`, and the public kotlin-reflect API does not tell them apart,
+  so `toSource` detects the mutable collection types from `KType.toString()`, which is not a contract —
+  re-probe it after every Kotlin upgrade, see `should render mutable collection types in source`
+  and `should render typealiased mutable collection types in source`.
+
 ## Anti-patterns to avoid
 
 - Inside a lambda walking a chain of exceptions in a `Throwable` extension, like `generateSequence(this) { read(null) { cause } }`,
