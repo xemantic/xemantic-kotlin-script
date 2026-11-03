@@ -102,6 +102,37 @@ ScriptSession {
   a name which is not a Kotlin identifier, a duplicate name, a value which is not of the type,
   a name of a member of the `ScriptScope`, like `await` or `coroutineContext`,
   or a type which the snippets cannot refer to, like a private or a local class.
+* A snippet can add Maven dependencies to the session, like a `.main.kts` script:
+  ```kotlin
+  @file:DependsOn("org.jsoup:jsoup:1.16.1")
+  import org.jsoup.Jsoup
+  Jsoup.parse("<p>Hello</p>").text()
+  ```
+  The dependencies, with their transitive ones, are resolved from Maven Central,
+  or the repositories declared with `@file:Repository("https://...")` instead, by this or any earlier snippet,
+  into the local Maven repository, `~/.m2/repository` by default,
+  and stay available to the snippets executed after it.
+  A class available to the host takes precedence over the one of the same name in a dependency,
+  so a dependency cannot replace a library of the host with another version of it.
+  A dependency which cannot be resolved fails the snippet with an `ExecutionPhase.COMPILATION` error pointing to its `@file:DependsOn` line.
+* A dependency can be declared without version, like `@file:DependsOn("org.jsoup:jsoup")`,
+  as an LLM might know only the versions released before its knowledge cutoff.
+  It is resolved to its latest version, like `pip install` does:
+  the highest stable one in the Maven ordering, among the versions listed by the `maven-metadata.xml` of the repositories,
+  neither a `SNAPSHOT`, nor a pre-release, like `2.0-RC1` or `1.9.20-Beta`,
+  or the highest pre-release one, if there is no stable one.
+  A stable version with a qualifier, which Maven orders after its release, like `0.8.0-0.6.x-compat` after `0.8.0`,
+  gives way to its release, if there is one.
+  The LLM should be told the resolved version, as it might not know its API:
+  a successful snippet returns it as `ScriptResult.Value.resolvedVersions`, like `mapOf("org.jsoup:jsoup" to "1.24.1")`,
+  which, unlike the compiler warnings, is worth showing to the LLM always,
+  while a failed snippet reports it in the error message,
+  as a warning pointing to the `@file:DependsOn` line, like `Resolved 'org.jsoup:jsoup' to its latest stable version '1.24.1'`.
+  The resolved version is kept for the session, so a later snippet declaring the dependency again does not load another version.
+  The `maven-metadata.xml` is read directly, without the mirrors, proxies and credentials of the Maven settings,
+  which apply only to resolving the dependency in the version found.
+  A version range, like `[1.0,)`, and the `RELEASE` and `LATEST` versions of Maven are resolved by Maven itself,
+  which might select a pre-release version.
 
 ### Known limitations
 
