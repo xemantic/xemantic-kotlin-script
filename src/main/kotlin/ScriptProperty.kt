@@ -32,10 +32,20 @@ import kotlin.reflect.KTypeParameter
 import kotlin.reflect.KTypeProjection
 import kotlin.reflect.KVariance
 import kotlin.reflect.KVisibility
+import kotlin.reflect.full.isSubtypeOf
+import kotlin.reflect.full.withNullability
 import kotlin.reflect.typeOf
 
 /**
  * A value provided to the snippets of a [ScriptSession], as a property of the session.
+ *
+ * A mutable collection type, like `MutableList<String>`, is seen by the snippets as such,
+ * so they can modify the collection shared with the host,
+ * while the same collection provided as a read-only type, like `List<String>`, cannot be modified by the snippets.
+ * Note that the type inferred by [property] from a value of `mutableListOf()` is `MutableList`.
+ * A read-only implementation of the Kotlin standard library, like `emptyList()`, cannot be provided as a mutable collection type,
+ * while a Java collection is accepted, even if it is read-only, like the one of `listOf("a", "b")` or `Collections.unmodifiableList`,
+ * as it cannot be told apart from a mutable one.
  *
  * @param name the name of the property, a Kotlin identifier, which is not a hard keyword like `in`.
  * @param type the type of the property as seen by the snippets,
@@ -45,12 +55,6 @@ import kotlin.reflect.typeOf
  *   Note that [typeOf] does not retain the receiver of a function type,
  *   so a property of type `Int.() -> Int` is seen by the snippets as `(Int) -> Int`.
  * @param value the value of the property, of the [type].
- *
- * A mutable collection type, like `MutableList<String>`, is seen by the snippets as such,
- * so they can modify the collection shared with the host,
- * while the same collection provided as a read-only type, like `List<String>`, cannot be modified by the snippets.
- * Note that the type inferred by [property] from a value of `mutableListOf()` is `MutableList`.
- * A read-only Kotlin collection, like `emptyList()`, cannot be provided as a mutable collection type.
  */
 public class ScriptProperty<T>(
     public val name: String,
@@ -84,12 +88,12 @@ public class ScriptProperty<T>(
                 "Property '$name' is null, while its type is not nullable: $type"
             }
         } else {
-            require(
-                ((type.classifier as? KClass<*>)?.isInstance(value) ?: true)
-                        // a read-only Kotlin collection, like emptyList(), is a java.util.List as well
-                        && type.mutableCollectionType()?.isInstance?.invoke(value) ?: true
-            ) {
+            require((type.classifier as? KClass<*>)?.isInstance(value) ?: true) {
                 "Property '$name' of type $type has a value of class ${value::class.java.name}"
+            }
+            // a read-only Kotlin collection, like emptyList(), is a java.util.List as well
+            require(type.mutableCollectionType()?.isInstance?.invoke(value) ?: true) {
+                "Property '$name' of type $type has a value of class ${value::class.java.name}, which is a read-only collection"
             }
         }
     }
@@ -151,60 +155,42 @@ internal fun KType.toSource(): String {
  * The mutable collection type, like `kotlin.collections.MutableList`, if this is one.
  *
  * A mutable collection type and its read-only counterpart share the classifier, like `List::class`,
- * and the public API of kotlin-reflect does not tell them apart —
- * only its internal implementations of [KType] keep the mutability (`AbstractKType.mutableCollectionClass`),
- * and render it in [KType.toString], which is not a contract, see `should render mutable collection types in source`.
- * The rendering starts with the qualified name of the type itself, followed by its type arguments,
- * unless the type is abbreviated by a typealias, like `Items /* = kotlin.collections.MutableList<kotlin.String> */`,
- * which keeps the expansion in a comment.
+ * but only the mutable one is a subtype of the mutable type, also when abbreviated by a typealias.
+ * The classifier selects the most specific mutable type, like `MutableList`, not its supertype `MutableCollection`.
  */
 private fun KType.mutableCollectionType(): MutableCollectionType? =
-    mutableCollectionTypes[classifier]?.takeIf { toString().expanded().startsWith("${it.name}<") }
-
-/**
- * The expansion of the typealias abbreviating this rendered type, like `kotlin.collections.MutableList<kotlin.String>`
- * of `Items /* = kotlin.collections.MutableList<kotlin.String> */`, or this rendered type, if it is not abbreviated.
- *
- * The comment of a typealias in a type argument, like `List<Items /* = … */>`, belongs to the argument, not to this type.
- */
-private fun String.expanded(): String {
-    var depth = 0
-    forEachIndexed { index, char ->
-        when {
-            char == '<' -> depth++
-            // not the arrow of a function type, like `(kotlin.Int) -> kotlin.Int`
-            char == '>' && getOrNull(index - 1) != '-' -> depth--
-            depth == 0 && startsWith(ABBREVIATION, index) -> return substring(index + ABBREVIATION.length)
-        }
-    }
-    return this
-}
-
-private const val ABBREVIATION = " /* = "
+    mutableCollectionTypes[classifier]?.takeIf { withNullability(false).isSubtypeOf(it.type) }
 
 /**
  * A mutable collection type.
  *
  * @param name the qualified name, like `kotlin.collections.MutableList`.
+ * @param type the type, like `MutableList<*>`, a supertype of all its parameterizations.
  * @param isInstance whether the value is of this type, and not of its read-only counterpart only,
  *   as checked by the cast of the property in the snippets.
  */
 private class MutableCollectionType(
     val name: String,
+    val type: KType,
     val isInstance: (Any) -> Boolean
 )
 
+private inline fun <reified T : Any> mutableCollectionType(
+    name: String
+) = MutableCollectionType(name, typeOf<T>()) { it is T }
+
 /** The mutable collection types by the read-only collection classes, which are also their classifiers. */
 private val mutableCollectionTypes: Map<KClass<*>, MutableCollectionType> = mapOf(
-    Iterable::class to MutableCollectionType("kotlin.collections.MutableIterable") { it is MutableIterable<*> },
-    Collection::class to MutableCollectionType("kotlin.collections.MutableCollection") { it is MutableCollection<*> },
-    List::class to MutableCollectionType("kotlin.collections.MutableList") { it is MutableList<*> },
-    Set::class to MutableCollectionType("kotlin.collections.MutableSet") { it is MutableSet<*> },
-    Map::class to MutableCollectionType("kotlin.collections.MutableMap") { it is MutableMap<*, *> },
-    Map.Entry::class to MutableCollectionType("kotlin.collections.MutableMap.MutableEntry") { it is MutableMap.MutableEntry<*, *> },
-    Iterator::class to MutableCollectionType("kotlin.collections.MutableIterator") { it is MutableIterator<*> },
-    ListIterator::class to MutableCollectionType("kotlin.collections.MutableListIterator") { it is MutableListIterator<*> }
+    Iterable::class to mutableCollectionType<MutableIterable<*>>("kotlin.collections.MutableIterable"),
+    Collection::class to mutableCollectionType<MutableCollection<*>>("kotlin.collections.MutableCollection"),
+    List::class to mutableCollectionType<MutableList<*>>("kotlin.collections.MutableList"),
+    Set::class to mutableCollectionType<MutableSet<*>>("kotlin.collections.MutableSet"),
+    Map::class to mutableCollectionType<MutableMap<*, *>>("kotlin.collections.MutableMap"),
+    Map.Entry::class to mutableCollectionType<MutableMap.MutableEntry<*, *>>("kotlin.collections.MutableMap.MutableEntry"),
+    Iterator::class to mutableCollectionType<MutableIterator<*>>("kotlin.collections.MutableIterator"),
+    ListIterator::class to mutableCollectionType<MutableListIterator<*>>("kotlin.collections.MutableListIterator")
 )
+
 private fun KTypeProjection.toSource(): String = when (variance) {
     null -> "*"
     KVariance.INVARIANT -> type!!.toSource()

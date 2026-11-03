@@ -568,11 +568,20 @@ class ScriptPropertiesTest {
 
         // then
         assert(messages == listOf(
-            "Property 'list' of type kotlin.collections.MutableList<kotlin.String> has a value of class kotlin.collections.EmptyList",
-            "Property 'map' of type kotlin.collections.MutableMap<kotlin.String, kotlin.Int> has a value of class kotlin.collections.EmptyMap",
-            "Property 'collection' of type kotlin.collections.MutableCollection<kotlin.String> has a value of class kotlin.collections.EmptySet",
-            "Property 'aliased' of type com.xemantic.kotlin.script.MutableItems /* = kotlin.collections.MutableList<kotlin.String> */ has a value of class kotlin.collections.EmptyList"
+            "Property 'list' of type kotlin.collections.MutableList<kotlin.String> has a value of class kotlin.collections.EmptyList, which is a read-only collection",
+            "Property 'map' of type kotlin.collections.MutableMap<kotlin.String, kotlin.Int> has a value of class kotlin.collections.EmptyMap, which is a read-only collection",
+            "Property 'collection' of type kotlin.collections.MutableCollection<kotlin.String> has a value of class kotlin.collections.EmptySet, which is a read-only collection",
+            "Property 'aliased' of type com.xemantic.kotlin.script.MutableItems /* = kotlin.collections.MutableList<kotlin.String> */ has a value of class kotlin.collections.EmptyList, which is a read-only collection"
         ))
+    }
+
+    @Test
+    fun `should accept Java collection value of mutable collection type`() {
+        // when
+        val property = ScriptProperty("foo", typeOf<MutableList<String>>(), listOf("a", "b"))
+
+        // then
+        assert(property.value == listOf("a", "b"))
     }
 
     @Test
