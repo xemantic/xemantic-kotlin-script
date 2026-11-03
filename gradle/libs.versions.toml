@@ -6,14 +6,18 @@ kotlin = "2.4.21"
 kotlinxCoroutines = "1.11.0"
 kotlinLogging = "8.0.4"
 slf4j = "2.0.20"
+logback = "1.6.6"
 xemanticKotlinCore = "0.9.0"
 xemanticKotlinTest = "1.18.0"
 asm = "9.10.1"
+ktor = "3.6.1"
+# the version brought by kotlin-scripting-dependencies-maven
+mavenResolver = "2.0.24"
 # plugins
-versionCatalogUpdatePlugin = "1.1.1"
+versionCatalogUpdatePlugin = "1.1.2"
 dokkaPlugin = "2.2.0"
 mavenPublishPlugin = "0.37.0"
-jreleaserPlugin = "1.26.0"
+jreleaserPlugin = "1.27.0"
 xemanticConventionsPlugin = "0.7.1"
 
 [libraries]
@@ -21,14 +25,21 @@ kotlin-scripting-common = { module = "org.jetbrains.kotlin:kotlin-scripting-comm
 kotlin-scripting-jvm = { module = "org.jetbrains.kotlin:kotlin-scripting-jvm", version.ref = "kotlin" }
 kotlin-scripting-jvm-host = { module = "org.jetbrains.kotlin:kotlin-scripting-jvm-host", version.ref = "kotlin" }
 kotlin-compiler-embeddable = { module = "org.jetbrains.kotlin:kotlin-compiler-embeddable", version.ref = "kotlin" }
+kotlin-scripting-compiler-embeddable = { module = "org.jetbrains.kotlin:kotlin-scripting-compiler-embeddable", version.ref = "kotlin" }
+kotlin-scripting-dependencies = { module = "org.jetbrains.kotlin:kotlin-scripting-dependencies", version.ref = "kotlin" }
+kotlin-scripting-dependencies-maven = { module = "org.jetbrains.kotlin:kotlin-scripting-dependencies-maven", version.ref = "kotlin" }
+maven-resolver-util = { module = "org.apache.maven.resolver:maven-resolver-util", version.ref = "mavenResolver" }
 kotlin-reflect = { module = "org.jetbrains.kotlin:kotlin-reflect", version.ref = "kotlin" }
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinxCoroutines" }
 xemantic-kotlin-core = { module = "com.xemantic.kotlin:xemantic-kotlin-core", version.ref = "xemanticKotlinCore" }
 kotlin-logging = { module = "io.github.oshai:kotlin-logging", version.ref = "kotlinLogging" }
 slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
+logback-classic = { module = "ch.qos.logback:logback-classic", version.ref = "logback" }
 kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
 kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "kotlinxCoroutines" }
 xemantic-kotlin-test = { module = "com.xemantic.kotlin:xemantic-kotlin-test", version.ref = "xemanticKotlinTest" }
+ktor-server-cio = { module = "io.ktor:ktor-server-cio", version.ref = "ktor" }
+ktor-client-cio = { module = "io.ktor:ktor-client-cio", version.ref = "ktor" }
 
 [plugins]
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }

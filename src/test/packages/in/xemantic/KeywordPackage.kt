@@ -16,15 +16,12 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-package com.xemantic.kotlin.script.names
+@file:Suppress("unused")
 
-/*
- * Named with the characters ending a string literal, or starting a template, for the scripts importing them,
- * as the script compilation does not resolve a backticked import alias, like `import kotlin.check as `say$hi``.
- */
+package `in`.xemantic
 
-@Suppress("unused")
-fun `say$hi`(flag: Boolean) {}
+/** In a package starting with a Kotlin keyword, like the ones of the `in` domain. */
+class Box<T>(val value: T)
 
-@Suppress("unused")
-fun `say"hi"`(flag: Boolean) {}
+/** Named like the class of the root package. */
+class RootConfig(val name: String)

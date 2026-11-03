@@ -54,6 +54,12 @@ kotlin {
         progressiveMode = true
     }
 
+    sourceSets.test {
+        // the test types outside the com.xemantic.kotlin.script package,
+        // in a source root of their own, not to break the package prefix inference of the IDE
+        kotlin.srcDir("src/test/packages")
+    }
+
 }
 
 java {
@@ -70,8 +76,14 @@ dependencies {
     implementation(libs.kotlin.scripting.common)
     implementation(libs.kotlin.scripting.jvm)
     implementation(libs.kotlin.scripting.jvm.host)
-    // the parser, to tell the declarations of the script from its statements
+    // the K2 REPL compiler, keeping the state of the session between the snippets
+    implementation(libs.kotlin.scripting.compiler.embeddable)
     implementation(libs.kotlin.compiler.embeddable)
+    // the @file:DependsOn and @file:Repository annotations of the snippets, resolved from Maven repositories
+    implementation(libs.kotlin.scripting.dependencies)
+    implementation(libs.kotlin.scripting.dependencies.maven)
+    // the Maven ordering of the versions, to resolve the latest one of a dependency declared without version
+    implementation(libs.maven.resolver.util)
     // the compiler brings kotlin-reflect 1.6.10, which mutates final fields, deprecated since JDK 26
     implementation(libs.kotlin.reflect)
     implementation(libs.xemantic.kotlin.core)
@@ -82,6 +94,10 @@ dependencies {
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.xemantic.kotlin.test)
+    testImplementation(libs.ktor.server.cio)
+    testImplementation(libs.ktor.client.cio)
+    // only the tests bind an SLF4J backend, a library leaves this choice to the application
+    testRuntimeOnly(libs.logback.classic)
 }
 
 configurations.all {

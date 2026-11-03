@@ -1,3 +1,4 @@
+
 /*
  * xemantic-kotlin-script - Kotlin script execution with LLM-friendly diagnostics
  * Copyright (C) 2026  Kazimierz Pogoda / Xemantic
@@ -16,8 +17,13 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-package com.xemantic.kotlin.script.literal
+@file:Suppress("unused")
 
-/** Making the values of a literal type callable, for the scripts importing it. */
-@Suppress("unused")
-operator fun Int.invoke(x: Any?): String = "invoked $this with $x"
+/** In the root package, which a script with a `package` directive can refer to only by importing it. */
+class RootConfig(val v: Int) {
+    class Entry(val config: RootConfig)
+}
+
+/** In the root package, named like a hard keyword. */
+@Suppress("ClassName")
+class `is`(val v: Int)

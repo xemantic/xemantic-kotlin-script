@@ -16,11 +16,29 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-/** In the root package, which a script with a `package` directive can refer to only by importing it. */
-class RootConfig(val v: Int) {
-    class Entry(val config: RootConfig)
-}
 
-/** In the root package, named like a hard keyword. */
-@Suppress("ClassName")
-class `is`(val v: Int)
+package com.xemantic.kotlin.script
+
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * The values of the properties of the open sessions,
+ * read by the declarations of the properties preceding the snippets of a session, see [ScriptProperty].
+ */
+public object ScriptPropertyValues {
+
+    private val sessions = ConcurrentHashMap<Int, Map<String, Any?>>()
+
+    /** The value of the property of this [name] provided to the [session]. */
+    public fun get(session: Int, name: String): Any? =
+        checkNotNull(sessions[session]) { "The session is closed" }[name]
+
+    internal fun register(session: Int, values: Map<String, Any?>) {
+        sessions[session] = values
+    }
+
+    internal fun unregister(session: Int) {
+        sessions.remove(session)
+    }
+
+}

@@ -36,6 +36,8 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   In a functional-style test where the setup is inlined into the action, `// given` may be omitted, but `// when` and `// then` stay.
 - Assert a boolean expression with `assert(expr)` from `com.xemantic.kotlin.test` — it is power-assert-instrumented in `build.gradle.kts`, so a failure prints every subvalue of the expression.
   Do not fall back to `assertEquals` / `assertTrue` / `assertNotNull` from `kotlin.test`, which discard that information.
+- A test that an object is garbage collected must not create it within `runTest`: a frame of its coroutine can keep a stale reference to it, so the test fails without a leak —
+  see `should release closed session with its dependencies`.
 - Never assert on wall-clock time (a ratio or a bound): tests run under whatever CI load there is, and fail with no code change.
   To guard against, say, quadratic backtracking, feed an input large enough that the regression hangs for minutes while the correct code takes milliseconds.
 
@@ -46,68 +48,42 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 
 ## Known gotchas
 
-- An `object`, an `enum class` or a nested class declared in a test script cannot access the dependencies, nor call the functions moved out of the script body, which are the members of the script instance ("captures the script class instance") —
-  to test a moved declaration accessing them, use a top-level class instead, moved e.g. by making it refer to an enum, or implement a sealed interface.
-  Moving a top-level property along with them does not help, not even a constant one: it becomes a member of the script instance too, and `const val` is rejected there — a plain `.kts` fails the same way.
-- A test script needing a function to stay local to the script body, while it is called before its declaration, or by a declaration which cannot be local,
-  must make it read a property which is not initialized with a literal, like `val p = "1".toInt()` —
-  a `val p = 1` is a constant, which does not keep such a function local, but is moved together with it (#38).
-- To test a hint about an unresolved local class, refer to it in the script body before its declaration —
-  a moved declaration referring to a local class moves the class along, so it never meets it unresolved.
-  A local `val` and a local `class` of the same name conflict, unlike a local `fun` and a `class`.
 - After upgrading the Gradle wrapper, `test` may fail with `NoSuchFileException: build/test-results/test/binary/in-progress-results-generic.bin`, because the results of the previous Gradle version are stale — delete `build/test-results` (or run `clean`) and retry.
 - After a fresh Gradle daemon starts, the first build reports `configuration cache cannot be reused because file '.../caches/jreleaser/jreleaser/<version>/marker.txt' has changed` —
   the JReleaser plugin bumps a banner counter in that file behind Gradle's back on every configuration,
   so the cache is invalidated once per daemon lifetime and reused normally afterwards; it is harmless.
-
 - The Gradle configuration cache is enabled (`gradle.properties`), so a task action (`doLast { … }`) must not call a function declared in the build script — the script object is not serializable.
   Inline the logic or move the helper into `buildSrc` / an included build, and register tasks with `tasks.register(...)` rather than the `by tasks.registering` delegate.
-- Expected compilation error messages in `ScriptExecutorTest` are compiler-version specific: Kotlin 2.4 dropped the redundant "must either have an explicit type" diagnostic for `val x =` which 2.3 reported, so re-check them after every Kotlin upgrade.
-- The types of the local properties, which only the compiler knows, are read from the message of its `Initializer type mismatch` error, which is compiler-version specific as well —
-  a changed message only silently disables the confirmation, which `should report calls of declarations moved out of the script body to local properties of function types inferred by the compiler` catches.
-- Tests run with kotlinx.coroutines debug mode (Gradle enables `-ea`), so an exception thrown by the script block arrives as a stack-trace-recovery copy wrapping the original, which `ScriptExecutor` unwraps.
-  This hides bugs of the exception reporting which only show in production: test them with an exception class the recovery cannot copy, i.e. without a `(String)`, `(String, Throwable)` or `(Throwable)` constructor.
-  An exception whose `getStackTrace()` contains `null` crashes the recovery itself, so such a case can only be tested by calling `ScriptErrorReporter` directly.
-  The same applies to a compilation failure shared through the compilation cache: the waiters receive such a copy, while the compiling caller gets the original, so a message built from its `cause` differs between them unless unwrapped.
-
-- When comparing a script with a regular `.kts` evaluated by `BasicJvmScriptingHost`, remember that its body cannot call suspending functions, unlike the script block,
-  and that the compiler reports such a call there with another message ("Suspend function '…' can only be called from a coroutine…") than within a non-inline lambda of the block ("Suspension functions can only be called within coroutine body.").
-- In a regular `.kts`, a call before a function's declaration ranks it after the receivers everywhere, but only if the compiler resolves that call to it, not `append` of `buildString { append("x") }` — see `ScriptStructure.forwardReferencedFunctions`.
-- A local function of the script block takes precedence over the members and the extensions of every implicit receiver, even over the own member of a local class calling it.
-  So does a function of a regular `.kts` (K2) in its statements and in the bodies of its functions, but not within a declaration of an inferred type, like `val x = …` or `fun f() = …`, nor in the last expression (unless e.g. a string template, an equality or a `while` loop, but not a `for` loop), where it ranks after them, like a local extension of the outermost receiver — see `Reference.isInInferredType`.
-  The properties of a regular `.kts` rank after the receivers everywhere.
-
-- The script compilation does not resolve a backticked import alias, not even a plain one like ``import kotlin.check as `verify` `` (`Unresolved reference`), while the same alias without backticks works —
-  so a test needing a library function of a name with special characters, like `` `say$hi` ``, declares it in the test sources, see `StringLiteralNames.kt`, and star-imports its package.
-
-- When deliberately probing the `providedProperties` model of a regular `.kts` with `BasicJvmScriptingHost` (not the reference one, see #101),
-  a provided property declared as `KotlinType(typeOf<(String) -> String>())` loses its type arguments, and as `KotlinType("(String) -> String")` is unresolved —
-  provide an instance of a class implementing the function type, declared as `KotlinType(ThatClass::class)`.
-- In a regular `.kts`, a callable reference to a function of the script from a class of the script, like `::log`, crashes the compiler backend ("No mapping for symbol"), so there is no reference behaviour to match.
-
-- A moved function with an inferred return type, like `fun launch(block: () -> Unit) = "mine"`, is preferred to the `CoroutineScope` extensions of the script body, unlike one with a declared type,
-  so a test of a reference resolved to the coroutine scope instead needs the declared type.
-
-- A regular script does not always call the most specific overload (K2, probed with `BasicJvmScriptingHost`):
-  a script function whose return type is inferred from its expression body is preferred to the other overloads, even more specific ones, within the inferred contexts (see `isInDeclaredType` for which ones),
-  and to a member of an implicit receiver, like `show` in `B().run { show(1) }`, even within `fun h(): String`.
-  A default value of a parameter of a function behaves like a declared type, while `isInDeclaredType` classifies it by the function, a known difference (#102), like local functions resolved by the specification (#100).
-- In a regular script, a constructor of a script class ranks below the receivers of the lambdas, including the script instance in `run { Foo(2) }`, and above the dependencies,
-  while a local function of the block ranks above them all, see `ScriptSource.laterDeclaredClassCandidates`.
-
-- A `VirtualMachineError`, like the `OutOfMemoryError` the fatal error tests throw, escaping a test does not fail it, but aborts the whole Gradle test executor (`Could not complete execution for Gradle Test Executor`) —
+- Expected compilation error messages in the tests are compiler-version specific, re-check them after every Kotlin upgrade.
+- A `VirtualMachineError`, like an `OutOfMemoryError`, escaping a test does not fail it, but aborts the whole Gradle test executor (`Could not complete execution for Gradle Test Executor`) —
   catch it with `runCatching` and assert on it, also where only a regression would let it escape.
-- `runTest` fails on its timeout only once the test body can be cancelled, so a regression blocking the dispatcher threads hangs the build forever, unless the test waits for them cancellably (see `onOtherThread` in `ScriptExecutorTest`).
 
-- In a regular `.kts`, K2 resolves a script function declared *before* the reference ahead of the members of the implicit receivers, and one declared *later* after them (a script property always after them, see #36).
-  But once a function of an inferred return type is called before its declaration, its body resolves *all* script functions after the receiver members, also the ones declared before the call:
-  `fun c() = with(Obj()) { b() }` calls `Obj.b` when `fun a() = c()` precedes it, even with `fun b()` declared first.
-  A declared return type restores the order, a block body too.
-  Probe both orders and both kinds of return types when comparing the resolution with a regular script.
+### The K2 REPL compiler (`K2ReplCompiler`)
+
+- `K2ReplCompiler.createCompilationState` must get a host configuration with `repl { firReplHistoryProvider(...); isReplSnippetSource { _, _ -> true } }` —
+  passing the plain `defaultJvmScriptingHostConfiguration` crashes the first snippet with an NPE in `Fir2IrReplSnippetConfiguratorExtensionImpl`.
+- Its own history provider keeps the snippets which failed to compile, so the next snippet resolves their declarations, and fails at runtime — see `ReplHistory`.
+- `compile` drops the warnings of a successful snippet (`asSuccess()` without reports), they are read from the message collector instead.
+- `compile` may throw instead of returning a failure, e.g. on a backend crash.
+- `providedProperties` are not resolved by the K2 REPL — the dependencies are declared by a generated first snippet instead.
+- The evaluator evaluates every compiled snippet not evaluated yet before the given one, so a compiled snippet is always evaluated, even if the caller was cancelled meanwhile.
+- Never interrupt the thread while compiling: an interrupt closes any interruptible NIO channel in use (JDK behaviour), which the compiler's JAR reading might rely on — a precaution, not reproduced.
+  An interrupted `runBlocking` (kotlinx.coroutines 1.11) does not throw at once: it runs its pending events first, then cancels its coroutine and waits for it to complete —
+  so a thread already interrupted still evaluates the snippet, see `should evaluate compiled snippet of caller cancelled before the evaluation`.
+- A configuration refinement, like resolving `@file:DependsOn`, runs twice per snippet, and its failure does not stop the compilation:
+  it continues without the refined configuration, also without the default imports, and the failure is reported without its code and end, like any warning of a refinement —
+  see `SnippetDependencyResolver.takeDependencies`.
+  The classpath added by a refinement stays with the compiler even if the snippet fails to compile.
+- Known compiler bugs, each with a test pinning the hint: a class of an earlier snippet is unresolved in a declaration of an inferred type calling it,
+  a value class property or function of an earlier snippet is called by a mangled name, which is not declared (the provided properties work around it with `@get:JvmName`),
+  an `inline` declaration cannot be called across snippets.
+  Re-probe them after every Kotlin upgrade — the workarounds and hints might become obsolete.
 
 ## Anti-patterns to avoid
 
 - Inside a lambda walking a chain of exceptions in a `Throwable` extension, like `generateSequence(this) { read(null) { cause } }`,
   an unqualified `read` binds to the outer receiver, not the lambda parameter, so every step returns the first cause —
   always qualify it, `exception.read(null) { cause }`, and test the chain at least two causes deep.
+- A test of cancellation must signal "started" from within the block to be cancelled, like inside `await { }`, not before it —
+  otherwise the cancellation can arrive before the block starts, so its `finally` never runs, and the test is flaky.
 - Do not add content to this file that is already discoverable by reading the source or build scripts — that inflates context without adding signal, reducing AI agent task success rates (see [arxiv 2602.11988](https://arxiv.org/abs/2602.11988)).
