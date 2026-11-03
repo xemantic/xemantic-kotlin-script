@@ -98,6 +98,8 @@ public interface ScriptSession : AutoCloseable {
      * A failure of the compilation, even an internal one of the compiler, is reported as an [ExecutionPhase.COMPILATION] error,
      * an exception thrown by the snippet, as an [ExecutionPhase.EVALUATION] error,
      * except for a [VirtualMachineError] other than [StackOverflowError], which is thrown.
+     * A failure of declaring the properties of the session, like a type the compiler rejects although it is valid,
+     * is reported by every execution, in the phase in which it occurred, without executing the snippet.
      *
      * @throws IllegalStateException if the session is closed.
      */
@@ -182,6 +184,9 @@ internal class DefaultScriptSession(
 
     /** Created on the first snippet, as resolving the classpath takes long. */
     private var repl: Repl? = null
+
+    /** The failure of declaring the [properties], reported by every execution, as the snippets would not see them. */
+    private var propertiesFailure: ScriptResult.Error? = null
 
     @Volatile
     private var closed = false
@@ -301,74 +306,63 @@ internal class DefaultScriptSession(
         val result = withContext(sessionDispatcher + NonCancellable) {
             val repl = repl ?: Repl().also {
                 repl = it
-                declareProperties(it)
+                propertiesFailure = declareProperties(it)
             }
-            val name = "snippet${++snippetCount}.kts"
-            snippets[name] = snippet.lines()
-            logger.debug { "$name: compiling" }
-            val compilation = repl.compile(snippet, name)
-            when (val result = compilation.result) {
-                is ResultWithDiagnostics.Failure -> ScriptResult.Error(
-                    message = reporter.describe(result.reports),
-                    phase = ExecutionPhase.COMPILATION
-                )
-                is ResultWithDiagnostics.Success -> {
-                    logger.debug { "$name: evaluating" }
-                    val evaluation = scope.evaluate(callerJob) {
-                        repl.evaluator.eval(result.value, repl.evaluationConfiguration)
-                    }
-                    evaluation.toScriptResult(compilation)
-                }
-            }
+            propertiesFailure ?: repl.execute(snippet, "snippet${++snippetCount}.kts", callerJob)
         }
         currentCoroutineContext().ensureActive()
         result
     }
 
-    /** Declares the [properties] in the snippet preceding the ones of the session. */
-    private suspend fun declareProperties(repl: Repl) {
-        if (properties.isEmpty()) return
-        val name = "properties.kts"
-        val source = properties.joinToString("\n") { it.declaration(id) }
-        snippets[name] = source.lines()
-        val compilation = repl.compile(source, name).result
-        val evaluation = compilation.valueOrNull()?.let {
-            repl.evaluator.eval(it, repl.evaluationConfiguration).valueOrNull()?.get()?.result
-        }
-        check(evaluation != null && evaluation !is ResultValue.Error) {
-            "The properties cannot be declared:\n" + if (compilation is ResultWithDiagnostics.Failure) {
-                reporter.describe(compilation.reports)
-            } else {
-                (evaluation as? ResultValue.Error)?.let { reporter.describe(it.error) } ?: "evaluation failed"
+    /** Compiles and evaluates the [snippet] of this [name], cancelled together with the [callerJob]. */
+    private suspend fun Repl.execute(
+        snippet: String,
+        name: String,
+        callerJob: Job
+    ): ScriptResult {
+        snippets[name] = snippet.lines()
+        logger.debug { "$name: compiling" }
+        val compilation = compile(snippet, name)
+        return when (val result = compilation.result) {
+            is ResultWithDiagnostics.Failure -> ScriptResult.Error(
+                message = reporter.describe(result.reports),
+                phase = ExecutionPhase.COMPILATION
+            )
+            is ResultWithDiagnostics.Success -> {
+                logger.debug { "$name: evaluating" }
+                val evaluation = scope.evaluate(callerJob) {
+                    evaluator.eval(result.value, evaluationConfiguration)
+                }
+                evaluation.toScriptResult(compilation)
             }
+        }
+    }
+
+    /**
+     * Declares the [properties] in the snippet preceding the ones of the session,
+     * returning the failure of the declaration, if any, in the phase in which it failed.
+     *
+     * A failed declaration is not retried, as its source is the same on every execution,
+     * and a declaration which failed to evaluate stays compiled in the history of the compiler.
+     */
+    private suspend fun declareProperties(repl: Repl): ScriptResult.Error? {
+        if (properties.isEmpty()) return null
+        val source = properties.joinToString("\n") { it.declaration(id) }
+        // not cancelled by the caller, so its cancellation cannot fail the declaration for all the next executions
+        val result = repl.execute(source, "properties.kts", Job())
+        return (result as? ScriptResult.Error)?.let {
+            ScriptResult.Error("The properties cannot be declared:\n${it.message}", it.phase)
         }
     }
 
     private fun ResultWithDiagnostics<*>.toScriptResult(
         compilation: Compilation
     ): ScriptResult {
-        val compilationReports = compilation.result.reports
-        val resolvedVersions = compilation.dependencies.resolvedVersions
         @Suppress("UNCHECKED_CAST")
         val result = (valueOrNull() as? LinkedSnippet<KJvmEvaluatedSnippet>)
             ?.get()?.result
         result?.scriptClass?.java?.declaredClasses?.mapTo(snippetClassNames) { it.simpleName }
-        return when (result) {
-            is ResultValue.Value -> ScriptResult.Value(result.value, reporter.warnings(compilationReports), resolvedVersions)
-            is ResultValue.Unit -> ScriptResult.Value(Unit, reporter.warnings(compilationReports), resolvedVersions)
-            is ResultValue.Error -> {
-                val error = result.error
-                if (error.isFatal) throw error
-                ScriptResult.Error(
-                    reporter.describe(error, compilation.dependencies.warnings + compilationReports),
-                    ExecutionPhase.EVALUATION
-                )
-            }
-            is ResultValue.NotEvaluated, null -> ScriptResult.Error(
-                reporter.describe(reports.ifEmpty { compilation.dependencies.warnings + compilationReports }),
-                ExecutionPhase.EVALUATION
-            )
-        }
+        return reporter.scriptResult(result, reports, compilation.result.reports, compilation.dependencies)
     }
 
     /**
@@ -400,6 +394,35 @@ internal class DefaultScriptSession(
  */
 private val Throwable.isFatal: Boolean
     get() = this is VirtualMachineError && this !is StackOverflowError
+
+/**
+ * The [ScriptResult] of the evaluation [result] of a snippet, `null` if the evaluation failed with the [evaluationReports],
+ * where [ResultValue.NotEvaluated] is a failure as well,
+ * with the [compilationReports] and the [dependencies] of the snippet.
+ *
+ * @throws VirtualMachineError thrown by the snippet, other than [StackOverflowError].
+ */
+internal fun ScriptErrorReporter.scriptResult(
+    result: ResultValue?,
+    evaluationReports: List<ScriptDiagnostic>,
+    compilationReports: List<ScriptDiagnostic>,
+    dependencies: SnippetDependencyResolver.SnippetDependencies
+): ScriptResult = when (result) {
+    is ResultValue.Value -> ScriptResult.Value(result.value, warnings(compilationReports), dependencies.resolvedVersions)
+    is ResultValue.Unit -> ScriptResult.Value(Unit, warnings(compilationReports), dependencies.resolvedVersions)
+    is ResultValue.Error -> {
+        val error = result.error
+        if (error.isFatal) throw error
+        ScriptResult.Error(
+            describe(error, dependencies.warnings + compilationReports),
+            ExecutionPhase.EVALUATION
+        )
+    }
+    is ResultValue.NotEvaluated, null -> ScriptResult.Error(
+        describe(evaluationReports.ifEmpty { dependencies.warnings + compilationReports }),
+        ExecutionPhase.EVALUATION
+    )
+}
 
 /**
  * The JVM target of the snippets, the one of the running JVM, or the latest one supported by the compiler, if it is newer,

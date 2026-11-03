@@ -102,6 +102,11 @@ ScriptSession {
   a name which is not a Kotlin identifier, a duplicate name, a value which is not of the type,
   a name of a member of the `ScriptScope`, like `await` or `coroutineContext`,
   or a type which the snippets cannot refer to, like a private or a local class.
+  A property which passes this validation might still fail to be declared,
+  like one of a type the compiler rejects, e.g. `Enum<String>` created with `createType`,
+  or one of a class loaded by another class loader than the one of the session, which its value cannot be cast to.
+  Such a failure is reported by every `execute`, as a `ScriptResult.Error` starting with `The properties cannot be declared:`,
+  in the `ExecutionPhase` in which the declaration failed, without executing the snippet.
 * A snippet can add Maven dependencies to the session, like a `.main.kts` script:
   ```kotlin
   @file:DependsOn("org.jsoup:jsoup:1.16.1")
