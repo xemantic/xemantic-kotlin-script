@@ -399,7 +399,7 @@ class ScriptSessionTest {
     }
 
     @Test
-    fun `should report StackOverflowError of the compiler and continue the session without declarations of the snippet`() = runTest {
+    fun `should report StackOverflowError of the compiler as a compilation failure and continue the session`() = runTest {
         // given
         session.execute("val x = 41")
         // nested deep enough to overflow the stack of the parser at any thread stack size, in milliseconds

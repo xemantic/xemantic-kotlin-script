@@ -245,12 +245,11 @@ internal class DefaultScriptSession(
             val result = try {
                 compiler.compile(listOf(snippet.toScriptSource(name)), compilationConfiguration)
             } catch (e: Throwable) {
-                if (e is VirtualMachineError && e !is StackOverflowError) {
+                if (e.isFatal) {
                     // otherwise the next snippet would see the declarations and the dependencies of this one
                     runCatching {
-                        history.rollback()
-                        dependencyResolver.takeDependencies()
-                    }.exceptionOrNull()?.let(e::addSuppressed)
+                        conclude(null)
+                    }.exceptionOrNull()?.takeIf { it !== e }?.let(e::addSuppressed)
                     throw e
                 }
                 ResultWithDiagnostics.Failure(
@@ -261,6 +260,16 @@ internal class DefaultScriptSession(
                     )
                 )
             }
+            return conclude(result)
+        }
+
+        /**
+         * Takes the dependencies of the compiled snippet, and keeps it in the history only if the [result] is a success,
+         * where a `null` [result] stands for a compilation which threw.
+         */
+        private fun conclude(
+            result: ResultWithDiagnostics<LinkedSnippet<CompiledSnippet>>?
+        ): Compilation {
             val dependencies = dependencyResolver.takeDependencies()
             if (result is ResultWithDiagnostics.Success) {
                 history.commit()
@@ -272,7 +281,7 @@ internal class DefaultScriptSession(
             history.rollback()
             return Compilation(
                 ResultWithDiagnostics.Failure(
-                    dependencies.warnings + dependencies.errors.ifEmpty { result.reports }
+                    dependencies.warnings + dependencies.errors.ifEmpty { result?.reports.orEmpty() }
                 ),
                 dependencies
             )
@@ -349,7 +358,7 @@ internal class DefaultScriptSession(
             is ResultValue.Unit -> ScriptResult.Value(Unit, reporter.warnings(compilationReports), resolvedVersions)
             is ResultValue.Error -> {
                 val error = result.error
-                if (error is VirtualMachineError && error !is StackOverflowError) throw error
+                if (error.isFatal) throw error
                 ScriptResult.Error(
                     reporter.describe(error, compilation.dependencies.warnings + compilationReports),
                     ExecutionPhase.EVALUATION
@@ -384,6 +393,13 @@ internal class DefaultScriptSession(
     }
 
 }
+
+/**
+ * Whether this throwable is thrown by the session instead of being reported:
+ * a [VirtualMachineError], like an [OutOfMemoryError], other than a [StackOverflowError], which is reported as a failure of the snippet.
+ */
+private val Throwable.isFatal: Boolean
+    get() = this is VirtualMachineError && this !is StackOverflowError
 
 /**
  * The JVM target of the snippets, the one of the running JVM, or the latest one supported by the compiler, if it is newer,
