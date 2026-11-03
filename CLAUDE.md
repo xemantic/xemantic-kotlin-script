@@ -36,6 +36,8 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   In a functional-style test where the setup is inlined into the action, `// given` may be omitted, but `// when` and `// then` stay.
 - Assert a boolean expression with `assert(expr)` from `com.xemantic.kotlin.test` — it is power-assert-instrumented in `build.gradle.kts`, so a failure prints every subvalue of the expression.
   Do not fall back to `assertEquals` / `assertTrue` / `assertNotNull` from `kotlin.test`, which discard that information.
+- A test that an object is garbage collected must not create it within `runTest`: a frame of its coroutine can keep a stale reference to it, so the test fails without a leak —
+  see `should release closed session with its dependencies`.
 - Never assert on wall-clock time (a ratio or a bound): tests run under whatever CI load there is, and fail with no code change.
   To guard against, say, quadratic backtracking, feed an input large enough that the regression hangs for minutes while the correct code takes milliseconds.
 
@@ -68,6 +70,10 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 - Never interrupt the thread while compiling: an interrupt closes any interruptible NIO channel in use (JDK behaviour), which the compiler's JAR reading might rely on — a precaution, not reproduced.
   An interrupted `runBlocking` (kotlinx.coroutines 1.11) does not throw at once: it runs its pending events first, then cancels its coroutine and waits for it to complete —
   so a thread already interrupted still evaluates the snippet, see `should evaluate compiled snippet of caller cancelled before the evaluation`.
+- A configuration refinement, like resolving `@file:DependsOn`, runs twice per snippet, and its failure does not stop the compilation:
+  it continues without the refined configuration, also without the default imports, and the failure is reported without its code and end, like any warning of a refinement —
+  see `SnippetDependencyResolver.takeDependencies`.
+  The classpath added by a refinement stays with the compiler even if the snippet fails to compile.
 - Known compiler bugs, each with a test pinning the hint: a class of an earlier snippet is unresolved in a declaration of an inferred type calling it,
   a value class property or function of an earlier snippet is called by a mangled name, which is not declared (the dependencies work around it with `@get:JvmName`),
   an `inline` declaration cannot be called across snippets.
