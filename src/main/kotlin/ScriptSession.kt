@@ -88,12 +88,14 @@ public interface ScriptSession : AutoCloseable {
     /**
      * Executes the [snippet] after the previous ones, waiting for the snippets executed concurrently.
      *
-     * When the caller is cancelled while the snippet is evaluated, the thread of the session is interrupted,
-     * and the coroutines of [ScriptScope.await] are cancelled,
+     * When the caller is cancelled, or the session is [closed][close], while the snippet is evaluated,
+     * the thread of the session is interrupted, and the coroutines of [ScriptScope.await] are cancelled,
+     * so the snippet fails with an [ExecutionPhase.EVALUATION] error, returned to a caller which is not cancelled,
      * while a snippet which neither blocks interruptibly, nor awaits, runs to its end.
-     * A caller without a [Job] in its context, like `suspend fun main`, cannot cancel the evaluation.
-     * A cancellation while the snippet is compiled waits for the compilation to end,
-     * and it is evaluated then, as the session would evaluate it before the next one anyway.
+     * A caller without a [Job] in its context, like `suspend fun main`, cannot cancel the evaluation, only closing the session can.
+     * A cancellation, or closing the session, while the snippet is compiled waits for the compilation to end,
+     * as the compiler is never interrupted, and the snippet is evaluated then, cancelled already,
+     * as the session would evaluate it before the next one anyway.
      *
      * A failure of the compilation, even an internal one of the compiler, is reported as an [ExecutionPhase.COMPILATION] error,
      * an exception thrown by the snippet, as an [ExecutionPhase.EVALUATION] error,
@@ -108,8 +110,9 @@ public interface ScriptSession : AutoCloseable {
     ): ScriptResult
 
     /**
-     * Closes the session, cancelling the coroutines launched by its snippets,
-     * and releasing the compiler and the thread, once the snippet being executed, if any, ends.
+     * Closes the session, cancelling the coroutines launched by its snippets, and the evaluation of the snippet being executed, if any,
+     * like a cancellation of its caller, see [execute],
+     * and releasing the compiler and the thread, once that snippet ends.
      */
     override fun close()
 
