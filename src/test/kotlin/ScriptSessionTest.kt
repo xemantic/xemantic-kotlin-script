@@ -492,6 +492,202 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should hint at uninitialized property of snippet which failed in the evaluation`() = runTest {
+        // given
+        session.execute("val s: String = error(\"boom\")")
+
+        // when
+        val result = session.execute("s.length")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.NullPointerException: Cannot invoke "String.length()" because the return value of "getS()" is null
+                  hint: 's' is declared in snippet1.kts, which failed in the evaluation, so it might be left uninitialized, null despite its type - declare it again, together with the declarations reading it, as they keep reading the uninitialized one.
+                  at <snippet body>(snippet2.kts:1)
+                  | s.length
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint at uninitialized property read by function of snippet which failed in the evaluation`() = runTest {
+        // given
+        session.execute("""
+            val name: String = error("boom")
+            fun greet() = "Hello, ${'$'}{name.uppercase()}"
+        """.trimIndent())
+
+        // when
+        val result = session.execute("greet()")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.NullPointerException: Cannot invoke "String.toUpperCase(java.util.Locale)" because "name" is null
+                  hint: 'name' is declared in snippet1.kts, which failed in the evaluation, so it might be left uninitialized, null despite its type - declare it again, together with the declarations reading it, like 'greet' of snippet1.kts, as they keep reading the uninitialized one.
+                  at greet(snippet1.kts:2)
+                  | fun greet() = "Hello, ${'$'}{name.uppercase()}"
+                  at <snippet body>(snippet2.kts:1)
+                  | greet()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint at uninitialized property read by object of snippet which failed in the evaluation`() = runTest {
+        // given
+        session.execute("""
+            val s: String = error("boom")
+            object Config { val length = s.length }
+        """.trimIndent())
+
+        // when
+        val result = session.execute("Config.length")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.ExceptionInInitializerError
+                  at <snippet body>(snippet2.kts:1)
+                  | Config.length
+                Caused by: java.lang.NullPointerException: Cannot invoke "String.length()" because the return value of "getS()" is null
+                  hint: 's' is declared in snippet1.kts, which failed in the evaluation, so it might be left uninitialized, null despite its type - declare it again, together with the declarations reading it, like 'Config' of snippet1.kts, as they keep reading the uninitialized one.
+                  at Config.<clinit>(snippet1.kts:2)
+                  | object Config { val length = s.length }
+                  at <snippet body>(snippet2.kts:1)
+                  | Config.length
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint at uninitialized property read by function of snippet which failed in the evaluation also after redeclaring the property`() = runTest {
+        // given
+        session.execute("""
+            val name: String = error("boom")
+            fun greet() = "Hello, ${'$'}{name.uppercase()}"
+        """.trimIndent())
+        session.execute("val name = \"World\"")
+
+        // when
+        val result = session.execute("greet()")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.NullPointerException: Cannot invoke "String.toUpperCase(java.util.Locale)" because "name" is null
+                  hint: 'name' is declared in snippet1.kts, which failed in the evaluation, so it might be left uninitialized, null despite its type - declare it again, together with the declarations reading it, like 'greet' of snippet1.kts, as they keep reading the uninitialized one.
+                  at greet(snippet1.kts:2)
+                  | fun greet() = "Hello, ${'$'}{name.uppercase()}"
+                  at <snippet body>(snippet3.kts:1)
+                  | greet()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint at uninitialized property read by function of later snippet`() = runTest {
+        // given
+        session.execute("val s: String = error(\"boom\")")
+        session.execute("fun size(): Int = s.length")
+
+        // when
+        val result = session.execute("size()")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.NullPointerException: Cannot invoke "String.length()" because the return value of "getS()" is null
+                  hint: 's' is declared in snippet1.kts, which failed in the evaluation, so it might be left uninitialized, null despite its type - declare it again, together with the declarations reading it, like 'size' of snippet2.kts, as they keep reading the uninitialized one.
+                  at size(snippet2.kts:1)
+                  | fun size(): Int = s.length
+                  at <snippet body>(snippet3.kts:1)
+                  | size()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint at uninitialized delegated property of snippet which failed in the evaluation`() = runTest {
+        // given
+        session.execute("""
+            error("boom")
+            val s: String by lazy { "lazy" }
+        """.trimIndent())
+
+        // when
+        val result = session.execute("s.length")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.NullPointerException: Cannot invoke "kotlin.Lazy.getValue()" because "<local1>" is null
+                  hint: 's' is declared in snippet1.kts, which failed in the evaluation, so it might be left uninitialized, null despite its type - declare it again, together with the declarations reading it, as they keep reading the uninitialized one.
+                  at getS(snippet1.kts:2)
+                  | val s: String by lazy { "lazy" }
+                  at <snippet body>(snippet2.kts:1)
+                  | s.length
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint at uninitialized property of any getter name`() = runTest {
+        // given
+        session.execute("""
+            error("boom")
+            val issue: String = "a"
+            val isOk: String = "b"
+            val ä: String = "c"
+            val isä: String = "d"
+        """.trimIndent())
+
+        // when
+        val messages = listOf("issue", "isOk", "ä", "isä").associateWith { property ->
+            (session.execute("$property.length") as ScriptResult.Error).message
+        }
+
+        // then
+        messages.forEach { (property, message) ->
+            assert("hint: '$property' is declared in snippet1.kts" in message)
+        }
+    }
+
+    @Test
+    fun `should not hint at null property of snippet which did not fail in the evaluation`() = runTest {
+        // given
+        session.execute("val s: String = error(\"boom\")")
+        session.execute("val missing = System.getProperty(\"no.such.property\")")
+
+        // when
+        val result = session.execute("missing.length")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.NullPointerException: Cannot invoke "String.length()" because the return value of "getMissing()" is null
+                  at <snippet body>(snippet3.kts:1)
+                  | missing.length
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should continue the session after a failing snippet`() = runTest {
         // given
         session.execute("val x = 41")
