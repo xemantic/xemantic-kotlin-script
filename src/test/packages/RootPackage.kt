@@ -1,3 +1,4 @@
+
 /*
  * xemantic-kotlin-script - Kotlin script execution with LLM-friendly diagnostics
  * Copyright (C) 2026  Kazimierz Pogoda / Xemantic
@@ -15,6 +16,8 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+
+@file:Suppress("unused")
 
 /** In the root package, which a script with a `package` directive can refer to only by importing it. */
 class RootConfig(val v: Int) {

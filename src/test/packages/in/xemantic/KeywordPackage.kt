@@ -16,6 +16,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+@file:Suppress("unused")
+
 package `in`.xemantic
 
 /** In a package starting with a Kotlin keyword, like the ones of the `in` domain. */
