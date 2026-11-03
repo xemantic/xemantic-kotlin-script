@@ -31,6 +31,10 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
+import java.util.concurrent.CompletableFuture
+import kotlin.coroutines.Continuation
+import kotlin.coroutines.EmptyCoroutineContext
+import kotlin.coroutines.startCoroutine
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
@@ -997,6 +1001,26 @@ class ScriptSessionTest {
 
             // then
             assert(evaluated.isCompleted)
+        }
+    }
+
+    /** Like `suspend fun main`, or any coroutine started with `startCoroutine`, see #135. */
+    @Test
+    fun `should execute snippet of caller without a Job`() {
+        // given
+        val execution = CompletableFuture<Result<ScriptResult>>()
+
+        // when
+        suspend {
+            session.execute("await { 42 }")
+        }.startCoroutine(Continuation(EmptyCoroutineContext) {
+            execution.complete(it)
+        })
+
+        // then
+        execution.get().getOrThrow() should {
+            be<ScriptResult.Value>()
+            have(value == 42)
         }
     }
 
