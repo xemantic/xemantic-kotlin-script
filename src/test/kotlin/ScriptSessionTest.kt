@@ -24,6 +24,7 @@ import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
 import com.xemantic.kotlin.script.test.collectGarbageUntilCleared
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CompletableJob
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -40,10 +41,14 @@ import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.coroutines.startCoroutine
+import kotlin.reflect.KClassifier
+import kotlin.reflect.KType
+import kotlin.reflect.typeOf
 import kotlin.script.experimental.api.ResultValue
 import kotlin.test.AfterTest
 import kotlin.test.Test
@@ -1209,6 +1214,125 @@ class ScriptSessionTest {
         // bounded, so a hang fails the test instead of hanging the build
         execution.get(1, TimeUnit.MINUTES)
         return WeakReference(session)
+    }
+
+    /** See #142. */
+    @Test
+    fun `should declare properties of session closed while declaring them`() = runTest {
+        // given
+        val closedWhileDeclaring = AtomicBoolean()
+        lateinit var session: ScriptSession
+        val stringType = typeOf<String>()
+        // the type is rendered into the source of the declaration on the thread of the session,
+        // so the session is closed there, past the check of a closed session, before the declaration is evaluated
+        val type = object : KType by stringType {
+            override val classifier: KClassifier?
+                get() {
+                    if (Thread.currentThread().name.startsWith("script-session-")
+                        && closedWhileDeclaring.compareAndSet(false, true)
+                    ) {
+                        session.close()
+                    }
+                    return stringType.classifier
+                }
+            override fun toString() = stringType.toString()
+        }
+        session = ScriptSession(listOf(ScriptProperty("greeting", type, "Hello")))
+
+        // when
+        val result = session.execute("greeting")
+
+        // then
+        assert(closedWhileDeclaring.get())
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "Hello")
+        }
+    }
+
+    /** See #142. */
+    @Test
+    fun `should read property in snippet running when the session is closed`() = runTest {
+        // given
+        val started = Job()
+        val session = ScriptSession {
+            provide<CompletableJob>("started", started)
+            provide("greeting", "Hello")
+        }
+        val execution = async(Dispatchers.Default) {
+            session.execute("""
+                started.complete()
+                // neither interrupted, nor awaiting, so it runs until the session is closed
+                while (isActive) Thread.onSpinWait()
+                greeting
+            """.trimIndent())
+        }
+        started.join()
+
+        // when
+        session.close()
+
+        // then
+        execution.await() should {
+            be<ScriptResult.Value>()
+            have(value == "Hello")
+        }
+    }
+
+    /** See #142. */
+    @Test
+    fun `should read property in coroutine launched by snippet when the session is closed`() = runTest {
+        // given
+        val started = Job()
+        val read = CompletableDeferred<String>()
+        val session = ScriptSession {
+            provide<CompletableJob>("started", started)
+            provide<CompletableDeferred<String>>("read", read)
+            provide("greeting", "Hello")
+        }
+        session.execute("""
+            launch {
+                try {
+                    started.complete()
+                    awaitCancellation()
+                } finally {
+                    read.complete(greeting)
+                }
+            }
+        """.trimIndent())
+        started.join()
+
+        // when
+        session.close()
+
+        // then
+        assert(read.await() == "Hello")
+    }
+
+    /** See #142. */
+    @Test
+    fun `should release property value of closed session`() {
+        // given
+        val value = propertyValueOfClosedSession()
+
+        // when
+        collectGarbageUntilCleared(value)
+
+        // then
+        assert(value.get() == null)
+    }
+
+    /**
+     * The weak reference to the value of a property of a closed session, declared by a snippet,
+     * created outside of `runTest`, as a frame of its coroutine can keep a stale reference to the session.
+     */
+    private fun propertyValueOfClosedSession(): WeakReference<Any> {
+        val value = Any()
+        val session = ScriptSession(listOf(property("value", value)))
+        val result = runBlocking { session.execute("value.hashCode()") }
+        assert(result is ScriptResult.Value)
+        session.close()
+        return WeakReference(value)
     }
 
     @Test
