@@ -42,6 +42,12 @@ private val unresolvedReference = Regex("Unresolved reference '(.+)'\\.")
 /** The mangled name of a method taking or returning a value class, like `getTimeout-UwyO8pc`. */
 private val mangledMethod = Regex("[\\p{L}_][\\p{L}\\p{N}_]*-[\\p{L}\\p{N}_]{7}\\(")
 
+/**
+ * The member read as `null` in the message of a [NullPointerException] of the JVM,
+ * like `Snippet1.getS()` of `Cannot invoke "String.length()" because the return value of "Snippet1.getS()" is null`.
+ */
+private val nullMember = Regex("because (?:the return value of )?\"([^\"]+)\" is null")
+
 /** The method evaluating the body of a snippet. */
 private const val SNIPPET_BODY_METHOD = "\$\$eval"
 
@@ -51,10 +57,13 @@ private const val SNIPPET_BODY_METHOD = "\$\$eval"
  *
  * @param snippets the lines of the snippets by their names, like `snippet3.kts`.
  * @param snippetClassNames the simple names of the classes declared by the evaluated snippets.
+ * @param uninitializedProperties the properties of the snippets which failed in the evaluation, `null` then,
+ *   by their members in the message of a [NullPointerException], see [UninitializedProperty].
  */
 internal class ScriptErrorReporter(
     private val snippets: Map<String, List<String>>,
-    private val snippetClassNames: Set<String> = emptySet()
+    private val snippetClassNames: Set<String> = emptySet(),
+    private val uninitializedProperties: Map<String, UninitializedProperty> = emptyMap()
 ) {
 
     /**
@@ -166,6 +175,12 @@ internal class ScriptErrorReporter(
             append("$indent  hint: a property or a function of a value class type, like Duration, declared in an earlier snippet,")
             append(" cannot be called from another snippet, as the K2 REPL compiler mangles its name only when calling it")
             append(" - declare it in the same snippet, or wrap the value in a regular class.\n")
+        }
+        if (throwable is NullPointerException) {
+            throwable.read(null) { message }?.let { nullMember.find(it) }?.groupValues?.get(1)?.let(uninitializedProperties::get)?.let {
+                append("$indent  hint: '${it.name}' is declared in ${it.snippet}, which failed in the evaluation,")
+                append(" so it might be left uninitialized, null despite its type - declare it again.\n")
+            }
         }
         // the exception class of a snippet might override it to contain nulls
         appendFrames(throwable.read(emptyList()) { stackTrace.filterNotNull() }, indent)
@@ -314,3 +329,12 @@ internal inline fun <T> Throwable.read(
 } catch (_: Throwable) {
     fallback
 }
+
+/**
+ * The property of this [name], declared by the [snippet], like `snippet3.kts`, which failed in the evaluation,
+ * while the property was `null`, most likely never initialized, despite its type.
+ */
+internal class UninitializedProperty(
+    val name: String,
+    val snippet: String
+)
