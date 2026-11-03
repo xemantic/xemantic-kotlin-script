@@ -42,6 +42,12 @@ class Outer {
     class Box<T>(val items: List<T>)
 }
 
+typealias MutableItems = MutableList<String>
+
+class IndexHolder {
+    val index: MutableMap<String, List<Int>> = mutableMapOf()
+}
+
 class ScriptPropertiesTest {
 
     @Test
@@ -158,6 +164,99 @@ class ScriptPropertiesTest {
                 have(value == "foo4221")
             }
         }
+    }
+
+    @Test
+    fun `should provide properties of mutable collection types`() = runTest {
+        ScriptSession {
+            provide<MutableList<String>>("items", mutableListOf())
+            provide<MutableMap<String, MutableSet<Int>>>("index", mutableMapOf())
+        }.use { session ->
+            // when
+            val result = session.execute($$"""
+                items.add("foo")
+                index.getOrPut("foo") { mutableSetOf() }.add(42)
+                "$items $index"
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == "[foo] {foo=[42]}")
+            }
+        }
+    }
+
+    @Test
+    fun `should render mutable collection types in source`() {
+        // given
+        val types = listOf(
+            typeOf<MutableIterable<String>>(),
+            typeOf<MutableCollection<String>>(),
+            typeOf<MutableList<String>>(),
+            typeOf<MutableSet<String>>(),
+            typeOf<MutableMap<String, Int>>(),
+            typeOf<MutableMap.MutableEntry<String, Int>>(),
+            typeOf<MutableIterator<String>>(),
+            typeOf<MutableListIterator<String>>(),
+            typeOf<MutableList<*>?>(),
+            typeOf<Map<String, MutableList<out Number>?>>(),
+            typeOf<(MutableSet<Int>) -> MutableIterator<Int>>(),
+            typeOf<MutableItems>(),
+            IndexHolder::index.returnType
+        )
+
+        // when
+        val sources = types.map { it.toSource() }
+
+        // then
+        assert(sources == listOf(
+            "kotlin.collections.MutableIterable<kotlin.String>",
+            "kotlin.collections.MutableCollection<kotlin.String>",
+            "kotlin.collections.MutableList<kotlin.String>",
+            "kotlin.collections.MutableSet<kotlin.String>",
+            "kotlin.collections.MutableMap<kotlin.String, kotlin.Int>",
+            "kotlin.collections.MutableMap.MutableEntry<kotlin.String, kotlin.Int>",
+            "kotlin.collections.MutableIterator<kotlin.String>",
+            "kotlin.collections.MutableListIterator<kotlin.String>",
+            "kotlin.collections.MutableList<*>?",
+            "kotlin.collections.Map<kotlin.String, kotlin.collections.MutableList<out kotlin.Number>?>",
+            "kotlin.Function1<kotlin.collections.MutableSet<kotlin.Int>, kotlin.collections.MutableIterator<kotlin.Int>>",
+            "kotlin.collections.MutableList<kotlin.String>",
+            "kotlin.collections.MutableMap<kotlin.String, kotlin.collections.List<kotlin.Int>>"
+        ))
+    }
+
+    @Test
+    fun `should render read-only collection types in source`() {
+        // given
+        val types = listOf(
+            typeOf<Iterable<String>>(),
+            typeOf<Collection<String>>(),
+            typeOf<List<String>>(),
+            typeOf<Set<String>>(),
+            typeOf<Map<String, Int>>(),
+            typeOf<Map.Entry<String, Int>>(),
+            typeOf<Iterator<String>>(),
+            typeOf<ListIterator<String>>(),
+            typeOf<java.util.ArrayList<String>>()
+        )
+
+        // when
+        val sources = types.map { it.toSource() }
+
+        // then
+        assert(sources == listOf(
+            "kotlin.collections.Iterable<kotlin.String>",
+            "kotlin.collections.Collection<kotlin.String>",
+            "kotlin.collections.List<kotlin.String>",
+            "kotlin.collections.Set<kotlin.String>",
+            "kotlin.collections.Map<kotlin.String, kotlin.Int>",
+            "kotlin.collections.Map.Entry<kotlin.String, kotlin.Int>",
+            "kotlin.collections.Iterator<kotlin.String>",
+            "kotlin.collections.ListIterator<kotlin.String>",
+            "java.util.ArrayList<kotlin.String>"
+        ))
     }
 
     @Test

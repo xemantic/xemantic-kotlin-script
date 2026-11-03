@@ -132,10 +132,34 @@ private fun ScriptProperty<*>.getterName(): String =
 internal fun KType.toSource(): String {
     val kClass = classifier as KClass<*>
     // validated to be accessible, so neither local nor anonymous
-    val name = kClass.qualifiedName!!.split('.').joinToString(".") { it.quoted() }
+    val name = (mutableCollectionName() ?: kClass.qualifiedName!!).split('.').joinToString(".") { it.quoted() }
     val arguments = if (arguments.isEmpty()) "" else arguments.joinToString(prefix = "<", postfix = ">") { it.toSource() }
     return name + arguments + if (isMarkedNullable) "?" else ""
 }
+
+/**
+ * The qualified name of the mutable collection type, like `kotlin.collections.MutableList`, if this is one.
+ *
+ * A mutable collection type and its read-only counterpart share the classifier, like `List::class`,
+ * and the public API of kotlin-reflect does not tell them apart —
+ * only its internal implementations of [KType] keep the mutability (`AbstractKType.mutableCollectionClass`), and render it in [KType.toString].
+ * The rendering starts with the qualified name of the type itself, followed by its type arguments,
+ * so the prefix identifies the mutable type unambiguously, also when nested in a type argument of another type.
+ */
+private fun KType.mutableCollectionName(): String? =
+    mutableCollectionNames[classifier]?.takeIf { toString().startsWith("$it<") }
+
+/** The read-only collection classes, which are also the classifiers of their mutable counterparts. */
+private val mutableCollectionNames: Map<KClass<*>, String> = mapOf(
+    Iterable::class to "kotlin.collections.MutableIterable",
+    Collection::class to "kotlin.collections.MutableCollection",
+    List::class to "kotlin.collections.MutableList",
+    Set::class to "kotlin.collections.MutableSet",
+    Map::class to "kotlin.collections.MutableMap",
+    Map.Entry::class to "kotlin.collections.MutableMap.MutableEntry",
+    Iterator::class to "kotlin.collections.MutableIterator",
+    ListIterator::class to "kotlin.collections.MutableListIterator"
+)
 
 private fun KTypeProjection.toSource(): String = when (variance) {
     null -> "*"
