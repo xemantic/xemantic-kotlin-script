@@ -289,6 +289,29 @@ class MavenDependenciesTest {
     }
 
     @Test
+    fun `should look up dependency declared without version once in repository declared again`() = runTest {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // given
+            val declaration = """@file:Repository("${server.url}", options = ["username=alice", "password=secret"])"""
+            session.execute(declaration)
+
+            // when
+            val result = session.execute("""
+                $declaration
+                @file:DependsOn("com.xemantic.fixture:greeter")
+                fixture.greeter.Greeter.greet("Alice")
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == "Hi Alice")
+            }
+            assert(server.metadataRequests == 1)
+        }
+    }
+
+    @Test
     fun `should report unresolved dependency declared without version in repository without its credentials`() = runTest {
         MavenRepositoryServer(username = "alice", password = "secret").use { server ->
             // when

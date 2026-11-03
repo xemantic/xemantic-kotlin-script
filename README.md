@@ -155,7 +155,8 @@ ScriptSession {
   in the repositories declared with their options, like `@file:Repository("https://...", options = ["username=...", "password=..."])`,
   with the mirrors, proxies and server credentials of the Maven settings, `~/.m2/settings.xml` by default,
   among the `maven-metadata.xml` files cached in the local Maven repository, refreshed once a day, or installed into it.
-  In the offline mode of the Maven settings, a dependency without any `maven-metadata.xml` there
+  In the offline mode of the Maven settings, only the `file:` repositories are read,
+  and a dependency without any `maven-metadata.xml` there
   is resolved to the latest of its versions present in the local Maven repository.
   A version range, like `[1.0,)`, and the `RELEASE` and `LATEST` versions of Maven are resolved by Maven itself,
   which might select a pre-release version.

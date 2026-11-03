@@ -29,13 +29,15 @@ import io.ktor.server.response.respondBytes
 import io.ktor.server.routing.route
 import io.ktor.server.routing.routing
 import kotlinx.coroutines.runBlocking
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.io.encoding.Base64
 import kotlin.io.path.isRegularFile
 import kotlin.io.path.readBytes
 
 /**
  * A local HTTP server of the [MavenRepository], at [url],
- * answering `401` to a request without the basic authentication of the [username] and [password].
+ * answering `401` to a request without the basic authentication of the [username] and [password],
+ * and `500` to the next [failingRequests] authenticated ones.
  */
 class MavenRepositoryServer(
     username: String,
@@ -44,6 +46,18 @@ class MavenRepositoryServer(
 
     private val credentials = "Basic " + Base64.encode("$username:$password".encodeToByteArray())
 
+    private val failures = AtomicInteger()
+
+    private val metadataRequestCounter = AtomicInteger()
+
+    /** The number of the next authenticated requests answered with `500`. */
+    var failingRequests: Int
+        get() = failures.get()
+        set(value) = failures.set(value)
+
+    /** The number of the authenticated requests of a `maven-metadata.xml`. */
+    val metadataRequests: Int get() = metadataRequestCounter.get()
+
     private val server = embeddedServer(CIO, host = "127.0.0.1", port = 0) {
         routing {
             // also HEAD, which Maven sends to verify an artifact in the local repository downloaded from another one
@@ -51,11 +65,16 @@ class MavenRepositoryServer(
                 handle {
                     val path = call.parameters.getAll("path")!!.joinToString("/")
                     val file = MavenRepository.directory.resolve(path).normalize()
+                    val authorized = call.request.header(HttpHeaders.Authorization) == credentials
+                    if (authorized && path.endsWith("/maven-metadata.xml")) metadataRequestCounter.incrementAndGet()
                     when {
-                        call.request.header(HttpHeaders.Authorization) != credentials -> {
+                        !authorized -> {
                             call.response.header(HttpHeaders.WWWAuthenticate, "Basic realm=\"fixture\"")
                             call.respondBytes(ByteArray(0), status = HttpStatusCode.Unauthorized)
                         }
+                        failures.getAndUpdate { maxOf(it - 1, 0) } > 0 -> call.respondBytes(
+                            ByteArray(0), status = HttpStatusCode.InternalServerError
+                        )
                         !file.startsWith(MavenRepository.directory) || !file.isRegularFile() -> call.respondBytes(
                             ByteArray(0), status = HttpStatusCode.NotFound
                         )
