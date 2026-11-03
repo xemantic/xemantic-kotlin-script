@@ -52,6 +52,9 @@ import org.jetbrains.kotlin.scripting.compiler.plugin.services.isReplSnippetSour
 import kotlin.script.experimental.api.ScriptDiagnostic
 import kotlin.script.experimental.api.ScriptEvaluationConfiguration
 import kotlin.script.experimental.api.defaultImports
+import kotlin.script.experimental.api.refineConfiguration
+import kotlin.script.experimental.dependencies.DependsOn
+import kotlin.script.experimental.dependencies.Repository
 import kotlin.script.experimental.api.implicitReceivers
 import kotlin.script.experimental.api.valueOrNull
 import kotlin.script.experimental.host.toScriptSource
@@ -164,6 +167,8 @@ internal class DefaultScriptSession(
 
     private val disposable = Disposer.newDisposable(name)
 
+    private val dependencyResolver = SnippetDependencyResolver(classLoader)
+
     /** The lines of the snippets by their names, like `snippet3.kts`, accessed on the [thread] only. */
     private val snippets = HashMap<String, List<String>>()
 
@@ -192,13 +197,17 @@ internal class DefaultScriptSession(
                 jvmTarget(scriptJvmTarget(System.getProperty("java.specification.version")))
             }
             implicitReceivers(ScriptScope::class)
-            // the snippets can launch coroutines without imports
+            // the snippets can launch coroutines, and declare dependencies, without imports
+            defaultImports(DependsOn::class, Repository::class)
             defaultImports("kotlinx.coroutines.*")
+            refineConfiguration {
+                onAnnotations(DependsOn::class, Repository::class, handler = dependencyResolver::refine)
+            }
         }
 
         val evaluationConfiguration = ScriptEvaluationConfiguration {
             jvm {
-                baseClassLoader(classLoader)
+                baseClassLoader(dependencyResolver.classLoader)
             }
             implicitReceivers(scope)
         }
@@ -229,7 +238,7 @@ internal class DefaultScriptSession(
         suspend fun compile(
             snippet: String,
             name: String
-        ): ResultWithDiagnostics<LinkedSnippet<CompiledSnippet>> {
+        ): Compilation {
             val result = try {
                 compiler.compile(listOf(snippet.toScriptSource(name)), compilationConfiguration)
             } catch (e: Exception) {
@@ -241,12 +250,21 @@ internal class DefaultScriptSession(
                     )
                 )
             }
+            val dependencies = dependencyResolver.takeDependencies()
             if (result is ResultWithDiagnostics.Success) {
                 history.commit()
-                return ResultWithDiagnostics.Success(result.value, messageCollector.diagnostics.toList())
+                return Compilation(
+                    ResultWithDiagnostics.Success(result.value, messageCollector.diagnostics.toList()),
+                    dependencies
+                )
             }
             history.rollback()
-            return result
+            return Compilation(
+                ResultWithDiagnostics.Failure(
+                    dependencies.warnings + dependencies.errors.ifEmpty { result.reports }
+                ),
+                dependencies
+            )
         }
 
         val evaluator = K2ReplEvaluator()
@@ -267,17 +285,18 @@ internal class DefaultScriptSession(
             val name = "snippet${++snippetCount}.kts"
             snippets[name] = snippet.lines()
             logger.debug { "$name: compiling" }
-            when (val compilation = repl.compile(snippet, name)) {
+            val compilation = repl.compile(snippet, name)
+            when (val result = compilation.result) {
                 is ResultWithDiagnostics.Failure -> ScriptResult.Error(
-                    message = reporter.describe(compilation.reports),
+                    message = reporter.describe(result.reports),
                     phase = ExecutionPhase.COMPILATION
                 )
                 is ResultWithDiagnostics.Success -> {
                     logger.debug { "$name: evaluating" }
                     val evaluation = scope.evaluate(callerJob) {
-                        repl.evaluator.eval(compilation.value, repl.evaluationConfiguration)
+                        repl.evaluator.eval(result.value, repl.evaluationConfiguration)
                     }
-                    evaluation.toScriptResult(compilation.reports)
+                    evaluation.toScriptResult(compilation)
                 }
             }
         }
@@ -291,7 +310,7 @@ internal class DefaultScriptSession(
         val name = "dependencies.kts"
         val source = dependencies.joinToString("\n") { it.declaration(id) }
         snippets[name] = source.lines()
-        val compilation = repl.compile(source, name)
+        val compilation = repl.compile(source, name).result
         val evaluation = compilation.valueOrNull()?.let {
             repl.evaluator.eval(it, repl.evaluationConfiguration).valueOrNull()?.get()?.result
         }
@@ -305,26 +324,40 @@ internal class DefaultScriptSession(
     }
 
     private fun ResultWithDiagnostics<*>.toScriptResult(
-        compilationReports: List<ScriptDiagnostic>
+        compilation: Compilation
     ): ScriptResult {
+        val compilationReports = compilation.result.reports
+        val resolvedVersions = compilation.dependencies.resolvedVersions
         @Suppress("UNCHECKED_CAST")
         val result = (valueOrNull() as? LinkedSnippet<KJvmEvaluatedSnippet>)
             ?.get()?.result
         result?.scriptClass?.java?.declaredClasses?.mapTo(snippetClassNames) { it.simpleName }
         return when (result) {
-            is ResultValue.Value -> ScriptResult.Value(result.value, reporter.warnings(compilationReports))
-            is ResultValue.Unit -> ScriptResult.Value(Unit, reporter.warnings(compilationReports))
+            is ResultValue.Value -> ScriptResult.Value(result.value, reporter.warnings(compilationReports), resolvedVersions)
+            is ResultValue.Unit -> ScriptResult.Value(Unit, reporter.warnings(compilationReports), resolvedVersions)
             is ResultValue.Error -> {
                 val error = result.error
                 if (error is VirtualMachineError && error !is StackOverflowError) throw error
-                ScriptResult.Error(reporter.describe(error, compilationReports), ExecutionPhase.EVALUATION)
+                ScriptResult.Error(
+                    reporter.describe(error, compilation.dependencies.warnings + compilationReports),
+                    ExecutionPhase.EVALUATION
+                )
             }
             is ResultValue.NotEvaluated, null -> ScriptResult.Error(
-                reporter.describe(reports.ifEmpty { compilationReports }),
+                reporter.describe(reports.ifEmpty { compilation.dependencies.warnings + compilationReports }),
                 ExecutionPhase.EVALUATION
             )
         }
     }
+
+    /**
+     * The [result] of compiling a snippet, with its [dependencies],
+     * reported by the [result] only if it fails.
+     */
+    private class Compilation(
+        val result: ResultWithDiagnostics<LinkedSnippet<CompiledSnippet>>,
+        val dependencies: SnippetDependencyResolver.SnippetDependencies
+    )
 
     override fun close() {
         if (closed) return
@@ -333,6 +366,7 @@ internal class DefaultScriptSession(
         ScriptDependencyValues.unregister(id)
         thread.execute {
             Disposer.dispose(disposable)
+            dependencyResolver.close()
         }
         thread.shutdown()
     }

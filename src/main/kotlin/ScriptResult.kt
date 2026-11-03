@@ -50,10 +50,15 @@ public sealed interface ScriptResult {
      *   or [Unit] if the snippet does not end with an expression.
      * @property warnings the compiler warnings, pointing to the offending lines of the snippet,
      *   or `null` if there are none. They might reveal a bug, even if the snippet succeeded.
+     * @property resolvedVersions the versions resolved for the dependencies declared by the snippet without version,
+     *   like `org.jsoup:jsoup` resolved to `1.24.1`, by their coordinates, as an LLM might not know their API.
+     *   Unlike the [warnings], they are worth showing to the LLM always.
+     *   If the snippet fails, they are reported as warnings in the [Error.message] instead.
      */
     public class Value(
         public val value: Any?,
-        public val warnings: String? = null
+        public val warnings: String? = null,
+        public val resolvedVersions: Map<String, String> = emptyMap()
     ) : ScriptResult
 
 }
