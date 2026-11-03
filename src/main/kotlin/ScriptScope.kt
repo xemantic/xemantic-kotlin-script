@@ -46,8 +46,8 @@ public class ScriptScope internal constructor(
      * like `await { client.get(url) }`.
      *
      * The [block] runs on the thread of the snippet,
-     * and it is cancelled when the caller executing the snippet is cancelled,
-     * or, outside of a snippet, like in a launched coroutine, when the session is closed.
+     * and it is cancelled when the session is closed,
+     * or, within a snippet, also when the caller executing the snippet is cancelled.
      */
     public fun <T> await(
         block: suspend CoroutineScope.() -> T
@@ -68,9 +68,9 @@ public class ScriptScope internal constructor(
         }
     }
 
-    /** Evaluates the snippet [block] on the current thread, cancelled together with the [job] of its caller. */
-    internal inline fun <T> evaluate(job: Job, block: () -> T): T {
-        val evaluation = SnippetEvaluation(job)
+    /** Evaluates the snippet [block] on the current thread, cancelled together with the [callerJob], or when the session is closed. */
+    internal inline fun <T> evaluate(callerJob: Job, block: () -> T): T {
+        val evaluation = SnippetEvaluation(callerJob, coroutineContext.job)
         this.evaluation.set(evaluation)
         try {
             return block()
