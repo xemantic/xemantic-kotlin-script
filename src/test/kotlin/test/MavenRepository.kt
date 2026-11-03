@@ -20,11 +20,13 @@
 package com.xemantic.kotlin.script.test
 
 import java.nio.file.Path
+import java.security.MessageDigest
 import java.util.jar.JarOutputStream
 import java.util.zip.ZipEntry
 import javax.tools.ToolProvider
 import kotlin.io.path.createDirectories
 import kotlin.io.path.createTempDirectory
+import kotlin.io.path.name
 import kotlin.io.path.outputStream
 import kotlin.io.path.readBytes
 import kotlin.io.path.relativeTo
@@ -109,6 +111,15 @@ object MavenRepository {
             )
         )
         repository.metadata("preview", listOf("0.1-beta"))
+        repository.checksums()
+    }
+
+    /** Writes the `.sha1` of every file, as Maven warns about each download without a checksum. */
+    private fun Path.checksums() {
+        walk().toList().forEach { file ->
+            val digest = MessageDigest.getInstance("SHA-1").digest(file.readBytes())
+            file.resolveSibling("${file.name}.sha1").writeText(digest.toHexString())
+        }
     }
 
     private class Library(val version: String, val jar: Path)
