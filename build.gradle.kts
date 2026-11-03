@@ -84,6 +84,13 @@ dependencies {
     implementation(libs.kotlin.scripting.dependencies.maven)
     // the Maven ordering of the versions, to resolve the latest one of a dependency declared without version
     implementation(libs.maven.resolver.util)
+    // the versions of a dependency declared without version, looked up like kotlin-scripting-dependencies-maven resolves it
+    implementation(libs.maven.resolver.impl)
+    implementation(libs.maven.resolver.connector.basic)
+    implementation(libs.maven.resolver.transport.file)
+    implementation(libs.maven.resolver.transport.http)
+    implementation(libs.maven.resolver.provider)
+    implementation(libs.maven.settings)
     // the compiler brings kotlin-reflect 1.6.10, which mutates final fields, deprecated since JDK 26
     implementation(libs.kotlin.reflect)
     implementation(libs.xemantic.kotlin.core)

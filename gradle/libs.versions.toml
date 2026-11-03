@@ -13,6 +13,10 @@ asm = "9.10.1"
 ktor = "3.6.1"
 # the version brought by kotlin-scripting-dependencies-maven
 mavenResolver = "2.0.24"
+# the versions of the implementation of Maven Resolver brought by kotlin-scripting-dependencies-maven,
+# to look up the versions of a dependency in the same way as it resolves the dependency
+mavenResolverImpl = "1.9.27"
+maven = "3.9.16"
 # plugins
 versionCatalogUpdatePlugin = "1.1.2"
 dokkaPlugin = "2.2.0"
@@ -29,6 +33,12 @@ kotlin-scripting-compiler-embeddable = { module = "org.jetbrains.kotlin:kotlin-s
 kotlin-scripting-dependencies = { module = "org.jetbrains.kotlin:kotlin-scripting-dependencies", version.ref = "kotlin" }
 kotlin-scripting-dependencies-maven = { module = "org.jetbrains.kotlin:kotlin-scripting-dependencies-maven", version.ref = "kotlin" }
 maven-resolver-util = { module = "org.apache.maven.resolver:maven-resolver-util", version.ref = "mavenResolver" }
+maven-resolver-impl = { module = "org.apache.maven.resolver:maven-resolver-impl", version.ref = "mavenResolverImpl" }
+maven-resolver-connector-basic = { module = "org.apache.maven.resolver:maven-resolver-connector-basic", version.ref = "mavenResolverImpl" }
+maven-resolver-transport-file = { module = "org.apache.maven.resolver:maven-resolver-transport-file", version.ref = "mavenResolverImpl" }
+maven-resolver-transport-http = { module = "org.apache.maven.resolver:maven-resolver-transport-http", version.ref = "mavenResolverImpl" }
+maven-resolver-provider = { module = "org.apache.maven:maven-resolver-provider", version.ref = "maven" }
+maven-settings = { module = "org.apache.maven:maven-settings", version.ref = "maven" }
 kotlin-reflect = { module = "org.jetbrains.kotlin:kotlin-reflect", version.ref = "kotlin" }
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinxCoroutines" }
 xemantic-kotlin-core = { module = "com.xemantic.kotlin:xemantic-kotlin-core", version.ref = "xemanticKotlinCore" }

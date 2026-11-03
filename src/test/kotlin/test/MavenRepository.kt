@@ -54,16 +54,21 @@ object MavenRepository {
         Runtime.getRuntime().addShutdownHook(Thread { dir.toFile().deleteRecursively() })
     }
 
+    /** The directory of the repository. */
+    val directory: Path = fixtureDir.resolve("repository")
+
     /** The URL of the repository, to be declared with `@file:Repository`. */
-    val url: String
+    val url: String = directory.toUri().toString()
+
+    /** The local repository, which the libraries are resolved into. */
+    val localRepository: Path = fixtureDir.resolve("local")
 
     init {
-        val repository = fixtureDir.resolve("repository")
-        url = repository.toUri().toString()
+        val repository = directory
         val settings = fixtureDir.resolve("settings.xml")
         settings.writeText("""
             <settings>
-              <localRepository>${fixtureDir.resolve("local")}</localRepository>
+              <localRepository>$localRepository</localRepository>
             </settings>
         """.trimIndent())
         System.setProperty("org.apache.maven.user-settings", settings.toString())
