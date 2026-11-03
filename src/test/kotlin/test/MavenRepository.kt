@@ -64,7 +64,6 @@ object MavenRepository {
     val localRepository: Path = fixtureDir.resolve("local")
 
     init {
-        val repository = directory
         val settings = fixtureDir.resolve("settings.xml")
         settings.writeText("""
             <settings>
@@ -73,7 +72,7 @@ object MavenRepository {
         """.trimIndent())
         System.setProperty("org.apache.maven.user-settings", settings.toString())
         val greeters = listOf("1.0" to "Hello", "1.10" to "Hi", "1.9" to "Hey", "2.0-RC1" to "Howdy").map { (version, greeting) ->
-            repository.library(
+            directory.library(
                 artifactId = "greeter",
                 version = version,
                 sources = mapOf(
@@ -86,8 +85,8 @@ object MavenRepository {
                 )
             )
         }
-        repository.metadata("greeter", greeters.map { it.version })
-        repository.library(
+        directory.metadata("greeter", greeters.map { it.version })
+        directory.library(
             artifactId = "greeting-card",
             sources = mapOf(
                 "fixture/card/GreetingCard.java" to """
@@ -102,8 +101,8 @@ object MavenRepository {
             dependencies = listOf("greeter"),
             classpath = listOf(greeters.first().jar)
         )
-        repository.metadata("greeting-card", listOf("1.0"))
-        repository.library(
+        directory.metadata("greeting-card", listOf("1.0"))
+        directory.library(
             artifactId = "preview",
             version = "0.1-beta",
             sources = mapOf(
@@ -115,8 +114,8 @@ object MavenRepository {
                 """.trimIndent()
             )
         )
-        repository.metadata("preview", listOf("0.1-beta"))
-        repository.checksums()
+        directory.metadata("preview", listOf("0.1-beta"))
+        directory.checksums()
     }
 
     /** Writes the `.sha1` of every file, as Maven warns about each download without a checksum. */

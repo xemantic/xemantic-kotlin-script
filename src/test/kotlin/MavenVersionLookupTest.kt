@@ -167,6 +167,37 @@ class MavenVersionLookupTest {
     }
 
     @Test
+    fun `should look up latest of versions which Maven orders below zero`() {
+        // given the versions of early Guava releases, which Maven orders below any numeric one
+        val repository = createTempDirectory("maven-remote")
+        try {
+            repository.resolve("com/google/guava/guava").createDirectories().resolve("maven-metadata.xml").writeText("""
+                <metadata>
+                  <groupId>com.google.guava</groupId>
+                  <artifactId>guava</artifactId>
+                  <versioning>
+                    <versions>
+                      <version>r03</version>
+                      <version>r09</version>
+                    </versions>
+                  </versioning>
+                </metadata>
+            """.trimIndent())
+            val lookup = MavenVersionLookup { settings() }
+
+            // when
+            val latest = lookup.latestVersion(
+                "com.google.guava", "guava", listOf(remoteRepository(repository.toUri().toString()))
+            )
+
+            // then
+            assert(latest?.version == "r09" && latest.stable)
+        } finally {
+            repository.toFile().deleteRecursively()
+        }
+    }
+
+    @Test
     fun `should not find any version of missing artifact`() {
         // given
         val lookup = MavenVersionLookup { settings() }

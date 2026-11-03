@@ -40,7 +40,6 @@ import org.eclipse.aether.util.repository.DefaultMirrorSelector
 import org.eclipse.aether.util.repository.DefaultProxySelector
 import org.eclipse.aether.util.version.GenericVersionScheme
 import java.io.File
-import java.nio.file.Path
 import kotlin.script.experimental.dependencies.ExternalDependenciesResolver
 import kotlin.script.experimental.dependencies.RepositoryCoordinates
 import kotlin.script.experimental.dependencies.impl.mavenRepoId
@@ -122,8 +121,14 @@ internal class MavenVersionLookup(
 
     private val session: RepositorySystemSession by lazy {
         MavenRepositorySystemUtils.newSession().apply {
-            localRepositoryManager = system.newLocalRepositoryManager(this, LocalRepository(Path.of(settings.localRepository)))
+            // deprecated in Maven Resolver 2, but its Path constructor is missing from the 1.9 brought by Kotlin
+            @Suppress("DEPRECATION")
+            val localRepository = LocalRepository(File(settings.localRepository))
+            localRepositoryManager = system.newLocalRepositoryManager(this, localRepository)
             isOffline = settings.isOffline
+            // bounding the compilation of a snippet when a repository stalls, unlike the defaults, 30 s and 30 min
+            setConfigProperty("aether.connector.connectTimeout", 10_000)
+            setConfigProperty("aether.connector.requestTimeout", 30_000)
         }
     }
 
@@ -142,7 +147,8 @@ internal class MavenVersionLookup(
         repositories: List<RemoteRepository>
     ): LatestMavenVersion? {
         val request = VersionRangeRequest(
-            DefaultArtifact(groupId, artifactId, "jar", "[0,)"),
+            // not [0,), which excludes the versions ordered below 0, like r09, v1.2 or M1
+            DefaultArtifact(groupId, artifactId, "jar", "(,)"),
             repositories.mapNotNull { it.withSettings() },
             null
         )
