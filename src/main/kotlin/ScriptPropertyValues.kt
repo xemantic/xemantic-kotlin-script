@@ -23,7 +23,8 @@ import java.util.concurrent.ConcurrentHashMap
 
 /**
  * The values of the properties of the open sessions,
- * read by the declarations of the properties preceding the snippets of a session, see [ScriptProperty].
+ * read by the declarations of the properties preceding the snippets of a session, see [ScriptProperty],
+ * and kept until a closed session ends its last snippet.
  */
 public object ScriptPropertyValues {
 
