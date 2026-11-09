@@ -51,10 +51,12 @@ private const val SNIPPET_BODY_METHOD = "\$\$eval"
  *
  * @param snippets the lines of the snippets by their names, like `snippet3.kts`.
  * @param snippetClassNames the simple names of the classes declared by the evaluated snippets.
+ * @param uninitializedProperties the properties of the snippets which failed in the evaluation, `null` then.
  */
 internal class ScriptErrorReporter(
     private val snippets: Map<String, List<String>>,
-    private val snippetClassNames: Set<String> = emptySet()
+    private val snippetClassNames: Set<String> = emptySet(),
+    private val uninitializedProperties: UninitializedProperties = UninitializedProperties()
 ) {
 
     /**
@@ -168,7 +170,19 @@ internal class ScriptErrorReporter(
             append(" - declare it in the same snippet, or wrap the value in a regular class.\n")
         }
         // the exception class of a snippet might override it to contain nulls
-        appendFrames(throwable.read(emptyList()) { stackTrace.filterNotNull() }, indent)
+        val stackTrace = throwable.read(emptyList()) { stackTrace.filterNotNull() }
+        if (throwable is NullPointerException) {
+            uninitializedProperties.readBy(throwable, stackTrace)?.let { property ->
+                append("$indent  hint: '${property.name}' is declared in ${property.snippet}, which failed in the evaluation,")
+                append(" so it might be left uninitialized, null despite its type")
+                append(" - declare it again, together with the declarations reading it,")
+                stackTrace.firstOrNull { it.fileName in snippets && !property.isGetter(it) }?.let { frame ->
+                    frame.declarationName()?.let { append(" like '$it' of ${frame.fileName},") }
+                }
+                append(" as they keep reading the uninitialized one.\n")
+            }
+        }
+        appendFrames(stackTrace, indent)
         for (suppressed in throwable.read(emptyArray()) { suppressed }) {
             if (!appendThrowable(suppressed, "Suppressed: ", "$indent  ", reported)) return false
         }
@@ -262,6 +276,14 @@ internal class ScriptErrorReporter(
             else -> listOfNotNull(type, methodParts.lastOrNull() ?: methodName).joinToString(".")
         }
     }
+
+    /**
+     * The name of the declaration of this snippet frame, like `greet`, `Checker.check`, or `Config` of its initializer,
+     * or `null` for the body of a snippet, or a lambda, which is not a declaration to redeclare.
+     */
+    private fun StackTraceElement.declarationName(): String? = functionName().takeIf {
+        it != "<snippet body>" && it != "<lambda>"
+    }?.removeSuffix(".<init>")?.removeSuffix(".<clinit>")
 
     /**
      * The length of the sequence of frames starting at the [index], and the number of its consecutive repetitions,

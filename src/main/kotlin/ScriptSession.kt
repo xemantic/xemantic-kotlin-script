@@ -86,6 +86,13 @@ private val sessionIds = AtomicInteger()
  *
  * A failure of a snippet is reported as [ScriptResult.Error], with a message pointing to its offending lines,
  * and the session continues, without the declarations of a snippet which failed to compile.
+ * A snippet which failed in the evaluation keeps its declarations, also the properties it did not initialize,
+ * which hold `null` despite their type, or zero, or `false`, if it is a primitive one,
+ * while the functions and classes compiled against such a property keep reading it, also after it is redeclared.
+ * A [NullPointerException] of the JVM naming such a property is reported with a hint
+ * to declare it again, together with the declarations reading it,
+ * but not a property of a primitive type, a value copied from the property before the failing read,
+ * or without the helpful messages of the [NullPointerException] in the JVM.
  */
 public interface ScriptSession : AutoCloseable {
 
@@ -104,6 +111,7 @@ public interface ScriptSession : AutoCloseable {
      * A failure of the compilation, even an internal one of the compiler, is reported as an [ExecutionPhase.COMPILATION] error,
      * an exception thrown by the snippet, as an [ExecutionPhase.EVALUATION] error,
      * except for a [VirtualMachineError] other than [StackOverflowError], which is thrown.
+     * The declarations of a snippet which threw stay visible to the next snippets, also the uninitialized properties, see [ScriptSession].
      * A failure of declaring the properties of the session, like a type the compiler rejects although it is valid,
      * is reported by every execution, in the phase in which it occurred, without executing the snippet.
      *
@@ -206,7 +214,10 @@ internal class DefaultScriptSession(
     /** The simple names of the classes declared by the evaluated snippets. */
     private val snippetClassNames = HashSet<String>()
 
-    private val reporter = ScriptErrorReporter(snippets, snippetClassNames)
+    /** The properties of the snippets which failed in the evaluation, `null` then. */
+    private val uninitializedProperties = UninitializedProperties()
+
+    private val reporter = ScriptErrorReporter(snippets, snippetClassNames, uninitializedProperties)
 
     private var snippetCount = 0
 
@@ -377,7 +388,7 @@ internal class DefaultScriptSession(
                 val evaluation = scope.evaluate(callerJob) {
                     evaluator.eval(result.value, evaluationConfiguration)
                 }
-                evaluation.toScriptResult(compilation)
+                evaluation.toScriptResult(compilation, name)
             }
         }
     }
@@ -399,14 +410,21 @@ internal class DefaultScriptSession(
         }
     }
 
+    /** The [ScriptResult] of evaluating the snippet of this [name]. */
     private fun ResultWithDiagnostics<*>.toScriptResult(
-        compilation: Compilation
+        compilation: Compilation,
+        name: String
     ): ScriptResult {
         @Suppress("UNCHECKED_CAST")
         val result = (valueOrNull() as? LinkedSnippet<KJvmEvaluatedSnippet>)
             ?.get()?.result
         result?.scriptClass?.java?.declaredClasses?.mapTo(snippetClassNames) { it.simpleName }
-        return reporter.scriptResult(result, reports, compilation.result.reports, compilation.dependencies)
+        return reporter.scriptResult(result, reports, compilation.result.reports, compilation.dependencies).also {
+            // after reporting it, as the snippet itself did not read them after it failed
+            if (result is ResultValue.Error) {
+                result.scriptClass?.java?.let { uninitializedProperties.keep(it, name) }
+            }
+        }
     }
 
     /**
@@ -437,7 +455,7 @@ internal class DefaultScriptSession(
  * Whether this throwable is thrown by the session instead of being reported:
  * a [VirtualMachineError], like an [OutOfMemoryError], other than a [StackOverflowError], which is reported as a failure of the snippet.
  */
-private val Throwable.isFatal: Boolean
+internal val Throwable.isFatal: Boolean
     get() = this is VirtualMachineError && this !is StackOverflowError
 
 /**
