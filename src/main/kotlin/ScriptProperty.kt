@@ -26,7 +26,9 @@ import org.jetbrains.kotlin.lexer.KtKeywordToken
 import org.jetbrains.kotlin.name.FqNameUnsafe
 import org.jetbrains.kotlin.lexer.KtTokens
 import java.lang.reflect.Modifier
+import kotlin.jvm.functions.FunctionN
 import kotlin.reflect.KClass
+import kotlin.reflect.KFunction
 import kotlin.reflect.KType
 import kotlin.reflect.KTypeParameter
 import kotlin.reflect.KTypeProjection
@@ -79,19 +81,6 @@ public class ScriptProperty<T>(
                 "Property '$name' is of type ${it.name}, which is a type parameter - provide it as a concrete type"
             )
         }
-        // a KType implemented by hand could not be rendered in the source of the session
-        type.nonClassType()?.let {
-            throw IllegalArgumentException(
-                "Property '$name' is of type $it, which is not of a class - provide it as a class type, e.g. with typeOf"
-            )
-        }
-        type.mismatchedArgumentsType()?.let {
-            val kClass = it.classifier as KClass<*>
-            throw IllegalArgumentException(
-                "Property '$name' is of type $it, which has ${it.arguments.size} type arguments, " +
-                        "while ${kClass.qualifiedName} takes ${kClass.typeParameterCount()} - provide it as a complete type, e.g. with typeOf"
-            )
-        }
         // rendered in the source of the session, where it would not compile, like `(Mutable)List<String!>!`
         require('!' !in type.toString()) {
             "Property '$name' is of platform type $type, which the snippets cannot refer to - provide it as a Kotlin type, e.g. with typeOf"
@@ -99,6 +88,19 @@ public class ScriptProperty<T>(
         type.inaccessibleClass()?.let {
             throw IllegalArgumentException(
                 "Property '$name' is of type ${it.name}, which is not accessible to the snippets - provide it as a public type"
+            )
+        }
+        // a KType implemented by hand could not be rendered in the source of the session
+        type.nonClassType()?.let {
+            throw IllegalArgumentException(
+                "Property '$name' is of type $it, which is not of a class - provide it as a class type, e.g. with typeOf"
+            )
+        }
+        type.mismatchedArguments()?.let { (type, expected) ->
+            val arguments = type.arguments.size
+            throw IllegalArgumentException(
+                "Property '$name' is of type $type, which has $arguments type argument${if (arguments == 1) "" else "s"}, " +
+                        "while ${(type.classifier as KClass<*>).qualifiedName} takes $expected - provide it as a complete type, e.g. with typeOf"
             )
         }
         if (value == null) {
@@ -279,11 +281,25 @@ private fun KType.nonClassType(): KType? =
 
 /**
  * The first of this type, or of its type arguments, whose number of type arguments differs from the type parameters of its class,
- * like the one of a [KType] implemented by hand, provided all their classifiers are classes.
+ * like the one of a [KType] implemented by hand, paired with that number of type parameters,
+ * provided all their classifiers are classes, accessible to the snippets.
  */
-private fun KType.mismatchedArgumentsType(): KType? =
-    takeUnless { arguments.size == (classifier as KClass<*>).typeParameterCount() }
-        ?: arguments.firstNotNullOfOrNull { it.type?.mismatchedArgumentsType() }
+private fun KType.mismatchedArguments(): Pair<KType, Int>? {
+    val kClass = classifier as KClass<*>
+    if (kClass !in arityErasedClasses) {
+        val expected = kClass.typeParameterCount()
+        if (arguments.size != expected) return this to expected
+    }
+    return arguments.firstNotNullOfOrNull { it.type?.mismatchedArguments() }
+}
+
+/**
+ * The classifiers of the types produced by [typeOf] with the parameter types and the return type as arguments,
+ * while the class takes only the return type:
+ * `KFunction` of a function reference type, like `KFunction1<String, Int>` or `KSuspendFunction1<String, Int>`,
+ * and `FunctionN` of a function type of more than 22 parameters.
+ */
+private val arityErasedClasses: Set<KClass<*>> = setOf(KFunction::class, FunctionN::class)
 
 /** The number of the type parameters of this class, and of its outer classes, if it is an inner class, as the arguments of its type. */
 private fun KClass<*>.typeParameterCount(): Int =

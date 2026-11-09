@@ -29,6 +29,9 @@ import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
 import java.net.URLClassLoader
 import kotlin.reflect.KClassifier
+import kotlin.reflect.KFunction1
+import kotlin.reflect.KFunction23
+import kotlin.reflect.KSuspendFunction1
 import kotlin.reflect.KType
 import kotlin.reflect.KTypeProjection
 import kotlin.reflect.full.createType
@@ -861,11 +864,57 @@ class ScriptPropertiesTest {
 
         // then
         assert(exceptions.map { it.message } == listOf(
-            "Property 'foo' is of type Generic.Inner<kotlin.Int>, which has 1 type arguments, while com.xemantic.kotlin.script.Generic.Inner takes 2 - provide it as a complete type, e.g. with typeOf",
+            "Property 'foo' is of type Generic.Inner<kotlin.Int>, which has 1 type argument, while com.xemantic.kotlin.script.Generic.Inner takes 2 - provide it as a complete type, e.g. with typeOf",
             "Property 'foo' is of type kotlin.collections.List, which has 0 type arguments, while kotlin.collections.List takes 1 - provide it as a complete type, e.g. with typeOf",
-            "Property 'foo' is of type kotlin.String<kotlin.Int>, which has 1 type arguments, while kotlin.String takes 0 - provide it as a complete type, e.g. with typeOf",
-            "Property 'foo' is of type Generic.Inner<kotlin.Int>, which has 1 type arguments, while com.xemantic.kotlin.script.Generic.Inner takes 2 - provide it as a complete type, e.g. with typeOf"
+            "Property 'foo' is of type kotlin.String<kotlin.Int>, which has 1 type argument, while kotlin.String takes 0 - provide it as a complete type, e.g. with typeOf",
+            "Property 'foo' is of type Generic.Inner<kotlin.Int>, which has 1 type argument, while com.xemantic.kotlin.script.Generic.Inner takes 2 - provide it as a complete type, e.g. with typeOf"
         ))
+    }
+
+    /** The classifier of a function reference type, like `KFunction1<String, Int>`, is `KFunction`, which takes only the return type. */
+    @Test
+    fun `should accept properties of function reference types`() {
+        // given
+        val types = listOf(
+            typeOf<KFunction1<String, Int>>(),
+            typeOf<KSuspendFunction1<String, Int>>(),
+            typeOf<KFunction23<Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Unit>>()
+        )
+
+        // when
+        val properties = types.map { ScriptProperty("f", it, ::twice) }
+
+        // then
+        assert(properties.map { it.type } == types)
+    }
+
+    /** The classifier of a function type of more than 22 parameters is `FunctionN`, which takes only the return type. */
+    @Test
+    fun `should accept property of function type of more than 22 parameters`() {
+        // given
+        val type = typeOf<((Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> Unit)?>()
+
+        // when
+        val property = ScriptProperty("f", type, null)
+
+        // then
+        assert(property.type == type)
+    }
+
+    /** The accessibility is checked first, as the reflection of a synthetic class, like the one of a lambda, may fail. */
+    @Test
+    fun `should reject property of hand-written type of lambda class before its type arguments`() {
+        // given
+        val lambda = suspend { 42 }
+        val type = handWrittenType(lambda::class, listOf(KTypeProjection.invariant(typeOf<Int>())), "Lambda<kotlin.Int>")
+
+        // when
+        val exception = assertFailsWith<IllegalArgumentException> {
+            ScriptProperty("foo", type, lambda)
+        }
+
+        // then
+        assert(exception.message == "Property 'foo' is of type ${lambda::class.java.name}, which is not accessible to the snippets - provide it as a public type")
     }
 
     @Test
@@ -923,6 +972,9 @@ class ScriptPropertiesTest {
     }
 
 }
+
+@Suppress("unused") // referenced as a value of function reference types
+private fun twice(x: String): Int = x.length * 2
 
 /** A nullable [KType] implemented by hand, seen by the members of the interface only. */
 private fun handWrittenType(
