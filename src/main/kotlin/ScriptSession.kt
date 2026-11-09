@@ -482,35 +482,6 @@ internal val Throwable.isFatal: Boolean
     get() = this is VirtualMachineError && this !is StackOverflowError
 
 /**
- * The [ScriptResult] of the evaluation [result] of a snippet, `null` if the evaluation failed with the [evaluationReports],
- * where [ResultValue.NotEvaluated] is a failure as well,
- * with the [compilationReports] and the [dependencies] of the snippet.
- *
- * @throws VirtualMachineError thrown by the snippet, other than [StackOverflowError].
- */
-internal fun ScriptErrorReporter.scriptResult(
-    result: ResultValue?,
-    evaluationReports: List<ScriptDiagnostic>,
-    compilationReports: List<ScriptDiagnostic>,
-    dependencies: SnippetDependencyResolver.SnippetDependencies
-): ScriptResult = when (result) {
-    is ResultValue.Value -> ScriptResult.Value(result.value, warnings(compilationReports), dependencies.resolvedVersions)
-    is ResultValue.Unit -> ScriptResult.Value(Unit, warnings(compilationReports), dependencies.resolvedVersions)
-    is ResultValue.Error -> {
-        val error = result.error
-        if (error.isFatal) throw error
-        ScriptResult.Error(
-            describe(error, dependencies.warnings + compilationReports),
-            ExecutionPhase.EVALUATION
-        )
-    }
-    is ResultValue.NotEvaluated, null -> ScriptResult.Error(
-        describe(evaluationReports.ifEmpty { dependencies.warnings + compilationReports }),
-        ExecutionPhase.EVALUATION
-    )
-}
-
-/**
  * The JVM target of the snippets, the one of the running JVM, or the latest one supported by the compiler, if it is newer,
  * like `21` of the `java.specification.version`.
  */
