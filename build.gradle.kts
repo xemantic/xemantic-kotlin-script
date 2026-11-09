@@ -107,10 +107,23 @@ dependencies {
     testRuntimeOnly(libs.logback.classic)
 }
 
+// the versions of Maven Resolver and Maven must be the ones brought by kotlin-scripting-dependencies-maven,
+// otherwise the API and the implementation of Maven Resolver of 2 major versions are mixed on the classpath
+val expectedVersions = mapOf(
+    "org.apache.maven.resolver" to libs.versions.mavenResolver.get(),
+    "org.apache.maven" to libs.versions.maven.get()
+)
+
 configurations.all {
     resolutionStrategy.eachDependency {
         if (requested.group == "org.ow2.asm") {
             useVersion(libs.versions.asm.get())
+        }
+        expectedVersions[requested.group]?.let { expected ->
+            check(requested.version == expected) {
+                "$requested is requested, while gradle/libs.versions.toml declares the version $expected of ${requested.group}, " +
+                    "see the comment on mavenResolver there"
+            }
         }
     }
 }
@@ -144,6 +157,10 @@ versionCatalogUpdate {
         // kotlinTarget / javaTarget are plain version constants with no version.ref
         versions = setOf("kotlinTarget", "javaTarget", "asm")
         keepUnusedVersions = false
+    }
+    pin {
+        // bumped together with Kotlin, see the comment on mavenResolver in libs.versions.toml
+        versions = setOf("mavenResolver", "maven")
     }
 }
 

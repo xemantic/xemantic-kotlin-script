@@ -170,8 +170,6 @@ internal class MavenVersionLookup(
      * as a session remembers a failure, or a missing `maven-metadata.xml`, not to look it up again.
      */
     private fun newSession(): RepositorySystemSession = MavenRepositorySystemUtils.newSession().apply {
-        // deprecated in Maven Resolver 2, but its Path constructor is missing from the 1.9 brought by Kotlin
-        @Suppress("DEPRECATION")
         val localRepository = LocalRepository(File(settings.localRepository))
         localRepositoryManager = system.newLocalRepositoryManager(this, localRepository)
         isOffline = settings.isOffline
