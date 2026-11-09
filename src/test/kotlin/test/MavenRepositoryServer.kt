@@ -20,11 +20,14 @@ package com.xemantic.kotlin.script.test
 
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.cio.CIO
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.request.header
+import io.ktor.server.request.httpMethod
 import io.ktor.server.response.header
+import io.ktor.server.response.respond
 import io.ktor.server.response.respondBytes
 import io.ktor.server.routing.route
 import io.ktor.server.routing.routing
@@ -100,6 +103,8 @@ class MavenRepositoryServer(
                         !file.startsWith(MavenRepository.directory) || !file.isRegularFile() -> call.respondBytes(
                             ByteArray(0), status = HttpStatusCode.NotFound
                         )
+                        // without a body, which would be read as the response to the next request on the connection
+                        call.request.httpMethod == HttpMethod.Head -> call.respond(HttpStatusCode.OK)
                         else -> call.respondBytes(file.readBytes(), ContentType.Application.OctetStream)
                     }
                 }

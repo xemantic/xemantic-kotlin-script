@@ -207,12 +207,19 @@ internal class MavenVersionLookup(
      * or, in the offline mode, if none lists any, among the versions present in the local repository,
      * or `null`, if there is none, see [latestMavenVersion].
      *
-     * A repository refusing its credentials with `401`, while another of the [repositories]
-     * of the same id and URL is read, like with the corrected credentials, is superseded by it:
-     * its failure is not reported, and it is passed to [superseded], so it is not looked up again.
-     * Any other failure, like `403`, which might be scoped to the artifact, or a transient `500`, supersedes none.
+     * The `401` of a repository, while another of the [repositories] of the same id and URL is read,
+     * like declared again with the corrected credentials, is not reported, even if the artifact is not found there,
+     * as it would hide the reason of the failed lookup.
+     * Only on a stronger evidence of wrong credentials, a repository is superseded, passed to [superseded],
+     * not to be looked up again, so its credentials are not sent again, which might lock the account:
+     * it is declared with credentials, refused with `401`, and another declaration of it lists the versions of the artifact.
+     * A `401` of a declaration without credentials is no evidence, as it might be the refusal of a private artifact
+     * to the anonymous access, which still reads the public ones.
+     * The trade-off: a declaration with credentials scoped to some artifacts, or refused by a transient `401`,
+     * is superseded as well — declaring it again restores it.
+     * Any other failure, like `403`, which might be scoped to the artifact, or a transient `500`, is reported, and supersedes none.
      *
-     * @throws Exception if there is no version, and some repository, not superseded, cannot be read,
+     * @throws Exception if there is no version, and some repository cannot be read, other than by the `401` not reported,
      *   reporting the repositories blocked by a mirror of the Maven settings before any other failure,
      *   see [BlockedRepositoryException].
      */
@@ -231,7 +238,7 @@ internal class MavenVersionLookup(
             null
         )
         val result = system.resolveVersionRange(newSession(), request)
-        val failures = supersede(looked, result.exceptions.filter { it !is MetadataNotFoundException })
+        val failures = supersede(looked, result.exceptions)
         failures.superseded.forEach(superseded)
         val versions = result.versions.map { it.toString() }.ifEmpty {
             if (settings.isOffline) localVersions(groupId, artifactId) else emptyList()
@@ -246,32 +253,41 @@ internal class MavenVersionLookup(
     }
 
     /**
-     * The [failures] of the [looked] repositories, the declared ones paired with them as looked up, split into
-     * the declared repositories [superseded][LookupFailures.superseded], which refused their credentials with `401`,
-     * while another of the same id and URL was read, like the same repository declared with the corrected credentials,
-     * and the failures of the others, to be [reported][LookupFailures.reported].
-     * None is superseded if some of the failures does not name its repository, as it is unknown which ones were read.
+     * The failures of the [looked] repositories, the declared ones paired with them as looked up, among the [exceptions],
+     * split into the failures to be [reported][LookupFailures.reported], all but the `401` of a repository
+     * of which another declaration was read, and the declared repositories [superseded][LookupFailures.superseded],
+     * the ones with credentials refused with `401`, of which another declaration returned the metadata, see [latestVersion].
+     * All are reported, and none is superseded, if some of the failures, other than a metadata not found, does not name its repository,
+     * as it is unknown which ones were read.
      */
     private fun supersede(
         looked: List<Pair<RemoteRepository, RemoteRepository>>,
-        failures: List<Exception>
+        exceptions: List<Exception>
     ): LookupFailures {
-        val failed = failures.map {
-            (it as? MetadataTransferException)?.repository ?: return LookupFailures(emptyList(), failures)
+        val failures = exceptions.filter { it !is MetadataNotFoundException }
+        val failed = failures.map { failure ->
+            val repository = (failure as? MetadataTransferException)?.repository
+                ?: return LookupFailures(reported = failures, superseded = emptyList())
+            failure to repository
         }
-        val unauthorized = failures.filter { it.isUnauthorized() }.map { (it as MetadataTransferException).repository }
-        val read = looked.filter { it.second !in failed }
-        val superseded = looked.filter { (declared, settled) ->
-            settled in unauthorized && read.any { (other, _) -> other.id == declared.id && other.url == declared.url }
+        // also the metadata not found in the local repository, which names none
+        val notFound = exceptions.filterIsInstance<MetadataNotFoundException>().mapNotNull { it.repository }
+        val read = looked.map { it.second }.filter { repository -> failed.none { it.second == repository } }
+        val served = read.filter { it !in notFound }
+        fun RemoteRepository.declaredAgainAs(other: RemoteRepository) = other != this && other.id == id && other.url == url
+        val refusedWhileRead = failed.filter { (failure, repository) ->
+            failure.isUnauthorized() && read.any { repository.declaredAgainAs(it) }
         }
-        val supersededSettled = superseded.map { it.second }
+        val refusedWhileServed = refusedWhileRead.map { it.second }.filter { repository ->
+            repository.authentication != null && read.any { it in served && repository.declaredAgainAs(it) }
+        }
         return LookupFailures(
-            superseded = superseded.map { it.first },
-            reported = failures.filterIndexed { index, _ -> failed[index] !in supersededSettled }
+            reported = failed.filterNot { it in refusedWhileRead }.map { it.first },
+            superseded = looked.filter { it.second in refusedWhileServed }.map { it.first }
         )
     }
 
-    private class LookupFailures(val superseded: List<RemoteRepository>, val reported: List<Exception>)
+    private class LookupFailures(val reported: List<Exception>, val superseded: List<RemoteRepository>)
 
     /** The versions of the artifact in the local repository, also these resolved without its `maven-metadata.xml`. */
     private fun localVersions(groupId: String, artifactId: String): List<String> =

@@ -222,10 +222,10 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
      * and a date-style version, like `20040616`, to any other one of the same stability, see [latestMavenVersion].
      * It is kept for the session, so a later snippet declaring it again does not load another one.
      *
-     * A repository declared with wrong credentials, and again with the corrected ones,
-     * is dropped once its declaration with the corrected credentials is read, while the wrong ones are refused with `401`,
-     * so neither its failure hides the reason of a failed lookup, nor its credentials are sent again by a later version lookup —
-     * the mavenResolver, keeping every declaration, still sends them, resolving the version found.
+     * A repository declared with wrong credentials, and again with the corrected ones, does not hide the reason of a failed lookup
+     * by the `401` of the wrong ones, and it is dropped once the corrected ones return the metadata of a dependency,
+     * while the wrong ones are refused with `401`, so they are not sent again by a later version lookup —
+     * the mavenResolver, keeping every declaration, still sends them, resolving the version found, see [MavenVersionLookup.latestVersion].
      */
     private fun versionOf(coordinates: String): LatestMavenVersion = latestVersions.getOrPut(coordinates) {
         val (groupId, artifactId) = coordinates.split(':')

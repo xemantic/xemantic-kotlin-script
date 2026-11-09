@@ -55,6 +55,9 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 - The Gradle configuration cache is enabled (`gradle.properties`), so a task action (`doLast { … }`) must not call a function declared in the build script — the script object is not serializable.
   Inline the logic or move the helper into `buildSrc` / an included build, and register tasks with `tasks.register(...)` rather than the `by tasks.registering` delegate.
 - Expected compilation error messages in the tests are compiler-version specific, re-check them after every Kotlin upgrade.
+- A ktor test server answering any method in one `route { handle { } }`, without the `AutoHeadResponse` plugin, sends the body of a `HEAD` response —
+  Maven Resolver's pooled HTTP client then reads it as the next response on the keep-alive connection, skipping it as garbage lines,
+  and stalls for tens of seconds, so a test times out under load only — see `should answer HEAD request without body on keep-alive connection`.
 - A `VirtualMachineError`, like an `OutOfMemoryError`, escaping a test does not fail it, but aborts the whole Gradle test executor (`Could not complete execution for Gradle Test Executor`) —
   catch it with `runCatching` and assert on it, also where only a regression would let it escape.
 - When the build fails on an `org.apache.maven(.resolver)` artifact requested in another version than the catalog's, after a Kotlin upgrade,

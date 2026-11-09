@@ -342,7 +342,7 @@ class MavenVersionLookupTest {
     }
 
     @Test
-    fun `should not find any version of missing artifact in repository declared again with corrected credentials`() {
+    fun `should not find any version of missing artifact in repository declared again with corrected credentials without superseding`() {
         MavenRepositoryServer(username = "alice", password = "secret").use { server ->
             // given
             val lookup = MavenVersionLookup { settings() }
@@ -357,7 +357,29 @@ class MavenVersionLookupTest {
 
             // then
             assert(latest == null)
-            assert(superseded == listOf(wrong))
+            // the refusal might be scoped to the missing artifact, so it is no evidence of wrong credentials
+            assert(superseded.isEmpty())
+        }
+    }
+
+    @Test
+    fun `should not supersede repository declared without credentials by its declaration with credentials`() {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // given
+            val lookup = MavenVersionLookup { settings() }
+            val anonymous = remoteRepository(server.url)
+            val authenticated = remoteRepository(server.url, "username=alice", "password=secret")
+            val superseded = mutableListOf<RemoteRepository>()
+
+            // when
+            val latest = lookup.latestVersion("com.xemantic.fixture", "greeter", listOf(anonymous, authenticated)) {
+                superseded += it
+            }
+
+            // then
+            // a private artifact is refused to the anonymous access, which might still read the public ones
+            assert(latest?.version == "1.10")
+            assert(superseded.isEmpty())
         }
     }
 
