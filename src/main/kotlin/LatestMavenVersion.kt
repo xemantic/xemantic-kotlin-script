@@ -33,6 +33,7 @@ import org.eclipse.aether.resolution.VersionRangeRequest
 import org.eclipse.aether.spi.connector.RepositoryConnectorFactory
 import org.eclipse.aether.spi.connector.transport.TransporterFactory
 import org.eclipse.aether.transfer.MetadataNotFoundException
+import org.eclipse.aether.transfer.NoRepositoryConnectorException
 import org.eclipse.aether.transport.file.FileTransporterFactory
 import org.eclipse.aether.transport.http.HttpTransporterFactory
 import org.eclipse.aether.util.repository.AuthenticationBuilder
@@ -113,8 +114,9 @@ internal fun latestMavenVersion(
 /**
  * Looks up the latest version of a Maven artifact with Maven Resolver,
  * set up like `MavenDependenciesResolver` resolves the artifact in the version found:
- * with the local repository, the mirrors, the proxies and the server credentials of the Maven [settings],
- * and also in their offline mode, which `MavenDependenciesResolver` does not honor.
+ * with the local repository, the mirrors, the proxies and the server credentials of the Maven [settings].
+ * It also honors their offline mode and their blocked mirrors, which `MavenDependenciesResolver` does not,
+ * and reaches a mirror through the proxy, which `MavenDependenciesResolver` bypasses, see [withSettings].
  */
 internal class MavenVersionLookup(
     settingsFactory: () -> Settings = ::createMavenSettings
@@ -148,11 +150,16 @@ internal class MavenVersionLookup(
         }
     }
 
-    /** The mirrors of the Maven settings. */
+    /**
+     * The mirrors of the Maven settings, also the blocking ones, like the `maven-default-http-blocker` of Maven,
+     * which refuse the repositories they mirror instead of serving them.
+     * `MavenDependenciesResolver` ignores the `blocked` flag of a mirror,
+     * so it resolves the artifact from the URL of the blocking mirror, `http://0.0.0.0/`, and fails to connect.
+     */
     private val mirrorSelector by lazy {
         DefaultMirrorSelector().apply {
             settings.mirrors.orEmpty().forEach {
-                add(it.id, it.url, it.layout, false, false, it.mirrorOf, it.mirrorOfLayouts)
+                add(it.id, it.url, it.layout, false, it.isBlocked, it.mirrorOf, it.mirrorOfLayouts)
             }
         }
     }
@@ -198,7 +205,9 @@ internal class MavenVersionLookup(
      * or, in the offline mode, if none lists any, among the versions present in the local repository,
      * or `null`, if there is none, see [latestMavenVersion].
      *
-     * @throws Exception if there is no version, and some repository cannot be read.
+     * @throws Exception if there is no version, and some repository cannot be read,
+     *   reporting the repositories blocked by a mirror of the Maven settings before any other failure,
+     *   see [BlockedRepositoryException].
      */
     fun latestVersion(
         groupId: String,
@@ -215,8 +224,12 @@ internal class MavenVersionLookup(
         val versions = result.versions.map { it.toString() }.ifEmpty {
             if (settings.isOffline) localVersions(groupId, artifactId) else emptyList()
         }
-        val failure = result.exceptions.firstOrNull { it !is MetadataNotFoundException }
-        if (versions.isEmpty() && failure != null) throw failure
+        if (versions.isEmpty()) {
+            // the block is actionable configuration advice, so it is reported before the failures of the other repositories
+            val blocked = result.exceptions.mapNotNull { failure -> failure.blockedMirror()?.let { it to failure } }
+            if (blocked.isNotEmpty()) throw BlockedRepositoryException(blocked.map { it.first }, blocked.first().second)
+            result.exceptions.firstOrNull { it !is MetadataNotFoundException }?.let { throw it }
+        }
         return latestMavenVersion(versions)
     }
 
@@ -249,6 +262,35 @@ internal class MavenVersionLookup(
 
 /** The protocols of the repositories supported by `MavenDependenciesResolver`. */
 private val supportedProtocol = Regex("https?|file")
+
+/**
+ * The blocking mirror of the Maven settings, which refused to read the repository it mirrors, failing with this exception,
+ * reported by Maven Resolver as a missing connector of the mirror, however deep it is wrapped,
+ * or `null`, if this is another failure.
+ */
+internal fun Throwable.blockedMirror(): RemoteRepository? =
+    generateSequence(this) { it.cause }
+        .filterIsInstance<NoRepositoryConnectorException>()
+        .map { it.repository }
+        .firstOrNull { it.isBlocked }
+
+/**
+ * The repositories blocked by the [mirrors] of the Maven settings, like the `maven-default-http-blocker` of Maven blocks the plain HTTP ones,
+ * named by their URLs, in a line per mirror, as the [cause] names the mirror and its URL instead, `http://0.0.0.0/`,
+ * which is never connected to.
+ * Each of the [mirrors] is selected for a single repository, so it names the one it blocks.
+ */
+private class BlockedRepositoryException(
+    mirrors: List<RemoteRepository>,
+    cause: Throwable
+) : IllegalStateException(
+    mirrors.groupBy { it.id }.entries.joinToString("\n") { (id, mirrorsOfId) ->
+        val urls = mirrorsOfId.map { it.mirroredRepositories.single().url }
+        val (noun, verb) = if (urls.size == 1) "Repository" to "is" else "Repositories" to "are"
+        "$noun ${urls.joinToString(", ")} $verb blocked by the mirror '$id' of the Maven settings"
+    },
+    cause
+)
 
 /**
  * The repository system of Maven Resolver, with its services registered in this locator.

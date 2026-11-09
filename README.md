@@ -172,6 +172,13 @@ ScriptSession {
   in the repositories declared with their options, like `@file:Repository("https://...", options = ["username=...", "password=..."])`,
   with the mirrors, proxies and server credentials of the Maven settings, `~/.m2/settings.xml` by default,
   among the `maven-metadata.xml` files cached in the local Maven repository, refreshed once a day, or installed into it.
+  A repository blocked by a mirror of the settings, like the `maven-default-http-blocker` of Maven blocks the plain `http:` ones,
+  is reported as blocked, naming the mirror, when no other repository lists a version.
+  The dependencies themselves, also in the versions looked up, are resolved by Kotlin's own resolver,
+  which applies the settings with two limitations:
+  it resolves a mirrored repository from the mirror directly, bypassing the proxy,
+  and it ignores the block of a mirror, so a dependency held only by the blocked repositories
+  fails to connect to the URL of the blocking mirror, like `http://0.0.0.0/`, instead of being reported as blocked.
   In the offline mode of the Maven settings, only the `file:` repositories are read,
   along with the `maven-metadata.xml` files already cached from the other repositories,
   and a dependency without any `maven-metadata.xml` there
