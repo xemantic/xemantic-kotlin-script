@@ -74,30 +74,40 @@ private val versionScheme: VersionScheme = GenericVersionScheme()
 /** The numeric release of a version, like the `0.8.0` of `0.8.0-0.6.x-compat`. */
 private val numericRelease = Regex("""^\d+(\.\d+)*""")
 
-/** A version, which major component is a date, like the `20040616` of commons-collections, or its `20031027.000000`. */
-private val dateStyleVersion = Regex("""^(19|20)\d{6}(\D.*)?$""")
+/**
+ * A version starting with a date, `yyyyMMdd`, or a timestamp, `yyyyMMddHHmmss`,
+ * like the `20040616` of commons-collections, its `20031027.000000`, or a `20030418083655`,
+ * optionally followed by a separator and anything, like `20040616-beta`.
+ * A plain 8-digit build number, like `20240101`, is indistinguishable from a date, so it is date-style too.
+ */
+private val dateStyleVersion = Regex("""^(19|20)\d{6}(\d{6})?(\D.*)?$""")
 
 private fun String.isPreRelease() = split(versionTokenSeparator).any { preReleaseToken.matches(it) }
 
 /**
- * The latest of the [versions] in the Maven ordering, preferring the stable ones,
- * never a `SNAPSHOT`, or `null`, if there is none.
- * A date-style version, like the `20040616` of commons-collections, which Maven orders after any release,
- * gives way to any other stable version, if there is one.
- * A stable version with a qualifier, which Maven orders after its release, like `0.8.0-0.6.x-compat` after `0.8.0`,
+ * The preference of the latest version: a stable one before a pre-release,
+ * then any other before a date-style one, then the higher in the Maven ordering.
+ */
+private val latestVersionPreference: Comparator<String> = compareByDescending<String> { it.isPreRelease() }
+    .thenByDescending { dateStyleVersion.matches(it) }
+    .thenBy { versionScheme.parseVersion(it) }
+
+/**
+ * The latest of the [versions], never a `SNAPSHOT`, or `null`, if there is none:
+ * the highest in the Maven ordering, preferring the stable ones to the pre-releases,
+ * and any other to the date-style ones, like the `20040616` of commons-collections,
+ * which Maven orders after any release.
+ * A version with a qualifier, which Maven orders after its release, like `0.8.0-0.6.x-compat` after `0.8.0`,
  * gives way to its release, if there is one.
  */
 internal fun latestMavenVersion(
     versions: Collection<String>
 ): LatestMavenVersion? {
     val candidates = versions.filterNot { it.endsWith("-SNAPSHOT", ignoreCase = true) }
-    val (preReleases, allStable) = candidates.partition { it.isPreRelease() }
-    val stable = allStable.filterNot { dateStyleVersion.matches(it) }.ifEmpty { allStable }
-    return stable.maxByOrNull { versionScheme.parseVersion(it) }?.let { highest ->
-        val release = numericRelease.find(highest)?.value
-        LatestMavenVersion(stable.firstOrNull { it == release } ?: highest, stable = true)
-    }
-        ?: preReleases.maxByOrNull { versionScheme.parseVersion(it) }?.let { LatestMavenVersion(it, stable = false) }
+    val highest = candidates.maxWithOrNull(latestVersionPreference) ?: return null
+    val release = numericRelease.find(highest)?.value
+    val latest = candidates.firstOrNull { it == release } ?: highest
+    return LatestMavenVersion(latest, stable = !latest.isPreRelease())
 }
 
 /**

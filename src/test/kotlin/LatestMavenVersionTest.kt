@@ -120,6 +120,67 @@ class LatestMavenVersionTest {
     }
 
     @Test
+    fun `should select date-style version without any other one`() {
+        // given
+        val versions = listOf(
+            "20030418.083655",
+            "20040616"
+        )
+
+        // when
+        val latest = latestMavenVersion(versions)
+
+        // then
+        assert(latest?.version == "20040616" && latest.stable)
+    }
+
+    @Test
+    fun `should recognize date-style version without separator`() {
+        // given a timestamp without a separator, which Maven orders after any release
+        val versions = listOf(
+            "3.2.2",
+            "20030418083655"
+        )
+
+        // when
+        val latest = latestMavenVersion(versions)
+
+        // then
+        assert(latest?.version == "3.2.2" && latest.stable)
+    }
+
+    @Test
+    fun `should prefer pre-release version to date-style pre-release version`() {
+        // given
+        val versions = listOf(
+            "20040616-beta",
+            "2.0-RC1"
+        )
+
+        // when
+        val latest = latestMavenVersion(versions)
+
+        // then
+        assert(latest?.version == "2.0-RC1" && !latest.stable)
+    }
+
+    @Test
+    fun `should prefer date-style stable version to pre-release version`() {
+        // given
+        val versions = listOf(
+            "20040616",
+            "2.0-RC1",
+            "20040616-beta"
+        )
+
+        // when
+        val latest = latestMavenVersion(versions)
+
+        // then
+        assert(latest?.version == "20040616" && latest.stable)
+    }
+
+    @Test
     fun `should skip pre-release versions`() {
         // given
         val versions = listOf(
