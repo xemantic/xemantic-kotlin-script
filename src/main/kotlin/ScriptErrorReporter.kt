@@ -157,7 +157,7 @@ internal class ScriptErrorReporter(
         append(prefix)
         if (throwable in reported) {
             append("[CIRCULAR REFERENCE: ")
-            appendDescription(throwable)
+            appendDescription(throwable, indent)
             append("]\n")
             return true
         }
@@ -166,7 +166,7 @@ internal class ScriptErrorReporter(
             return false
         }
         reported += throwable
-        appendDescription(throwable)
+        appendDescription(throwable, indent)
         append('\n')
         if (throwable is NoSuchMethodError && throwable.read(null) { message }?.let { mangledMethod.containsMatchIn(it) } == true) {
             append("$indent  hint: a property or a function of a value class type, like Duration, declared in an earlier snippet,")
@@ -195,8 +195,15 @@ internal class ScriptErrorReporter(
         } ?: true
     }
 
+    /**
+     * The class and the message of the [throwable], with the later lines of a multi-line message
+     * indented like the frames, by the [indent] of the throwable, so that they read as a part of the headline
+     * also within a cause or a suppressed exception, and do not break the structure of the report.
+     * The trailing line breaks of the message are dropped, and `\r\n` is normalized to `\n`.
+     */
     private fun StringBuilder.appendDescription(
-        throwable: Throwable
+        throwable: Throwable,
+        indent: String
     ) {
         append(throwable.javaClass.name.withoutSnippetClassName().replace('$', '.'))
         val message = try {
@@ -206,7 +213,13 @@ internal class ScriptErrorReporter(
         }
         message?.let {
             append(": ")
-            append(it.withoutSnippetClassName())
+            it.withoutSnippetClassName().trimEnd('\n', '\r').lines().forEachIndexed { index, line ->
+                if (index > 0) {
+                    append('\n')
+                    if (line.isNotEmpty()) append("$indent  ")
+                }
+                append(line)
+            }
         }
     }
 

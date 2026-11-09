@@ -232,6 +232,9 @@ java.lang.IllegalArgumentException: value must be positive
 
 The frames are named after the functions of the snippets, e.g. `at Checker.check(snippet1.kts:5)`,
 and repeated frames of a recursion are collapsed.
+The later lines of a multi-line exception message are indented like the frames,
+also within a `Caused by:` or a `Suppressed:` exception,
+so that they do not break the structure of the report.
 The classes declared by the snippets are named as declared, like `Color.BLUE`,
 not qualified by the generated snippet class, like `Snippet1.Color.BLUE`.
 
