@@ -23,14 +23,18 @@ import com.xemantic.kotlin.test.be
 import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
+import com.xemantic.kotlin.script.test.collectGarbageUntilCleared
 import kotlinx.coroutines.CompletableJob
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
+import java.lang.ref.WeakReference
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.Continuation
@@ -1060,6 +1064,147 @@ class ScriptSessionTest {
             be<ScriptResult.Value>()
             have(value == 42)
         }
+    }
+
+    /** See #143. */
+    @Test
+    fun `should cancel awaited block when the session is closed`() = runTest {
+        // given
+        val started = Job()
+        val stopped = Job()
+        val session = ScriptSession {
+            provide<CompletableJob>("started", started)
+            provide<CompletableJob>("stopped", stopped)
+        }
+        val execution = async(Dispatchers.Default) {
+            session.execute("""
+                await {
+                    started.complete()
+                    try {
+                        awaitCancellation()
+                    } finally {
+                        stopped.complete()
+                    }
+                }
+            """.trimIndent())
+        }
+        started.join()
+
+        // when
+        session.close()
+
+        // then
+        execution.await() should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            have("The session is closed" in message)
+        }
+        assert(stopped.isCompleted)
+    }
+
+    /** See #143. */
+    @Test
+    fun `should interrupt blocking snippet when the session is closed`() = runTest {
+        // given
+        val started = Job()
+        val session = ScriptSession {
+            provide<CompletableJob>("started", started)
+        }
+        val execution = async(Dispatchers.Default) {
+            session.execute("""
+                started.complete()
+                Thread.sleep(600_000)
+            """.trimIndent())
+        }
+        started.join()
+
+        // when
+        session.close()
+
+        // then
+        execution.await() should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            have("InterruptedException" in message)
+        }
+    }
+
+    /** The caller cannot cancel the evaluation, but closing the session can, see #135 and #143. */
+    @Test
+    fun `should cancel awaited block of caller without a Job when the session is closed`() {
+        // given
+        val started = Job()
+        val stopped = Job()
+        val session = ScriptSession {
+            provide<CompletableJob>("started", started)
+            provide<CompletableJob>("stopped", stopped)
+        }
+        val execution = CompletableFuture<Result<ScriptResult>>()
+        suspend {
+            session.execute("""
+                await {
+                    started.complete()
+                    try {
+                        awaitCancellation()
+                    } finally {
+                        stopped.complete()
+                    }
+                }
+            """.trimIndent())
+        }.startCoroutine(Continuation(EmptyCoroutineContext) {
+            execution.complete(it)
+        })
+        runBlocking { started.join() }
+
+        // when
+        session.close()
+
+        // then
+        // bounded, so a hang fails the test instead of hanging the build
+        execution.get(1, TimeUnit.MINUTES).getOrThrow() should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+        }
+        assert(stopped.isCompleted)
+    }
+
+    /** See #143. */
+    @Test
+    fun `should release session closed while awaiting`() {
+        // given
+        val session = sessionClosedWhileAwaiting()
+
+        // when
+        collectGarbageUntilCleared(session)
+
+        // then
+        assert(session.get() == null)
+    }
+
+    /**
+     * The weak reference to a session closed while its snippet awaits forever,
+     * created outside of `runTest`, as a frame of its coroutine can keep a stale reference to the session.
+     */
+    private fun sessionClosedWhileAwaiting(): WeakReference<Any> {
+        val started = Job()
+        val session = ScriptSession {
+            provide<CompletableJob>("started", started)
+        }
+        val execution = CompletableFuture.supplyAsync {
+            runBlocking {
+                session.execute("""
+                    await {
+                        started.complete()
+                        awaitCancellation()
+                    }
+                """.trimIndent())
+            }
+        }
+        runBlocking { started.join() }
+        session.close()
+        // bounded, so a hang fails the test instead of hanging the build
+        execution.get(1, TimeUnit.MINUTES)
+        return WeakReference(session)
     }
 
     @Test

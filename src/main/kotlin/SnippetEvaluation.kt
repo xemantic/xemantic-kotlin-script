@@ -19,6 +19,7 @@
 
 package com.xemantic.kotlin.script
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -26,13 +27,19 @@ import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.launch
 
 /**
- * The evaluation of a snippet on the current thread, interrupting it when the [job] of the caller is cancelled,
- * also when it already is, so a blocking call of the snippet fails immediately,
+ * The evaluation of a snippet on the current thread, cancelled when the job of its caller is cancelled,
+ * or the session of the [sessionJob] is closed.
+ *
+ * The cancellation of the [job] interrupts the thread, also when it is cancelled already, so a blocking call of the snippet fails immediately,
  * unless it is [uninterruptible], like waiting in [ScriptScope.await], which the cancellation of the job reaches anyway.
  */
 internal class SnippetEvaluation(
-    val job: Job
+    callerJob: Job,
+    sessionJob: Job
 ) {
+
+    /** The job of the evaluation, a child of the job of the caller, so the cancellation of either does not cancel the other. */
+    val job = Job(callerJob)
 
     private val thread = Thread.currentThread()
 
@@ -45,9 +52,17 @@ internal class SnippetEvaluation(
         awaitCancellation()
     }
 
+    // completed by closing the session, also when it is closed already, and by the end of the evaluation
+    private val sessionWatcher = CoroutineScope(sessionJob + Dispatchers.Unconfined).launch {
+        awaitCancellation()
+    }
+
     init {
         watcher.invokeOnCompletion {
             interruptIfCancelled()
+        }
+        sessionWatcher.invokeOnCompletion {
+            job.cancel(CancellationException("The session is closed"))
         }
     }
 
@@ -77,6 +92,8 @@ internal class SnippetEvaluation(
         synchronized(this) {
             running = false
         }
+        sessionWatcher.cancel()
+        job.cancel()
         watcher.cancel()
         Thread.interrupted()
     }
