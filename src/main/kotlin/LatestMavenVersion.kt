@@ -119,20 +119,32 @@ internal fun latestMavenVersion(
  * with the local repository, the mirrors, the proxies and the server credentials of the Maven [settings].
  * It also honors their offline mode and their blocked mirrors, which `MavenDependenciesResolver` does not,
  * and reaches a mirror through the proxy, which `MavenDependenciesResolver` bypasses, see [withSettings].
+ * Closing it shuts down its repository system, see [close].
  */
 internal class MavenVersionLookup(
     settingsFactory: () -> Settings = ::createMavenSettings
-) {
+) : AutoCloseable {
 
     private val settings by lazy(settingsFactory)
 
-    private val system: RepositorySystem by lazy {
-        @Suppress("DEPRECATION")
-        MavenRepositorySystemUtils.newServiceLocator().apply {
+    /** The repository system, created by the first lookup, so a lookup never used creates none to shut down. */
+    private var system: RepositorySystem? = null
+
+    private var closed = false
+
+    /**
+     * The repository system, created by the first lookup.
+     *
+     * @throws IllegalStateException if the lookup is closed.
+     */
+    @Synchronized
+    private fun system(): RepositorySystem {
+        check(!closed) { "The version lookup is closed" }
+        return system ?: @Suppress("DEPRECATION") MavenRepositorySystemUtils.newServiceLocator().apply {
             addService(RepositoryConnectorFactory::class.java, BasicRepositoryConnectorFactory::class.java)
             addService(TransporterFactory::class.java, HttpTransporterFactory::class.java)
             addService(TransporterFactory::class.java, FileTransporterFactory::class.java)
-        }.repositorySystem()
+        }.repositorySystem().also { system = it }
     }
 
     /** The active proxy of the Maven settings, if any. */
@@ -188,10 +200,12 @@ internal class MavenVersionLookup(
     /**
      * A new session, for each lookup, like `MavenDependenciesResolver` does for each resolution,
      * as a session remembers a failure, or a missing `maven-metadata.xml`, not to look it up again.
+     * It has no `RepositoryCache`, so the HTTP transport of each repository keeps its connection pool to itself,
+     * and shuts it down once the repository is read, instead of keeping it in the cache of the session, left to the garbage collector.
      */
-    private fun newSession(): RepositorySystemSession = MavenRepositorySystemUtils.newSession().apply {
+    private fun RepositorySystem.newSession(): RepositorySystemSession = MavenRepositorySystemUtils.newSession().apply {
         val localRepository = LocalRepository(File(settings.localRepository))
-        localRepositoryManager = system.newLocalRepositoryManager(this, localRepository)
+        localRepositoryManager = newLocalRepositoryManager(this, localRepository)
         isOffline = settings.isOffline
         // in the offline mode, the file repositories are still read, like by Maven itself
         setConfigProperty("aether.offline.protocols", "file")
@@ -222,6 +236,7 @@ internal class MavenVersionLookup(
      * @throws Exception if there is no version, and some repository cannot be read, other than by the `401` not reported,
      *   reporting the repositories blocked by a mirror of the Maven settings before any other failure,
      *   see [BlockedRepositoryException].
+     * @throws IllegalStateException if the lookup is closed.
      */
     fun latestVersion(
         groupId: String,
@@ -229,6 +244,7 @@ internal class MavenVersionLookup(
         repositories: List<RemoteRepository>,
         superseded: (RemoteRepository) -> Unit = {}
     ): LatestMavenVersion? {
+        val system = system()
         // each declared repository with the settings applied
         val looked = repositories.mapNotNull { repository -> repository.withSettings()?.let { repository to it } }
         val request = VersionRangeRequest(
@@ -237,7 +253,7 @@ internal class MavenVersionLookup(
             looked.map { it.second },
             null
         )
-        val result = system.resolveVersionRange(newSession(), request)
+        val result = system.resolveVersionRange(system.newSession(), request)
         val failures = supersede(looked, result.exceptions)
         failures.superseded.forEach(superseded)
         val versions = result.versions.map { it.toString() }.ifEmpty {
@@ -288,6 +304,20 @@ internal class MavenVersionLookup(
     }
 
     private class LookupFailures(val reported: List<Exception>, val superseded: List<RemoteRepository>)
+
+    /**
+     * Shuts down the repository system, if any lookup created it, releasing its resources, like the named locks,
+     * and refuses the next lookups.
+     * Closing a closed lookup has no effect.
+     * A lookup in progress would complete with the repository system shut down, which Maven Resolver 1.9 still serves,
+     * but none is, as the [SnippetDependencyResolver] is closed on the thread of the session, after its last compilation.
+     */
+    @Synchronized
+    override fun close() {
+        if (closed) return
+        closed = true
+        system?.shutdown()
+    }
 
     /** The versions of the artifact in the local repository, also these resolved without its `maven-metadata.xml`. */
     private fun localVersions(groupId: String, artifactId: String): List<String> =

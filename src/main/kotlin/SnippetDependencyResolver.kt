@@ -282,7 +282,11 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
     }
 
     override fun close() {
-        classLoader.close()
+        try {
+            versionLookup.close()
+        } finally {
+            classLoader.close()
+        }
     }
 
     class DependencyClassLoader(parent: ClassLoader) : URLClassLoader(emptyArray(), parent) {
