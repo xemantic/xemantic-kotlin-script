@@ -70,9 +70,13 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
         ).also { result ->
             if (result.valueOrNull() == true) {
                 remoteRepository(repositoryCoordinates, options)?.let { repository ->
-                    // a repository declared again by a later snippet is looked up once
-                    if (repositories.none { (_, it) -> it.id == repository.id && it.url == repository.url }) {
+                    // a repository declared again by a later snippet is looked up once, with the options declared last,
+                    // like the corrected credentials, while the mavenResolver keeps every declaration
+                    val index = repositories.indexOfFirst { (_, it) -> it.id == repository.id && it.url == repository.url }
+                    if (index < 0) {
                         repositories += repositoryCoordinates.string to repository
+                    } else {
+                        repositories[index] = repositoryCoordinates.string to repository
                     }
                 }
             }
@@ -80,8 +84,8 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
     }
 
     /**
-     * The repositories declared by the snippets so far, by their coordinates, in the order of their declaration,
-     * as added to the [mavenResolver], with their options, like the credentials.
+     * The repositories declared by the snippets so far, by their coordinates, in the order of their first declaration,
+     * as added to the [mavenResolver], with the options of their last declaration, like the credentials.
      */
     private val repositories = mutableListOf<Pair<String, RemoteRepository>>()
 

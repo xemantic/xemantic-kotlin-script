@@ -271,6 +271,7 @@ class MavenDependenciesTest {
 
     @Test
     fun `should resolve latest version of dependency declared without version with repository credentials`() = runTest {
+        // given
         MavenRepositoryServer(username = "alice", password = "secret").use { server ->
             // when
             val result = session.execute("""
@@ -312,7 +313,34 @@ class MavenDependenciesTest {
     }
 
     @Test
+    fun `should look up dependency declared without version with corrected credentials of repository declared again`() = runTest {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // given
+            val wrong = session.execute("""
+                @file:Repository("${server.url}", options = ["username=alice", "password=wrong"])
+                @file:DependsOn("com.xemantic.fixture:greeter")
+                42
+            """.trimIndent())
+            assert(wrong is ScriptResult.Error)
+
+            // when
+            val result = session.execute("""
+                @file:Repository("${server.url}", options = ["username=alice", "password=secret"])
+                @file:DependsOn("com.xemantic.fixture:greeter")
+                fixture.greeter.Greeter.greet("Alice")
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == "Hi Alice")
+            }
+        }
+    }
+
+    @Test
     fun `should report unresolved dependency declared without version in repository without its credentials`() = runTest {
+        // given
         MavenRepositoryServer(username = "alice", password = "secret").use { server ->
             // when
             val result = session.execute("""
