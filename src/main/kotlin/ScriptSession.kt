@@ -23,12 +23,12 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.job
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -91,6 +91,7 @@ public interface ScriptSession : AutoCloseable {
      * When the caller is cancelled while the snippet is evaluated, the thread of the session is interrupted,
      * and the coroutines of [ScriptScope.await] are cancelled,
      * while a snippet which neither blocks interruptibly, nor awaits, runs to its end.
+     * A caller without a [Job] in its context, like `suspend fun main`, cannot cancel the evaluation.
      * A cancellation while the snippet is compiled waits for the compilation to end,
      * and it is evaluated then, as the session would evaluate it before the next one anyway.
      *
@@ -275,7 +276,8 @@ internal class DefaultScriptSession(
         snippet: String
     ): ScriptResult = mutex.withLock {
         check(!closed) { "The session is closed" }
-        val callerJob = currentCoroutineContext().job
+        // a caller without a job, like `suspend fun main`, cannot cancel the evaluation
+        val callerJob = currentCoroutineContext()[Job] ?: Job()
         // a cancelled compilation would leave the compiled snippet to be evaluated before the next one
         val result = withContext(sessionDispatcher + NonCancellable) {
             val repl = repl ?: Repl().also {
