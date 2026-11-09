@@ -830,6 +830,29 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should hint at uninitialized property of snippet which threw fatal error`() = runTest {
+        // given
+        // a regression lets the OutOfMemoryError escape, which would abort the Gradle test executor
+        val failure = runCatching { session.execute("val s: String = throw OutOfMemoryError(\"fake\")") }
+
+        // when
+        val result = session.execute("s.length")
+
+        // then
+        assert(failure.exceptionOrNull() is OutOfMemoryError)
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.NullPointerException: Cannot invoke "String.length()" because the return value of "getS()" is null
+                  hint: 's' is declared in snippet1.kts, which failed in the evaluation, so it might be left uninitialized, null despite its type - declare it again, together with the declarations reading it, as they keep reading the uninitialized one.
+                  at <snippet body>(snippet2.kts:1)
+                  | s.length
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should hint at uninitialized property of getter of custom JVM name`() = runTest {
         // given
         session.execute("@get:JvmName(\"text\") val s: String = error(\"boom\")")
@@ -872,6 +895,76 @@ class ScriptSessionTest {
                   | fun greet() = name.uppercase()
                   at <snippet body>(snippet2.kts:1)
                   | greet()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint at uninitialized properties in the error of the snippet which failed in the evaluation`() = runTest {
+        // when
+        val result = session.execute("""
+            class Foo
+            val a: String = "a"
+            val b: String = error("boom")
+            val c: Foo = Foo()
+            val d: String by lazy { "d" }
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IllegalStateException: boom
+                  hint: 'b', 'c' and 'd' are left uninitialized, null despite their type, as the snippet failed before initializing them, while they stay declared - declare them again, together with the declarations reading them, as they keep reading the uninitialized ones.
+                  at <snippet body>(snippet1.kts:3)
+                  | val b: String = error("boom")
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint at assigning uninitialized var in the error of the snippet which failed in the evaluation`() = runTest {
+        // when
+        val result = session.execute("""
+            var a: String = error("boom")
+            val b: String = "b"
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IllegalStateException: boom
+                  hint: 'b' is left uninitialized, null despite its type, as the snippet failed before initializing it, while it stays declared - declare it again, together with the declarations reading it, as they keep reading the uninitialized one.
+                  hint: 'a' is left uninitialized, null despite its type, as the snippet failed before initializing it, while it stays declared - assign it, instead of declaring it again, as the declarations reading it keep reading the same one.
+                  at <snippet body>(snippet1.kts:1)
+                  | var a: String = error("boom")
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not hint at properties which can be null or zero in the error of the snippet which failed in the evaluation`() = runTest {
+        // when
+        val result = session.execute("""
+            val p = System.getProperty("no.such.property")
+            val n: String? = "n"
+            val i: Int = 1
+            lateinit var l: String
+            val t: Int get() = i
+            error("boom")
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IllegalStateException: boom
+                  at <snippet body>(snippet1.kts:6)
+                  | error("boom")
             """.trimIndent()
         }
     }

@@ -523,12 +523,11 @@ internal class DefaultScriptSession(
             scriptClass.declaredClasses.mapTo(snippetClassNames) { it.simpleName }
             inlinedFrames.keep(scriptClass)
         }
-        return reporter.scriptResult(result, reports, compilation.result.reports, compilation.dependencies).also {
-            // after reporting it, as the snippet itself did not read them after it failed
-            if (result is ResultValue.Error) {
-                result.scriptClass?.java?.let { uninitializedProperties.keep(it, name) }
-            }
-        }
+        // before reporting it, as the report throws a fatal error, while the declarations of the snippet stay in the history
+        val uninitialized = (result as? ResultValue.Error)?.scriptClass?.java?.let {
+            uninitializedProperties.keep(it, name)
+        } ?: emptyList()
+        return reporter.scriptResult(result, reports, compilation.result.reports, compilation.dependencies, uninitialized)
     }
 
     /**
