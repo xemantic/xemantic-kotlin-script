@@ -28,6 +28,7 @@ import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
 import java.net.URLClassLoader
+import kotlin.reflect.KClassifier
 import kotlin.reflect.KType
 import kotlin.reflect.KTypeProjection
 import kotlin.reflect.full.createType
@@ -816,6 +817,73 @@ class ScriptPropertiesTest {
         assert(property.type.toSource() == "kotlin.collections.List<kotlin.String>")
     }
 
+    @Test
+    fun `should reject property of hand-written type without class`() {
+        // given
+        val classless = handWrittenType(classifier = null, name = "Classless")
+        val types = listOf(
+            classless,
+            handWrittenType(List::class, listOf(KTypeProjection.covariant(classless)), "kotlin.collections.List<out Classless>")
+        )
+
+        // when
+        val exceptions = types.map { type ->
+            assertFailsWith<IllegalArgumentException> {
+                ScriptProperty("foo", type, "bar")
+            }
+        }
+
+        // then
+        assert(exceptions.map { it.message } == listOf(
+            "Property 'foo' is of type Classless, which is not of a class - provide it as a class type, e.g. with typeOf",
+            "Property 'foo' is of type Classless, which is not of a class - provide it as a class type, e.g. with typeOf"
+        ))
+    }
+
+    @Test
+    fun `should reject property of hand-written type with type arguments not matching its class`() {
+        // given
+        val int = KTypeProjection.invariant(typeOf<Int>())
+        val inner = handWrittenType(Generic.Inner::class, listOf(int), "Generic.Inner<kotlin.Int>")
+        val types = listOf(
+            inner,
+            handWrittenType(List::class, emptyList(), "kotlin.collections.List"),
+            handWrittenType(String::class, listOf(int), "kotlin.String<kotlin.Int>"),
+            handWrittenType(List::class, listOf(KTypeProjection.invariant(inner)), "kotlin.collections.List<Generic.Inner<kotlin.Int>>")
+        )
+
+        // when
+        val exceptions = types.map { type ->
+            assertFailsWith<IllegalArgumentException> {
+                ScriptProperty("foo", type, null)
+            }
+        }
+
+        // then
+        assert(exceptions.map { it.message } == listOf(
+            "Property 'foo' is of type Generic.Inner<kotlin.Int>, which has 1 type arguments, while com.xemantic.kotlin.script.Generic.Inner takes 2 - provide it as a complete type, e.g. with typeOf",
+            "Property 'foo' is of type kotlin.collections.List, which has 0 type arguments, while kotlin.collections.List takes 1 - provide it as a complete type, e.g. with typeOf",
+            "Property 'foo' is of type kotlin.String<kotlin.Int>, which has 1 type arguments, while kotlin.String takes 0 - provide it as a complete type, e.g. with typeOf",
+            "Property 'foo' is of type Generic.Inner<kotlin.Int>, which has 1 type arguments, while com.xemantic.kotlin.script.Generic.Inner takes 2 - provide it as a complete type, e.g. with typeOf"
+        ))
+    }
+
+    @Test
+    fun `should accept property of hand-written type of inner class with type arguments of its outer classes`() {
+        // given
+        val type = handWrittenType(
+            Generic.Inner.Deep::class,
+            listOf(typeOf<Boolean>(), typeOf<Int>(), typeOf<String>()).map { KTypeProjection.invariant(it) },
+            "Generic<kotlin.String>.Inner<kotlin.Int>.Deep<kotlin.Boolean>"
+        )
+
+        // when
+        val property = ScriptProperty("deep", type, null)
+
+        // then
+        assert(property.type.toSource() == "com.xemantic.kotlin.script.Generic<kotlin.String>.Inner<kotlin.Int>.Deep<kotlin.Boolean>?")
+    }
+
     /** `MutableList::class` is `List::class`, so only [typeOf] and the types of the members keep the mutability. */
     @Test
     fun `should render type created from mutable collection class as read-only`() {
@@ -854,4 +922,17 @@ class ScriptPropertiesTest {
         assert(exception.message == "Property 'foo' is of platform type $type, which the snippets cannot refer to - provide it as a Kotlin type, e.g. with typeOf")
     }
 
+}
+
+/** A nullable [KType] implemented by hand, seen by the members of the interface only. */
+private fun handWrittenType(
+    classifier: KClassifier?,
+    arguments: List<KTypeProjection> = emptyList(),
+    name: String
+): KType = object : KType {
+    override val classifier = classifier
+    override val arguments = arguments
+    override val isMarkedNullable = true
+    override val annotations = emptyList<Annotation>()
+    override fun toString() = name
 }

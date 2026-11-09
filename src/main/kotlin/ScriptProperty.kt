@@ -79,6 +79,19 @@ public class ScriptProperty<T>(
                 "Property '$name' is of type ${it.name}, which is a type parameter - provide it as a concrete type"
             )
         }
+        // a KType implemented by hand could not be rendered in the source of the session
+        type.nonClassType()?.let {
+            throw IllegalArgumentException(
+                "Property '$name' is of type $it, which is not of a class - provide it as a class type, e.g. with typeOf"
+            )
+        }
+        type.mismatchedArgumentsType()?.let {
+            val kClass = it.classifier as KClass<*>
+            throw IllegalArgumentException(
+                "Property '$name' is of type $it, which has ${it.arguments.size} type arguments, " +
+                        "while ${kClass.qualifiedName} takes ${kClass.typeParameterCount()} - provide it as a complete type, e.g. with typeOf"
+            )
+        }
         // rendered in the source of the session, where it would not compile, like `(Mutable)List<String!>!`
         require('!' !in type.toString()) {
             "Property '$name' is of platform type $type, which the snippets cannot refer to - provide it as a Kotlin type, e.g. with typeOf"
@@ -93,7 +106,7 @@ public class ScriptProperty<T>(
                 "Property '$name' is null, while its type is not nullable: $type"
             }
         } else {
-            require((type.classifier as? KClass<*>)?.isInstance(value) ?: true) {
+            require((type.classifier as KClass<*>).isInstance(value)) {
                 "Property '$name' of type $type has a value of class ${value::class.java.name}"
             }
             // a read-only Kotlin collection, like emptyList(), is a java.util.List as well
@@ -259,6 +272,22 @@ private val hardKeywords = KtTokens.KEYWORDS.types.mapTo(HashSet()) { (it as KtK
 /** The first type parameter of this type, or of its type arguments, like `T` of a generic function. */
 private fun KType.typeParameter(): KTypeParameter? =
     classifier as? KTypeParameter ?: arguments.firstNotNullOfOrNull { it.type?.typeParameter() }
+
+/** The first of this type, or of its type arguments, whose classifier is not a class, like the one of a [KType] implemented by hand. */
+private fun KType.nonClassType(): KType? =
+    takeUnless { classifier is KClass<*> } ?: arguments.firstNotNullOfOrNull { it.type?.nonClassType() }
+
+/**
+ * The first of this type, or of its type arguments, whose number of type arguments differs from the type parameters of its class,
+ * like the one of a [KType] implemented by hand, provided all their classifiers are classes.
+ */
+private fun KType.mismatchedArgumentsType(): KType? =
+    takeUnless { arguments.size == (classifier as KClass<*>).typeParameterCount() }
+        ?: arguments.firstNotNullOfOrNull { it.type?.mismatchedArgumentsType() }
+
+/** The number of the type parameters of this class, and of its outer classes, if it is an inner class, as the arguments of its type. */
+private fun KClass<*>.typeParameterCount(): Int =
+    typeParameters.size + if (isInner) java.declaringClass?.kotlin?.typeParameterCount() ?: 0 else 0
 
 /** The first class of this type, or of its type arguments, which the snippets cannot refer to. */
 private fun KType.inaccessibleClass(): Class<*>? =
