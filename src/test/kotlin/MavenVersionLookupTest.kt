@@ -174,6 +174,35 @@ class MavenVersionLookupTest {
     }
 
     @Test
+    fun `should fail to look up latest version in repository blocked by mirror in settings`() {
+        // given the default mirror of Maven, which blocks the plain HTTP repositories
+        val lookup = MavenVersionLookup {
+            settings {
+                addMirror(Mirror().apply {
+                    id = "maven-default-http-blocker"
+                    mirrorOf = "external:http:*"
+                    @Suppress("HttpUrlsUsage")
+                    url = "http://0.0.0.0/"
+                    isBlocked = true
+                })
+            }
+        }
+        @Suppress("HttpUrlsUsage")
+        val repository = remoteRepository("http://repo.example.com/")
+
+        // when
+        val result = runCatching {
+            lookup.latestVersion("com.xemantic.fixture", "greeter", listOf(repository))
+        }
+
+        // then
+        val message = result.exceptionOrNull()?.message
+        assert(
+            message == "Repository http://repo.example.com/ is blocked by the mirror 'maven-default-http-blocker' of the Maven settings"
+        )
+    }
+
+    @Test
     fun `should look up latest version in local repository in offline mode`() {
         // given
         localRepository.artifact("com/xemantic/fixture/greeter", "1.0", "1.10", "2.0-RC1")
