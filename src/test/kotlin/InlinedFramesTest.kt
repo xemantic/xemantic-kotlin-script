@@ -234,6 +234,96 @@ class InlinedFramesTest {
     }
 
     @Test
+    fun `should omit intermediate frame of inline function calling the same inline function twice`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            inline fun inner(x: Int) { if (x == 2) throw IllegalStateException("x=" + x) }
+            inline fun outer() {
+                inner(1)
+                inner(2)
+            }
+            fun frame(): StackTraceElement = try { outer(); error("not thrown") } catch (e: IllegalStateException) { e.stackTrace[0] }
+        """.trimIndent())
+
+        // then
+        // both copies of inner share the line of the frame, so the line calling the one throwing is unknown
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "inner", "snippet1.kts", 1),
+                StackTraceElement("Snippet1", "frame", "snippet1.kts", 6)
+            )
+        )
+    }
+
+    @Test
+    fun `should omit intermediate frame of inline function called also directly on the same line`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            inline fun inner(x: Int) { if (x == 2) throw IllegalStateException("x=" + x) }
+            inline fun outer() { inner(1) }
+            fun frame(): StackTraceElement = try { outer(); inner(2); error("not thrown") } catch (e: IllegalStateException) { e.stackTrace[0] }
+        """.trimIndent())
+
+        // then
+        // the copy of inner within outer shares the line of the frame, so it is unknown whether outer called the one throwing
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "inner", "snippet1.kts", 1),
+                StackTraceElement("Snippet1", "frame", "snippet1.kts", 3)
+            )
+        )
+    }
+
+    @Test
+    fun `should resolve call site of inline function called on a line without a line number of its own`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            inline fun boom(): Nothing = throw IllegalStateException("boom")
+            fun frame(): StackTraceElement = try {
+                val map = mapOf<Int, Int>()
+                val value = map[1]
+                    ?: boom()
+                error("not thrown " + value)
+            } catch (e: IllegalStateException) {
+                e.stackTrace[0]
+            }
+        """.trimIndent())
+
+        // then
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "boom", "snippet1.kts", 1),
+                StackTraceElement("Snippet1", "frame", "snippet1.kts", 5)
+            )
+        )
+    }
+
+    @Test
+    fun `should resolve intermediate frame of nested inline function called in finally block`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            inline fun inner(): Nothing = throw IllegalStateException("inner")
+            inline fun outer() {
+                try {
+                    println("try")
+                } finally {
+                    inner()
+                }
+            }
+            fun frame(): StackTraceElement = try { outer(); error("not thrown") } catch (e: IllegalStateException) { e.stackTrace[0] }
+        """.trimIndent())
+
+        // then
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "inner", "snippet1.kts", 1),
+                StackTraceElement("Snippet1", "outer", "snippet1.kts", 6),
+                StackTraceElement("Snippet1", "frame", "snippet1.kts", 9)
+            )
+        )
+    }
+
+    @Test
     fun `should not resolve frame of a line within the snippet without reading its class`() = runTest {
         // given
         execute(snippet)

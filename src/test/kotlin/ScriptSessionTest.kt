@@ -1571,6 +1571,33 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should omit frame of inline function calling the same inline function twice`() = runTest {
+        // when
+        val result = session.execute("""
+            inline fun inner(x: Int) { if (x == 2) throw IllegalStateException("x=" + x) }
+            inline fun outer() {
+                inner(1)
+                inner(2)
+            }
+            outer()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            // both copies of inner share the lines, so the one throwing is unknown, and outer is omitted rather than reported at a wrong line
+            message.substringBefore("\n\n") sameAs """
+                java.lang.IllegalStateException: x=2
+                  at inner(snippet1.kts:1)
+                  | inline fun inner(x: Int) { if (x == 2) throw IllegalStateException("x=" + x) }
+                  at <snippet body>(snippet1.kts:6)
+                  | outer()
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should report lines of three levels of nested inline functions declared in the snippet`() = runTest {
         // when
         val result = session.execute("""

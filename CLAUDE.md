@@ -97,6 +97,9 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   which the compiler may give to the initialization of an inline marker variable (`ICONST_0; ISTORE`), so it cannot be the line of a frame throwing.
 - The same line may be inlined in several scopes, like the line of a `forEach { }` call in an inline function
   and of its lambda body on the same line — the first scope in the bytecode names the function, so it is ambiguous by design.
+- The copies of an inline function called twice from the same outermost call site share their synthetic lines (one SMAP range),
+  and their marker variables share the name and the slot — so never merge the ranges of a marker by name and slot,
+  and never pick the first line entry as the one throwing, see `should omit intermediate frame of inline function calling the same inline function twice`.
 
 ## Anti-patterns to avoid
 
