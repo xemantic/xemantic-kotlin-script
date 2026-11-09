@@ -20,6 +20,7 @@ package com.xemantic.kotlin.script
 
 import io.github.oshai.kotlinlogging.KotlinLogging
 import java.lang.reflect.Modifier
+import kotlin.reflect.KMutableProperty
 import kotlin.reflect.KProperty1
 import kotlin.reflect.full.declaredMemberProperties
 import kotlin.reflect.full.isSubtypeOf
@@ -50,12 +51,14 @@ private val nullType = typeOf<Nothing?>()
  *
  * @property className the name of the class of the [snippet], like `Snippet3`.
  * @property getter the name of the getter of the property, like `getS`, if it is declared.
+ * @property mutable whether it is a `var`, which can be assigned, instead of declaring it again.
  */
 internal class UninitializedProperty(
     val name: String,
     val snippet: String,
     val className: String,
-    val getter: String?
+    val getter: String?,
+    val mutable: Boolean
 ) {
 
     /** Whether this [frame] is of the [getter] of this property, reading the delegate of a delegated one. */
@@ -118,7 +121,7 @@ internal class UninitializedProperties {
         if (!delegated && nullType.isSubtypeOf(property.returnType)) return null
         if (!field.trySetAccessible() || field.get(null) != null) return null
         val getter = property.javaGetter?.name
-        val uninitialized = UninitializedProperty(property.name, snippet, scriptClass.name, getter)
+        val uninitialized = UninitializedProperty(property.name, snippet, scriptClass.name, getter, property is KMutableProperty<*>)
         byMember["${scriptClass.name}.${field.name}"] = uninitialized
         if (getter != null) {
             if (delegated) {
@@ -152,3 +155,25 @@ internal class UninitializedProperties {
 
 }
 
+/**
+ * The name of the Kotlin property of the JVM [accessor] of this name, like `timeout` of `getTimeout`, or of `setTimeout`,
+ * or the name itself, if it is not an accessor, like `greet`, or a getter named like its property, like `isOk`.
+ *
+ * The compiler capitalizes only an ASCII first letter of the property, like `getä` of `ä`,
+ * so a `get` or `set` followed by an ASCII lowercase letter, like `getter`, is not an accessor,
+ * while a name starting with consecutive uppercase letters, like `getURL`, is kept, like `URL`.
+ */
+internal fun propertyName(
+    accessor: String
+): String = if (
+    accessor.length > 3
+    && (accessor.startsWith("get") || accessor.startsWith("set"))
+    && accessor[3] !in 'a'..'z'
+) {
+    accessor.substring(3).let { name ->
+        if (name.length > 1 && name[1].isUpperCase()) name
+        else name.replaceFirstChar { if (it in 'A'..'Z') it.lowercaseChar() else it }
+    }
+} else {
+    accessor
+}

@@ -743,6 +743,93 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should name function reading uninitialized property in lambda`() = runTest {
+        // given
+        session.execute("""
+            val name: String = error("boom")
+            fun greet() = lazy { name.uppercase() }.value
+        """.trimIndent())
+
+        // when
+        val result = session.execute("greet()")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.NullPointerException: Cannot invoke "String.toUpperCase(java.util.Locale)" because "name" is null
+                  hint: 'name' is declared in snippet1.kts, which failed in the evaluation, so it might be left uninitialized, null despite its type - declare it again, together with the declarations reading it, like 'greet' of snippet1.kts, as they keep reading the uninitialized one.
+                  at <lambda>(snippet1.kts:2)
+                  | fun greet() = lazy { name.uppercase() }.value
+                  at greet(snippet1.kts:2)
+                  | fun greet() = lazy { name.uppercase() }.value
+                  at <snippet body>(snippet2.kts:1)
+                  | greet()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should name declarations calling the one reading uninitialized property`() = runTest {
+        // given
+        session.execute("""
+            val name: String = error("boom")
+            fun greet() = "Hello, ${'$'}{name.uppercase()}"
+        """.trimIndent())
+        session.execute("fun wrapper() = greet()")
+        session.execute("""
+            val name = "World"
+            fun greet() = "Hello, ${'$'}{name.uppercase()}"
+        """.trimIndent())
+
+        // when
+        val result = session.execute("wrapper()")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.NullPointerException: Cannot invoke "String.toUpperCase(java.util.Locale)" because "name" is null
+                  hint: 'name' is declared in snippet1.kts, which failed in the evaluation, so it might be left uninitialized, null despite its type - declare it again, together with the declarations reading it, like 'greet' of snippet1.kts, and the ones calling them, like 'wrapper' of snippet2.kts, as they keep reading the uninitialized one.
+                  at greet(snippet1.kts:2)
+                  | fun greet() = "Hello, ${'$'}{name.uppercase()}"
+                  at wrapper(snippet2.kts:1)
+                  | fun wrapper() = greet()
+                  at <snippet body>(snippet4.kts:1)
+                  | wrapper()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should name property of custom getter reading uninitialized property`() = runTest {
+        // given
+        session.execute("val name: String = error(\"boom\")")
+
+        // when
+        val result = session.execute("""
+            val t: Int get() = name.length
+            t
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.NullPointerException: Cannot invoke "String.length()" because the return value of "getName()" is null
+                  hint: 'name' is declared in snippet1.kts, which failed in the evaluation, so it might be left uninitialized, null despite its type - declare it again, together with the declarations reading it, like 't' of snippet2.kts, as they keep reading the uninitialized one.
+                  at getT(snippet2.kts:1)
+                  | val t: Int get() = name.length
+                  at <snippet body>(snippet2.kts:2)
+                  | t
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should hint at uninitialized property of getter of custom JVM name`() = runTest {
         // given
         session.execute("@get:JvmName(\"text\") val s: String = error(\"boom\")")
@@ -759,6 +846,32 @@ class ScriptSessionTest {
                   hint: 's' is declared in snippet1.kts, which failed in the evaluation, so it might be left uninitialized, null despite its type - declare it again, together with the declarations reading it, as they keep reading the uninitialized one.
                   at <snippet body>(snippet2.kts:1)
                   | s.length
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint at assigning uninitialized var of snippet which failed in the evaluation`() = runTest {
+        // given
+        session.execute("""
+            var name: String = error("boom")
+            fun greet() = name.uppercase()
+        """.trimIndent())
+
+        // when
+        val result = session.execute("greet()")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.NullPointerException: Cannot invoke "String.toUpperCase(java.util.Locale)" because "name" is null
+                  hint: 'name' is declared in snippet1.kts, which failed in the evaluation, so it might be left uninitialized, null despite its type - assign it, instead of declaring it again, as the declarations reading it, like 'greet' of snippet1.kts, keep reading the same one.
+                  at greet(snippet1.kts:2)
+                  | fun greet() = name.uppercase()
+                  at <snippet body>(snippet2.kts:1)
+                  | greet()
             """.trimIndent()
         }
     }

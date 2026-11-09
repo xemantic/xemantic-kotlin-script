@@ -177,13 +177,7 @@ internal class ScriptErrorReporter(
         val stackTrace = throwable.read(emptyList()) { stackTrace.filterNotNull() }
         if (throwable is NullPointerException) {
             uninitializedProperties.readBy(throwable, stackTrace)?.let { property ->
-                append("$indent  hint: '${property.name}' is declared in ${property.snippet}, which failed in the evaluation,")
-                append(" so it might be left uninitialized, null despite its type")
-                append(" - declare it again, together with the declarations reading it,")
-                stackTrace.firstOrNull { it.fileName in snippets && !property.isGetter(it) }?.let { frame ->
-                    frame.declarationName()?.let { append(" like '$it' of ${frame.fileName},") }
-                }
-                append(" as they keep reading the uninitialized one.\n")
+                appendUninitializedReadHint(property, stackTrace, indent)
             }
         }
         appendFrames(stackTrace, indent)
@@ -194,6 +188,40 @@ internal class ScriptErrorReporter(
             appendThrowable(it, "${indent}Caused by: ", indent, reported)
         } ?: true
     }
+
+    /**
+     * The hint at the [property] of an earlier snippet, read as `null` by the exception thrown at the [stackTrace],
+     * naming the declaration reading it, the first snippet frame of a declaration, like `greet`, so not a lambda, or the body of a snippet,
+     * and the declarations calling it, which keep calling the one reading the uninitialized property, even after redeclaring both,
+     * while a `var` is assigned instead, which all of them see.
+     */
+    private fun StringBuilder.appendUninitializedReadHint(
+        property: UninitializedProperty,
+        stackTrace: List<StackTraceElement>,
+        indent: String
+    ) {
+        val readers = stackTrace.filter {
+            it.fileName in snippets && !property.isGetter(it)
+        }.mapNotNull { frame ->
+            frame.declarationName()?.let { "'$it' of ${frame.fileName}" }
+        }.distinct()
+        append("$indent  hint: '${property.name}' is declared in ${property.snippet}, which failed in the evaluation,")
+        append(" so it might be left uninitialized, null despite its type - ")
+        if (property.mutable) {
+            append("assign it, instead of declaring it again, as the declarations reading it")
+            readers.firstOrNull()?.let { append(", like $it,") }
+            append(" keep reading the same one.\n")
+        } else {
+            append("declare it again, together with the declarations reading it,")
+            readers.firstOrNull()?.let { append(" like $it,") }
+            readers.drop(1).takeIf { it.isNotEmpty() }?.let { append(" and the ones calling them, like ${it.enumerated()},") }
+            append(" as they keep reading the uninitialized one.\n")
+        }
+    }
+
+    /** Like `'a', 'b' and 'c'`. */
+    private fun List<String>.enumerated(): String =
+        if (size <= 1) joinToString() else dropLast(1).joinToString() + " and " + last()
 
     /**
      * The class and the message of the [throwable], with the later lines of a multi-line message
@@ -293,11 +321,15 @@ internal class ScriptErrorReporter(
 
     /**
      * The name of the declaration of this snippet frame, like `greet`, `Checker.check`, or `Config` of its initializer,
+     * the property of an accessor, like `t` of `getT`, see [propertyName],
      * or `null` for the body of a snippet, or a lambda, which is not a declaration to redeclare.
      */
     private fun StackTraceElement.declarationName(): String? = functionName().takeIf {
         it != "<snippet body>" && it != "<lambda>"
-    }?.removeSuffix(".<init>")?.removeSuffix(".<clinit>")
+    }?.removeSuffix(".<init>")?.removeSuffix(".<clinit>")?.let { name ->
+        val dot = name.lastIndexOf('.')
+        name.substring(0, dot + 1) + propertyName(name.substring(dot + 1))
+    }
 
     /**
      * The length of the sequence of frames starting at the [index], and the number of its consecutive repetitions,
