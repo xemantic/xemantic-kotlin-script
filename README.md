@@ -158,10 +158,10 @@ ScriptSession {
   the highest stable one in the Maven ordering, among the versions listed by the `maven-metadata.xml` of the repositories,
   neither a `SNAPSHOT`, nor a pre-release, like `2.0-RC1` or `1.9.20-Beta`,
   or the highest pre-release one, if there is no stable one.
-  A stable version with a qualifier, which Maven orders after its release, like `0.8.0-0.6.x-compat` after `0.8.0`,
-  gives way to its release, if there is one.
   A date-style version, like the `20040616` of `commons-collections:commons-collections`, which Maven orders after any release,
-  gives way to any other stable version, like `3.2.2`, if there is one.
+  gives way to any other version of the same stability, like `3.2.2`, if there is one.
+  A version with a qualifier, which Maven orders after its release, like `0.8.0-0.6.x-compat` after `0.8.0`,
+  gives way to its release, if there is one.
   The LLM should be told the resolved version, as it might not know its API:
   a successful snippet returns it as `ScriptResult.Value.resolvedVersions`, like `mapOf("org.jsoup:jsoup" to "1.24.1")`,
   which, unlike the compiler warnings, is worth showing to the LLM always,

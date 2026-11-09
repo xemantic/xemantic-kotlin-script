@@ -217,8 +217,8 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
      * looked up with their options, like the credentials, and the Maven settings, like the dependency is resolved, see [MavenVersionLookup]:
      * the highest stable one in the Maven ordering, neither a `SNAPSHOT`, nor a pre-release, like `2.0-RC1`,
      * or the highest pre-release one, if it has no stable one, like `pip install` does —
-     * a stable version with a qualifier, like `0.8.0-0.6.x-compat`, gives way to its release, like `0.8.0`,
-     * and a date-style version, like `20040616`, to any other stable one, see [latestMavenVersion].
+     * a version with a qualifier, like `0.8.0-0.6.x-compat`, gives way to its release, like `0.8.0`,
+     * and a date-style version, like `20040616`, to any other one of the same stability, see [latestMavenVersion].
      * It is kept for the session, so a later snippet declaring it again does not load another one.
      */
     private fun versionOf(coordinates: String): LatestMavenVersion = latestVersions.getOrPut(coordinates) {
