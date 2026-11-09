@@ -52,11 +52,13 @@ private const val SNIPPET_BODY_METHOD = "\$\$eval"
  * @param snippets the lines of the snippets by their names, like `snippet3.kts`.
  * @param snippetClassNames the simple names of the classes declared by the evaluated snippets.
  * @param uninitializedProperties the properties of the snippets which failed in the evaluation, `null` then.
+ * @param inlinedFrames the frames of the code inlined into the snippets, of the lines beyond the end of a snippet.
  */
 internal class ScriptErrorReporter(
     private val snippets: Map<String, List<String>>,
     private val snippetClassNames: Set<String> = emptySet(),
-    private val uninitializedProperties: UninitializedProperties = UninitializedProperties()
+    private val uninitializedProperties: UninitializedProperties = UninitializedProperties(),
+    private val inlinedFrames: InlinedFrames = InlinedFrames(snippets)
 ) {
 
     /**
@@ -215,13 +217,17 @@ internal class ScriptErrorReporter(
     /**
      * The frames of the snippets, preceded by the frame throwing the exception, if it is not one of them,
      * like `java.lang.Class.getDeclaredField(Class.java:2794)`,
-     * with the repeated sequences of frames, like of a recursion, collapsed.
+     * with a frame of inlined code, its line beyond the end of the snippet, resolved to the frames
+     * of the inlined function and of its call site, see [InlinedFrames],
+     * and with the repeated sequences of frames, like of a recursion, collapsed.
      */
     private fun StringBuilder.appendFrames(
         stackTrace: List<StackTraceElement>,
         indent: String
     ) {
-        val frames = stackTrace.withIndex().mapNotNull { (index, element) ->
+        val frames = stackTrace.flatMap { element ->
+            inlinedFrames.resolve(element) ?: listOf(element)
+        }.withIndex().mapNotNull { (index, element) ->
             val lines = snippets[element.fileName]
             val line = element.lineNumber.takeIf { lines != null && it in 1..lines.size }
             when {
