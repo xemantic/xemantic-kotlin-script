@@ -115,7 +115,7 @@ internal class ScriptErrorReporter(
             append("The compiler failed internally: ")
             appendThrowable(exception, "", "  ", Collections.newSetFromMap(IdentityHashMap()))
         } else {
-            append(diagnostic.message.trimEnd().lines().joinToString("\n  "))
+            append(diagnostic.message.indentContinuationLines("  "))
             append('\n')
         }
         if (location != null && lines != null) {
@@ -157,7 +157,7 @@ internal class ScriptErrorReporter(
         append(prefix)
         if (throwable in reported) {
             append("[CIRCULAR REFERENCE: ")
-            appendDescription(throwable)
+            appendDescription(throwable, indent)
             append("]\n")
             return true
         }
@@ -166,7 +166,7 @@ internal class ScriptErrorReporter(
             return false
         }
         reported += throwable
-        appendDescription(throwable)
+        appendDescription(throwable, indent)
         append('\n')
         if (throwable is NoSuchMethodError && throwable.read(null) { message }?.let { mangledMethod.containsMatchIn(it) } == true) {
             append("$indent  hint: a property or a function of a value class type, like Duration, declared in an earlier snippet,")
@@ -195,8 +195,14 @@ internal class ScriptErrorReporter(
         } ?: true
     }
 
+    /**
+     * The class and the message of the [throwable], with the later lines of a multi-line message
+     * indented like the frames, by the [indent] of the throwable, so that they read as a part of the headline
+     * also within a cause or a suppressed exception, and do not break the structure of the report.
+     */
     private fun StringBuilder.appendDescription(
-        throwable: Throwable
+        throwable: Throwable,
+        indent: String
     ) {
         append(throwable.javaClass.name.withoutSnippetClassName().replace('$', '.'))
         val message = try {
@@ -206,7 +212,7 @@ internal class ScriptErrorReporter(
         }
         message?.let {
             append(": ")
-            append(it.withoutSnippetClassName())
+            append(it.withoutSnippetClassName().indentContinuationLines("$indent  "))
         }
     }
 
@@ -350,6 +356,15 @@ internal fun ScriptErrorReporter.scriptResult(
         ExecutionPhase.EVALUATION
     )
 }
+
+/**
+ * This message with its lines after the first indented by the [indent], so that they read as a continuation of the first,
+ * where a blank line stays empty, the trailing whitespace of the message and of each line is dropped,
+ * and line breaks of any kind are normalized to `\n`.
+ */
+private fun String.indentContinuationLines(indent: String): String = trimEnd().lines().mapIndexed { index, line ->
+    line.trimEnd().let { if (index == 0 || it.isEmpty()) it else "$indent$it" }
+}.joinToString("\n")
 
 /** The names of the classes of the snippets without the snippet class, like `Color.BLUE` instead of `Snippet3.Color.BLUE`. */
 private fun String.withoutSnippetClassName(): String = replace(snippetQualifiedName, "")

@@ -411,6 +411,11 @@ class ScriptSessionTest {
             )
             // the exception is the headline, not repeated as its own cause
             have(message.lines().count { "java.lang.RuntimeException" in it } == 1)
+            // the IR dump of the message is indented to the column of the frames of the headline exception, 4 spaces,
+            // so it does not break the structure of the report, where a nested exception starts at 2 spaces
+            val irDump = message.lines().drop(1).takeWhile { !it.trimStart().startsWith("at ") }
+            have(irDump.isNotEmpty())
+            have(irDump.all { it.isEmpty() || it.startsWith("    ") })
         }
         next should {
             be<ScriptResult.Value>()
@@ -826,6 +831,24 @@ class ScriptSessionTest {
                 java.lang.Exception: must fail
                   at <snippet body>(snippet1.kts:1)
                   | throw Exception("must fail")
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report runtime exception with multi-line message indented`() = runTest {
+        // when
+        val result = session.execute("throw IllegalStateException(\"a\\nb\")")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IllegalStateException: a
+                  b
+                  at <snippet body>(snippet1.kts:1)
+                  | throw IllegalStateException("a\nb")
             """.trimIndent()
         }
     }
