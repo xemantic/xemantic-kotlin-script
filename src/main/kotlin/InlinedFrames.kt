@@ -100,15 +100,12 @@ internal class InlinedFrames(
      *
      * @throws VirtualMachineError thrown by reading the class, other than [StackOverflowError].
      */
-    private fun snippetClass(className: String): SnippetClass? = classes[className] ?: try {
-        classLoader?.getResourceAsStream(className.replace('.', '/') + ".class")?.use { it.readBytes() }?.let { bytes ->
-            SnippetClass(bytes).also { classes[className] = it }
+    private fun snippetClass(className: String): SnippetClass? = classes[className]
+        ?: logger.readOr(null, { "cannot read the class $className of a frame" }) {
+            classLoader?.getResourceAsStream(className.replace('.', '/') + ".class")?.use { it.readBytes() }?.let { bytes ->
+                SnippetClass(bytes).also { classes[className] = it }
+            }
         }
-    } catch (e: Throwable) {
-        if (e.isFatal) throw e
-        logger.debug(e) { "cannot read the class $className of a frame" }
-        null
-    }
 
 }
 

@@ -46,6 +46,9 @@ private val mangledMethod = Regex("[\\p{L}_][\\p{L}\\p{N}_]*-[\\p{L}\\p{N}_]{7}\
 /** The method evaluating the body of a snippet. */
 private const val SNIPPET_BODY_METHOD = "\$\$eval"
 
+/** The most properties named in the hint at the ones left uninitialized by a snippet, the first ones declared. */
+private const val MAX_NAMED_UNINITIALIZED = 5
+
 /**
  * Describes the failures of the snippets of a session in a form an LLM can act on,
  * pointing to the offending lines of the snippets.
@@ -54,12 +57,14 @@ private const val SNIPPET_BODY_METHOD = "\$\$eval"
  * @param snippetClassNames the simple names of the classes declared by the evaluated snippets.
  * @param uninitializedProperties the properties of the snippets which failed in the evaluation, `null` then.
  * @param inlinedFrames the frames of the code inlined into the snippets, of the lines beyond the end of a snippet.
+ * @param propertyAccessors the properties of the accessors of the classes of the snippets, named in the hints by the property.
  */
 internal class ScriptErrorReporter(
     private val snippets: Map<String, List<String>>,
     private val snippetClassNames: Set<String> = emptySet(),
     private val uninitializedProperties: UninitializedProperties = UninitializedProperties(),
-    private val inlinedFrames: InlinedFrames = InlinedFrames(snippets)
+    private val inlinedFrames: InlinedFrames = InlinedFrames(snippets),
+    private val propertyAccessors: PropertyAccessors = PropertyAccessors()
 ) {
 
     /**
@@ -229,7 +234,7 @@ internal class ScriptErrorReporter(
 
     /**
      * The hints at the properties left [uninitialized] by the snippet which failed, the `val`s, and then the `var`s,
-     * which are assigned instead of declaring them again.
+     * which are assigned instead of declaring them again, naming the first [MAX_NAMED_UNINITIALIZED] of each, and counting the rest.
      */
     private fun StringBuilder.appendUninitializedHint(
         uninitialized: List<UninitializedProperty>,
@@ -240,7 +245,9 @@ internal class ScriptErrorReporter(
             val plural = properties.size > 1
             val them = if (plural) "them" else "it"
             val one = if (plural) "ones" else "one"
-            append("$indent  hint: ${properties.map { "'${it.name}'" }.enumerated()} ${if (plural) "are" else "is"} left uninitialized,")
+            val named = properties.take(MAX_NAMED_UNINITIALIZED).map { "'${it.name}'" }
+            val more = properties.size - named.size
+            append("$indent  hint: ${(named + listOfNotNull("$more more".takeIf { more > 0 })).enumerated()} ${if (plural) "are" else "is"} left uninitialized,")
             append(" null despite ${if (plural) "their" else "its"} type, as the snippet failed before initializing $them,")
             append(" while ${if (plural) "they stay" else "it stays"} declared - ")
             if (properties.first().mutable) {
@@ -353,14 +360,14 @@ internal class ScriptErrorReporter(
 
     /**
      * The name of the declaration of this snippet frame, like `greet`, `Checker.check`, or `Config` of its initializer,
-     * the property of an accessor, like `t` of `getT`, see [propertyName],
+     * the property of an accessor, like `t` of `getT`, see [PropertyAccessors],
      * or `null` for the body of a snippet, or a lambda, which is not a declaration to redeclare.
      */
     private fun StackTraceElement.declarationName(): String? = functionName().takeIf {
         it != "<snippet body>" && it != "<lambda>"
     }?.removeSuffix(".<init>")?.removeSuffix(".<clinit>")?.let { name ->
-        val dot = name.lastIndexOf('.')
-        name.substring(0, dot + 1) + propertyName(name.substring(dot + 1))
+        val property = propertyAccessors.propertyOf(this) ?: return name
+        name.substring(0, name.lastIndexOf('.') + 1) + property
     }
 
     /**

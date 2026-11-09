@@ -19,6 +19,7 @@
 
 package com.xemantic.kotlin.script
 
+import io.github.oshai.kotlinlogging.KLogger
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineName
@@ -239,7 +240,10 @@ internal class DefaultScriptSession(
     /** The frames of the code inlined into the snippets, read from their class files. */
     private val inlinedFrames = InlinedFrames(snippets)
 
-    private val reporter = ScriptErrorReporter(snippets, snippetClassNames, uninitializedProperties, inlinedFrames)
+    /** The properties of the accessors of the classes of the snippets. */
+    private val propertyAccessors = PropertyAccessors()
+
+    private val reporter = ScriptErrorReporter(snippets, snippetClassNames, uninitializedProperties, inlinedFrames, propertyAccessors)
 
     private var snippetCount = 0
 
@@ -509,7 +513,7 @@ internal class DefaultScriptSession(
         val source = properties.joinToString("\n") { it.declaration(id) }
         // with its own job, so a cancellation of the caller cannot fail the declaration for all the next executions,
         // while closing the session cancels it harmlessly, as it neither blocks, nor awaits, and the snippet waiting for it is rejected then, see execute
-        val result = repl.compileAndEvaluate(source, "properties.kts", Job())
+        val result = repl.compileAndEvaluate(source, PROPERTIES_SNIPPET, Job())
         return (result as? ScriptResult.Error)?.let {
             ScriptResult.Error("The properties cannot be declared:\n${it.message}", it.phase)
         }
@@ -526,9 +530,11 @@ internal class DefaultScriptSession(
         result?.scriptClass?.java?.let { scriptClass ->
             scriptClass.declaredClasses.mapTo(snippetClassNames) { it.simpleName }
             inlinedFrames.keep(scriptClass)
+            propertyAccessors.keep(scriptClass)
         }
-        // before reporting it, as the report throws a fatal error, while the declarations of the snippet stay in the history
-        val uninitialized = (result as? ResultValue.Error)?.scriptClass?.java?.let {
+        // before reporting it, as the report throws a fatal error, while the declarations of the snippet stay in the history,
+        // except for the properties of the session, which the caller cannot declare again, while the compiler is disposed anyway
+        val uninitialized = (result as? ResultValue.Error)?.scriptClass?.java?.takeIf { name != PROPERTIES_SNIPPET }?.let {
             uninitializedProperties.keep(it, name)
         } ?: emptyList()
         return reporter.scriptResult(result, reports, compilation.result.reports, compilation.dependencies, uninitialized)
@@ -558,12 +564,31 @@ internal class DefaultScriptSession(
 
 }
 
+/** The name of the snippet declaring the properties of the session, preceding the ones of the caller. */
+private const val PROPERTIES_SNIPPET = "properties.kts"
+
 /**
  * Whether this throwable is thrown by the session instead of being reported:
  * a [VirtualMachineError], like an [OutOfMemoryError], other than a [StackOverflowError], which is reported as a failure of the snippet.
  */
 internal val Throwable.isFatal: Boolean
     get() = this is VirtualMachineError && this !is StackOverflowError
+
+/**
+ * The result of the [read], or the [fallback], if it throws, logged by this logger with the [message] at the debug level,
+ * except for a fatal error, which is thrown, see [isFatal].
+ */
+internal inline fun <T> KLogger.readOr(
+    fallback: T,
+    crossinline message: () -> String,
+    read: () -> T
+): T = try {
+    read()
+} catch (e: Throwable) {
+    if (e.isFatal) throw e
+    debug(e) { message() }
+    fallback
+}
 
 /**
  * The JVM target of the snippets, the one of the running JVM, or the latest one supported by the compiler, if it is newer,

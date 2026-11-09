@@ -830,6 +830,85 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should name function named like getter reading uninitialized property`() = runTest {
+        // given
+        session.execute("val name: String = error(\"boom\")")
+
+        // when
+        val result = session.execute("""
+            fun getGreeting(): String = name.uppercase()
+            getGreeting()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            have("like 'getGreeting' of snippet2.kts," in message)
+        }
+    }
+
+    @Test
+    fun `should name method of class named like getter reading uninitialized property`() = runTest {
+        // given
+        session.execute("val name: String = error(\"boom\")")
+
+        // when
+        val result = session.execute("""
+            class Bar {
+                fun getLabel(): String = name.uppercase()
+            }
+            Bar().getLabel()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            have("like 'Bar.getLabel' of snippet2.kts," in message)
+        }
+    }
+
+    @Test
+    fun `should name property of setter starting with is reading uninitialized property`() = runTest {
+        // given
+        session.execute("val name: String = error(\"boom\")")
+
+        // when
+        val result = session.execute("""
+            var isOk: String = ""
+                set(value) { field = value + name.length }
+            isOk = "x"
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            have("like 'isOk' of snippet2.kts," in message)
+        }
+    }
+
+    @Test
+    fun `should name property of accessor of custom JVM name reading uninitialized property`() = runTest {
+        // given
+        session.execute("val name: String = error(\"boom\")")
+
+        // when
+        val result = session.execute("""
+            val t: Int @JvmName("size") get() = name.length
+            t
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            have("like 't' of snippet2.kts," in message)
+        }
+    }
+
+    @Test
     fun `should hint at uninitialized property of snippet which threw fatal error`() = runTest {
         // given
         // a regression lets the OutOfMemoryError escape, which would abort the Gradle test executor
@@ -920,6 +999,22 @@ class ScriptSessionTest {
                   at <snippet body>(snippet1.kts:3)
                   | val b: String = error("boom")
             """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should list first uninitialized properties in declaration order in the error of the snippet which failed in the evaluation`() = runTest {
+        // when
+        val result = session.execute(buildString {
+            append("error(\"boom\")\n")
+            (1..12).forEach { append("val z$it: String = \"\"\n") }
+        })
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            have("hint: 'z1', 'z2', 'z3', 'z4', 'z5' and 7 more are left uninitialized," in message)
         }
     }
 

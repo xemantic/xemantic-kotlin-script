@@ -76,16 +76,17 @@ ScriptSession {
   like a `fun greet() = name.uppercase()` declared together with `val name: String = error("boom")`,
   as it keeps reading the uninitialized one — it has to be redeclared as well, with the declarations calling it,
   while assigning a `var` is enough, as all of them read the same one.
-  The error message of the failing snippet names the properties it left `null` despite their type,
+  The error message of the failing snippet names the properties it left `null` despite their type, the first five of them,
   with a hint to declare them again, together with the declarations reading them, or to assign a `var`.
   A `NullPointerException` of the JVM naming such a property later, like of `s.length` after `val s: String = error("boom")`,
   gets the hint as well, naming the declarations reading it, and the ones calling them, found in the stack trace, like `greet`.
   Neither hint covers a property of a primitive type, which reads as zero, or `false`, without failing,
-  and the later one needs the JVM to name the property, which it does not
-  for a value copied from the property before the failing read, like `val t = s` followed by `t.length`,
-  for the property passed as an argument, rejected by the check of a non-null parameter (`Parameter specified as non-null is null`),
-  or when the JVM runs without the helpful `NullPointerException` messages (`-XX:-ShowCodeDetailsInExceptionMessages`),
-  except for a delegated property, found by its getter in the stack trace.
+  nor a property of a nullable type, or of a platform type, like of `System.getProperty`, which is `null` by its type.
+  The later hint also needs the JVM to name the property in the message of the `NullPointerException`.
+  The JVM does not name it for a value copied from the property before the failing read, like `val t = s` followed by `t.length`,
+  nor for the property passed as an argument, rejected by the check of a non-null parameter (`Parameter specified as non-null is null`),
+  nor when it runs without the helpful `NullPointerException` messages (`-XX:-ShowCodeDetailsInExceptionMessages`).
+  A delegated property is the exception, as it is found by its getter in the stack trace instead.
 * Each snippet is a regular Kotlin script, compiled by the K2 REPL compiler of the Kotlin scripting API,
   against the whole classpath of the host application,
   so any class available to the host can be imported by a snippet.
