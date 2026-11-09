@@ -70,13 +70,11 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
         ).also { result ->
             if (result.valueOrNull() == true) {
                 remoteRepository(repositoryCoordinates, options)?.let { repository ->
-                    // a repository declared again by a later snippet is looked up once, with the options declared last,
-                    // like the corrected credentials, while the mavenResolver keeps every declaration
-                    val index = repositories.indexOfFirst { (_, it) -> it.id == repository.id && it.url == repository.url }
-                    if (index < 0) {
+                    // a repository declared again with the same options is looked up once,
+                    // while declared again with other options, like corrected credentials, or without them,
+                    // it is looked up with each, like the mavenResolver, which keeps every declaration, resolves from each
+                    if (repositories.none { (_, it) -> it == repository }) {
                         repositories += repositoryCoordinates.string to repository
-                    } else {
-                        repositories[index] = repositoryCoordinates.string to repository
                     }
                 }
             }
@@ -84,8 +82,8 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
     }
 
     /**
-     * The repositories declared by the snippets so far, by their coordinates, in the order of their first declaration,
-     * as added to the [mavenResolver], with the options of their last declaration, like the credentials.
+     * The distinct repositories declared by the snippets so far, by their coordinates, in the order of their declaration,
+     * as added to the [mavenResolver], with their options, like the credentials.
      */
     private val repositories = mutableListOf<Pair<String, RemoteRepository>>()
 
@@ -228,7 +226,7 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
         val searched = repositories.ifEmpty { listOf(mavenCentral.url to mavenCentral) }
         versionLookup.latestVersion(groupId, artifactId, searched.map { it.second })
             ?: throw IllegalStateException(
-                "Could not find any version of it in ${searched.joinToString(", ") { it.first }}" +
+                "Could not find any version of it in ${searched.map { it.first }.distinct().joinToString(", ")}" +
                     if (versionLookup.offline) ", in the offline mode of the Maven settings" else ""
             )
     }

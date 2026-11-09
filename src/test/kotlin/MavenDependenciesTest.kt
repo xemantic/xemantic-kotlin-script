@@ -321,7 +321,7 @@ class MavenDependenciesTest {
                 @file:DependsOn("com.xemantic.fixture:greeter")
                 42
             """.trimIndent())
-            assert(wrong is ScriptResult.Error)
+            assert(wrong is ScriptResult.Error && wrong.message.contains("401"))
 
             // when
             val result = session.execute("""
@@ -335,6 +335,28 @@ class MavenDependenciesTest {
                 be<ScriptResult.Value>()
                 have(value == "Hi Alice")
             }
+        }
+    }
+
+    @Test
+    fun `should look up dependency declared without version with credentials of repository declared again without them`() = runTest {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // given
+            session.execute("""@file:Repository("${server.url}", options = ["username=alice", "password=secret"])""")
+
+            // when
+            val result = session.execute("""
+                @file:Repository("${server.url}")
+                @file:DependsOn("com.xemantic.fixture:greeter")
+                fixture.greeter.Greeter.greet("Alice")
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == "Hi Alice")
+            }
+            assert(server.metadataRequests == 1)
         }
     }
 
