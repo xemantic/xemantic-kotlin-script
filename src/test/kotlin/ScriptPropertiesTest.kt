@@ -28,6 +28,7 @@ import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
 import java.net.URLClassLoader
+import kotlin.reflect.KType
 import kotlin.reflect.KTypeProjection
 import kotlin.reflect.full.createType
 import kotlin.reflect.typeOf
@@ -645,20 +646,76 @@ class ScriptPropertiesTest {
 
         // then
         assert(messages == listOf(
-            "Property 'list' of type kotlin.collections.MutableList<kotlin.String> has a value of class kotlin.collections.EmptyList, which is a read-only collection",
-            "Property 'map' of type kotlin.collections.MutableMap<kotlin.String, kotlin.Int> has a value of class kotlin.collections.EmptyMap, which is a read-only collection",
-            "Property 'collection' of type kotlin.collections.MutableCollection<kotlin.String> has a value of class kotlin.collections.EmptySet, which is a read-only collection",
-            "Property 'aliased' of type com.xemantic.kotlin.script.MutableItems /* = kotlin.collections.MutableList<kotlin.String> */ has a value of class kotlin.collections.EmptyList, which is a read-only collection"
+            "Property 'list' of type kotlin.collections.MutableList<kotlin.String> has a value of class kotlin.collections.EmptyList, which does not implement kotlin.collections.MutableList",
+            "Property 'map' of type kotlin.collections.MutableMap<kotlin.String, kotlin.Int> has a value of class kotlin.collections.EmptyMap, which does not implement kotlin.collections.MutableMap",
+            "Property 'collection' of type kotlin.collections.MutableCollection<kotlin.String> has a value of class kotlin.collections.EmptySet, which does not implement kotlin.collections.MutableCollection",
+            "Property 'aliased' of type com.xemantic.kotlin.script.MutableItems /* = kotlin.collections.MutableList<kotlin.String> */ has a value of class kotlin.collections.EmptyList, which does not implement kotlin.collections.MutableList"
         ))
     }
 
+    /** The list of `listOf("a", "b")` is a `java.util.Arrays.ArrayList`, which cannot grow, but can be modified in place. */
     @Test
-    fun `should accept Java collection value of mutable collection type`() {
+    fun `should accept Java collection value of mutable collection type`() = runTest {
+        ScriptSession(listOf(ScriptProperty("items", typeOf<MutableList<String>>(), listOf("a", "b")))).use { session ->
+            // when
+            val result = session.execute("""
+                items[0] = "c"
+                items
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == listOf("c", "b"))
+            }
+        }
+    }
+
+    /** The result of `buildList` implements `MutableList`, but is frozen, which is not detected. */
+    @Test
+    fun `should accept frozen collection value of mutable collection type`() = runTest {
+        ScriptSession(listOf(ScriptProperty("items", typeOf<MutableList<String>>(), buildList { add("a") }))).use { session ->
+            // when
+            val result = session.execute("""
+                items.add("b")
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Error>()
+                have(phase == ExecutionPhase.EVALUATION)
+                have(UnsupportedOperationException::class.qualifiedName!! in message)
+            }
+        }
+    }
+
+    /** The type implemented by hand is seen by the members of the [KType] interface only, so it is read-only. */
+    @Test
+    fun `should accept property of hand-written collection type`() {
+        // given
+        val type = object : KType {
+            override val classifier = List::class
+            override val arguments = listOf(KTypeProjection.invariant(typeOf<String>()))
+            override val isMarkedNullable = false
+            override val annotations = emptyList<Annotation>()
+            override fun toString() = "kotlin.collections.List<kotlin.String>"
+        }
+
         // when
-        val property = ScriptProperty("foo", typeOf<MutableList<String>>(), listOf("a", "b"))
+        val property = ScriptProperty("items", type, emptyList<String>())
 
         // then
-        assert(property.value == listOf("a", "b"))
+        assert(property.type.toSource() == "kotlin.collections.List<kotlin.String>")
+    }
+
+    /** `MutableList::class` is `List::class`, so only [typeOf] and the types of the members keep the mutability. */
+    @Test
+    fun `should render type created from mutable collection class as read-only`() {
+        // when
+        val type = MutableList::class.createType(listOf(KTypeProjection.invariant(typeOf<String>())))
+
+        // then
+        assert(type.toSource() == "kotlin.collections.List<kotlin.String>")
     }
 
     @Test
