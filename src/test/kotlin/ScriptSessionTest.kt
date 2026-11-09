@@ -1271,6 +1271,30 @@ class ScriptSessionTest {
         }
     }
 
+    /**
+     * A caller without a dispatcher has no thread to return to, so it would resume on the thread of the session,
+     * blocking the next snippet with whatever blocks the caller then, see #147.
+     */
+    @Test
+    fun `should not resume caller without a dispatcher on the session thread`() {
+        // given
+        val threads = CompletableFuture<Result<Pair<Any?, Thread>>>()
+
+        // when
+        suspend {
+            val result = session.execute("Thread.currentThread()")
+            assert(result is ScriptResult.Value)
+            result.value to Thread.currentThread()
+        }.startCoroutine(Continuation(EmptyCoroutineContext) {
+            threads.complete(it)
+        })
+
+        // then
+        // bounded, so a hang fails the test instead of hanging the build
+        val (sessionThread, callerThread) = threads.get(1, TimeUnit.MINUTES).getOrThrow()
+        assert(callerThread !== sessionThread)
+    }
+
     /** See #143. */
     @Test
     fun `should cancel awaited block when the session is closed`() = runTest {
