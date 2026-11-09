@@ -20,6 +20,7 @@
 package com.xemantic.kotlin.script
 
 import kotlinx.coroutines.runBlocking
+import org.eclipse.aether.repository.RemoteRepository
 import java.io.File
 import java.net.URLClassLoader
 import kotlin.script.experimental.api.ResultWithDiagnostics
@@ -32,9 +33,13 @@ import kotlin.script.experimental.api.ScriptDiagnostic
 import kotlin.script.experimental.api.ScriptSourceAnnotation
 import kotlin.script.experimental.api.SourceCode
 import kotlin.script.experimental.api.with
+import kotlin.script.experimental.api.valueOrNull
 import kotlin.script.experimental.dependencies.DependsOn
+import kotlin.script.experimental.dependencies.ExternalDependenciesResolver
 import kotlin.script.experimental.dependencies.Repository
+import kotlin.script.experimental.dependencies.RepositoryCoordinates
 import kotlin.script.experimental.dependencies.maven.MavenDependenciesResolver
+import kotlin.script.experimental.dependencies.maven.impl.mavenCentral
 import kotlin.script.experimental.dependencies.resolveFromScriptSourceAnnotations
 import kotlin.script.experimental.jvm.updateClasspath
 
@@ -52,10 +57,37 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
 
     val classLoader = DependencyClassLoader(parent)
 
-    private val resolver = MavenDependenciesResolver()
+    private val mavenResolver = MavenDependenciesResolver()
 
-    /** The repositories declared by the snippets so far, in the order of their declaration. */
-    private val repositories = mutableListOf<String>()
+    /** The resolver, keeping the [repositories] added to the [mavenResolver]. */
+    private val resolver = object : ExternalDependenciesResolver by mavenResolver {
+        override fun addRepository(
+            repositoryCoordinates: RepositoryCoordinates,
+            options: ExternalDependenciesResolver.Options,
+            sourceCodeLocation: SourceCode.LocationWithId?
+        ): ResultWithDiagnostics<Boolean> = mavenResolver.addRepository(
+            repositoryCoordinates, options, sourceCodeLocation
+        ).also { result ->
+            if (result.valueOrNull() == true) {
+                remoteRepository(repositoryCoordinates, options)?.let { repository ->
+                    // a repository declared again with the same options is looked up once,
+                    // while declared again with other options, like corrected credentials, or without them,
+                    // it is looked up with each, like the mavenResolver, which keeps every declaration, resolves from each
+                    if (repositories.none { (_, it) -> it == repository }) {
+                        repositories += repositoryCoordinates.string to repository
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * The distinct repositories declared by the snippets so far, by their coordinates, in the order of their declaration,
+     * as added to the [mavenResolver], with their options, like the credentials.
+     */
+    private val repositories = mutableListOf<Pair<String, RemoteRepository>>()
+
+    private val versionLookup = MavenVersionLookup()
 
     /** The latest versions of the dependencies declared without version, by their coordinates, kept for the session. */
     private val latestVersions = HashMap<String, LatestMavenVersion>()
@@ -135,7 +167,6 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
                 is ResultWithDiagnostics.Success -> {
                     files += result.value
                     reports += result.reports
-                    (annotation.annotation as? Repository)?.let { repositories += it.repositoriesCoordinates }
                 }
                 is ResultWithDiagnostics.Failure -> errors += annotation.failure(result.reports, lines)
             }
@@ -163,7 +194,8 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
         val latest = try {
             versionOf(coordinates)
         } catch (e: Exception) {
-            errors += diagnostic("Unresolved dependency '$coordinates': ${e.message ?: e.javaClass.name}", lines)
+            val cause = (e.message ?: e.javaClass.name).replace(repositoryIdWithUrl, "$1")
+            errors += diagnostic("Unresolved dependency '$coordinates': $cause", lines)
             return null
         }
         resolvedVersions[coordinates] = latest.version
@@ -181,7 +213,8 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
 
     /**
      * The latest version of the dependency of these [coordinates], `group:artifact`,
-     * in the repositories declared so far, or Maven Central, if none:
+     * in the repositories declared so far, or Maven Central, if none,
+     * looked up with their options, like the credentials, and the Maven settings, like the dependency is resolved, see [MavenVersionLookup]:
      * the highest stable one in the Maven ordering, neither a `SNAPSHOT`, nor a pre-release, like `2.0-RC1`,
      * or the highest pre-release one, if it has no stable one, like `pip install` does —
      * a stable version with a qualifier, like `0.8.0-0.6.x-compat`, gives way to its release, like `0.8.0`,
@@ -190,9 +223,12 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
      */
     private fun versionOf(coordinates: String): LatestMavenVersion = latestVersions.getOrPut(coordinates) {
         val (groupId, artifactId) = coordinates.split(':')
-        val searched = repositories.ifEmpty { listOf(MAVEN_CENTRAL) }
-        latestMavenVersion(groupId, artifactId, searched)
-            ?: throw IllegalStateException("Could not find any version of it in ${searched.joinToString(", ")}")
+        val searched = repositories.ifEmpty { listOf(mavenCentral.url to mavenCentral) }
+        versionLookup.latestVersion(groupId, artifactId, searched.map { it.second })
+            ?: throw IllegalStateException(
+                "Could not find any version of it in ${searched.map { it.first }.distinct().joinToString(", ")}" +
+                    if (versionLookup.offline) ", in the offline mode of the Maven settings" else ""
+            )
     }
 
     /**

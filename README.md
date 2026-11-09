@@ -165,8 +165,14 @@ ScriptSession {
   while a failed snippet reports it in the error message,
   as a warning pointing to the `@file:DependsOn` line, like `Resolved 'org.jsoup:jsoup' to its latest stable version '1.24.1'`.
   The resolved version is kept for the session, so a later snippet declaring the dependency again does not load another version.
-  The `maven-metadata.xml` is read directly, without the mirrors, proxies and credentials of the Maven settings,
-  which apply only to resolving the dependency in the version found.
+  The versions are looked up by Maven Resolver like the dependency is resolved,
+  in the repositories declared with their options, like `@file:Repository("https://...", options = ["username=...", "password=..."])`,
+  with the mirrors, proxies and server credentials of the Maven settings, `~/.m2/settings.xml` by default,
+  among the `maven-metadata.xml` files cached in the local Maven repository, refreshed once a day, or installed into it.
+  In the offline mode of the Maven settings, only the `file:` repositories are read,
+  along with the `maven-metadata.xml` files already cached from the other repositories,
+  and a dependency without any `maven-metadata.xml` there
+  is resolved to the latest of its versions present in the local Maven repository.
   A version range, like `[1.0,)`, and the `RELEASE` and `LATEST` versions of Maven are resolved by Maven itself,
   which might select a pre-release version.
 
