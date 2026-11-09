@@ -18,6 +18,7 @@
 
 package com.xemantic.kotlin.script
 
+import com.xemantic.kotlin.script.test.ConnectionRelay
 import com.xemantic.kotlin.script.test.MavenRepository
 import com.xemantic.kotlin.script.test.MavenRepositoryServer
 import com.xemantic.kotlin.script.test.ProxyServer
@@ -550,6 +551,58 @@ class MavenVersionLookupTest {
 
         // then
         assert(latest == null)
+    }
+
+    @Test
+    fun `should release connections of lookup once looked up`() {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            ConnectionRelay(server.url).use { relay ->
+                // given
+                val lookup = MavenVersionLookup { settings() }
+
+                // when
+                val latest = lookup.latestVersion(
+                    "com.xemantic.fixture", "greeter", listOf(remoteRepository(relay.url, "username=alice", "password=secret"))
+                )
+
+                // then
+                assert(latest?.version == "1.10" && latest.stable)
+                assert(relay.connections > 0)
+                assert(relay.awaitOpenConnections() == 0)
+            }
+        }
+    }
+
+    @Test
+    fun `should refuse to look up latest version once closed`() {
+        // given
+        val lookup = MavenVersionLookup { settings() }
+        val repositories = listOf(remoteRepository(MavenRepository.url))
+        val latest = lookup.latestVersion("com.xemantic.fixture", "greeter", repositories)
+
+        // when
+        lookup.close()
+        lookup.close()
+
+        // then
+        val failure = runCatching { lookup.latestVersion("com.xemantic.fixture", "greeter", repositories) }.exceptionOrNull()
+        assert(latest?.version == "1.10")
+        assert(failure is IllegalStateException && failure.message == "The version lookup is closed")
+    }
+
+    @Test
+    fun `should close version lookup never used`() {
+        // given
+        val lookup = MavenVersionLookup { error("Settings read") }
+
+        // when
+        lookup.close()
+
+        // then
+        val failure = runCatching {
+            lookup.latestVersion("com.xemantic.fixture", "greeter", listOf(remoteRepository(MavenRepository.url)))
+        }.exceptionOrNull()
+        assert(failure is IllegalStateException && failure.message == "The version lookup is closed")
     }
 
     @Test
