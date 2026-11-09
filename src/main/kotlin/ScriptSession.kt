@@ -308,8 +308,8 @@ internal class DefaultScriptSession(
                 ResultWithDiagnostics.Failure(
                     ScriptDiagnostic(
                         code = ScriptDiagnostic.unspecifiedError,
-                        // like Throwable.toString, but only the first line of the message, as the headline of the failure
-                        message = e.javaClass.name + (e.message?.let { ": ${it.lineSequence().first()}" } ?: ""),
+                        // the reporter renders the exception itself, this stands in for it where the exception is dropped
+                        message = e.message?.lineSequence()?.firstOrNull { it.isNotBlank() } ?: e.javaClass.name,
                         exception = e
                     )
                 )

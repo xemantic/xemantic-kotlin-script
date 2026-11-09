@@ -397,26 +397,9 @@ class ScriptSessionTest {
         session.execute("val x = 41")
 
         // when
-        val result = session.execute("val context: Int inline get() = coroutineContext.hashCode()")
-        val next = session.execute("x + 1")
-
-        // then
-        result should {
-            be<ScriptResult.Error>()
-            have(phase == ExecutionPhase.COMPILATION)
-            have(message.startsWith("error: The compiler failed internally: "))
-        }
-        next should {
-            be<ScriptResult.Value>()
-            have(value == 42)
-        }
-    }
-
-    @Test
-    fun `should name the class of the exception of the internal failure of the compiler`() = runTest {
-        // when
         // the backend crashes on an inline getter reading the coroutineContext of the script scope
         val result = session.execute("val context: Int inline get() = coroutineContext.hashCode()")
+        val next = session.execute("x + 1")
 
         // then
         result should {
@@ -427,6 +410,12 @@ class ScriptSessionTest {
                     "error: The compiler failed internally: java.lang.RuntimeException: Exception while generating code for "
                 )
             )
+            // the exception is the headline, not repeated as its own cause
+            have(message.lines().count { "java.lang.RuntimeException" in it } == 1)
+        }
+        next should {
+            be<ScriptResult.Value>()
+            have(value == 42)
         }
     }
 
@@ -450,6 +439,7 @@ class ScriptSessionTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.COMPILATION)
             have(message.startsWith("error: The compiler failed internally: java.lang.StackOverflowError\n"))
+            have(message.lines().count { "java.lang.StackOverflowError" in it } == 1)
         }
         bad should {
             be<ScriptResult.Error>()
