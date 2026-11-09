@@ -763,6 +763,24 @@ class ScriptPropertiesTest {
         }
     }
 
+    /** The type arguments are erased at runtime, so only the class of the value is checked, not the ones of its elements. */
+    @Test
+    fun `should accept nested read-only collection value of nested mutable collection type`() = runTest {
+        ScriptSession(listOf(ScriptProperty("index", typeOf<MutableMap<String, MutableSet<Int>>>(), mutableMapOf("a" to emptySet<Int>())))).use { session ->
+            // when
+            val result = session.execute("""
+                index["a"]!!.add(1)
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Error>()
+                have(phase == ExecutionPhase.EVALUATION)
+                have(UnsupportedOperationException::class.qualifiedName!! in message)
+            }
+        }
+    }
+
     /** The type implemented by hand is seen by the members of the [KType] interface only, so it is read-only. */
     @Test
     fun `should accept property of hand-written collection type`() {
