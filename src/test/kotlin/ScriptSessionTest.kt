@@ -36,7 +36,11 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import java.lang.ref.WeakReference
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CyclicBarrier
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.coroutines.startCoroutine
@@ -1272,6 +1276,98 @@ class ScriptSessionTest {
         assert(exception.message == "The session is closed")
     }
 
+    /** See #141. */
+    @Test
+    fun `should reject snippet of session closed before dispatching it to the thread of the session`() = runTest {
+        // given
+        lateinit var closedSession: ScriptSession
+        // closes the session after the check of a closed session in execute, before the snippet is dispatched
+        closedSession = DefaultScriptSession(emptyList(), Dispatchers.Default) { threadFactory ->
+            InterceptedExecutor(Executors.newSingleThreadExecutor(threadFactory)) { index, execute ->
+                if (index == 0) closedSession.close()
+                execute()
+            }
+        }
+
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            closedSession.execute("Thread.currentThread().name")
+        }
+
+        // then
+        assert(exception.message == "The session is closed")
+    }
+
+    /** See #141. */
+    @Test
+    fun `should reject snippet of session closed before dispatching it to the thread of the session after the disposal`() = runTest {
+        // given
+        val disposalQueued = CompletableFuture<Unit>()
+        val snippetQueued = CompletableFuture<Unit>()
+        lateinit var closedSession: ScriptSession
+        closedSession = DefaultScriptSession(emptyList(), Dispatchers.Default) { threadFactory ->
+            InterceptedExecutor(Executors.newSingleThreadExecutor(threadFactory)) { index, execute ->
+                when (index) {
+                    // the snippet, past the check of a closed session, closed on another thread
+                    0 -> {
+                        Thread { closedSession.close() }.start()
+                        disposalQueued.get(1, TimeUnit.MINUTES)
+                        execute()
+                        snippetQueued.complete(Unit)
+                    }
+                    // the disposal, queued before the snippet, while the thread is not shut down yet
+                    1 -> {
+                        execute()
+                        disposalQueued.complete(Unit)
+                        snippetQueued.get(1, TimeUnit.MINUTES)
+                    }
+                    else -> execute()
+                }
+            }
+        }
+
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            closedSession.execute("Thread.currentThread().name")
+        }
+
+        // then
+        assert(exception.message == "The session is closed")
+    }
+
+    /**
+     * Closing the session from many threads at once, repeatedly,
+     * as only the calls passing the check of a closed session together would fail, see #141.
+     */
+    @Test
+    fun `should close session concurrently from many threads`() {
+        val threads = 8
+        val pool = Executors.newFixedThreadPool(threads)
+        try {
+            repeat(1000) {
+                // given
+                val session = ScriptSession()
+                val barrier = CyclicBarrier(threads)
+
+                // when
+                val closings = List(threads) {
+                    pool.submit<Result<Unit>> {
+                        barrier.await()
+                        runCatching { session.close() }
+                    }
+                }
+
+                // then
+                closings.forEach {
+                    // bounded, so a deadlock fails the test instead of hanging the build
+                    assert(it.get(1, TimeUnit.MINUTES).exceptionOrNull() == null)
+                }
+            }
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
     @Test
     fun `should run snippet using session executing another snippet`() = runTest {
         ScriptSession().use { inner ->
@@ -1320,6 +1416,20 @@ class ScriptSessionTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.EVALUATION)
         }
+    }
+
+}
+
+/** Calls the [interceptor] with the index of the call, and the [execute][ExecutorService.execute] of the [delegate] to proceed with. */
+private class InterceptedExecutor(
+    private val delegate: ExecutorService,
+    private val interceptor: (index: Int, execute: () -> Unit) -> Unit
+) : ExecutorService by delegate {
+
+    private val calls = AtomicInteger()
+
+    override fun execute(command: Runnable) {
+        interceptor(calls.getAndIncrement()) { delegate.execute(command) }
     }
 
 }
