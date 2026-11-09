@@ -117,13 +117,24 @@ internal class MavenVersionLookup(
             addService(RepositoryConnectorFactory::class.java, BasicRepositoryConnectorFactory::class.java)
             addService(TransporterFactory::class.java, HttpTransporterFactory::class.java)
             addService(TransporterFactory::class.java, FileTransporterFactory::class.java)
-            // otherwise a service failing to instantiate is returned as null, reported as a bare NPE
-            setErrorHandler(object : DefaultServiceLocator.ErrorHandler() {
-                override fun serviceCreationFailed(type: Class<*>, impl: Class<*>, exception: Throwable) {
-                    throw IllegalStateException("Could not create the ${type.simpleName} of Maven Resolver: ${impl.name}", exception)
-                }
-            })
-        }.getService(RepositorySystem::class.java)
+        }.repositorySystem()
+    }
+
+    /** The active proxy of the Maven settings, if any. */
+    private val proxySelector by lazy {
+        DefaultProxySelector().apply {
+            settings.activeProxy?.let { proxy ->
+                add(
+                    Proxy(
+                        proxy.protocol,
+                        proxy.host,
+                        proxy.port,
+                        AuthenticationBuilder().addUsername(proxy.username).addPassword(proxy.password).build()
+                    ),
+                    proxy.nonProxyHosts
+                )
+            }
+        }
     }
 
     /** The mirrors of the Maven settings. */
@@ -211,17 +222,8 @@ internal class MavenVersionLookup(
      * like `MavenDependenciesResolver` does, or `null`, if its protocol is neither HTTP(S), nor `file`.
      */
     private fun RemoteRepository.withSettings(): RemoteRepository? {
-        val proxied = settings.activeProxy?.let { proxy ->
-            val selector = DefaultProxySelector().add(
-                Proxy(
-                    proxy.protocol,
-                    proxy.host,
-                    proxy.port,
-                    AuthenticationBuilder().addUsername(proxy.username).addPassword(proxy.password).build()
-                ),
-                proxy.nonProxyHosts
-            )
-            RemoteRepository.Builder(this).setProxy(selector.getProxy(this)).build()
+        val proxied = proxySelector.getProxy(this)?.let { proxy ->
+            RemoteRepository.Builder(this).setProxy(proxy).build()
         } ?: this
         if (!proxied.protocol.matches(supportedProtocol)) return null
         val repository = mirrorSelector.getMirror(proxied) ?: proxied
@@ -235,6 +237,36 @@ internal class MavenVersionLookup(
 
 /** The protocols of the repositories supported by `MavenDependenciesResolver`. */
 private val supportedProtocol = Regex("https?|file")
+
+/**
+ * The repository system of Maven Resolver, with its services registered in this locator.
+ *
+ * @throws ServiceCreationException if a service cannot be created.
+ */
+@Suppress("DEPRECATION")
+internal fun DefaultServiceLocator.repositorySystem(): RepositorySystem {
+    // otherwise a service failing to instantiate is returned as null, reported as a bare NPE
+    setErrorHandler(object : DefaultServiceLocator.ErrorHandler() {
+        override fun serviceCreationFailed(type: Class<*>, impl: Class<*>, exception: Throwable) {
+            // the locator reports the failure of a service again for each service depending on it
+            throw exception as? ServiceCreationException ?: ServiceCreationException(type, impl, exception)
+        }
+    })
+    return getService(RepositorySystem::class.java)
+}
+
+/**
+ * A service of Maven Resolver of the [type], which [impl]ementation cannot be created,
+ * reported with the root [cause] of the failure, as the locator wraps it in its reflection.
+ */
+private class ServiceCreationException(
+    type: Class<*>,
+    impl: Class<*>,
+    cause: Throwable
+) : IllegalStateException(
+    "Could not create the ${type.simpleName} of Maven Resolver, ${impl.name}: ${generateSequence(cause) { it.cause }.last()}",
+    cause
+)
 
 /**
  * The repository declared with `@file:Repository` with these [coordinates] and [options],

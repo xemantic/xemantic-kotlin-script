@@ -21,10 +21,16 @@ package com.xemantic.kotlin.script
 import com.xemantic.kotlin.script.test.MavenRepository
 import com.xemantic.kotlin.script.test.MavenRepositoryServer
 import com.xemantic.kotlin.test.assert
+import org.apache.maven.repository.internal.MavenRepositorySystemUtils
 import org.apache.maven.settings.Mirror
 import org.apache.maven.settings.Server
 import org.apache.maven.settings.Settings
+import org.eclipse.aether.RepositorySystemSession
+import org.eclipse.aether.connector.basic.BasicRepositoryConnectorFactory
 import org.eclipse.aether.repository.RemoteRepository
+import org.eclipse.aether.spi.connector.RepositoryConnectorFactory
+import org.eclipse.aether.spi.connector.transport.Transporter
+import org.eclipse.aether.spi.connector.transport.TransporterFactory
 import java.nio.file.Path
 import kotlin.io.path.createDirectories
 import kotlin.io.path.createTempDirectory
@@ -280,6 +286,25 @@ class MavenVersionLookupTest {
         assert(latest == null)
     }
 
+    @Test
+    fun `should report root cause of service of Maven Resolver which cannot be created`() {
+        // given a transporter factory, which the locator creates for the repository system through 4 other services
+        @Suppress("DEPRECATION")
+        val locator = MavenRepositorySystemUtils.newServiceLocator().apply {
+            addService(RepositoryConnectorFactory::class.java, BasicRepositoryConnectorFactory::class.java)
+            addService(TransporterFactory::class.java, FailingTransporterFactory::class.java)
+        }
+
+        // when
+        val failure = runCatching { locator.repositorySystem() }.exceptionOrNull()
+
+        // then
+        assert(
+            failure?.message == "Could not create the TransporterFactory of Maven Resolver, " +
+                "${FailingTransporterFactory::class.java.name}: java.lang.IllegalStateException: No transport"
+        )
+    }
+
     /** The repository declared with `@file:Repository` with these [coordinates] and [options]. */
     private fun remoteRepository(coordinates: String, vararg options: String): RemoteRepository = remoteRepository(
         RepositoryCoordinates(coordinates),
@@ -293,5 +318,24 @@ class MavenVersionLookupTest {
             resolve("$path/$version").createDirectories().resolve("$artifactId-$version.pom").writeText("<project/>")
         }
     }
+
+}
+
+/**
+ * A transporter factory, which cannot be created,
+ * public in the bytecode, as the locator accesses the constructor of a package-private class reflectively.
+ */
+internal class FailingTransporterFactory : TransporterFactory {
+
+    init {
+        error("No transport")
+    }
+
+    override fun newInstance(
+        session: RepositorySystemSession,
+        repository: RemoteRepository
+    ): Transporter = throw UnsupportedOperationException()
+
+    override fun getPriority(): Float = 0f
 
 }
