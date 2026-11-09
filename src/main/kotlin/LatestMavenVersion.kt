@@ -25,6 +25,7 @@ import org.eclipse.aether.RepositorySystem
 import org.eclipse.aether.RepositorySystemSession
 import org.eclipse.aether.artifact.DefaultArtifact
 import org.eclipse.aether.connector.basic.BasicRepositoryConnectorFactory
+import org.eclipse.aether.impl.DefaultServiceLocator
 import org.eclipse.aether.repository.LocalRepository
 import org.eclipse.aether.repository.Proxy
 import org.eclipse.aether.repository.RemoteRepository
@@ -116,7 +117,38 @@ internal class MavenVersionLookup(
             addService(RepositoryConnectorFactory::class.java, BasicRepositoryConnectorFactory::class.java)
             addService(TransporterFactory::class.java, HttpTransporterFactory::class.java)
             addService(TransporterFactory::class.java, FileTransporterFactory::class.java)
+            // otherwise a service failing to instantiate is returned as null, reported as a bare NPE
+            setErrorHandler(object : DefaultServiceLocator.ErrorHandler() {
+                override fun serviceCreationFailed(type: Class<*>, impl: Class<*>, exception: Throwable) {
+                    throw IllegalStateException("Could not create the ${type.simpleName} of Maven Resolver: ${impl.name}", exception)
+                }
+            })
         }.getService(RepositorySystem::class.java)
+    }
+
+    /** The mirrors of the Maven settings. */
+    private val mirrorSelector by lazy {
+        DefaultMirrorSelector().apply {
+            settings.mirrors.orEmpty().forEach {
+                add(it.id, it.url, it.layout, false, false, it.mirrorOf, it.mirrorOfLayouts)
+            }
+        }
+    }
+
+    /** The server credentials of the Maven settings, by the server id. */
+    private val authenticationSelector by lazy {
+        DefaultAuthenticationSelector().apply {
+            settings.servers.orEmpty().filter { it.id != null }.forEach {
+                add(
+                    it.id,
+                    AuthenticationBuilder()
+                        .addUsername(it.username)
+                        .addPassword(it.password)
+                        .addPrivateKey(it.privateKey, it.passphrase)
+                        .build()
+                )
+            }
+        }
     }
 
     /** Whether the Maven settings are in the offline mode. */
@@ -192,26 +224,11 @@ internal class MavenVersionLookup(
             RemoteRepository.Builder(this).setProxy(selector.getProxy(this)).build()
         } ?: this
         if (!proxied.protocol.matches(supportedProtocol)) return null
-        val mirrors = DefaultMirrorSelector().apply {
-            settings.mirrors.orEmpty().forEach {
-                add(it.id, it.url, it.layout, false, false, it.mirrorOf, it.mirrorOfLayouts)
-            }
-        }
-        val repository = mirrors.getMirror(proxied) ?: proxied
+        val repository = mirrorSelector.getMirror(proxied) ?: proxied
         if (repository.authentication != null) return repository
-        val servers = DefaultAuthenticationSelector().apply {
-            settings.servers.orEmpty().filter { it.id != null }.forEach {
-                add(
-                    it.id,
-                    AuthenticationBuilder()
-                        .addUsername(it.username)
-                        .addPassword(it.password)
-                        .addPrivateKey(it.privateKey, it.passphrase)
-                        .build()
-                )
-            }
-        }
-        return RemoteRepository.Builder(repository).setAuthentication(servers.getAuthentication(repository)).build()
+        return RemoteRepository.Builder(repository)
+            .setAuthentication(authenticationSelector.getAuthentication(repository))
+            .build()
     }
 
 }
