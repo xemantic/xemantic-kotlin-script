@@ -1661,8 +1661,181 @@ class ScriptSessionTest {
                 java.lang.IllegalStateException: too big
                   at <lambda>(snippet1.kts:3)
                   |         if (it > 2) throw IllegalStateException(message())
+                  at check(snippet1.kts:2)
+                  |     list.forEach {
                   at <snippet body>(snippet1.kts:7)
                   | check(numbers) { "too big" }
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report lines of nested inline functions declared in the snippet`() = runTest {
+        // when
+        val result = session.execute("""
+            inline fun inner() { throw IllegalStateException("x") }
+            inline fun outer() { inner() }
+            outer()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message.substringBefore("\n\n") sameAs """
+                java.lang.IllegalStateException: x
+                  at inner(snippet1.kts:1)
+                  | inline fun inner() { throw IllegalStateException("x") }
+                  at outer(snippet1.kts:2)
+                  | inline fun outer() { inner() }
+                  at <snippet body>(snippet1.kts:3)
+                  | outer()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should omit frame of inline function calling the same inline function twice`() = runTest {
+        // when
+        val result = session.execute("""
+            inline fun inner(x: Int) { if (x == 2) throw IllegalStateException("x=" + x) }
+            inline fun outer() {
+                inner(1)
+                inner(2)
+            }
+            outer()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            // both copies of inner share the lines, so the one throwing is unknown, and outer is omitted rather than reported at a wrong line
+            message.substringBefore("\n\n") sameAs """
+                java.lang.IllegalStateException: x=2
+                  at inner(snippet1.kts:1)
+                  | inline fun inner(x: Int) { if (x == 2) throw IllegalStateException("x=" + x) }
+                  at <snippet body>(snippet1.kts:6)
+                  | outer()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report lines of three levels of nested inline functions declared in the snippet`() = runTest {
+        // when
+        val result = session.execute("""
+            inline fun a(message: () -> String) { throw IllegalStateException(message()) }
+            inline fun b(message: () -> String) { a(message) }
+            inline fun c(message: () -> String) { b(message) }
+            c { "x" }
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IllegalStateException: x
+                  at a(snippet1.kts:1)
+                  | inline fun a(message: () -> String) { throw IllegalStateException(message()) }
+                  at b(snippet1.kts:2)
+                  | inline fun b(message: () -> String) { a(message) }
+                  at c(snippet1.kts:3)
+                  | inline fun c(message: () -> String) { b(message) }
+                  at <snippet body>(snippet1.kts:4)
+                  | c { "x" }
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report line of inline function calling inline function of the standard library`() = runTest {
+        // when
+        val result = session.execute("""
+            inline fun firstBig(list: List<Int>, predicate: (Int) -> Boolean) = list.first { it > 5 && predicate(it) }
+            firstBig(listOf(1)) { true }
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            // the line of the inlined code of the standard library depends on its version
+            message.replace(Regex("_Collections\\.kt:\\d+"), "_Collections.kt:N") sameAs """
+                java.util.NoSuchElementException: Collection contains no element matching the predicate.
+                  at kotlin.collections.CollectionsKt___CollectionsKt.first(_Collections.kt:N)
+                  at firstBig(snippet1.kts:1)
+                  | inline fun firstBig(list: List<Int>, predicate: (Int) -> Boolean) = list.first { it > 5 && predicate(it) }
+                  at <snippet body>(snippet1.kts:2)
+                  | firstBig(listOf(1)) { true }
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report lambda calling inline function within inline function declared in the snippet`() = runTest {
+        // when
+        val result = session.execute("""
+            inline fun ensure(condition: Boolean, message: () -> String) {
+                if (!condition) throw IllegalStateException(message())
+            }
+            inline fun check(list: List<Int>, message: () -> String) {
+                list.forEach {
+                    ensure(it <= 2, message)
+                }
+            }
+            check(listOf(1, 2, 3)) { "too big" }
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IllegalStateException: too big
+                  at ensure(snippet1.kts:2)
+                  |     if (!condition) throw IllegalStateException(message())
+                  at <lambda>(snippet1.kts:6)
+                  |         ensure(it <= 2, message)
+                  at check(snippet1.kts:5)
+                  |     list.forEach {
+                  at <snippet body>(snippet1.kts:9)
+                  | check(listOf(1, 2, 3)) { "too big" }
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report lines of nested inline functions inlined into method of class declared in earlier snippet`() = runTest {
+        // given
+        session.execute("""
+            inline fun ensure(condition: Boolean, message: () -> String) {
+                if (!condition) throw IllegalStateException(message())
+            }
+            inline fun ensurePositive(value: Int, message: () -> String) = ensure(value > 0, message)
+            class Account(val balance: Int) {
+                fun withdraw(amount: Int) = ensurePositive(balance - amount) { "insufficient balance" }
+            }
+        """.trimIndent())
+
+        // when
+        val result = session.execute("Account(1).withdraw(2)")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IllegalStateException: insufficient balance
+                  at ensure(snippet1.kts:2)
+                  |     if (!condition) throw IllegalStateException(message())
+                  at ensurePositive(snippet1.kts:4)
+                  | inline fun ensurePositive(value: Int, message: () -> String) = ensure(value > 0, message)
+                  at Account.withdraw(snippet1.kts:6)
+                  |     fun withdraw(amount: Int) = ensurePositive(balance - amount) { "insufficient balance" }
+                  at <snippet body>(snippet2.kts:1)
+                  | Account(1).withdraw(2)
             """.trimIndent()
         }
     }
