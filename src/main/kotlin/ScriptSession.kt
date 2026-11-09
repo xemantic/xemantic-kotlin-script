@@ -76,6 +76,18 @@ private val logger = KotlinLogging.logger {}
 private val sessionIds = AtomicInteger()
 
 /**
+ * The stack size of the thread of a session, in bytes.
+ *
+ * The K2 compiler recurses deeply, in the parser, PSI and FIR building,
+ * so the default 1 MB stack overflows at around 600 nesting levels of an expression, like nested parentheses, or a chain of `+`,
+ * which a legitimate snippet, especially a generated one, can exceed,
+ * while 16 MB takes tens of thousands of levels, and lets an evaluated snippet recurse deeper as well,
+ * with the overflow of an even deeper snippet still reported as a compilation failure, in milliseconds.
+ * The stack of a thread is reserved virtually and committed lazily, so the size costs little for the single thread of a session.
+ */
+internal const val SESSION_THREAD_STACK_SIZE: Long = 16L * 1024 * 1024
+
+/**
  * A stateful Kotlin scripting session, like a Kotlin notebook:
  * the declarations of an executed snippet, like `val`, `var`, `fun`, or `class`, and its imports,
  * stay visible to the snippets executed after it.
@@ -85,6 +97,9 @@ private val sessionIds = AtomicInteger()
  * and call suspending functions with [ScriptScope.await].
  * All the snippets of a session are compiled and evaluated on its own thread, one after another,
  * so a snippet can use an API bound to the thread which created it.
+ * The thread has a 16 MB stack, larger than the default one,
+ * so the compiler takes a deeply nested expression, of thousands of nesting levels, and a snippet can recurse deeper,
+ * while a [StackOverflowError] of the compiler on an even deeper one is reported as a compilation failure.
  *
  * A failure of a snippet is reported as [ScriptResult.Error], with a message pointing to its offending lines,
  * and the session continues, without the declarations of a snippet which failed to compile.
@@ -177,7 +192,7 @@ internal class DefaultScriptSession(
     private val name = "script-session-$id"
 
     private val thread = executor { runnable ->
-        Thread(runnable, name).apply { isDaemon = true }
+        Thread(null, runnable, name, SESSION_THREAD_STACK_SIZE).apply { isDaemon = true }
     }
 
     /**

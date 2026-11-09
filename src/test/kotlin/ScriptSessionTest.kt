@@ -422,8 +422,9 @@ class ScriptSessionTest {
     fun `should report StackOverflowError of the compiler as a compilation failure and continue the session`() = runTest {
         // given
         session.execute("val x = 41")
-        // nested deep enough to overflow the stack of the parser at any thread stack size, in milliseconds
-        val depth = 100_000
+        // nested deep enough to overflow the 16 MB stack of the session thread in milliseconds,
+        // which the parser overflows at around 40 thousand levels, see SESSION_THREAD_STACK_SIZE
+        val depth = 200_000
         val snippet = "val bad = 1\n" + "(".repeat(depth) + "1" + ")".repeat(depth)
 
         // when
@@ -451,6 +452,24 @@ class ScriptSessionTest {
         next should {
             be<ScriptResult.Value>()
             have(value == 42)
+        }
+    }
+
+    @Test
+    fun `should compile expression nested deeper than the default thread stack takes`() = runTest {
+        // given
+        // nested deep enough to overflow the default 1 MB thread stack, which the parser overflows at around 600 levels,
+        // and shallow enough for the stack of the session thread, which takes tens of thousands of levels
+        val depth = 5_000
+        val snippet = "(".repeat(depth) + "1" + ")".repeat(depth)
+
+        // when
+        val result = session.execute(snippet)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 1)
         }
     }
 
