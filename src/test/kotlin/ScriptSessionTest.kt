@@ -37,7 +37,6 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import java.lang.ref.WeakReference
 import java.util.concurrent.CompletableFuture
-import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -1573,12 +1572,15 @@ class ScriptSessionTest {
         return WeakReference(session)
     }
 
-    /** See #142. */
+    /**
+     * The properties are declared, as their values are released only after the declaration,
+     * while the snippet is rejected, as it would be cancelled before it ran, see #142 and #162.
+     */
     @Test
-    fun `should declare properties of session closed while declaring them`() = runTest {
+    fun `should reject snippet of session closed while declaring its properties`() = runTest {
         // given
         val closedWhileDeclaring = AtomicBoolean()
-        lateinit var session: ScriptSession
+        lateinit var session: DefaultScriptSession
         val stringType = typeOf<String>()
         // the type is rendered into the source of the declaration on the thread of the session,
         // so the session is closed there, past the check of a closed session, before the declaration is evaluated
@@ -1594,17 +1596,17 @@ class ScriptSessionTest {
                 }
             override fun toString() = stringType.toString()
         }
-        session = ScriptSession(listOf(ScriptProperty("greeting", type, "Hello")))
+        session = DefaultScriptSession(listOf(ScriptProperty("greeting", type, "Hello")), Dispatchers.Default)
 
         // when
-        val result = session.execute("greeting")
+        val exception = assertFailsWith<IllegalStateException> {
+            session.execute("greeting")
+        }
 
         // then
         assert(closedWhileDeclaring.get())
-        result should {
-            be<ScriptResult.Value>()
-            have(value == "Hello")
-        }
+        assert(exception.message == "The session is closed")
+        assert(session.repl != null)
     }
 
     /** See #142. */
@@ -1817,36 +1819,33 @@ class ScriptSessionTest {
     }
 
     /**
-     * Closing the session from many threads at once, repeatedly,
-     * as only the calls passing the check of a closed session together would fail, see #141.
+     * Closing the session again while it is being closed, from within the submission of its disposal to its thread,
+     * past the mark of a closed session, like a concurrent closing passing the check of a closed session, see #141 and #162.
      */
     @Test
-    fun `should close session concurrently from many threads`() {
-        val threads = 8
-        val pool = Executors.newFixedThreadPool(threads)
-        try {
-            repeat(1000) {
-                // given
-                val session = ScriptSession()
-                val barrier = CyclicBarrier(threads)
-
-                // when
-                val closings = List(threads) {
-                    pool.submit<Result<Unit>> {
-                        barrier.await()
-                        runCatching { session.close() }
-                    }
-                }
-
-                // then
-                closings.forEach {
-                    // bounded, so a deadlock fails the test instead of hanging the build
-                    assert(it.get(1, TimeUnit.MINUTES).exceptionOrNull() == null)
-                }
+    fun `should ignore closing the session again while it is being closed`() = runTest {
+        // given
+        lateinit var session: ScriptSession
+        var closingAgain: Result<Unit>? = null
+        val submissions = AtomicInteger()
+        session = DefaultScriptSession(emptyList(), Dispatchers.Default) { threadFactory ->
+            InterceptedExecutor(Executors.newSingleThreadExecutor(threadFactory)) { index, execute ->
+                submissions.incrementAndGet()
+                if (index == 0) closingAgain = runCatching { session.close() }
+                execute()
             }
-        } finally {
-            pool.shutdownNow()
         }
+
+        // when
+        session.close()
+
+        // then
+        assert(closingAgain?.isSuccess == true)
+        assert(submissions.get() == 1)
+        val exception = assertFailsWith<IllegalStateException> {
+            session.execute("1")
+        }
+        assert(exception.message == "The session is closed")
     }
 
     @Test

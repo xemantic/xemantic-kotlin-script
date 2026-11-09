@@ -23,11 +23,12 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -45,7 +46,8 @@ import java.util.concurrent.ThreadFactory
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.ContinuationInterceptor
-import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.resumeWithException
+import kotlin.coroutines.suspendCoroutine
 import kotlin.script.experimental.api.ResultValue
 import kotlin.script.experimental.api.ResultWithDiagnostics
 import kotlin.script.experimental.api.CompiledSnippet
@@ -146,9 +148,11 @@ public interface ScriptSession : AutoCloseable {
      * Closes the session, cancelling the coroutines launched by its snippets, and the evaluation of the snippet being executed, if any,
      * like a cancellation of its caller, see [execute],
      * and releasing the compiler, the thread, and the values of the properties, once that snippet ends,
-     * so the properties are declared also when the session is closed while declaring them.
+     * which might be the declaration of the properties, so they are declared also when the session is closed while declaring them,
+     * while the snippet waiting for the declaration is rejected, like one executed after closing.
      * The snippets and coroutines still running read the properties as before, as they were declared already.
-     * Closing a closed session, also concurrently, has no effect.
+     * Closing a closed session, also concurrently, has no effect,
+     * and returns at once, also while the first closing is still cancelling the coroutines, or queueing the release.
      */
     override fun close()
 
@@ -193,22 +197,6 @@ internal class DefaultScriptSession(
 
     private val thread = executor { runnable ->
         Thread(null, runnable, name, SESSION_THREAD_STACK_SIZE).apply { isDaemon = true }
-    }
-
-    /**
-     * Dispatches to the [thread], or, once it is shut down by [close], to [Dispatchers.IO],
-     * where the block of [execute] only fails the check of a closed session,
-     * unlike the dispatcher of `asCoroutineDispatcher`, which would cancel the rejected block,
-     * failing the execution with a [kotlinx.coroutines.CancellationException] instead.
-     */
-    private val sessionDispatcher = object : CoroutineDispatcher() {
-        override fun dispatch(context: CoroutineContext, block: Runnable) {
-            try {
-                thread.execute(block)
-            } catch (_: RejectedExecutionException) {
-                Dispatchers.IO.dispatch(context, block)
-            }
-        }
     }
 
     private val job = SupervisorJob()
@@ -411,20 +399,49 @@ internal class DefaultScriptSession(
         // a caller with a dispatcher but without a job cannot cancel the evaluation,
         // while a caller without a dispatcher, like `suspend fun main`, has the job of the withContext of execute
         val callerJob = currentCoroutineContext()[Job] ?: Job()
-        // a cancelled compilation would leave the compiled snippet to be evaluated before the next one
-        val result = withContext(sessionDispatcher + NonCancellable) {
-            // checked again on the thread, as the session could be closed before the block was dispatched to it,
-            // and the block could run after the disposal of the compiler then, or on another thread, see sessionDispatcher,
+        val result = onSessionThread {
+            // checked again on the thread, as the session could be closed before the block was submitted to it,
+            // with the disposal of the compiler queued before the block then,
             // while a session closed later disposes the compiler only after this block, queued after it on the thread
             check(!closed.get()) { "The session is closed" }
             propertiesFailure ?: run {
-                val repl = repl ?: createRepl()
+                val repl = repl ?: createRepl().also {
+                    // the session closed while the properties were declared has cancelled the snippet already,
+                    // so it would fail in the evaluation, while the properties are declared, see close
+                    check(!closed.get()) { "The session is closed" }
+                }
                 // null only if declaring the properties failed just now, with their failure kept, see createRepl
                 repl?.compileAndEvaluate(snippet, "snippet${++snippetCount}.kts", callerJob) ?: propertiesFailure!!
             }
         }
         currentCoroutineContext().ensureActive()
         result
+    }
+
+    /**
+     * Runs the [block] on the [thread], and returns its result, or throws its exception.
+     *
+     * The block is run by `runBlocking`, so it stays on the thread also if it suspends,
+     * which the compiler and the evaluator, suspending by their API, never do today,
+     * and a session closed meanwhile disposes the compiler only after the block, queued after it on the thread,
+     * so no code of the session runs on another thread, or against the disposed compiler.
+     * The caller waits for the block also when it is cancelled,
+     * as a cancelled compilation would leave the compiled snippet to be evaluated before the next one.
+     *
+     * @throws IllegalStateException if the session is closed, with the thread shut down, before the block is submitted.
+     */
+    private suspend fun <T> onSessionThread(
+        block: suspend CoroutineScope.() -> T
+    ): T = suspendCoroutine { continuation ->
+        try {
+            thread.execute {
+                continuation.resumeWith(
+                    runCatching { runBlocking(CoroutineName(name), block) }
+                )
+            }
+        } catch (_: RejectedExecutionException) {
+            continuation.resumeWithException(IllegalStateException("The session is closed"))
+        }
     }
 
     /**
