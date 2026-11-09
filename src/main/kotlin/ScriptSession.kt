@@ -112,10 +112,14 @@ internal const val SESSION_THREAD_STACK_SIZE: Long = 16L * 1024 * 1024
  * A snippet which failed in the evaluation keeps its declarations, also the properties it did not initialize,
  * which hold `null` despite their type, or zero, or `false`, if it is a primitive one,
  * while the functions and classes compiled against such a property keep reading it, also after it is redeclared.
- * A [NullPointerException] of the JVM naming such a property is reported with a hint
- * to declare it again, together with the declarations reading it,
- * but not a property of a primitive type, a value copied from the property before the failing read,
- * or without the helpful messages of the [NullPointerException] in the JVM.
+ * The error of the snippet names the properties it left `null`, with a hint to declare them again,
+ * together with the declarations reading them, or to assign a `var`, which all of them read,
+ * and a [NullPointerException] of the JVM naming such a property later gets the hint as well,
+ * with the declarations reading it, and calling them, found in the stack trace.
+ * Neither hint covers a property of a primitive type,
+ * and the later one needs the JVM to name the property, which it does not for a value copied from it before the failing read,
+ * for the property passed as an argument rejected by the check of a non-null parameter,
+ * or without the helpful messages of the [NullPointerException], unless it is a delegated property, found by its getter.
  */
 public interface ScriptSession : AutoCloseable {
 
