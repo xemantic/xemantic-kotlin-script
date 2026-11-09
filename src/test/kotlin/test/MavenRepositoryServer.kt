@@ -20,15 +20,19 @@ package com.xemantic.kotlin.script.test
 
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.cio.CIO
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.request.header
+import io.ktor.server.request.httpMethod
 import io.ktor.server.response.header
+import io.ktor.server.response.respond
 import io.ktor.server.response.respondBytes
 import io.ktor.server.routing.route
 import io.ktor.server.routing.routing
 import kotlinx.coroutines.runBlocking
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.io.encoding.Base64
 import kotlin.io.path.isRegularFile
@@ -37,26 +41,41 @@ import kotlin.io.path.readBytes
 /**
  * A local HTTP server of the [MavenRepository], at [url],
  * answering `401` to a request without the basic authentication of the [username] and [password],
- * and `500` to the next [failingRequests] authenticated ones.
+ * or of one of the [otherUsers], by their passwords,
+ * the [statuses] of the users given one, and `500` to the next [failingRequests] authenticated ones.
  */
 class MavenRepositoryServer(
     username: String,
-    password: String
+    password: String,
+    otherUsers: Map<String, String> = emptyMap()
 ) : AutoCloseable {
 
     private val credentials = "Basic " + Base64.encode("$username:$password".encodeToByteArray())
 
+    /** The users, by the basic authentication of their credentials. */
+    private val users = (mapOf(username to password) + otherUsers).entries.associate { (user, secret) ->
+        "Basic " + Base64.encode("$user:$secret".encodeToByteArray()) to user
+    }
+
+    /** The status answered to every authenticated request of a user, by the user, like `403` or `500`. */
+    val statuses: MutableMap<String, HttpStatusCode> = ConcurrentHashMap()
+
     private val failures = AtomicInteger()
 
     private val metadataRequestCounter = AtomicInteger()
+
+    private val wronglyAuthenticatedMetadataRequestCounter = AtomicInteger()
 
     /** The number of the next authenticated requests answered with `500`. */
     var failingRequests: Int
         get() = failures.get()
         set(value) = failures.set(value)
 
-    /** The number of the authenticated requests of a `maven-metadata.xml`. */
+    /** The number of the requests of a `maven-metadata.xml` authenticated as the [username]. */
     val metadataRequests: Int get() = metadataRequestCounter.get()
+
+    /** The number of the requests of a `maven-metadata.xml` with the basic authentication of unknown credentials. */
+    val wronglyAuthenticatedMetadataRequests: Int get() = wronglyAuthenticatedMetadataRequestCounter.get()
 
     private val server = embeddedServer(CIO, host = "127.0.0.1", port = 0) {
         routing {
@@ -65,19 +84,27 @@ class MavenRepositoryServer(
                 handle {
                     val path = call.parameters.getAll("path")!!.joinToString("/")
                     val file = MavenRepository.directory.resolve(path).normalize()
-                    val authorized = call.request.header(HttpHeaders.Authorization) == credentials
-                    if (authorized && path.endsWith("/maven-metadata.xml")) metadataRequestCounter.incrementAndGet()
+                    val authorization = call.request.header(HttpHeaders.Authorization)
+                    val user = users[authorization]
+                    if (path.endsWith("/maven-metadata.xml")) when {
+                        authorization == credentials -> metadataRequestCounter.incrementAndGet()
+                        authorization != null && user == null -> wronglyAuthenticatedMetadataRequestCounter.incrementAndGet()
+                    }
+                    val status = user?.let { statuses[it] }
                     when {
-                        !authorized -> {
+                        user == null -> {
                             call.response.header(HttpHeaders.WWWAuthenticate, "Basic realm=\"fixture\"")
                             call.respondBytes(ByteArray(0), status = HttpStatusCode.Unauthorized)
                         }
+                        status != null -> call.respondBytes(ByteArray(0), status = status)
                         failures.getAndUpdate { maxOf(it - 1, 0) } > 0 -> call.respondBytes(
                             ByteArray(0), status = HttpStatusCode.InternalServerError
                         )
                         !file.startsWith(MavenRepository.directory) || !file.isRegularFile() -> call.respondBytes(
                             ByteArray(0), status = HttpStatusCode.NotFound
                         )
+                        // without a body, which would be read as the response to the next request on the connection
+                        call.request.httpMethod == HttpMethod.Head -> call.respond(HttpStatusCode.OK)
                         else -> call.respondBytes(file.readBytes(), ContentType.Application.OctetStream)
                     }
                 }

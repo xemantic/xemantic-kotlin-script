@@ -26,6 +26,7 @@ import com.xemantic.kotlin.test.be
 import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
+import io.ktor.http.HttpStatusCode
 import java.lang.ref.WeakReference
 import kotlin.test.AfterTest
 import kotlin.test.Test
@@ -334,6 +335,95 @@ class MavenDependenciesTest {
             result should {
                 be<ScriptResult.Value>()
                 have(value == "Hi Alice")
+            }
+        }
+    }
+
+    @Test
+    fun `should report missing dependency declared without version in repository declared again with corrected credentials`() = runTest {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // given
+            val wrong = session.execute("""
+                @file:Repository("${server.url}", options = ["username=alice", "password=wrong"])
+                @file:DependsOn("com.xemantic.fixture:greeter")
+                42
+            """.trimIndent())
+            assert(wrong is ScriptResult.Error && wrong.message.contains("401"))
+
+            // when
+            val result = session.execute("""
+                @file:Repository("${server.url}", options = ["username=alice", "password=secret"])
+                @file:DependsOn("com.xemantic.fixture:missing")
+                42
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Error>()
+                have(phase == ExecutionPhase.COMPILATION)
+                message sameAs """
+                    snippet2.kts:2:1: error: Unresolved dependency 'com.xemantic.fixture:missing': Could not find any version of it in ${server.url}
+                      | <error>@file:DependsOn("com.xemantic.fixture:missing")</error>
+                """.trimIndent()
+            }
+        }
+    }
+
+    @Test
+    fun `should not look up metadata of dependency declared without version with wrong credentials of repository corrected since`() = runTest {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // given
+            session.execute("""
+                @file:Repository("${server.url}", options = ["username=alice", "password=wrong"])
+                @file:DependsOn("com.xemantic.fixture:greeter")
+                42
+            """.trimIndent())
+            session.execute("""
+                @file:Repository("${server.url}", options = ["username=alice", "password=secret"])
+                @file:DependsOn("com.xemantic.fixture:greeting-card")
+                42
+            """.trimIndent())
+            val wronglyAuthenticatedRequests = server.wronglyAuthenticatedMetadataRequests
+
+            // when
+            val result = session.execute("""
+                @file:DependsOn("com.xemantic.fixture:preview")
+                fixture.preview.Preview.version()
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == "0.1-beta")
+            }
+            assert(server.wronglyAuthenticatedMetadataRequests == wronglyAuthenticatedRequests)
+        }
+    }
+
+    @Test
+    fun `should look up dependency declared without version in repository after its server error while declared again`() = runTest {
+        MavenRepositoryServer(username = "alice", password = "secret", otherUsers = mapOf("bob" to "secret")).use { server ->
+            // given
+            server.statuses["alice"] = HttpStatusCode.InternalServerError
+            session.execute("""
+                @file:Repository("${server.url}", options = ["username=alice", "password=secret"])
+                @file:Repository("${server.url}", options = ["username=bob", "password=secret"])
+                @file:DependsOn("com.xemantic.fixture:missing")
+                42
+            """.trimIndent())
+            server.statuses.clear()
+            server.statuses["bob"] = HttpStatusCode.Forbidden
+
+            // when
+            val result = session.execute("""
+                @file:DependsOn("com.xemantic.fixture:preview")
+                fixture.preview.Preview.version()
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == "0.1-beta")
             }
         }
     }

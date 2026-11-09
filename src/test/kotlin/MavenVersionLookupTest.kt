@@ -22,6 +22,7 @@ import com.xemantic.kotlin.script.test.MavenRepository
 import com.xemantic.kotlin.script.test.MavenRepositoryServer
 import com.xemantic.kotlin.script.test.ProxyServer
 import com.xemantic.kotlin.test.assert
+import io.ktor.http.HttpStatusCode
 import org.apache.maven.repository.internal.MavenRepositorySystemUtils
 import org.apache.maven.settings.Mirror
 import org.apache.maven.settings.Proxy
@@ -337,6 +338,134 @@ class MavenVersionLookupTest {
             assert(latest?.version == "r09" && latest.stable)
         } finally {
             repository.toFile().deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should not find any version of missing artifact in repository declared again with corrected credentials without superseding`() {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // given
+            val lookup = MavenVersionLookup { settings() }
+            val wrong = remoteRepository(server.url, "username=alice", "password=wrong")
+            val corrected = remoteRepository(server.url, "username=alice", "password=secret")
+            val superseded = mutableListOf<RemoteRepository>()
+
+            // when
+            val latest = lookup.latestVersion("com.xemantic.fixture", "missing", listOf(wrong, corrected)) {
+                superseded += it
+            }
+
+            // then
+            assert(latest == null)
+            // the refusal might be scoped to the missing artifact, so it is no evidence of wrong credentials
+            assert(superseded.isEmpty())
+        }
+    }
+
+    @Test
+    fun `should not supersede repository declared without credentials by its declaration with credentials`() {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // given
+            val lookup = MavenVersionLookup { settings() }
+            val anonymous = remoteRepository(server.url)
+            val authenticated = remoteRepository(server.url, "username=alice", "password=secret")
+            val superseded = mutableListOf<RemoteRepository>()
+
+            // when
+            val latest = lookup.latestVersion("com.xemantic.fixture", "greeter", listOf(anonymous, authenticated)) {
+                superseded += it
+            }
+
+            // then
+            // a private artifact is refused to the anonymous access, which might still read the public ones
+            assert(latest?.version == "1.10")
+            assert(superseded.isEmpty())
+        }
+    }
+
+    @Test
+    fun `should report superseded declaration of repository found with corrected credentials`() {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // given
+            val lookup = MavenVersionLookup { settings() }
+            val wrong = remoteRepository(server.url, "username=alice", "password=wrong")
+            val corrected = remoteRepository(server.url, "username=alice", "password=secret")
+            val superseded = mutableListOf<RemoteRepository>()
+
+            // when
+            val latest = lookup.latestVersion("com.xemantic.fixture", "greeter", listOf(wrong, corrected)) {
+                superseded += it
+            }
+
+            // then
+            assert(latest?.version == "1.10")
+            assert(superseded == listOf(wrong))
+        }
+    }
+
+    @Test
+    fun `should report failure of repository declared again with wrong credentials only`() {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // given
+            val lookup = MavenVersionLookup { settings() }
+            val wrong = remoteRepository(server.url, "username=alice", "password=wrong")
+            val alsoWrong = remoteRepository(server.url, "username=alice", "password=wrong2")
+            val superseded = mutableListOf<RemoteRepository>()
+
+            // when
+            val result = runCatching {
+                lookup.latestVersion("com.xemantic.fixture", "greeter", listOf(wrong, alsoWrong)) {
+                    superseded += it
+                }
+            }
+
+            // then
+            assert(result.exceptionOrNull()?.message?.contains("401") == true)
+            assert(superseded.isEmpty())
+        }
+    }
+
+    @Test
+    fun `should report server error of repository declared again with other credentials not found`() {
+        MavenRepositoryServer(username = "alice", password = "secret", otherUsers = mapOf("bob" to "secret")).use { server ->
+            // given
+            val lookup = MavenVersionLookup { settings() }
+            val alice = remoteRepository(server.url, "username=alice", "password=secret")
+            val bob = remoteRepository(server.url, "username=bob", "password=secret")
+            server.statuses["alice"] = HttpStatusCode.InternalServerError
+            val superseded = mutableListOf<RemoteRepository>()
+
+            // when
+            val result = runCatching {
+                lookup.latestVersion("com.xemantic.fixture", "missing", listOf(alice, bob)) {
+                    superseded += it
+                }
+            }
+
+            // then
+            assert(result.exceptionOrNull()?.message?.contains("500") == true)
+            assert(superseded.isEmpty())
+        }
+    }
+
+    @Test
+    fun `should not supersede repository forbidden to credentials by its other credentials`() {
+        MavenRepositoryServer(username = "alice", password = "secret", otherUsers = mapOf("bob" to "secret")).use { server ->
+            // given
+            val lookup = MavenVersionLookup { settings() }
+            val alice = remoteRepository(server.url, "username=alice", "password=secret")
+            val bob = remoteRepository(server.url, "username=bob", "password=secret")
+            server.statuses["bob"] = HttpStatusCode.Forbidden
+            val superseded = mutableListOf<RemoteRepository>()
+
+            // when
+            val latest = lookup.latestVersion("com.xemantic.fixture", "greeter", listOf(alice, bob)) {
+                superseded += it
+            }
+
+            // then
+            assert(latest?.version == "1.10")
+            assert(superseded.isEmpty())
         }
     }
 

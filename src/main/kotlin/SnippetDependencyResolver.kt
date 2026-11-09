@@ -72,7 +72,8 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
                 remoteRepository(repositoryCoordinates, options)?.let { repository ->
                     // a repository declared again with the same options is looked up once,
                     // while declared again with other options, like corrected credentials, or without them,
-                    // it is looked up with each, like the mavenResolver, which keeps every declaration, resolves from each
+                    // it is looked up with each, like the mavenResolver, which keeps every declaration, resolves from each,
+                    // until a declaration refused its credentials is superseded by another one read, see versionOf
                     if (repositories.none { (_, it) -> it == repository }) {
                         repositories += repositoryCoordinates.string to repository
                     }
@@ -220,15 +221,21 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
      * a version with a qualifier, like `0.8.0-0.6.x-compat`, gives way to its release, like `0.8.0`,
      * and a date-style version, like `20040616`, to any other one of the same stability, see [latestMavenVersion].
      * It is kept for the session, so a later snippet declaring it again does not load another one.
+     *
+     * A repository declared with wrong credentials, and again with the corrected ones, does not hide the reason of a failed lookup
+     * by the `401` of the wrong ones, and it is dropped once the corrected ones return the metadata of a dependency,
+     * while the wrong ones are refused with `401`, so they are not sent again by a later version lookup —
+     * the mavenResolver, keeping every declaration, still sends them, resolving the version found, see [MavenVersionLookup.latestVersion].
      */
     private fun versionOf(coordinates: String): LatestMavenVersion = latestVersions.getOrPut(coordinates) {
         val (groupId, artifactId) = coordinates.split(':')
-        val searched = repositories.ifEmpty { listOf(mavenCentral.url to mavenCentral) }
-        versionLookup.latestVersion(groupId, artifactId, searched.map { it.second })
-            ?: throw IllegalStateException(
-                "Could not find any version of it in ${searched.map { it.first }.distinct().joinToString(", ")}" +
-                    if (versionLookup.offline) ", in the offline mode of the Maven settings" else ""
-            )
+        val searched = repositories.toList().ifEmpty { listOf(mavenCentral.url to mavenCentral) }
+        versionLookup.latestVersion(groupId, artifactId, searched.map { it.second }) { stale ->
+            repositories.removeAll { (_, repository) -> repository == stale }
+        } ?: throw IllegalStateException(
+            "Could not find any version of it in ${searched.map { it.first }.distinct().joinToString(", ")}" +
+                if (versionLookup.offline) ", in the offline mode of the Maven settings" else ""
+        )
     }
 
     /**
