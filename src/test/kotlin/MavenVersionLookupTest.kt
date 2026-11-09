@@ -20,9 +20,11 @@ package com.xemantic.kotlin.script
 
 import com.xemantic.kotlin.script.test.MavenRepository
 import com.xemantic.kotlin.script.test.MavenRepositoryServer
+import com.xemantic.kotlin.script.test.ProxyServer
 import com.xemantic.kotlin.test.assert
 import org.apache.maven.repository.internal.MavenRepositorySystemUtils
 import org.apache.maven.settings.Mirror
+import org.apache.maven.settings.Proxy
 import org.apache.maven.settings.Server
 import org.apache.maven.settings.Settings
 import org.eclipse.aether.RepositorySystemSession
@@ -136,6 +138,39 @@ class MavenVersionLookupTest {
 
         // then
         assert(latest?.version == "1.10" && latest.stable)
+    }
+
+    @Test
+    fun `should look up latest version in mirror of repository through proxy in settings`() {
+        ProxyServer().use { proxy ->
+            // given a mirror behind a firewall, which only the proxy of the settings passes
+            @Suppress("HttpUrlsUsage")
+            val mirrorUrl = "http://127.0.0.1:1/"
+            val lookup = MavenVersionLookup {
+                settings {
+                    addMirror(Mirror().apply {
+                        id = "fixture"
+                        mirrorOf = "*"
+                        url = mirrorUrl
+                    })
+                    addProxy(Proxy().apply {
+                        id = "firewall"
+                        protocol = "http"
+                        host = proxy.host
+                        port = proxy.port
+                    })
+                }
+            }
+
+            // when
+            val latest = lookup.latestVersion(
+                "com.xemantic.fixture", "greeter", listOf(remoteRepository("https://repo.example.com/"))
+            )
+
+            // then
+            assert(latest?.version == "1.10" && latest.stable)
+            assert(proxy.urls.contains("${mirrorUrl}com/xemantic/fixture/greeter/maven-metadata.xml"))
+        }
     }
 
     @Test
