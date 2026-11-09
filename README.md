@@ -88,6 +88,9 @@ ScriptSession {
 * All the snippets of a session are compiled and evaluated on its own thread, one after another,
   so a snippet can use an API bound to the thread which created it.
   Snippets executed concurrently wait for their turn.
+  The thread is given a 16 MB stack, larger than the default one,
+  so the compiler takes a deeply nested expression, of thousands of nesting levels,
+  and a snippet can recurse deeper.
   The caller of `execute` resumes where its dispatcher resumes it,
   or on `Dispatchers.Default` if it has no dispatcher, like `suspend fun main`,
   while a caller on `Dispatchers.Unconfined` resumes in place, on the thread of the session.
