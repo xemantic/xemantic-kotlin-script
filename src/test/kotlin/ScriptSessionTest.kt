@@ -26,27 +26,35 @@ import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CompletableJob
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.asContextElement
 import kotlinx.coroutines.async
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
 import java.lang.ref.WeakReference
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CyclicBarrier
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.Continuation
+import kotlin.coroutines.ContinuationInterceptor
+import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.coroutines.startCoroutine
 import kotlin.reflect.KClassifier
@@ -1994,6 +2002,185 @@ class ScriptSessionTest {
             assert(result is ScriptResult.Value)
             result.value to Thread.currentThread()
         }.startCoroutine(Continuation(EmptyCoroutineContext) {
+            threads.complete(it)
+        })
+
+        // then
+        // bounded, so a hang fails the test instead of hanging the build
+        val (sessionThread, callerThread) = threads.get(1, TimeUnit.MINUTES).getOrThrow()
+        assert(callerThread !== sessionThread)
+    }
+
+    /**
+     * A caller on [Dispatchers.Unconfined] would resume in place, on the thread of the session,
+     * blocking the next snippet with whatever blocks the caller then, like #147, see #172.
+     */
+    @Test
+    fun `should not resume caller on Dispatchers Unconfined on the session thread`() {
+        // when
+        val (sessionThread, callerThread) = runBlocking(Dispatchers.Unconfined) {
+            val result = session.execute("Thread.currentThread()")
+            assert(result is ScriptResult.Value)
+            result.value to Thread.currentThread()
+        }
+
+        // then
+        assert(callerThread !== sessionThread)
+    }
+
+    /**
+     * An [UnconfinedTestDispatcher] does not dispatch either, so its caller would resume on the thread of the session, see #172.
+     */
+    @Test
+    fun `should not resume caller on UnconfinedTestDispatcher on the session thread`() = runTest(UnconfinedTestDispatcher()) {
+        // when
+        val result = session.execute("Thread.currentThread()")
+        val callerThread = Thread.currentThread()
+
+        // then
+        assert(result is ScriptResult.Value)
+        assert(callerThread !== result.value)
+    }
+
+    /**
+     * A dispatcher which does not dispatch on its own thread only, like `Dispatchers.Main.immediate`,
+     * resumes its caller on its own thread, as a UI caller must, see #172.
+     */
+    @Test
+    fun `should resume caller of immediate dispatcher on its own thread`() {
+        // given
+        val executor = Executors.newSingleThreadExecutor()
+        val dispatcherThread = CompletableFuture.supplyAsync({ Thread.currentThread() }, executor).get()
+        val immediate = object : CoroutineDispatcher() {
+            override fun isDispatchNeeded(context: CoroutineContext) = Thread.currentThread() !== dispatcherThread
+            override fun dispatch(context: CoroutineContext, block: Runnable) = executor.execute(block)
+        }
+
+        try {
+            // when
+            val callerThread = runBlocking {
+                withContext(immediate) {
+                    val result = session.execute("42")
+                    assert(result is ScriptResult.Value)
+                    Thread.currentThread()
+                }
+            }
+
+            // then
+            assert(callerThread === dispatcherThread)
+        } finally {
+            executor.shutdown()
+        }
+    }
+
+    /**
+     * A caller with its own dispatcher is resumed by it directly, not through [Dispatchers.Default],
+     * so it resumes also while the snippets block all the workers of [Dispatchers.Default], see #172.
+     */
+    @Test
+    fun `should resume caller with a dispatcher while Dispatchers Default is saturated`() {
+        // given
+        val workers = Runtime.getRuntime().availableProcessors().coerceAtLeast(2)
+        val started = CountDownLatch(workers)
+        val released = CountDownLatch(1)
+        val session = ScriptSession {
+            provide<CountDownLatch>("started", started)
+            provide<CountDownLatch>("released", released)
+        }
+
+        session.use {
+            try {
+                // when
+                val execution = CompletableFuture.supplyAsync {
+                    runBlocking {
+                        session.execute(
+                            """
+                            repeat($workers) {
+                                launch {
+                                    started.countDown()
+                                    released.await()
+                                }
+                            }
+                            started.await()
+                            42
+                            """
+                        )
+                    }
+                }
+
+                // then
+                // bounded, so a hang fails the test instead of hanging the build
+                execution.get(1, TimeUnit.MINUTES) should {
+                    be<ScriptResult.Value>()
+                    have(value == 42)
+                }
+            } finally {
+                released.countDown()
+            }
+        }
+    }
+
+    /**
+     * A caller without a dispatcher waiting for the snippet of another caller would be resumed by the unlocking of that caller,
+     * in place, on its thread, like the main thread of a UI, so it is run on [Dispatchers.Default] instead, see #147 and #172.
+     */
+    @Test
+    fun `should not resume waiting caller without a dispatcher on the thread of the unlocking caller`() {
+        // given
+        val executor = Executors.newSingleThreadExecutor()
+        val unlockingThread = CompletableFuture.supplyAsync({ Thread.currentThread() }, executor).get()
+        val started = CountDownLatch(1)
+        val session = ScriptSession {
+            provide<CountDownLatch>("started", started)
+        }
+        try {
+            val unlocking = CoroutineScope(executor.asCoroutineDispatcher()).async {
+                session.execute("started.countDown(); Thread.sleep(Long.MAX_VALUE)")
+            }
+            started.await()
+            val waitingCompletion = CompletableFuture<Thread>()
+            // suspended on the lock held by the unlocking caller before startCoroutine returns,
+            // unless it is dispatched first, as it should be
+            suspend {
+                session.execute("42")
+            }.startCoroutine(Continuation(EmptyCoroutineContext) {
+                waitingCompletion.complete(Thread.currentThread())
+            })
+
+            // when
+            // the waiting caller is rejected by the closed session, completing on the thread it was resumed on
+            session.close()
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build
+            val waitingThread = waitingCompletion.get(1, TimeUnit.MINUTES)
+            assert(waitingThread !== unlockingThread)
+            runBlocking { unlocking.await() } should {
+                be<ScriptResult.Error>()
+            }
+        } finally {
+            session.close()
+            executor.shutdown()
+        }
+    }
+
+    /**
+     * A caller with a continuation interceptor which is not a dispatcher would resume in place, on the thread of the session, see #172.
+     */
+    @Test
+    fun `should not resume caller of non-dispatcher interceptor on the session thread`() {
+        // given
+        val interceptor = object : AbstractCoroutineContextElement(ContinuationInterceptor), ContinuationInterceptor {
+            override fun <T> interceptContinuation(continuation: Continuation<T>): Continuation<T> = continuation
+        }
+        val threads = CompletableFuture<Result<Pair<Any?, Thread>>>()
+
+        // when
+        suspend {
+            val result = session.execute("Thread.currentThread()")
+            assert(result is ScriptResult.Value)
+            result.value to Thread.currentThread()
+        }.startCoroutine(Continuation(interceptor) {
             threads.complete(it)
         })
 

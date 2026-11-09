@@ -27,6 +27,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asExecutor
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.runBlocking
@@ -137,9 +138,15 @@ public interface ScriptSession : AutoCloseable {
      * while a snippet which neither blocks interruptibly, nor awaits, runs to its end.
      * A caller without a [Job] in its context, like `suspend fun main`, cannot cancel the evaluation, only closing the session can.
      * A caller with a dispatcher in its context resumes where its dispatcher resumes it,
-     * which for [Dispatchers.Unconfined] is in place, on the thread of the session, blocking the next snippet until the caller suspends.
-     * A caller without a dispatcher, like `suspend fun main` as well, has no thread to return to, so it resumes on [Dispatchers.Default],
-     * which the coroutines launched by the snippets share by default, see [ScriptScope], so it should not block that thread for long.
+     * like the main thread for `Dispatchers.Main.immediate`, which does not dispatch on the main thread only,
+     * while a caller which would resume in place, on the thread of the session, blocking the next snippet with whatever blocks the caller then,
+     * resumes on [Dispatchers.Default] instead: a caller whose dispatcher does not dispatch, like [Dispatchers.Unconfined],
+     * one with a continuation interceptor which is not a [CoroutineDispatcher],
+     * and one without a dispatcher, like `suspend fun main` as well, which has no thread to return to.
+     * The coroutines launched by the snippets share [Dispatchers.Default] by default, see [ScriptScope],
+     * so such a caller should not block its thread for long.
+     * A dispatcher which reports a dispatch as needed, but runs the task on the dispatching thread,
+     * like `Executor(Runnable::run).asCoroutineDispatcher()`, cannot be told apart, so it resumes its caller on the thread of the session.
      * A cancellation, or closing the session, while the snippet is compiled waits for the compilation to end,
      * as the compiler is never interrupted, and the snippet is evaluated then, cancelled already,
      * as the session would evaluate it before the next one anyway.
@@ -409,8 +416,8 @@ internal class DefaultScriptSession(
     override suspend fun execute(
         snippet: String
     ): ScriptResult = if (currentCoroutineContext()[ContinuationInterceptor] == null) {
-        // a caller without a dispatcher, like `suspend fun main`, has no thread to return to from the thread of the session,
-        // so it would resume on it, blocking the next snippet with whatever blocks the caller then
+        // a caller without a dispatcher, like `suspend fun main`, has no thread to return to, see execute of ScriptSession,
+        // also when it waits on the mutex, which would resume it in place, on the thread of the unlocking caller
         withContext(Dispatchers.Default) { executeOnSessionThread(snippet) }
     } else {
         executeOnSessionThread(snippet)
@@ -453,6 +460,7 @@ internal class DefaultScriptSession(
      * If the evaluator ever suspended, and the interrupt of [close] arrived while `runBlocking` is parked,
      * kotlinx.coroutines 1.11 would cancel the blocking coroutine with an [InterruptedException],
      * so [execute] would throw it instead of returning an [ExecutionPhase.EVALUATION] error.
+     * The caller which would resume in place, on the thread, is resumed from [Dispatchers.Default] instead, see [execute].
      * The caller waits for the block also when it is cancelled,
      * as a cancelled compilation would leave the compiled snippet to be evaluated before the next one.
      *
@@ -461,13 +469,25 @@ internal class DefaultScriptSession(
     private suspend fun <T> onSessionThread(
         block: suspend CoroutineScope.() -> T
     ): T {
-        val context = currentCoroutineContext().minusKey(Job).minusKey(ContinuationInterceptor) + CoroutineName(name)
+        val callerContext = currentCoroutineContext()
+        val callerInterceptor = callerContext[ContinuationInterceptor]
+        val context = callerContext.minusKey(Job).minusKey(ContinuationInterceptor) + CoroutineName(name)
         return suspendCoroutine { continuation ->
             try {
                 thread.execute {
-                    continuation.resumeWith(
-                        runCatching { runBlocking(context, block) }
-                    )
+                    val result = runCatching { runBlocking(context, block) }
+                    // asked on the thread, as Dispatchers.Main.immediate dispatches off the main thread only, see execute of ScriptSession
+                    val inPlace = callerInterceptor !is CoroutineDispatcher || !callerInterceptor.isDispatchNeeded(callerContext)
+                    if (inPlace) {
+                        try {
+                            Dispatchers.Default.asExecutor().execute { continuation.resumeWith(result) }
+                        } catch (_: RejectedExecutionException) {
+                            // like after Dispatchers.shutdown(), resumed in place rather than never, holding the mutex
+                            continuation.resumeWith(result)
+                        }
+                    } else {
+                        continuation.resumeWith(result)
+                    }
                 }
             } catch (_: RejectedExecutionException) {
                 continuation.resumeWithException(IllegalStateException(SESSION_CLOSED_MESSAGE))
