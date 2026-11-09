@@ -432,7 +432,12 @@ internal class DefaultScriptSession(
             throw e
         }
         if (propertiesFailure != null) {
-            Disposer.dispose(disposable)
+            // the disposer disposes the whole subtree, and then rethrows an exception thrown by any of its disposables,
+            // which would make this first result differ from the kept failure returned by every later execution,
+            // so it is only logged; not tested, as no input makes a disposable of the compiler throw deterministically
+            runCatching { Disposer.dispose(disposable) }.onFailure { e ->
+                logger.warn(e) { "$name: disposing the compiler of the failed declaration of the properties failed" }
+            }
             return null
         }
         repl = created
