@@ -38,7 +38,10 @@ internal class SnippetEvaluation(
     sessionJob: Job
 ) {
 
-    /** The job of the evaluation, a child of the job of the caller, so the cancellation of either does not cancel the other. */
+    /**
+     * The job of the evaluation, a child of the job of the caller, so it is cancelled with the caller,
+     * while its own cancellation, by closing the session, does not cancel the caller.
+     */
     val job = Job(callerJob)
 
     private val thread = Thread.currentThread()

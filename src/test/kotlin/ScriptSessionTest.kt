@@ -18,12 +18,12 @@
 
 package com.xemantic.kotlin.script
 
+import com.xemantic.kotlin.script.test.collectGarbageUntilCleared
 import com.xemantic.kotlin.test.assert
 import com.xemantic.kotlin.test.be
 import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
-import com.xemantic.kotlin.script.test.collectGarbageUntilCleared
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CompletableJob
 import kotlinx.coroutines.Dispatchers
@@ -37,6 +37,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import java.lang.ref.WeakReference
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CyclicBarrier
@@ -1369,17 +1370,17 @@ class ScriptSessionTest {
     @Test
     fun `should interrupt blocking snippet when the caller is cancelled`() = runTest {
         // given
-        val started = Job()
+        val sleeping = CompletableDeferred<Thread>()
         ScriptSession {
-            provide<CompletableJob>("started", started)
+            provide<CompletableDeferred<Thread>>("sleeping", sleeping)
         }.use { session ->
             val execution = launch(kotlinx.coroutines.Dispatchers.Default) {
                 session.execute("""
-                    started.complete()
+                    sleeping.complete(Thread.currentThread())
                     Thread.sleep(60_000)
                 """.trimIndent())
             }
-            started.join()
+            sleeping.await().awaitSleeping()
 
             // when
             execution.cancelAndJoin()
@@ -1532,17 +1533,17 @@ class ScriptSessionTest {
     @Test
     fun `should interrupt blocking snippet when the session is closed`() = runTest {
         // given
-        val started = Job()
+        val sleeping = CompletableDeferred<Thread>()
         val session = ScriptSession {
-            provide<CompletableJob>("started", started)
+            provide<CompletableDeferred<Thread>>("sleeping", sleeping)
         }
         val execution = async(Dispatchers.Default) {
             session.execute("""
-                started.complete()
+                sleeping.complete(Thread.currentThread())
                 Thread.sleep(600_000)
             """.trimIndent())
         }
-        started.join()
+        sleeping.await().awaitSleeping()
 
         // when
         session.close()
@@ -1552,6 +1553,69 @@ class ScriptSessionTest {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.EVALUATION)
             have("InterruptedException" in message)
+        }
+    }
+
+    /** The interruption of closing the session is like any other to the snippet, see #160. */
+    @Test
+    fun `should return value of snippet catching the interruption when the session is closed`() = runTest {
+        // given
+        val sleeping = CompletableDeferred<Thread>()
+        val session = ScriptSession {
+            provide<CompletableDeferred<Thread>>("sleeping", sleeping)
+        }
+        val execution = async(Dispatchers.Default) {
+            session.execute("""
+                sleeping.complete(Thread.currentThread())
+                try {
+                    Thread.sleep(600_000)
+                    "slept"
+                } catch (e: InterruptedException) {
+                    "interrupted"
+                }
+            """.trimIndent())
+        }
+        sleeping.await().awaitSleeping()
+
+        // when
+        session.close()
+
+        // then
+        execution.await() should {
+            be<ScriptResult.Value>()
+            have(value == "interrupted")
+        }
+    }
+
+    /** The cancellation of the awaited block by closing the session is like any other to the snippet, see #160. */
+    @Test
+    fun `should return value of snippet catching the cancellation of awaited block when the session is closed`() = runTest {
+        // given
+        val started = Job()
+        val session = ScriptSession {
+            provide<CompletableJob>("started", started)
+        }
+        val execution = async(Dispatchers.Default) {
+            session.execute("""
+                try {
+                    await {
+                        started.complete()
+                        awaitCancellation()
+                    }
+                } catch (e: CancellationException) {
+                    "cancelled"
+                }
+            """.trimIndent())
+        }
+        started.join()
+
+        // when
+        session.close()
+
+        // then
+        execution.await() should {
+            be<ScriptResult.Value>()
+            have(value == "cancelled")
         }
     }
 
@@ -1590,8 +1654,17 @@ class ScriptSessionTest {
         execution.get(1, TimeUnit.MINUTES).getOrThrow() should {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.EVALUATION)
+            have("The session is closed" in message)
         }
         assert(stopped.isCompleted)
+    }
+
+    /**
+     * Waits until this thread of a session sleeps in a blocking call of its snippet,
+     * so the interruption reaches the blocking call, not the snippet before it, like the "started" signalled from within `await`.
+     */
+    private suspend fun Thread.awaitSleeping() {
+        while (state != Thread.State.TIMED_WAITING) yield()
     }
 
     /** See #143. */
@@ -1670,7 +1743,7 @@ class ScriptSessionTest {
         assert(session.repl != null)
     }
 
-    /** See #142. */
+    /** Guards the reading of a property by the snippet running when the session is closed, passes without the fix of #142. */
     @Test
     fun `should read property in snippet running when the session is closed`() = runTest {
         // given
@@ -1682,7 +1755,7 @@ class ScriptSessionTest {
         val execution = async(Dispatchers.Default) {
             session.execute("""
                 started.complete()
-                // neither interrupted, nor awaiting, so it runs until the session is closed
+                // spinning without checking the interruption, nor awaiting, so it runs until the session is closed, and reads the property then
                 while (isActive) Thread.onSpinWait()
                 greeting
             """.trimIndent())
@@ -1699,7 +1772,7 @@ class ScriptSessionTest {
         }
     }
 
-    /** See #142. */
+    /** Guards the reading of a property by a coroutine outliving the closing of the session, passes without the fix of #142. */
     @Test
     fun `should read property in coroutine launched by snippet when the session is closed`() = runTest {
         // given
@@ -1729,7 +1802,7 @@ class ScriptSessionTest {
         assert(read.await() == "Hello")
     }
 
-    /** See #142. */
+    /** Guards the release of the value of a property with the session, passes without the fix of #142. */
     @Test
     fun `should release property value of closed session`() {
         // given
