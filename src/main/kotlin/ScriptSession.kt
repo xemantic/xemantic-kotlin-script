@@ -217,7 +217,10 @@ internal class DefaultScriptSession(
     /** The properties of the snippets which failed in the evaluation, `null` then. */
     private val uninitializedProperties = UninitializedProperties()
 
-    private val reporter = ScriptErrorReporter(snippets, snippetClassNames, uninitializedProperties)
+    /** The frames of the code inlined into the snippets, read from their class files. */
+    private val inlinedFrames = InlinedFrames()
+
+    private val reporter = ScriptErrorReporter(snippets, snippetClassNames, uninitializedProperties, inlinedFrames)
 
     private var snippetCount = 0
 
@@ -418,7 +421,10 @@ internal class DefaultScriptSession(
         @Suppress("UNCHECKED_CAST")
         val result = (valueOrNull() as? LinkedSnippet<KJvmEvaluatedSnippet>)
             ?.get()?.result
-        result?.scriptClass?.java?.declaredClasses?.mapTo(snippetClassNames) { it.simpleName }
+        result?.scriptClass?.java?.let { scriptClass ->
+            scriptClass.declaredClasses.mapTo(snippetClassNames) { it.simpleName }
+            inlinedFrames.keep(scriptClass)
+        }
         return reporter.scriptResult(result, reports, compilation.result.reports, compilation.dependencies).also {
             // after reporting it, as the snippet itself did not read them after it failed
             if (result is ResultValue.Error) {

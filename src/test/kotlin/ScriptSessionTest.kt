@@ -1013,6 +1013,90 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should report lines of inline function declared in the snippet`() = runTest {
+        // when
+        val result = session.execute("""
+            inline fun ensure(condition: Boolean, message: () -> String) {
+                if (!condition) {
+                    val text = message()
+                    throw IllegalStateException(text)
+                }
+            }
+            val a = 1
+            ensure(a > 1) { "a must be greater than 1" }
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IllegalStateException: a must be greater than 1
+                  at ensure(snippet1.kts:4)
+                  |         throw IllegalStateException(text)
+                  at <snippet body>(snippet1.kts:8)
+                  | ensure(a > 1) { "a must be greater than 1" }
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report lines of inline function inlined into method of class declared in earlier snippet`() = runTest {
+        // given
+        session.execute("""
+            inline fun ensure(condition: Boolean, message: () -> String) {
+                if (!condition) {
+                    val text = message()
+                    throw IllegalStateException(text)
+                }
+            }
+            class Account(val balance: Int) {
+                fun withdraw(amount: Int) = ensure(amount <= balance) { "insufficient balance" }
+            }
+        """.trimIndent())
+
+        // when
+        val result = session.execute("Account(1).withdraw(2)")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IllegalStateException: insufficient balance
+                  at ensure(snippet1.kts:4)
+                  |         throw IllegalStateException(text)
+                  at Account.withdraw(snippet1.kts:8)
+                  |     fun withdraw(amount: Int) = ensure(amount <= balance) { "insufficient balance" }
+                  at <snippet body>(snippet2.kts:1)
+                  | Account(1).withdraw(2)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report line of the call of inline function of the standard library`() = runTest {
+        // when
+        val result = session.execute("""
+            val numbers = listOf(1, 2, 3)
+            numbers.first { it > 5 }
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            // the line of the inlined code of the standard library depends on its version
+            message.replace(Regex("_Collections\\.kt:\\d+"), "_Collections.kt:N") sameAs """
+                java.util.NoSuchElementException: Collection contains no element matching the predicate.
+                  at kotlin.collections.CollectionsKt___CollectionsKt.first(_Collections.kt:N)
+                  at <snippet body>(snippet1.kts:2)
+                  | numbers.first { it > 5 }
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should report unicode characters`() = runTest {
         // when
         val result = session.execute("val π = \"żółć\"\nπ + ł")

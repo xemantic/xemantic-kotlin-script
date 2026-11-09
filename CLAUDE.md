@@ -80,6 +80,13 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   an `inline` declaration cannot be called across snippets.
   Re-probe them after every Kotlin upgrade — the workarounds and hints might become obsolete.
 
+### The inlined frames (`InlinedFrames`)
+
+- The ASM relocated into `kotlin-compiler-embeddable` (`org.jetbrains.org.objectweb.asm`) lacks `Label.getOffset()`,
+  so the ranges of the inline markers are compared by the instruction indices of `asm.tree`, not by bytecode offsets.
+- A `@kotlin.internal.InlineOnly` function of the standard library, like `require` or `let`, is inlined with the lines of its call site,
+  only the other inline functions, like `first { }` or `forEach { }`, get the synthetic lines beyond the end of the snippet.
+
 ## Anti-patterns to avoid
 
 - Inside a lambda walking a chain of exceptions in a `Throwable` extension, like `generateSequence(this) { read(null) { cause } }`,
