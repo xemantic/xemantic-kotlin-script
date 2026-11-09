@@ -80,6 +80,27 @@ class AliasHolder {
     val map: Map<Transform, MutableItems> = mapOf()
 }
 
+/** The type arguments of an inner class and of its generic outer classes are rendered after their own class names. */
+class Generic<T>(val value: T) {
+
+    inner class Inner<U>(val extra: U) {
+
+        val pair: Pair<T, U> get() = value to extra
+
+        inner class Deep<V>(val more: V) {
+            val triple: Triple<T, U, V> get() = Triple(value, extra, more)
+        }
+
+    }
+
+    inner class Plain {
+        val outerValue: T get() = value
+    }
+
+    class Nested<U>(val item: U)
+
+}
+
 class ScriptPropertiesTest {
 
     @Test
@@ -330,6 +351,59 @@ class ScriptPropertiesTest {
             "kotlin.collections.ListIterator<kotlin.String>",
             "java.util.ArrayList<kotlin.String>"
         ))
+    }
+
+    @Test
+    fun `should render type arguments of inner class of generic class in source`() {
+        // given
+        val types = listOf(
+            typeOf<Generic<String>.Inner<Int>>(),
+            typeOf<Generic<String>.Inner<Int>?>(),
+            typeOf<Generic<List<String>>.Inner<Int?>>(),
+            typeOf<Generic<String>.Inner<Int>.Deep<Boolean>>(),
+            typeOf<Generic<String>.Plain>(),
+            typeOf<Generic<String>.Plain?>(),
+            typeOf<Generic.Nested<Int>>(),
+            typeOf<Generic<*>.Inner<out Number>>()
+        )
+
+        // when
+        val sources = types.map { it.toSource() }
+
+        // then
+        assert(sources == listOf(
+            "com.xemantic.kotlin.script.Generic<kotlin.String>.Inner<kotlin.Int>",
+            "com.xemantic.kotlin.script.Generic<kotlin.String>.Inner<kotlin.Int>?",
+            "com.xemantic.kotlin.script.Generic<kotlin.collections.List<kotlin.String>>.Inner<kotlin.Int?>",
+            "com.xemantic.kotlin.script.Generic<kotlin.String>.Inner<kotlin.Int>.Deep<kotlin.Boolean>",
+            "com.xemantic.kotlin.script.Generic<kotlin.String>.Plain",
+            "com.xemantic.kotlin.script.Generic<kotlin.String>.Plain?",
+            "com.xemantic.kotlin.script.Generic.Nested<kotlin.Int>",
+            "com.xemantic.kotlin.script.Generic<*>.Inner<out kotlin.Number>"
+        ))
+    }
+
+    @Test
+    fun `should provide properties of inner classes of generic class`() = runTest {
+        // given
+        val generic = Generic("foo")
+        ScriptSession {
+            "inner" provides generic.Inner(42)
+            "deep" provides generic.Inner(42).Deep(true)
+            "plain" provides generic.Plain()
+            provide<Generic<String>.Inner<Int>?>("missing", null)
+        }.use { session ->
+            // when
+            val result = session.execute("""
+                listOf(inner.pair, deep.triple, plain.outerValue, missing?.pair)
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == listOf("foo" to 42, Triple("foo", 42, true), "foo", null))
+            }
+        }
     }
 
     @Test

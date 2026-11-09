@@ -148,12 +148,38 @@ private fun ScriptProperty<*>.getterName(): String =
 
 /** This type as written in the Kotlin source, with the fully qualified names, quoted in backticks where needed. */
 internal fun KType.toSource(): String {
-    val kClass = classifier as KClass<*>
-    // validated to be accessible, so neither local nor anonymous
-    val name = (mutableCollectionType()?.name ?: kClass.qualifiedName!!).split('.').joinToString(".") { it.quoted() }
-    val arguments = if (arguments.isEmpty()) "" else arguments.joinToString(prefix = "<", postfix = ">") { it.toSource() }
-    return name + arguments + if (isMarkedNullable) "?" else ""
+    val mutable = mutableCollectionType()
+    val source = if (mutable != null) {
+        mutable.name.quotedQualified() + arguments.toSource()
+    } else {
+        (classifier as KClass<*>).toSource(arguments)
+    }
+    return source + if (isMarkedNullable) "?" else ""
 }
+
+/**
+ * This class with the type [arguments] as written in the source, like `Outer<String>.Inner<Int>`.
+ *
+ * The arguments of a type of an inner class start with the ones of the class itself,
+ * followed by the ones of its outer classes, from the enclosing one outwards, like `Inner<Int, String>` of `Outer<String>.Inner<Int>`,
+ * while in the source each class takes its own arguments.
+ */
+private fun KClass<*>.toSource(arguments: List<KTypeProjection>): String {
+    val own = arguments.take(typeParameters.size).toSource()
+    return if (isInner) {
+        java.declaringClass.kotlin.toSource(arguments.drop(typeParameters.size)) + "." + simpleName!!.quoted() + own
+    } else {
+        // validated to be accessible, so neither local nor anonymous
+        qualifiedName!!.quotedQualified() + own
+    }
+}
+
+private fun List<KTypeProjection>.toSource(): String =
+    if (isEmpty()) "" else joinToString(prefix = "<", postfix = ">") { it.toSource() }
+
+/** This qualified name with each of its segments quoted in backticks where needed. */
+private fun String.quotedQualified(): String =
+    split('.').joinToString(".") { it.quoted() }
 
 /**
  * The mutable collection type, like `kotlin.collections.MutableList`, if this is one.
@@ -169,7 +195,8 @@ private fun KType.mutableCollectionType(): MutableCollectionType? =
  * A mutable collection type.
  *
  * @param name the qualified name, like `kotlin.collections.MutableList`.
- * @param type the nullable type, like `MutableList<*>?`, a supertype of all its parameterizations, also the nullable ones.
+ * @param type the nullable type, like `MutableList<*>?`, a supertype of all its parameterizations, also the nullable ones,
+ *   while a [KType] not produced by kotlin-reflect is seen as the read-only type.
  * @param isInstance whether the value is of this type, and not of its read-only counterpart only,
  *   as checked by the cast of the property in the snippets.
  */
@@ -180,14 +207,14 @@ private class MutableCollectionType(
 ) {
 
     /**
-     * Whether the [type] is a parameterization of this type, or `false` if it cannot be told.
+     * Whether the [other] type is a parameterization of this type, or `false` if it cannot be told.
      *
      * [isSubtypeOf] casts both the types to the implementation of kotlin-reflect,
      * so it fails for a [KType] implemented by hand, which is seen by the members of the interface only,
      * where a mutable collection type is indistinguishable from its read-only counterpart.
      */
-    fun isSupertypeOf(type: KType): Boolean = try {
-        type.isSubtypeOf(this.type)
+    fun isSupertypeOf(other: KType): Boolean = try {
+        other.isSubtypeOf(type)
     } catch (e: ClassCastException) {
         false
     }
