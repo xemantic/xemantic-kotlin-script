@@ -27,6 +27,7 @@ import com.xemantic.kotlin.test.should
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CompletableJob
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.asContextElement
@@ -44,7 +45,7 @@ import kotlinx.coroutines.yield
 import java.lang.ref.WeakReference
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CyclicBarrier
-import java.util.concurrent.Executor
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -1957,25 +1958,94 @@ class ScriptSessionTest {
     }
 
     /**
-     * A caller dispatched by an executor running its tasks inline reports a dispatch as needed,
-     * but would run the caller on the thread of the session, see #172.
+     * A caller with its own dispatcher is resumed by it directly, not through [Dispatchers.Default],
+     * so it resumes also while the snippets block all the workers of [Dispatchers.Default], see #172.
      */
     @Test
-    fun `should not resume caller of inline executor dispatcher on the session thread`() {
+    fun `should resume caller with a dispatcher while Dispatchers Default is saturated`() {
         // given
-        val inline = Executor(Runnable::run).asCoroutineDispatcher()
-
-        // when
-        val (sessionThread, callerThread) = runBlocking {
-            withContext(inline) {
-                val result = session.execute("Thread.currentThread()")
-                assert(result is ScriptResult.Value)
-                result.value to Thread.currentThread()
-            }
+        val workers = Runtime.getRuntime().availableProcessors().coerceAtLeast(2)
+        val started = CountDownLatch(workers)
+        val released = CountDownLatch(1)
+        val session = ScriptSession {
+            provide<CountDownLatch>("started", started)
+            provide<CountDownLatch>("released", released)
         }
 
-        // then
-        assert(callerThread !== sessionThread)
+        session.use {
+            try {
+                // when
+                val execution = CompletableFuture.supplyAsync {
+                    runBlocking {
+                        session.execute(
+                            """
+                            repeat($workers) {
+                                launch {
+                                    started.countDown()
+                                    released.await()
+                                }
+                            }
+                            started.await()
+                            42
+                            """
+                        )
+                    }
+                }
+
+                // then
+                // bounded, so a hang fails the test instead of hanging the build
+                execution.get(1, TimeUnit.MINUTES) should {
+                    be<ScriptResult.Value>()
+                    have(value == 42)
+                }
+            } finally {
+                released.countDown()
+            }
+        }
+    }
+
+    /**
+     * A caller without a dispatcher waiting for the snippet of another caller would be resumed by the unlocking of that caller,
+     * in place, on its thread, like the main thread of a UI, so it is run on [Dispatchers.Default] instead, see #147 and #172.
+     */
+    @Test
+    fun `should not resume waiting caller without a dispatcher on the thread of the unlocking caller`() {
+        // given
+        val executor = Executors.newSingleThreadExecutor()
+        val unlockingThread = CompletableFuture.supplyAsync({ Thread.currentThread() }, executor).get()
+        val started = CountDownLatch(1)
+        val session = ScriptSession {
+            provide<CountDownLatch>("started", started)
+        }
+        try {
+            val unlocking = CoroutineScope(executor.asCoroutineDispatcher()).async {
+                session.execute("started.countDown(); Thread.sleep(Long.MAX_VALUE)")
+            }
+            started.await()
+            val waitingCompletion = CompletableFuture<Thread>()
+            // suspended on the lock held by the unlocking caller before startCoroutine returns,
+            // unless it is dispatched first, as it should be
+            suspend {
+                session.execute("42")
+            }.startCoroutine(Continuation(EmptyCoroutineContext) {
+                waitingCompletion.complete(Thread.currentThread())
+            })
+
+            // when
+            // the waiting caller is rejected by the closed session, completing on the thread it was resumed on
+            session.close()
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build
+            val waitingThread = waitingCompletion.get(1, TimeUnit.MINUTES)
+            assert(waitingThread !== unlockingThread)
+            runBlocking { unlocking.await() } should {
+                be<ScriptResult.Error>()
+            }
+        } finally {
+            session.close()
+            executor.shutdown()
+        }
     }
 
     /**

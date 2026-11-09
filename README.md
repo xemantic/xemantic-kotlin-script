@@ -98,10 +98,12 @@ ScriptSession {
   The thread is given a 16 MB stack, larger than the default one,
   so the compiler takes a deeply nested expression, of thousands of nesting levels,
   and a snippet can recurse deeper.
-  The caller of `execute` is resumed from `Dispatchers.Default`, never from the thread of the session,
-  so it resumes where its dispatcher resumes it from there, like the main thread for `Dispatchers.Main.immediate`,
-  or on `Dispatchers.Default` if its dispatcher resumes it in place, like `Dispatchers.Unconfined`,
-  or it has no dispatcher, like `suspend fun main`.
+  The caller of `execute` resumes where its dispatcher resumes it, like the main thread for `Dispatchers.Main.immediate`,
+  or on `Dispatchers.Default` if it would resume in place, on the thread of the session:
+  if it has no dispatcher, like `suspend fun main`, or one which does not dispatch, like `Dispatchers.Unconfined`,
+  or a continuation interceptor which is not a dispatcher.
+  Only a dispatcher running its tasks on the dispatching thread, like `Executor(Runnable::run).asCoroutineDispatcher()`,
+  resumes its caller on the thread of the session.
   Separate sessions run in parallel, each with its own state,
   and each holding its own compiler, which loads the whole classpath, so close the sessions no longer needed.
 * The snippets are received by the `ScriptScope`, a `CoroutineScope` living as long as the session,
