@@ -218,17 +218,20 @@ internal class MavenVersionLookup(
 
     /**
      * This repository, with the mirror, the proxy and the server credentials of the Maven settings applied,
-     * like `MavenDependenciesResolver` does, or `null`, if its protocol is neither HTTP(S), nor `file`.
+     * or `null`, if its protocol is neither HTTP(S), nor `file`.
+     *
+     * The mirror is selected first, and the proxy and the credentials are selected for the mirror,
+     * in the order of Maven itself, so a mirror is reached through the proxy, like behind a corporate firewall.
+     * `MavenDependenciesResolver` selects the proxy for the original repository instead,
+     * so it resolves the artifact from a mirror bypassing the proxy.
      */
     private fun RemoteRepository.withSettings(): RemoteRepository? {
-        val proxied = proxySelector.getProxy(this)?.let { proxy ->
-            RemoteRepository.Builder(this).setProxy(proxy).build()
-        } ?: this
-        if (!proxied.protocol.matches(supportedProtocol)) return null
-        val repository = mirrorSelector.getMirror(proxied) ?: proxied
-        if (repository.authentication != null) return repository
+        if (!protocol.matches(supportedProtocol)) return null
+        val repository = mirrorSelector.getMirror(this) ?: this
         return RemoteRepository.Builder(repository)
-            .setAuthentication(authenticationSelector.getAuthentication(repository))
+            .setProxy(proxySelector.getProxy(repository))
+            // the credentials declared with the repository take precedence over these of the settings
+            .setAuthentication(repository.authentication ?: authenticationSelector.getAuthentication(repository))
             .build()
     }
 
