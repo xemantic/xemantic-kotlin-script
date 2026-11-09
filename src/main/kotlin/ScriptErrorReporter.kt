@@ -55,6 +55,8 @@ private const val MAX_NAMED_UNINITIALIZED = 5
  *
  * @param snippets the lines of the snippets by their names, like `snippet3.kts`.
  * @param snippetClassNames the simple names of the classes declared by the evaluated snippets.
+ * @param snippetPropertyNames the names of the properties declared by the evaluated snippets, also of the provided ones.
+ * @param snippetFunctionNames the names of the functions declared by the evaluated snippets.
  * @param uninitializedProperties the properties of the snippets which failed in the evaluation, `null` then.
  * @param inlinedFrames the frames of the code inlined into the snippets, of the lines beyond the end of a snippet.
  * @param propertyAccessors the properties of the accessors of the classes of the snippets, named in the hints by the property.
@@ -62,6 +64,8 @@ private const val MAX_NAMED_UNINITIALIZED = 5
 internal class ScriptErrorReporter(
     private val snippets: Map<String, List<String>>,
     private val snippetClassNames: Set<String> = emptySet(),
+    private val snippetPropertyNames: Set<String> = emptySet(),
+    private val snippetFunctionNames: Set<String> = emptySet(),
     private val uninitializedProperties: UninitializedProperties = UninitializedProperties(),
     private val inlinedFrames: InlinedFrames = InlinedFrames(snippets),
     private val propertyAccessors: PropertyAccessors = PropertyAccessors()
@@ -148,10 +152,29 @@ internal class ScriptErrorReporter(
                 append("  | $sourceLine\n")
             }
         }
-        unresolvedReference.matchEntire(diagnostic.message)?.groupValues?.get(1)?.takeIf { it in snippetClassNames }?.let { name ->
+        unresolvedReference.matchEntire(diagnostic.message)?.groupValues?.get(1)?.let { name ->
+            appendUnresolvedEarlierDeclarationHint(name)
+        }
+    }
+
+    /**
+     * The hint at the K2 REPL compiler not resolving a class, a property or a function of this [name], declared by an earlier snippet,
+     * within a declaration of an inferred type used in the same snippet, which resolves once its type is declared.
+     * A declaration of a snippet which failed to compile is not kept, so not hinted at, as it stays unresolved also then.
+     */
+    private fun StringBuilder.appendUnresolvedEarlierDeclarationHint(name: String) {
+        if (name in snippetClassNames) {
             append("  hint: '$name' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type,")
             append(" like `fun f(x: Any) = x is $name` - declare the type, like `fun f(x: Any): Boolean = x is $name`.\n")
+            return
         }
+        val reference = when (name) {
+            in snippetPropertyNames -> name
+            in snippetFunctionNames -> "$name()"
+            else -> return
+        }
+        append("  hint: '$name' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet,")
+        append(" like `fun f() = $reference.toString()` - declare the type, like `fun f(): String = $reference.toString()`.\n")
     }
 
     /**

@@ -143,6 +143,30 @@ class ScriptPropertiesTest {
     }
 
     @Test
+    fun `should hint declaring the type when property is unresolved in declaration of inferred type`() = runTest {
+        ScriptSession {
+            "base" provides 10
+        }.use { session ->
+            // when
+            val result = session.execute("""
+                fun doubled() = base * 2
+                doubled()
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Error>()
+                have(phase == ExecutionPhase.COMPILATION)
+                message sameAs """
+                    snippet1.kts:1:17: error: Unresolved reference 'base'.
+                      | fun doubled() = <error>base</error> * 2
+                      hint: 'base' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = base.toString()` - declare the type, like `fun f(): String = base.toString()`.
+                """.trimIndent()
+            }
+        }
+    }
+
+    @Test
     fun `should provide properties from the list`() = runTest {
         ScriptSession(listOf(ScriptProperty("injected", typeOf<String>(), "foo"))).use { session ->
             // when
