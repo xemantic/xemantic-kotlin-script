@@ -24,6 +24,7 @@ import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
 import kotlin.script.experimental.api.ResultValue
+import kotlin.script.experimental.api.ScriptDiagnostic
 import kotlin.test.Test
 
 class ScriptErrorReporterTest {
@@ -141,6 +142,40 @@ class ScriptErrorReporterTest {
     }
 
     @Test
+    fun `should drop trailing whitespace of message and keep its blank lines empty`() {
+        // given
+        val exception = IllegalStateException("a  \n  \nb\n  ").thrownBySnippet()
+
+        // when
+        val report = reporter.describe(exception)
+
+        // then
+        assert(
+            report == "java.lang.IllegalStateException: a\n" +
+                "\n" +
+                "  b\n" +
+                "  at <snippet body>(snippet1.kts:1)\n" +
+                "  | throw IllegalStateException(\"a\\nb\")"
+        )
+    }
+
+    @Test
+    fun `should indent later lines of multi-line diagnostic message and keep its blank lines empty`() {
+        // given
+        val diagnostic = ScriptDiagnostic(
+            code = ScriptDiagnostic.unspecifiedError,
+            message = "a  \n  \nb\n  ",
+            severity = ScriptDiagnostic.Severity.ERROR
+        )
+
+        // when
+        val report = reporter.describe(listOf(diagnostic))
+
+        // then
+        assert(report == "error: a\n\n  b")
+    }
+
+    @Test
     fun `should report exception with empty message`() {
         // given
         val exception = IllegalStateException("").thrownBySnippet()
@@ -149,6 +184,7 @@ class ScriptErrorReporterTest {
         val report = reporter.describe(exception)
 
         // then
+        // the trailing space after the colon is deliberate, mirroring Throwable.toString() of an empty message
         assert(
             report == "java.lang.IllegalStateException: \n" +
                 "  at <snippet body>(snippet1.kts:1)\n" +

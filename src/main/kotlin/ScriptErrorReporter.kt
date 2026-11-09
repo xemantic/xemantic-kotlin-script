@@ -115,7 +115,7 @@ internal class ScriptErrorReporter(
             append("The compiler failed internally: ")
             appendThrowable(exception, "", "  ", Collections.newSetFromMap(IdentityHashMap()))
         } else {
-            append(diagnostic.message.trimEnd().lines().joinToString("\n  "))
+            append(diagnostic.message.indentContinuationLines("  "))
             append('\n')
         }
         if (location != null && lines != null) {
@@ -199,7 +199,6 @@ internal class ScriptErrorReporter(
      * The class and the message of the [throwable], with the later lines of a multi-line message
      * indented like the frames, by the [indent] of the throwable, so that they read as a part of the headline
      * also within a cause or a suppressed exception, and do not break the structure of the report.
-     * The trailing line breaks of the message are dropped, and `\r\n` is normalized to `\n`.
      */
     private fun StringBuilder.appendDescription(
         throwable: Throwable,
@@ -213,13 +212,7 @@ internal class ScriptErrorReporter(
         }
         message?.let {
             append(": ")
-            it.withoutSnippetClassName().trimEnd('\n', '\r').lines().forEachIndexed { index, line ->
-                if (index > 0) {
-                    append('\n')
-                    if (line.isNotEmpty()) append("$indent  ")
-                }
-                append(line)
-            }
+            append(it.withoutSnippetClassName().indentContinuationLines("$indent  "))
         }
     }
 
@@ -363,6 +356,15 @@ internal fun ScriptErrorReporter.scriptResult(
         ExecutionPhase.EVALUATION
     )
 }
+
+/**
+ * This message with its lines after the first indented by the [indent], so that they read as a continuation of the first,
+ * where a blank line stays empty, the trailing whitespace of the message and of each line is dropped,
+ * and line breaks of any kind are normalized to `\n`.
+ */
+private fun String.indentContinuationLines(indent: String): String = trimEnd().lines().mapIndexed { index, line ->
+    line.trimEnd().let { if (index == 0 || it.isEmpty()) it else "$indent$it" }
+}.joinToString("\n")
 
 /** The names of the classes of the snippets without the snippet class, like `Color.BLUE` instead of `Snippet3.Color.BLUE`. */
 private fun String.withoutSnippetClassName(): String = replace(snippetQualifiedName, "")

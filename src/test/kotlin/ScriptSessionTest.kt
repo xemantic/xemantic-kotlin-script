@@ -411,8 +411,11 @@ class ScriptSessionTest {
             )
             // the exception is the headline, not repeated as its own cause
             have(message.lines().count { "java.lang.RuntimeException" in it } == 1)
-            // the IR dump of the message is indented, like the frames, so it does not break the structure of the report
-            have(message.lines().drop(1).all { it.isEmpty() || it.startsWith("  ") })
+            // the IR dump of the message is indented to the column of the frames of the headline exception, 4 spaces,
+            // so it does not break the structure of the report, where a nested exception starts at 2 spaces
+            val irDump = message.lines().drop(1).takeWhile { !it.trimStart().startsWith("at ") }
+            have(irDump.isNotEmpty())
+            have(irDump.all { it.isEmpty() || it.startsWith("    ") })
         }
         next should {
             be<ScriptResult.Value>()
