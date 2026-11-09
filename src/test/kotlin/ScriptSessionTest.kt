@@ -28,6 +28,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CompletableJob
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.asContextElement
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
@@ -35,8 +36,10 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 import java.lang.ref.WeakReference
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -1282,12 +1285,15 @@ class ScriptSessionTest {
     @Test
     fun `should cancel coroutines launched by snippets when the session is closed`() = runTest {
         // given
+        val started = Job()
         val stopped = Job()
         val session = ScriptSession {
+            provide<CompletableJob>("started", started)
             provide<CompletableJob>("stopped", stopped)
         }
         session.execute("""
             launch {
+                started.complete()
                 try {
                     awaitCancellation()
                 } finally {
@@ -1295,6 +1301,8 @@ class ScriptSessionTest {
                 }
             }
         """.trimIndent())
+        // signalled from within the coroutine, as one cancelled before it started would never run its finally
+        started.join()
 
         // when
         session.close()
@@ -1429,6 +1437,36 @@ class ScriptSessionTest {
         // bounded, so a hang fails the test instead of hanging the build
         val (sessionThread, callerThread) = threads.get(1, TimeUnit.MINUTES).getOrThrow()
         assert(callerThread !== sessionThread)
+    }
+
+    /**
+     * A thread context element of the caller, like a thread local of a logging context as its `asContextElement`,
+     * is installed on the thread of the session for the snippet, and removed after it, see #162.
+     */
+    @Test
+    fun `should install thread context element of the caller on the session thread`() = runTest {
+        // given
+        val threadLocal = ThreadLocal<String>()
+        ScriptSession {
+            provide<ThreadLocal<String>>("threadLocal", threadLocal)
+        }.use { session ->
+
+            // when
+            val withElement = withContext(threadLocal.asContextElement("caller")) {
+                session.execute("threadLocal.get()")
+            }
+            val withoutElement = session.execute("threadLocal.get()")
+
+            // then
+            withElement should {
+                be<ScriptResult.Value>()
+                have(value == "caller")
+            }
+            withoutElement should {
+                be<ScriptResult.Value>()
+                have(value == null)
+            }
+        }
     }
 
     /** See #143. */
@@ -1846,6 +1884,42 @@ class ScriptSessionTest {
             session.execute("1")
         }
         assert(exception.message == "The session is closed")
+    }
+
+    /**
+     * A smoke test of closing the session from many threads at once, repeatedly,
+     * guarding only that no exception escapes any of the closings,
+     * as it passes also with the check of a closed session read, then written, instead of the compare-and-set,
+     * since the window between them is a single volatile read, see #141 and #162,
+     * while the order of marking the session closed and releasing it is pinned by the test above.
+     */
+    @Test
+    fun `should close session concurrently from many threads`() {
+        val threads = 8
+        val pool = Executors.newFixedThreadPool(threads)
+        try {
+            repeat(100) {
+                // given
+                val session = ScriptSession()
+                val barrier = CyclicBarrier(threads)
+
+                // when
+                val closings = List(threads) {
+                    pool.submit<Result<Unit>> {
+                        barrier.await()
+                        runCatching { session.close() }
+                    }
+                }
+
+                // then
+                closings.forEach {
+                    // bounded, so a deadlock fails the test instead of hanging the build
+                    assert(it.get(1, TimeUnit.MINUTES).exceptionOrNull() == null)
+                }
+            }
+        } finally {
+            pool.shutdownNow()
+        }
     }
 
     @Test

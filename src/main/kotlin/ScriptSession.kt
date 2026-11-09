@@ -22,8 +22,8 @@ package com.xemantic.kotlin.script
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineName
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.currentCoroutineContext
@@ -76,6 +76,9 @@ import kotlin.script.experimental.util.LinkedSnippet
 private val logger = KotlinLogging.logger {}
 
 private val sessionIds = AtomicInteger()
+
+/** The message of the [IllegalStateException] thrown by [ScriptSession.execute] of a closed session. */
+private const val SESSION_CLOSED_MESSAGE = "The session is closed"
 
 /**
  * The stack size of the thread of a session, in bytes.
@@ -396,7 +399,7 @@ internal class DefaultScriptSession(
     private suspend fun executeOnSessionThread(
         snippet: String
     ): ScriptResult = mutex.withLock {
-        check(!closed.get()) { "The session is closed" }
+        checkNotClosed()
         // a caller with a dispatcher but without a job cannot cancel the evaluation,
         // while a caller without a dispatcher, like `suspend fun main`, has the job of the withContext of execute
         val callerJob = currentCoroutineContext()[Job] ?: Job()
@@ -404,13 +407,12 @@ internal class DefaultScriptSession(
             // checked again on the thread, as the session could be closed before the block was submitted to it,
             // with the disposal of the compiler queued before the block then,
             // while a session closed later disposes the compiler only after this block, queued after it on the thread
-            check(!closed.get()) { "The session is closed" }
+            checkNotClosed()
             propertiesFailure ?: run {
-                val repl = repl ?: createRepl().also {
-                    // the session closed while the properties were declared has cancelled the snippet already,
-                    // so it would fail in the evaluation, while the properties are declared, see close
-                    check(!closed.get()) { "The session is closed" }
-                }
+                val repl = repl ?: createRepl()
+                // a snippet of the session closed while the properties were declared would be evaluated cancelled already,
+                // so it is rejected instead, like one executed after closing, while the properties are declared, see close
+                checkNotClosed()
                 // null only if declaring the properties failed just now, with their failure kept, see createRepl
                 repl?.compileAndEvaluate(snippet, "snippet${++snippetCount}.kts", callerJob) ?: propertiesFailure!!
             }
@@ -422,10 +424,15 @@ internal class DefaultScriptSession(
     /**
      * Runs the [block] on the [thread], and returns its result, or throws its exception.
      *
-     * The block is run by `runBlocking`, so it stays on the thread also if it suspends,
+     * The block is run by `runBlocking` in the context of the caller, without its job and dispatcher,
+     * so a thread context element of the caller, like a thread local as its `asContextElement`, is installed on the thread for the block,
+     * while the caller cancelled does not cancel the block, and the block stays on the thread also if it suspends,
      * which the compiler and the evaluator, suspending by their API, never do today,
      * and a session closed meanwhile disposes the compiler only after the block, queued after it on the thread,
      * so no code of the session runs on another thread, or against the disposed compiler.
+     * If the evaluator ever suspended, and the interrupt of [close] arrived while `runBlocking` is parked,
+     * kotlinx.coroutines 1.11 would cancel the blocking coroutine with an [InterruptedException],
+     * so [execute] would throw it instead of returning an [ExecutionPhase.EVALUATION] error.
      * The caller waits for the block also when it is cancelled,
      * as a cancelled compilation would leave the compiled snippet to be evaluated before the next one.
      *
@@ -433,16 +440,24 @@ internal class DefaultScriptSession(
      */
     private suspend fun <T> onSessionThread(
         block: suspend CoroutineScope.() -> T
-    ): T = suspendCoroutine { continuation ->
-        try {
-            thread.execute {
-                continuation.resumeWith(
-                    runCatching { runBlocking(CoroutineName(name), block) }
-                )
+    ): T {
+        val context = currentCoroutineContext().minusKey(Job).minusKey(ContinuationInterceptor) + CoroutineName(name)
+        return suspendCoroutine { continuation ->
+            try {
+                thread.execute {
+                    continuation.resumeWith(
+                        runCatching { runBlocking(context, block) }
+                    )
+                }
+            } catch (_: RejectedExecutionException) {
+                continuation.resumeWithException(IllegalStateException(SESSION_CLOSED_MESSAGE))
             }
-        } catch (_: RejectedExecutionException) {
-            continuation.resumeWithException(IllegalStateException("The session is closed"))
         }
+    }
+
+    /** @throws IllegalStateException if the session is closed. */
+    private fun checkNotClosed() {
+        check(!closed.get()) { SESSION_CLOSED_MESSAGE }
     }
 
     /**
