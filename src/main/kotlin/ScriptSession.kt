@@ -116,7 +116,9 @@ public interface ScriptSession : AutoCloseable {
     /**
      * Closes the session, cancelling the coroutines launched by its snippets, and the evaluation of the snippet being executed, if any,
      * like a cancellation of its caller, see [execute],
-     * and releasing the compiler and the thread, once that snippet ends.
+     * and releasing the compiler, the thread, and the values of the properties, once that snippet ends,
+     * so the properties are declared also when the session is closed while declaring them.
+     * The snippets and coroutines still running read the properties as before, as they were declared already.
      * Closing a closed session, also concurrently, has no effect.
      */
     override fun close()
@@ -419,8 +421,10 @@ internal class DefaultScriptSession(
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         job.cancel()
-        ScriptPropertyValues.unregister(id)
+        // released after the last evaluation on the thread, which might be the declaration of the properties reading them,
+        // and before the disposal, so its failure cannot keep them
         thread.execute {
+            ScriptPropertyValues.unregister(id)
             Disposer.dispose(disposable)
             dependencyResolver.close()
         }

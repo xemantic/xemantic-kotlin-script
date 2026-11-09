@@ -95,7 +95,8 @@ ScriptSession {
 * Closing the session cancels the coroutines launched by its snippets,
   and the snippet being evaluated, like cancelling its caller does, also a caller which cannot be cancelled, like `suspend fun main`,
   so its `execute` returns an evaluation error.
-  Then it releases its compiler and thread, once that snippet ends.
+  Then it releases its compiler, thread, and the values of its properties, once that snippet ends,
+  while the snippets and coroutines still running can read the properties until they end.
 * Properties of the given name and type are provided to the snippets of the session, like `"greeting" provides "Hello"`.
   The type is inferred from the value, including its type arguments,
   or can be given explicitly, e.g. `provide<String?>("name", null)` or `provide<Clock>("clock", fixedClock)`,
