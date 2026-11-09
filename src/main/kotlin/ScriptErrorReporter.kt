@@ -110,9 +110,7 @@ internal class ScriptErrorReporter(
         val exception = diagnostic.exception
         if (exception != null && diagnostic.severity >= ScriptDiagnostic.Severity.ERROR) {
             append("The compiler failed internally: ")
-            append(diagnostic.message.lineSequence().first())
-            append('\n')
-            appendThrowable(exception, "Caused by: ", "  ", Collections.newSetFromMap(IdentityHashMap()))
+            appendThrowable(exception, "", "  ", Collections.newSetFromMap(IdentityHashMap()))
         } else {
             append(diagnostic.message.trimEnd().lines().joinToString("\n  "))
             append('\n')
@@ -143,13 +141,16 @@ internal class ScriptErrorReporter(
         }
     }
 
+    /**
+     * @param prefix the lead of the first line, with its indent, like `  Caused by: `, as the caller might continue a line.
+     * @param indent the indent of the following lines, the frames, the suppressed exceptions and the causes.
+     */
     private fun StringBuilder.appendThrowable(
         throwable: Throwable,
         prefix: String,
         indent: String,
         reported: MutableSet<Throwable>
     ): Boolean {
-        append(indent)
         append(prefix)
         if (throwable in reported) {
             append("[CIRCULAR REFERENCE: ")
@@ -184,10 +185,10 @@ internal class ScriptErrorReporter(
         }
         appendFrames(stackTrace, indent)
         for (suppressed in throwable.read(emptyArray()) { suppressed }) {
-            if (!appendThrowable(suppressed, "Suppressed: ", "$indent  ", reported)) return false
+            if (!appendThrowable(suppressed, "$indent  Suppressed: ", "$indent  ", reported)) return false
         }
         return throwable.read(null) { cause }?.let {
-            appendThrowable(it, "Caused by: ", indent, reported)
+            appendThrowable(it, "${indent}Caused by: ", indent, reported)
         } ?: true
     }
 
