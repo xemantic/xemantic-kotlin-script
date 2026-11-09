@@ -28,6 +28,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CompletableJob
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.asContextElement
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
@@ -35,6 +36,7 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 import java.lang.ref.WeakReference
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CyclicBarrier
@@ -1283,12 +1285,15 @@ class ScriptSessionTest {
     @Test
     fun `should cancel coroutines launched by snippets when the session is closed`() = runTest {
         // given
+        val started = Job()
         val stopped = Job()
         val session = ScriptSession {
+            provide<CompletableJob>("started", started)
             provide<CompletableJob>("stopped", stopped)
         }
         session.execute("""
             launch {
+                started.complete()
                 try {
                     awaitCancellation()
                 } finally {
@@ -1296,6 +1301,8 @@ class ScriptSessionTest {
                 }
             }
         """.trimIndent())
+        // signalled from within the coroutine, as one cancelled before it started would never run its finally
+        started.join()
 
         // when
         session.close()
@@ -1430,6 +1437,36 @@ class ScriptSessionTest {
         // bounded, so a hang fails the test instead of hanging the build
         val (sessionThread, callerThread) = threads.get(1, TimeUnit.MINUTES).getOrThrow()
         assert(callerThread !== sessionThread)
+    }
+
+    /**
+     * A thread context element of the caller, like a thread local of a logging context as its `asContextElement`,
+     * is installed on the thread of the session for the snippet, and removed after it, see #162.
+     */
+    @Test
+    fun `should install thread context element of the caller on the session thread`() = runTest {
+        // given
+        val threadLocal = ThreadLocal<String>()
+        ScriptSession {
+            provide<ThreadLocal<String>>("threadLocal", threadLocal)
+        }.use { session ->
+
+            // when
+            val withElement = withContext(threadLocal.asContextElement("caller")) {
+                session.execute("threadLocal.get()")
+            }
+            val withoutElement = session.execute("threadLocal.get()")
+
+            // then
+            withElement should {
+                be<ScriptResult.Value>()
+                have(value == "caller")
+            }
+            withoutElement should {
+                be<ScriptResult.Value>()
+                have(value == null)
+            }
+        }
     }
 
     /** See #143. */
@@ -1573,12 +1610,15 @@ class ScriptSessionTest {
         return WeakReference(session)
     }
 
-    /** See #142. */
+    /**
+     * The properties are declared, as their values are released only after the declaration,
+     * while the snippet is rejected, as it would be cancelled before it ran, see #142 and #162.
+     */
     @Test
-    fun `should declare properties of session closed while declaring them`() = runTest {
+    fun `should reject snippet of session closed while declaring its properties`() = runTest {
         // given
         val closedWhileDeclaring = AtomicBoolean()
-        lateinit var session: ScriptSession
+        lateinit var session: DefaultScriptSession
         val stringType = typeOf<String>()
         // the type is rendered into the source of the declaration on the thread of the session,
         // so the session is closed there, past the check of a closed session, before the declaration is evaluated
@@ -1594,17 +1634,17 @@ class ScriptSessionTest {
                 }
             override fun toString() = stringType.toString()
         }
-        session = ScriptSession(listOf(ScriptProperty("greeting", type, "Hello")))
+        session = DefaultScriptSession(listOf(ScriptProperty("greeting", type, "Hello")), Dispatchers.Default)
 
         // when
-        val result = session.execute("greeting")
+        val exception = assertFailsWith<IllegalStateException> {
+            session.execute("greeting")
+        }
 
         // then
         assert(closedWhileDeclaring.get())
-        result should {
-            be<ScriptResult.Value>()
-            have(value == "Hello")
-        }
+        assert(exception.message == "The session is closed")
+        assert(session.repl != null)
     }
 
     /** See #142. */
@@ -1817,15 +1857,48 @@ class ScriptSessionTest {
     }
 
     /**
-     * Closing the session from many threads at once, repeatedly,
-     * as only the calls passing the check of a closed session together would fail, see #141.
+     * Closing the session again while it is being closed, from within the submission of its disposal to its thread,
+     * past the mark of a closed session, like a concurrent closing passing the check of a closed session, see #141 and #162.
+     */
+    @Test
+    fun `should ignore closing the session again while it is being closed`() = runTest {
+        // given
+        lateinit var session: ScriptSession
+        var closingAgain: Result<Unit>? = null
+        val submissions = AtomicInteger()
+        session = DefaultScriptSession(emptyList(), Dispatchers.Default) { threadFactory ->
+            InterceptedExecutor(Executors.newSingleThreadExecutor(threadFactory)) { index, execute ->
+                submissions.incrementAndGet()
+                if (index == 0) closingAgain = runCatching { session.close() }
+                execute()
+            }
+        }
+
+        // when
+        session.close()
+
+        // then
+        assert(closingAgain?.isSuccess == true)
+        assert(submissions.get() == 1)
+        val exception = assertFailsWith<IllegalStateException> {
+            session.execute("1")
+        }
+        assert(exception.message == "The session is closed")
+    }
+
+    /**
+     * A smoke test of closing the session from many threads at once, repeatedly,
+     * guarding only that no exception escapes any of the closings,
+     * as it passes also with the check of a closed session read, then written, instead of the compare-and-set,
+     * since the window between them is a single volatile read, see #141 and #162,
+     * while the order of marking the session closed and releasing it is pinned by the test above.
      */
     @Test
     fun `should close session concurrently from many threads`() {
         val threads = 8
         val pool = Executors.newFixedThreadPool(threads)
         try {
-            repeat(1000) {
+            repeat(100) {
                 // given
                 val session = ScriptSession()
                 val barrier = CyclicBarrier(threads)
