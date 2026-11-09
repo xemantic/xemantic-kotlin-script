@@ -20,6 +20,8 @@
 package com.xemantic.kotlin.script
 
 import io.github.oshai.kotlinlogging.KotlinLogging
+import org.jetbrains.kotlin.codegen.inline.SMAP
+import org.jetbrains.kotlin.codegen.inline.SMAPParser
 import org.jetbrains.org.objectweb.asm.ClassReader
 import org.jetbrains.org.objectweb.asm.tree.ClassNode
 import org.jetbrains.org.objectweb.asm.tree.LineNumberNode
@@ -30,18 +32,14 @@ private val logger = KotlinLogging.logger {}
 /** The prefix of the local variable marking the inlined body of a function, like `$i$f$boom`. */
 private const val INLINE_FUNCTION_MARKER = "\$i\$f\$"
 
+/** The prefix of the local variable marking the inlined body of a lambda argument, like `$i$a$-forEach-Snippet1$check$1`. */
+private const val INLINE_LAMBDA_MARKER = "\$i\$a\$"
+
 /** The function of inlined code without a marker in scope at its line. */
 private const val UNKNOWN_INLINE_FUNCTION = "<inlined>"
 
-private const val KOTLIN_STRATUM = "Kotlin"
-
-private const val KOTLIN_DEBUG_STRATUM = "KotlinDebug"
-
-/** A line mapping of an SMAP, like `2#1,3:37,2`: the input start line, with the optional file id and repeat count, the output start line, with the optional increment. */
-private val lineMapping = Regex("(\\d+)(?:#(\\d+))?(?:,(\\d+))?:(\\d+)(?:,(\\d+))?")
-
-/** A file of an SMAP, like `+ 1 snippet1.kts`, where the `+` marks the path following on the next line. */
-private val fileInfo = Regex("(\\+ )?(\\d+) (.+)")
+/** The function of inlined code of a lambda argument, named like the lambda frames by `ScriptErrorReporter`. */
+private const val INLINE_LAMBDA = "<lambda>"
 
 /**
  * The frames of the code inlined into the methods of the classes of the snippets.
@@ -54,13 +52,17 @@ private val fileInfo = Regex("(\\+ )?(\\d+) (.+)")
  *
  * The class files are read from the class loader of the latest evaluated snippet, which loads the earlier ones as well.
  * Accessed on the thread of the session only, like the snippets.
+ *
+ * @param snippets the lines of the snippets by their names, like `snippet3.kts`.
  */
-internal class InlinedFrames {
+internal class InlinedFrames(
+    private val snippets: Map<String, List<String>>
+) {
 
     private var classLoader: ClassLoader? = null
 
-    /** The classes of the frames resolved so far, `null` if the class file could not be read. */
-    private val classes = HashMap<String, SnippetClass?>()
+    /** The classes of the frames read so far. */
+    private val classes = HashMap<String, SnippetClass>()
 
     /** Keeps the class loader of the [scriptClass] of the latest evaluated snippet. */
     fun keep(scriptClass: Class<*>) {
@@ -68,35 +70,36 @@ internal class InlinedFrames {
     }
 
     /**
-     * The frames of the [frame] with a line beyond the end of its snippet:
+     * The frames of the [frame] of inlined code, its line beyond the end of its snippet:
      * the frame of the inlined function, followed by the frame of the call site,
      * which is the [frame] itself if the call site is unknown,
-     * or `null` if the line is not mapped by the class of the [frame].
+     * or `null` if the [frame] is not of a snippet, its line is a line of the snippet itself,
+     * or the class of the [frame] cannot be read.
      */
     fun resolve(frame: StackTraceElement): List<StackTraceElement>? {
-        // not getOrPut, which would read again a class which could not be read
-        val snippetClass = (if (frame.className in classes) classes[frame.className] else read(frame.className).also {
-            classes[frame.className] = it
-        }) ?: return null
-        val inlined = snippetClass.kotlin?.map(frame.lineNumber) ?: return null
+        if (frame.fileName !in snippets) return null
+        val snippetClass = snippetClass(frame.className) ?: return null
+        val range = snippetClass.smap?.findRange(frame.lineNumber) ?: return null
+        val inlined = range.mapDestToSource(frame.lineNumber)
+        // the lines of the snippet itself are mapped to themselves
+        if (inlined.file == frame.fileName && inlined.line == frame.lineNumber) return null
         val function = snippetClass.inlineFunction(frame.methodName, frame.lineNumber) ?: UNKNOWN_INLINE_FUNCTION
-        val callSite = snippetClass.kotlinDebug?.map(frame.lineNumber)
+        val callSite = range.callSite
         return listOf(
-            StackTraceElement(inlined.path?.replace('/', '.') ?: frame.className, function, inlined.file, inlined.line),
+            StackTraceElement(inlined.path.replace('/', '.'), function, inlined.file, inlined.line),
             if (callSite != null) StackTraceElement(frame.className, frame.methodName, callSite.file, callSite.line) else frame
         )
     }
 
     /**
-     * Reads the class of this [className] from the class loader of the latest snippet.
+     * The class of this [className] read so far, or read from the class loader of the latest snippet,
+     * `null` if it cannot be read, which is not kept, as the class loader might not be known yet, or not load the class yet.
      *
      * @throws VirtualMachineError thrown by reading the class, other than [StackOverflowError].
      */
-    private fun read(className: String): SnippetClass? = try {
+    private fun snippetClass(className: String): SnippetClass? = classes[className] ?: try {
         classLoader?.getResourceAsStream(className.replace('.', '/') + ".class")?.use { it.readBytes() }?.let { bytes ->
-            val node = ClassNode()
-            ClassReader(bytes).accept(node, ClassReader.SKIP_FRAMES)
-            SnippetClass(node)
+            SnippetClass(bytes).also { classes[className] = it }
         }
     } catch (e: Throwable) {
         if (e.isFatal) throw e
@@ -106,14 +109,13 @@ internal class InlinedFrames {
 
 }
 
-/** The strata of the SMAP of a snippet class, and the inline functions by the lines of their inlined bodies. */
-private class SnippetClass(node: ClassNode) {
+/** The SMAP of a snippet class, and its inline functions by the lines of their inlined bodies. */
+private class SnippetClass(bytes: ByteArray) {
 
-    private val strata = node.sourceDebug?.let { parseSmap(it) }.orEmpty()
+    private val node = ClassNode().also { ClassReader(bytes).accept(it, ClassReader.SKIP_FRAMES) }
 
-    val kotlin: Stratum? = strata[KOTLIN_STRATUM]
-
-    val kotlinDebug: Stratum? = strata[KOTLIN_DEBUG_STRATUM]
+    /** The SMAP of the class, with the call sites of the `KotlinDebug` stratum, `null` if the class has none. */
+    val smap: SMAP? = node.sourceDebug?.let { SMAPParser.parseOrNull(it) }
 
     /** The names of the inline functions by the method and the line of their inlined bodies, the innermost one of nested inlining. */
     private val inlineFunctions: Map<Pair<String, Int>, String> = buildMap {
@@ -125,105 +127,21 @@ private class SnippetClass(node: ClassNode) {
     private fun MethodNode.collectInlineFunctions(
         functions: MutableMap<Pair<String, Int>, String>
     ) {
-        val markers = localVariables.orEmpty().filter { it.name.startsWith(INLINE_FUNCTION_MARKER) }
+        val markers = localVariables.orEmpty().filter {
+            it.name.startsWith(INLINE_FUNCTION_MARKER) || it.name.startsWith(INLINE_LAMBDA_MARKER)
+        }
         if (markers.isEmpty()) return
         val ranges = markers.map { Triple(it.name, instructions.indexOf(it.start), instructions.indexOf(it.end)) }
         instructions.filterIsInstance<LineNumberNode>().forEach { lineNumber ->
             val index = instructions.indexOf(lineNumber.start)
             ranges.filter { (_, start, end) -> index in start..<end }
                 .maxWithOrNull(compareBy({ it.second }, { -it.third }))
-                ?.let { functions.putIfAbsent(name to lineNumber.line, it.first.removePrefix(INLINE_FUNCTION_MARKER)) }
+                ?.let { functions.putIfAbsent(name to lineNumber.line, it.first.inlineFunctionName()) }
         }
     }
 
 }
 
-/** A location in the source [file], like `snippet1.kts`, of the class of the [path], like `Snippet1`, if given. */
-private class Location(
-    val file: String,
-    val path: String?,
-    val line: Int
-)
-
-/** A stratum of an SMAP, its files by the ids, and its line mappings. */
-private class Stratum(
-    private val files: Map<Int, Pair<String, String?>>,
-    private val lines: List<LineMapping>
-) {
-
-    /** The source location of the output [line], or `null` if it is not mapped. */
-    fun map(line: Int): Location? = lines.firstNotNullOfOrNull { it.map(line) }?.let { (fileId, inputLine) ->
-        files[fileId]?.let { (file, path) -> Location(file, path, inputLine) }
-    }
-
-}
-
-/** A line mapping of an SMAP: the [repeat] input lines from the [inputStart] of the [fileId], each to [increment] output lines from the [outputStart]. */
-private class LineMapping(
-    private val inputStart: Int,
-    private val fileId: Int,
-    private val repeat: Int,
-    private val outputStart: Int,
-    private val increment: Int
-) {
-
-    /** The file id and the input line of the [output] line, or `null` if it is outside this mapping. */
-    fun map(output: Int): Pair<Int, Int>? {
-        val offset = output - outputStart
-        if (offset < 0 || offset >= repeat * increment) return null
-        return fileId to inputStart + offset / increment
-    }
-
-}
-
-/** The strata of the [smap] by their names, like `Kotlin`, empty if it is not an SMAP. */
-private fun parseSmap(smap: String): Map<String, Stratum> {
-    val lines = smap.lines()
-    if (lines.firstOrNull() != "SMAP") return emptyMap()
-    val strata = HashMap<String, Stratum>()
-    var stratum: String? = null
-    var files = HashMap<Int, Pair<String, String?>>()
-    var mappings = ArrayList<LineMapping>()
-    var section: Char? = null
-    var lastFileId = 1
-    fun endStratum() {
-        stratum?.let { strata[it] = Stratum(files, mappings) }
-    }
-    var index = 1
-    while (index < lines.size) {
-        val line = lines[index++]
-        when {
-            line.startsWith("*S ") -> {
-                endStratum()
-                stratum = line.substring(3).trim()
-                files = HashMap()
-                mappings = ArrayList()
-                section = null
-            }
-            line == "*E" -> {
-                endStratum()
-                return strata
-            }
-            line.startsWith("*") -> section = line.getOrNull(1)
-            stratum == null -> {}
-            section == 'F' -> fileInfo.matchEntire(line)?.let { match ->
-                val (plus, id, name) = match.destructured
-                val path = if (plus.isNotEmpty() && index < lines.size) lines[index++] else null
-                files[id.toInt()] = name to path
-            }
-            section == 'L' -> lineMapping.matchEntire(line)?.let { match ->
-                val (inputStart, fileId, repeat, outputStart, increment) = match.destructured
-                lastFileId = fileId.toIntOrNull() ?: lastFileId
-                mappings += LineMapping(
-                    inputStart = inputStart.toInt(),
-                    fileId = lastFileId,
-                    repeat = repeat.toIntOrNull() ?: 1,
-                    outputStart = outputStart.toInt(),
-                    increment = increment.toIntOrNull() ?: 1
-                )
-            }
-        }
-    }
-    endStratum()
-    return strata
-}
+/** The name of the function of this inline marker variable, `<lambda>` for a lambda argument. */
+private fun String.inlineFunctionName(): String =
+    if (startsWith(INLINE_LAMBDA_MARKER)) INLINE_LAMBDA else removePrefix(INLINE_FUNCTION_MARKER)

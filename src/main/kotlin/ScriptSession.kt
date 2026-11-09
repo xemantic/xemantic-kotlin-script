@@ -218,7 +218,7 @@ internal class DefaultScriptSession(
     private val uninitializedProperties = UninitializedProperties()
 
     /** The frames of the code inlined into the snippets, read from their class files. */
-    private val inlinedFrames = InlinedFrames()
+    private val inlinedFrames = InlinedFrames(snippets)
 
     private val reporter = ScriptErrorReporter(snippets, snippetClassNames, uninitializedProperties, inlinedFrames)
 

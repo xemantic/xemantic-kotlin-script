@@ -58,7 +58,7 @@ internal class ScriptErrorReporter(
     private val snippets: Map<String, List<String>>,
     private val snippetClassNames: Set<String> = emptySet(),
     private val uninitializedProperties: UninitializedProperties = UninitializedProperties(),
-    private val inlinedFrames: InlinedFrames = InlinedFrames()
+    private val inlinedFrames: InlinedFrames = InlinedFrames(snippets)
 ) {
 
     /**
@@ -225,12 +225,7 @@ internal class ScriptErrorReporter(
         indent: String
     ) {
         val frames = stackTrace.flatMap { element ->
-            val lines = snippets[element.fileName]
-            if (lines != null && element.lineNumber > lines.size) {
-                inlinedFrames.resolve(element) ?: listOf(element)
-            } else {
-                listOf(element)
-            }
+            inlinedFrames.resolve(element) ?: listOf(element)
         }.withIndex().mapNotNull { (index, element) ->
             val lines = snippets[element.fileName]
             val line = element.lineNumber.takeIf { lines != null && it in 1..lines.size }

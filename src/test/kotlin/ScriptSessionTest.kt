@@ -1041,6 +1041,33 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should report lambda of inline function declared in the snippet`() = runTest {
+        // when
+        val result = session.execute("""
+            inline fun check(list: List<Int>, message: () -> String) {
+                list.forEach {
+                    if (it > 2) throw IllegalStateException(message())
+                }
+            }
+            val numbers = listOf(1, 2, 3)
+            check(numbers) { "too big" }
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IllegalStateException: too big
+                  at <lambda>(snippet1.kts:3)
+                  |         if (it > 2) throw IllegalStateException(message())
+                  at <snippet body>(snippet1.kts:7)
+                  | check(numbers) { "too big" }
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should report lines of inline function inlined into method of class declared in earlier snippet`() = runTest {
         // given
         session.execute("""
