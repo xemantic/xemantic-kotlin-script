@@ -57,6 +57,9 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 - Expected compilation error messages in the tests are compiler-version specific, re-check them after every Kotlin upgrade.
 - A `VirtualMachineError`, like an `OutOfMemoryError`, escaping a test does not fail it, but aborts the whole Gradle test executor (`Could not complete execution for Gradle Test Executor`) —
   catch it with `runCatching` and assert on it, also where only a regression would let it escape.
+- When the build fails on an `org.apache.maven(.resolver)` artifact requested in another version than the catalog's, after a Kotlin upgrade,
+  `./gradlew dependencies --configuration runtimeClasspath | grep -E 'maven-resolver-api|maven-core'` shows the versions Kotlin brings now — the failure message names only the requested one.
+  Never pin a newer Maven Resolver instead: a pin lifts only its own artifacts, so the API of 2.x meets the implementation of 1.9 on the classpath, which works by luck until a `NoSuchMethodError`.
 
 ### The K2 REPL compiler (`K2ReplCompiler`)
 
