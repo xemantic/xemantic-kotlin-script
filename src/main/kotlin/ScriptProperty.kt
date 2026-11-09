@@ -26,7 +26,9 @@ import org.jetbrains.kotlin.lexer.KtKeywordToken
 import org.jetbrains.kotlin.name.FqNameUnsafe
 import org.jetbrains.kotlin.lexer.KtTokens
 import java.lang.reflect.Modifier
+import kotlin.jvm.functions.FunctionN
 import kotlin.reflect.KClass
+import kotlin.reflect.KFunction
 import kotlin.reflect.KType
 import kotlin.reflect.KTypeParameter
 import kotlin.reflect.KTypeProjection
@@ -88,12 +90,25 @@ public class ScriptProperty<T>(
                 "Property '$name' is of type ${it.name}, which is not accessible to the snippets - provide it as a public type"
             )
         }
+        // a KType implemented by hand could not be rendered in the source of the session
+        type.nonClassType()?.let {
+            throw IllegalArgumentException(
+                "Property '$name' is of type $it, which is not of a class - provide it as a class type, e.g. with typeOf"
+            )
+        }
+        type.mismatchedArguments()?.let { (type, expected) ->
+            val arguments = type.arguments.size
+            throw IllegalArgumentException(
+                "Property '$name' is of type $type, which has $arguments type argument${if (arguments == 1) "" else "s"}, " +
+                        "while ${(type.classifier as KClass<*>).qualifiedName} takes $expected - provide it as a complete type, e.g. with typeOf"
+            )
+        }
         if (value == null) {
             require(type.isMarkedNullable) {
                 "Property '$name' is null, while its type is not nullable: $type"
             }
         } else {
-            require((type.classifier as? KClass<*>)?.isInstance(value) ?: true) {
+            require((type.classifier as KClass<*>).isInstance(value)) {
                 "Property '$name' of type $type has a value of class ${value::class.java.name}"
             }
             // a read-only Kotlin collection, like emptyList(), is a java.util.List as well
@@ -259,6 +274,36 @@ private val hardKeywords = KtTokens.KEYWORDS.types.mapTo(HashSet()) { (it as KtK
 /** The first type parameter of this type, or of its type arguments, like `T` of a generic function. */
 private fun KType.typeParameter(): KTypeParameter? =
     classifier as? KTypeParameter ?: arguments.firstNotNullOfOrNull { it.type?.typeParameter() }
+
+/** The first of this type, or of its type arguments, whose classifier is not a class, like the one of a [KType] implemented by hand. */
+private fun KType.nonClassType(): KType? =
+    takeUnless { classifier is KClass<*> } ?: arguments.firstNotNullOfOrNull { it.type?.nonClassType() }
+
+/**
+ * The first of this type, or of its type arguments, whose number of type arguments differs from the type parameters of its class,
+ * like the one of a [KType] implemented by hand, paired with that number of type parameters,
+ * provided all their classifiers are classes, accessible to the snippets.
+ */
+private fun KType.mismatchedArguments(): Pair<KType, Int>? {
+    val kClass = classifier as KClass<*>
+    if (kClass !in arityErasedClasses) {
+        val expected = kClass.typeParameterCount()
+        if (arguments.size != expected) return this to expected
+    }
+    return arguments.firstNotNullOfOrNull { it.type?.mismatchedArguments() }
+}
+
+/**
+ * The classifiers of the types produced by [typeOf] with the parameter types and the return type as arguments,
+ * while the class takes only the return type:
+ * `KFunction` of a function reference type, like `KFunction1<String, Int>` or `KSuspendFunction1<String, Int>`,
+ * and `FunctionN` of a function type of more than 22 parameters.
+ */
+private val arityErasedClasses: Set<KClass<*>> = setOf(KFunction::class, FunctionN::class)
+
+/** The number of the type parameters of this class, and of its outer classes, if it is an inner class, as the arguments of its type. */
+private fun KClass<*>.typeParameterCount(): Int =
+    typeParameters.size + if (isInner) java.declaringClass?.kotlin?.typeParameterCount() ?: 0 else 0
 
 /** The first class of this type, or of its type arguments, which the snippets cannot refer to. */
 private fun KType.inaccessibleClass(): Class<*>? =

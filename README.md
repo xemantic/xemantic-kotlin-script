@@ -145,7 +145,8 @@ ScriptSession {
   Invalid properties are rejected with `IllegalArgumentException`:
   a name which is not a Kotlin identifier, a duplicate name, a value which is not of the type,
   a name of a member of the `ScriptScope`, like `await` or `coroutineContext`,
-  or a type which the snippets cannot refer to, like a private or a local class.
+  or a type which the snippets cannot refer to, like a private or a local class,
+  or a `KType` implemented by hand whose classifier is not a class, or whose type arguments do not match the type parameters of its class.
   A property which passes this validation might still fail to be declared,
   like one of a type the compiler rejects, e.g. `Enum<String>` created with `createType`,
   or one of a class loaded by another class loader than the one of the session, which its value cannot be cast to.

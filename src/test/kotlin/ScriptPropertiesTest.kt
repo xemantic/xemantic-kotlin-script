@@ -28,6 +28,10 @@ import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
 import java.net.URLClassLoader
+import kotlin.reflect.KClassifier
+import kotlin.reflect.KFunction1
+import kotlin.reflect.KFunction23
+import kotlin.reflect.KSuspendFunction1
 import kotlin.reflect.KType
 import kotlin.reflect.KTypeProjection
 import kotlin.reflect.full.createType
@@ -840,6 +844,119 @@ class ScriptPropertiesTest {
         assert(property.type.toSource() == "kotlin.collections.List<kotlin.String>")
     }
 
+    @Test
+    fun `should reject property of hand-written type without class`() {
+        // given
+        val classless = handWrittenType(classifier = null, name = "Classless")
+        val types = listOf(
+            classless,
+            handWrittenType(List::class, listOf(KTypeProjection.covariant(classless)), "kotlin.collections.List<out Classless>")
+        )
+
+        // when
+        val exceptions = types.map { type ->
+            assertFailsWith<IllegalArgumentException> {
+                ScriptProperty("foo", type, "bar")
+            }
+        }
+
+        // then
+        assert(exceptions.map { it.message } == listOf(
+            "Property 'foo' is of type Classless, which is not of a class - provide it as a class type, e.g. with typeOf",
+            "Property 'foo' is of type Classless, which is not of a class - provide it as a class type, e.g. with typeOf"
+        ))
+    }
+
+    @Test
+    fun `should reject property of hand-written type with type arguments not matching its class`() {
+        // given
+        val int = KTypeProjection.invariant(typeOf<Int>())
+        val inner = handWrittenType(Generic.Inner::class, listOf(int), "Generic.Inner<kotlin.Int>")
+        val types = listOf(
+            inner,
+            handWrittenType(List::class, emptyList(), "kotlin.collections.List"),
+            handWrittenType(String::class, listOf(int), "kotlin.String<kotlin.Int>"),
+            handWrittenType(List::class, listOf(KTypeProjection.invariant(inner)), "kotlin.collections.List<Generic.Inner<kotlin.Int>>")
+        )
+
+        // when
+        val exceptions = types.map { type ->
+            assertFailsWith<IllegalArgumentException> {
+                ScriptProperty("foo", type, null)
+            }
+        }
+
+        // then
+        assert(exceptions.map { it.message } == listOf(
+            "Property 'foo' is of type Generic.Inner<kotlin.Int>, which has 1 type argument, while com.xemantic.kotlin.script.Generic.Inner takes 2 - provide it as a complete type, e.g. with typeOf",
+            "Property 'foo' is of type kotlin.collections.List, which has 0 type arguments, while kotlin.collections.List takes 1 - provide it as a complete type, e.g. with typeOf",
+            "Property 'foo' is of type kotlin.String<kotlin.Int>, which has 1 type argument, while kotlin.String takes 0 - provide it as a complete type, e.g. with typeOf",
+            "Property 'foo' is of type Generic.Inner<kotlin.Int>, which has 1 type argument, while com.xemantic.kotlin.script.Generic.Inner takes 2 - provide it as a complete type, e.g. with typeOf"
+        ))
+    }
+
+    /** The classifier of a function reference type, like `KFunction1<String, Int>`, is `KFunction`, which takes only the return type. */
+    @Test
+    fun `should accept properties of function reference types`() {
+        // given
+        val types = listOf(
+            typeOf<KFunction1<String, Int>>(),
+            typeOf<KSuspendFunction1<String, Int>>(),
+            typeOf<KFunction23<Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Unit>>()
+        )
+
+        // when
+        val properties = types.map { ScriptProperty("f", it, ::twice) }
+
+        // then
+        assert(properties.map { it.type } == types)
+    }
+
+    /** The classifier of a function type of more than 22 parameters is `FunctionN`, which takes only the return type. */
+    @Test
+    fun `should accept property of function type of more than 22 parameters`() {
+        // given
+        val type = typeOf<((Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> Unit)?>()
+
+        // when
+        val property = ScriptProperty("f", type, null)
+
+        // then
+        assert(property.type == type)
+    }
+
+    /** The accessibility is checked first, as the reflection of a synthetic class, like the one of a lambda, may fail. */
+    @Test
+    fun `should reject property of hand-written type of lambda class before its type arguments`() {
+        // given
+        val lambda = suspend { 42 }
+        val type = handWrittenType(lambda::class, listOf(KTypeProjection.invariant(typeOf<Int>())), "Lambda<kotlin.Int>")
+
+        // when
+        val exception = assertFailsWith<IllegalArgumentException> {
+            ScriptProperty("foo", type, lambda)
+        }
+
+        // then
+        assert(exception.message == "Property 'foo' is of type ${lambda::class.java.name}, which is not accessible to the snippets - provide it as a public type")
+    }
+
+    @Test
+    fun `should accept property of hand-written type of inner class with type arguments of its outer classes`() {
+        // given
+        val type = handWrittenType(
+            Generic.Inner.Deep::class,
+            listOf(typeOf<Boolean>(), typeOf<Int>(), typeOf<String>()).map { KTypeProjection.invariant(it) },
+            "Generic<kotlin.String>.Inner<kotlin.Int>.Deep<kotlin.Boolean>"
+        )
+
+        // when
+        val property = ScriptProperty("deep", type, null)
+
+        // then
+        assert(property.type.toSource() == "com.xemantic.kotlin.script.Generic<kotlin.String>.Inner<kotlin.Int>.Deep<kotlin.Boolean>?")
+    }
+
     /** `MutableList::class` is `List::class`, so only [typeOf] and the types of the members keep the mutability. */
     @Test
     fun `should render type created from mutable collection class as read-only`() {
@@ -878,4 +995,20 @@ class ScriptPropertiesTest {
         assert(exception.message == "Property 'foo' is of platform type $type, which the snippets cannot refer to - provide it as a Kotlin type, e.g. with typeOf")
     }
 
+}
+
+@Suppress("unused") // referenced as a value of function reference types
+private fun twice(x: String): Int = x.length * 2
+
+/** A nullable [KType] implemented by hand, seen by the members of the interface only. */
+private fun handWrittenType(
+    classifier: KClassifier?,
+    arguments: List<KTypeProjection> = emptyList(),
+    name: String
+): KType = object : KType {
+    override val classifier = classifier
+    override val arguments = arguments
+    override val isMarkedNullable = true
+    override val annotations = emptyList<Annotation>()
+    override fun toString() = name
 }
