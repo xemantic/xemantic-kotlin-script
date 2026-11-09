@@ -112,7 +112,8 @@ ScriptSession {
 * Closing the session cancels the coroutines launched by its snippets,
   and the snippet being evaluated, like cancelling its caller does, also a caller which cannot be cancelled, like `suspend fun main`,
   so its `execute` returns an evaluation error,
-  unless the snippet runs to its end, as above, or catches the `InterruptedException`, or the `CancellationException` of `await`.
+  unless the snippet runs to its end, as above, or catches the `InterruptedException`, or the `CancellationException` of `await`,
+  and ends without blocking, or awaiting, again, as its evaluation stays cancelled.
   Then it releases its compiler, thread, and the values of its properties, once that snippet ends,
   while the snippets and coroutines still running keep reading the properties from the fields of their scripts, unaffected by the release.
 * Properties of the given name and type are provided to the snippets of the session, like `"greeting" provides "Hello"`.

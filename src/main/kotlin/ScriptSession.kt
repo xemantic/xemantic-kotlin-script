@@ -126,6 +126,7 @@ public interface ScriptSession : AutoCloseable {
      * the thread of the session is interrupted, and the coroutines of [ScriptScope.await] are cancelled,
      * so a blocking call of the snippet, like `Thread.sleep`, throws an [InterruptedException], and its `await` a [kotlinx.coroutines.CancellationException],
      * which fail the snippet with an [ExecutionPhase.EVALUATION] error, returned to a caller which is not cancelled, unless the snippet catches them,
+     * and ends without blocking, or awaiting, again, as its evaluation stays cancelled,
      * while a snippet which neither blocks interruptibly, nor awaits, runs to its end.
      * A caller without a [Job] in its context, like `suspend fun main`, cannot cancel the evaluation, only closing the session can.
      * A caller with a dispatcher in its context resumes where its dispatcher resumes it,
