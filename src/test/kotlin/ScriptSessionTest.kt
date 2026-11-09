@@ -413,6 +413,24 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should name the class of the exception of the internal failure of the compiler`() = runTest {
+        // when
+        // the backend crashes on an inline getter reading the coroutineContext of the script scope
+        val result = session.execute("val context: Int inline get() = coroutineContext.hashCode()")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            have(
+                message.lineSequence().first().startsWith(
+                    "error: The compiler failed internally: java.lang.RuntimeException: Exception while generating code for "
+                )
+            )
+        }
+    }
+
+    @Test
     fun `should report StackOverflowError of the compiler as a compilation failure and continue the session`() = runTest {
         // given
         session.execute("val x = 41")
