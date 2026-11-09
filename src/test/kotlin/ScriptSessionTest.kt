@@ -909,6 +909,66 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should name extension property reading uninitialized property`() = runTest {
+        // given
+        session.execute("val name: String = error(\"boom\")")
+
+        // when
+        val result = session.execute("""
+            val String.foo: Int get() = name.length
+            "x".foo
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            have("like 'foo' of snippet2.kts," in message)
+        }
+    }
+
+    @Test
+    fun `should name inherited property of object reading uninitialized property`() = runTest {
+        // given
+        session.execute("val name: String = error(\"boom\")")
+
+        // when
+        val result = session.execute("""
+            interface Foo { val label: Int get() = name.length }
+            object Impl : Foo
+            Impl.label
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            have("like 'Foo.label' of snippet2.kts, and the ones calling them, like 'Impl.label' of snippet2.kts," in message)
+        }
+    }
+
+    @Test
+    fun `should name function named like getter of property reading uninitialized property`() = runTest {
+        // given
+        session.execute("val name: String = error(\"boom\")")
+
+        // when
+        val result = session.execute("""
+            val t: Int = 1
+            fun getT(n: Int): Int = name.length + n
+            getT(1)
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            // a frame does not tell the function from the getter of t, so neither is renamed
+            have("like 'getT' of snippet2.kts," in message)
+        }
+    }
+
+    @Test
     fun `should hint at uninitialized property of snippet which threw fatal error`() = runTest {
         // given
         // a regression lets the OutOfMemoryError escape, which would abort the Gradle test executor

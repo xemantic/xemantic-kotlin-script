@@ -19,9 +19,13 @@
 package com.xemantic.kotlin.script
 
 import io.github.oshai.kotlinlogging.KotlinLogging
-import kotlin.reflect.KMutableProperty1
-import kotlin.reflect.full.declaredMemberProperties
+import kotlin.reflect.KClass
+import kotlin.reflect.KMutableProperty
+import kotlin.reflect.full.functions
+import kotlin.reflect.full.memberExtensionProperties
+import kotlin.reflect.full.memberProperties
 import kotlin.reflect.jvm.javaGetter
+import kotlin.reflect.jvm.javaMethod
 import kotlin.reflect.jvm.javaSetter
 
 private val logger = KotlinLogging.logger {}
@@ -30,6 +34,9 @@ private val logger = KotlinLogging.logger {}
  * The properties of the accessors of the classes of the snippets, like `t` of `Snippet2.getT`, read with kotlin-reflect,
  * as the name of a method does not tell an accessor from a function named like one, like `getGreeting`,
  * nor give the property of an accessor of a custom JVM name, like `t` of `@get:JvmName("size") val t`.
+ * Also the extension properties, and the inherited ones, like `label` of `Impl.getLabel` bridging to `Foo.getLabel`,
+ * while an accessor named like a function of the class, like `getT` of `val t` next to `fun getT(n: Int)`,
+ * is not mapped, as a frame does not tell them apart.
  *
  * The classes are loaded by the class loader of the latest evaluated snippet, which loads the earlier ones as well.
  * Accessed on the thread of the session only, like the snippets.
@@ -61,14 +68,22 @@ internal class PropertyAccessors {
     private fun accessors(className: String): Map<String, String>? = classes[className]
         ?: logger.readOr(null, { "cannot read the accessors of the class $className of a frame" }) {
             // not initialized, as a static initializer of the class might not have run yet, or have failed
-            classLoader?.let { Class.forName(className, false, it) }?.kotlin?.declaredMemberProperties?.let { properties ->
-                buildMap {
-                    properties.forEach { property ->
-                        property.javaGetter?.let { put(it.name, property.name) }
-                        (property as? KMutableProperty1<*, *>)?.javaSetter?.let { put(it.name, property.name) }
-                    }
-                }
-            }?.also { classes[className] = it }
+            classLoader?.let { Class.forName(className, false, it) }?.kotlin?.accessors()?.also { classes[className] = it }
         }
+
+    /** The names of the properties of this class by the names of their accessors, but the ones named like a function of the class. */
+    private fun KClass<*>.accessors(): Map<String, String> {
+        val functions = functions.mapNotNullTo(HashSet()) { it.javaMethod?.name }
+        return buildMap {
+            (memberProperties + memberExtensionProperties).forEach { property ->
+                listOfNotNull(
+                    property.javaGetter,
+                    (property as? KMutableProperty<*>)?.javaSetter
+                ).forEach { accessor ->
+                    if (accessor.name !in functions) put(accessor.name, property.name)
+                }
+            }
+        }
+    }
 
 }

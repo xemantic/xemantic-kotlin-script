@@ -76,8 +76,9 @@ ScriptSession {
   like a `fun greet() = name.uppercase()` declared together with `val name: String = error("boom")`,
   as it keeps reading the uninitialized one — it has to be redeclared as well, with the declarations calling it,
   while assigning a `var` is enough, as all of them read the same one.
-  The error message of the failing snippet names the properties it left `null` despite their type, the first five of them,
-  with a hint to declare them again, together with the declarations reading them, or to assign a `var`.
+  The error message of the failing snippet names the properties it left `null` despite their type,
+  the first five `val`s and the first five `var`s, counting the rest,
+  with a hint to declare the `val`s again, together with the declarations reading them, and to assign the `var`s.
   A `NullPointerException` of the JVM naming such a property later, like of `s.length` after `val s: String = error("boom")`,
   gets the hint as well, naming the declarations reading it, and the ones calling them, found in the stack trace, like `greet`.
   Neither hint covers a property of a primitive type, which reads as zero, or `false`, without failing,
