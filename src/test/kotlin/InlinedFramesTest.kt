@@ -20,6 +20,7 @@ package com.xemantic.kotlin.script
 
 import com.xemantic.kotlin.test.assert
 import kotlinx.coroutines.test.runTest
+import java.io.InputStream
 import kotlin.test.AfterTest
 import kotlin.test.Test
 
@@ -68,18 +69,35 @@ class InlinedFramesTest {
     }
 
     @Test
-    fun `should not resolve frame of a line within the snippet`() = runTest {
+    fun `should not resolve frame of a line within the snippet without reading its class`() = runTest {
         // given
         execute(snippet)
-        val marker = execute("Marker()")!!
+        val classLoader = CountingClassLoader(execute("Marker()")!!.javaClass)
         val inlinedFrames = InlinedFrames(snippets)
-        inlinedFrames.keep(marker.javaClass)
+        inlinedFrames.keep(classLoader.marker)
 
         // when
         val resolved = inlinedFrames.resolve(StackTraceElement("Snippet1", "frame", "snippet1.kts", 3))
 
         // then
         assert(resolved == null)
+        assert(classLoader.reads == 0)
+    }
+
+    @Test
+    fun `should not resolve frame without a line number without reading its class`() = runTest {
+        // given
+        execute(snippet)
+        val classLoader = CountingClassLoader(execute("Marker()")!!.javaClass)
+        val inlinedFrames = InlinedFrames(snippets)
+        inlinedFrames.keep(classLoader.marker)
+
+        // when
+        val resolved = inlinedFrames.resolve(StackTraceElement("Snippet1", "frame", "snippet1.kts", -1))
+
+        // then
+        assert(resolved == null)
+        assert(classLoader.reads == 0)
     }
 
     @Test
@@ -95,6 +113,25 @@ class InlinedFramesTest {
 
         // then
         assert(resolved == null)
+    }
+
+}
+
+/**
+ * A class loader counting the class files read through it,
+ * defining the [marker] class again, so that it is the class loader of its [marker].
+ */
+private class CountingClassLoader(marker: Class<*>) : ClassLoader(marker.classLoader) {
+
+    var reads = 0
+
+    val marker: Class<*> = marker.classLoader.getResourceAsStream(marker.name.replace('.', '/') + ".class")!!
+        .use { it.readBytes() }
+        .let { defineClass(marker.name, it, 0, it.size) }
+
+    override fun getResourceAsStream(name: String): InputStream? {
+        reads++
+        return super.getResourceAsStream(name)
     }
 
 }

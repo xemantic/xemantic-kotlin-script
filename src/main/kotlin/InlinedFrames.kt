@@ -71,13 +71,16 @@ internal class InlinedFrames(
 
     /**
      * The frames of the [frame] of inlined code, its line beyond the end of its snippet:
-     * the frame of the inlined function, followed by the frame of the call site,
+     * the frame of the inlined function, followed by the frame of its outermost call site in the method of the [frame],
+     * as the `KotlinDebug` stratum flattens nested inlining to the call site in the method,
      * which is the [frame] itself if the call site is unknown,
-     * or `null` if the [frame] is not of a snippet, its line is a line of the snippet itself,
+     * or `null` if the [frame] is not of a snippet, its line is a line of the snippet itself or unknown,
      * or the class of the [frame] cannot be read.
      */
     fun resolve(frame: StackTraceElement): List<StackTraceElement>? {
-        if (frame.fileName !in snippets) return null
+        val lines = snippets[frame.fileName] ?: return null
+        // the class is not read for a frame which cannot be of inlined code
+        if (frame.lineNumber <= lines.size) return null
         val snippetClass = snippetClass(frame.className) ?: return null
         val range = snippetClass.smap?.findRange(frame.lineNumber) ?: return null
         val inlined = range.mapDestToSource(frame.lineNumber)
@@ -112,14 +115,19 @@ internal class InlinedFrames(
 /** The SMAP of a snippet class, and its inline functions by the lines of their inlined bodies. */
 private class SnippetClass(bytes: ByteArray) {
 
-    private val node = ClassNode().also { ClassReader(bytes).accept(it, ClassReader.SKIP_FRAMES) }
-
     /** The SMAP of the class, with the call sites of the `KotlinDebug` stratum, `null` if the class has none. */
-    val smap: SMAP? = node.sourceDebug?.let { SMAPParser.parseOrNull(it) }
+    val smap: SMAP?
 
     /** The names of the inline functions by the method and the line of their inlined bodies, the innermost one of nested inlining. */
-    private val inlineFunctions: Map<Pair<String, Int>, String> = buildMap {
-        node.methods.forEach { method -> method.collectInlineFunctions(this) }
+    private val inlineFunctions: Map<Pair<String, Int>, String>
+
+    init {
+        // the node is not kept, only what the frames need
+        val node = ClassNode().also { ClassReader(bytes).accept(it, ClassReader.SKIP_FRAMES) }
+        smap = node.sourceDebug?.let { SMAPParser.parseOrNull(it) }
+        inlineFunctions = buildMap {
+            node.methods.forEach { method -> method.collectInlineFunctions(this) }
+        }
     }
 
     fun inlineFunction(method: String, line: Int): String? = inlineFunctions[method to line]
