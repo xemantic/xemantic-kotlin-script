@@ -194,7 +194,7 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
         val latest = try {
             versionOf(coordinates)
         } catch (e: Exception) {
-            val cause = (e.message ?: e.javaClass.name).replace(repositoryIdWithUrl, "$1")
+            val cause = (e.message ?: e.javaClass.name).withRepositoryUrls()
             errors += diagnostic("Unresolved dependency '$coordinates': $cause", lines)
             return null
         }
@@ -249,7 +249,7 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
             report.exception?.let { exception ->
                 generateSequence(exception) { it.cause }.last().message
             } ?: report.message
-        }.replace(repositoryIdWithUrl, "$1")
+        }.withRepositoryUrls()
         return diagnostic("$subject: $cause", lines)
     }
 
@@ -274,9 +274,6 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
         )
     }
 
-    /** A repository in a message of Maven, like `in repo_id (https://repo/)`, where the id is derived from the URL. */
-    private val repositoryIdWithUrl = Regex("""\S+ \(([a-z]+:[^)]*)\)""")
-
     override fun close() {
         classLoader.close()
     }
@@ -292,3 +289,16 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
 
 }
 
+/**
+ * This message of Maven with each repository, like `repo_id (https://repo/)`, shortened to its URL,
+ * as the id is derived from the URL by `MavenDependenciesResolver`, or given by the `mavenRepoId` option,
+ * neither of which can contain whitespace, unlike the id of Maven Central, `maven central`.
+ */
+internal fun String.withRepositoryUrls(): String = replace(repositoryIdWithUrl, "$1")
+
+/**
+ * A repository in a message of Maven, like `repo_id (https://repo/)`, see [withRepositoryUrls]:
+ * the id of Maven Central, with its space, or any id without whitespace, and the URL in the parentheses following it,
+ * so the parentheses of the message itself, like `Unauthorized (401)`, are kept.
+ */
+private val repositoryIdWithUrl = Regex("""(?:${Regex.escape(mavenCentral.id)}|\S+) \(([a-z]+:[^)]*)\)""")
