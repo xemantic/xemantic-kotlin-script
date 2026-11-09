@@ -33,6 +33,7 @@ import org.eclipse.aether.repository.RemoteRepository
 import org.eclipse.aether.spi.connector.RepositoryConnectorFactory
 import org.eclipse.aether.spi.connector.transport.Transporter
 import org.eclipse.aether.spi.connector.transport.TransporterFactory
+import org.eclipse.aether.transfer.NoRepositoryConnectorException
 import java.nio.file.Path
 import kotlin.io.path.createDirectories
 import kotlin.io.path.createTempDirectory
@@ -175,18 +176,8 @@ class MavenVersionLookupTest {
 
     @Test
     fun `should fail to look up latest version in repository blocked by mirror in settings`() {
-        // given the default mirror of Maven, which blocks the plain HTTP repositories
-        val lookup = MavenVersionLookup {
-            settings {
-                addMirror(Mirror().apply {
-                    id = "maven-default-http-blocker"
-                    mirrorOf = "external:http:*"
-                    @Suppress("HttpUrlsUsage")
-                    url = "http://0.0.0.0/"
-                    isBlocked = true
-                })
-            }
-        }
+        // given
+        val lookup = MavenVersionLookup { settings { addMirror(httpBlocker()) } }
         @Suppress("HttpUrlsUsage")
         val repository = remoteRepository("http://repo.example.com/")
 
@@ -200,6 +191,88 @@ class MavenVersionLookupTest {
         assert(
             message == "Repository http://repo.example.com/ is blocked by the mirror 'maven-default-http-blocker' of the Maven settings"
         )
+    }
+
+    @Test
+    fun `should report repository blocked by mirror in settings over earlier failure`() {
+        // given a repository, which cannot be connected to, declared before the blocked one
+        val lookup = MavenVersionLookup { settings { addMirror(httpBlocker()) } }
+        @Suppress("HttpUrlsUsage")
+        val blocked = remoteRepository("http://repo.example.com/")
+
+        // when
+        val result = runCatching {
+            lookup.latestVersion("com.xemantic.fixture", "greeter", listOf(unreachable, blocked))
+        }
+
+        // then
+        val message = result.exceptionOrNull()?.message
+        assert(
+            message == "Repository http://repo.example.com/ is blocked by the mirror 'maven-default-http-blocker' of the Maven settings"
+        )
+    }
+
+    @Test
+    fun `should report all repositories blocked by mirror in settings`() {
+        // given
+        val lookup = MavenVersionLookup { settings { addMirror(httpBlocker()) } }
+        @Suppress("HttpUrlsUsage")
+        val repositories = listOf(remoteRepository("http://a.example.com/"), remoteRepository("http://b.example.com/"))
+
+        // when
+        val result = runCatching {
+            lookup.latestVersion("com.xemantic.fixture", "greeter", repositories)
+        }
+
+        // then
+        val message = result.exceptionOrNull()?.message
+        assert(
+            message == "Repositories http://a.example.com/, http://b.example.com/ " +
+                "are blocked by the mirror 'maven-default-http-blocker' of the Maven settings"
+        )
+    }
+
+    @Test
+    fun `should report repositories blocked by several mirrors in settings by mirror`() {
+        // given a blocking mirror of each repository, by its id
+        val lookup = MavenVersionLookup {
+            settings {
+                addMirror(httpBlocker(id = "blocker-a", mirrorOf = "a"))
+                addMirror(httpBlocker(id = "blocker-b", mirrorOf = "b"))
+            }
+        }
+        val repositories = listOf(
+            remoteRepository("https://a.example.com/", "maven_repository_id=a"),
+            remoteRepository("https://b.example.com/", "maven_repository_id=b")
+        )
+
+        // when
+        val result = runCatching {
+            lookup.latestVersion("com.xemantic.fixture", "greeter", repositories)
+        }
+
+        // then
+        val message = result.exceptionOrNull()?.message
+        assert(
+            message == "Repository https://a.example.com/ is blocked by the mirror 'blocker-a' of the Maven settings\n" +
+                "Repository https://b.example.com/ is blocked by the mirror 'blocker-b' of the Maven settings"
+        )
+    }
+
+    @Test
+    fun `should find blocking mirror wrapped deeper in cause chain`() {
+        // given the missing connector of a blocking mirror, wrapped twice
+        @Suppress("HttpUrlsUsage")
+        val mirror = RemoteRepository.Builder("blocker", "default", "http://0.0.0.0/").setBlocked(true).build()
+        val failure = IllegalStateException(
+            "Could not resolve", IllegalStateException("Could not read", NoRepositoryConnectorException(mirror))
+        )
+
+        // when
+        val blocking = failure.blockedMirror()
+
+        // then
+        assert(blocking?.id == "blocker")
     }
 
     @Test
@@ -367,6 +440,21 @@ class MavenVersionLookupTest {
             failure?.message == "Could not create the TransporterFactory of Maven Resolver, " +
                 "${FailingTransporterFactory::class.java.name}: java.lang.IllegalStateException: No transport"
         )
+    }
+
+    /**
+     * A blocking mirror of the settings, like the `maven-default-http-blocker` of Maven by default,
+     * which blocks the plain HTTP repositories, except these of the localhost.
+     */
+    private fun httpBlocker(
+        id: String = "maven-default-http-blocker",
+        mirrorOf: String = "external:http:*"
+    ): Mirror = Mirror().apply {
+        this.id = id
+        this.mirrorOf = mirrorOf
+        @Suppress("HttpUrlsUsage")
+        url = "http://0.0.0.0/"
+        isBlocked = true
     }
 
     /** The repository declared with `@file:Repository` with these [coordinates] and [options]. */
