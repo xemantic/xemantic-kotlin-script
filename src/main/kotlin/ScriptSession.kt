@@ -32,6 +32,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.intellij.lang.annotations.Language
+import org.jetbrains.kotlin.com.intellij.openapi.Disposable
 import org.jetbrains.kotlin.com.intellij.openapi.util.Disposer
 import org.jetbrains.kotlin.config.JvmTarget
 import org.jetbrains.kotlin.scripting.compiler.plugin.impl.K2ReplCompiler
@@ -229,15 +230,26 @@ internal class DefaultScriptSession(
 
     private var snippetCount = 0
 
-    /** Created on the first snippet, as resolving the classpath takes long. */
-    private var repl: Repl? = null
+    /** Created on the first snippet, as resolving the classpath takes long, see [createRepl]. */
+    internal var repl: Repl? = null
 
-    /** The failure of declaring the [properties], reported by every execution, as the snippets would not see them. */
+    /**
+     * The failure of declaring the [properties], reported by every execution, as the snippets would not see them,
+     * kept instead of the [repl], as nothing can be compiled in it again.
+     */
     private var propertiesFailure: ScriptResult.Error? = null
 
     private val closed = AtomicBoolean()
 
-    private inner class Repl {
+    /**
+     * The K2 REPL compiler of the session, with its evaluator.
+     *
+     * @param disposable the disposable of the compiler, disposed with the session,
+     * or on its own, if the properties cannot be declared, or the compiler cannot be created, see [createRepl].
+     */
+    internal inner class Repl(
+        val disposable: Disposable
+    ) {
 
         val compilationConfiguration = ScriptCompilationConfiguration {
             jvm {
@@ -269,11 +281,6 @@ internal class DefaultScriptSession(
         /** Collects the warnings, which the compilation does not return with the compiled snippet. */
         val messageCollector = ScriptDiagnosticsMessageCollector(null)
 
-        /** Disposed with the session, or on its own, if the properties cannot be declared, see [execute]. */
-        val disposable = Disposer.newDisposable("$name-repl").also {
-            Disposer.register(this@DefaultScriptSession.disposable, it)
-        }
-
         val compiler = K2ReplCompiler(
             K2ReplCompiler.createCompilationState(
                 messageCollector,
@@ -288,13 +295,37 @@ internal class DefaultScriptSession(
             )
         )
 
+        /** Compiles and evaluates the [snippet] of this [name], cancelled together with the [callerJob]. */
+        suspend fun compileAndEvaluate(
+            snippet: String,
+            name: String,
+            callerJob: Job
+        ): ScriptResult {
+            snippets[name] = snippet.lines()
+            logger.debug { "$name: compiling" }
+            val compilation = compile(snippet, name)
+            return when (val result = compilation.result) {
+                is ResultWithDiagnostics.Failure -> ScriptResult.Error(
+                    message = reporter.describe(result.reports),
+                    phase = ExecutionPhase.COMPILATION
+                )
+                is ResultWithDiagnostics.Success -> {
+                    logger.debug { "$name: evaluating" }
+                    val evaluation = scope.evaluate(callerJob) {
+                        evaluator.eval(result.value, evaluationConfiguration)
+                    }
+                    evaluation.toScriptResult(compilation, name)
+                }
+            }
+        }
+
         /**
          * Compiles the [snippet] of this [name], keeping it in the history of the compiler only if it compiles,
          * with an internal failure of the compiler, also an [Error], like a [StackOverflowError] on a deeply nested expression,
          * reported as the failure of the compilation,
          * except for a [VirtualMachineError] other than [StackOverflowError], which is thrown.
          */
-        suspend fun compile(
+        private suspend fun compile(
             snippet: String,
             name: String
         ): Compilation {
@@ -371,60 +402,54 @@ internal class DefaultScriptSession(
             // and the block could run after the disposal of the compiler then, or on another thread, see sessionDispatcher,
             // while a session closed later disposes the compiler only after this block, queued after it on the thread
             check(!closed.get()) { "The session is closed" }
-            // kept only once the properties are declared, or their failure is, so a fatal error,
-            // like an OutOfMemoryError, cannot leave the session without them, while the next execution
-            // declares them again in another compiler, not seeing the declaration which threw
-            val repl = repl ?: Repl().also { created ->
-                try {
-                    propertiesFailure = declareProperties(created)
-                } catch (e: Throwable) {
-                    runCatching { Disposer.dispose(created.disposable) }.exceptionOrNull()?.let(e::addSuppressed)
-                    throw e
-                }
-                repl = created
+            propertiesFailure ?: run {
+                val repl = repl ?: createRepl()
+                // null only if declaring the properties failed just now, with their failure kept, see createRepl
+                repl?.compileAndEvaluate(snippet, "snippet${++snippetCount}.kts", callerJob) ?: propertiesFailure!!
             }
-            propertiesFailure ?: repl.execute(snippet, "snippet${++snippetCount}.kts", callerJob)
         }
         currentCoroutineContext().ensureActive()
         result
     }
 
-    /** Compiles and evaluates the [snippet] of this [name], cancelled together with the [callerJob]. */
-    private suspend fun Repl.execute(
-        snippet: String,
-        name: String,
-        callerJob: Job
-    ): ScriptResult {
-        snippets[name] = snippet.lines()
-        logger.debug { "$name: compiling" }
-        val compilation = compile(snippet, name)
-        return when (val result = compilation.result) {
-            is ResultWithDiagnostics.Failure -> ScriptResult.Error(
-                message = reporter.describe(result.reports),
-                phase = ExecutionPhase.COMPILATION
-            )
-            is ResultWithDiagnostics.Success -> {
-                logger.debug { "$name: evaluating" }
-                val evaluation = scope.evaluate(callerJob) {
-                    evaluator.eval(result.value, evaluationConfiguration)
-                }
-                evaluation.toScriptResult(compilation, name)
-            }
+    /**
+     * Creates the [Repl] with the [properties] declared, and keeps it as the [repl],
+     * or disposes it, if they cannot be declared, as nothing can be compiled in it again,
+     * keeping only their failure as the [propertiesFailure], and returning `null`.
+     *
+     * The compiler is disposed also if creating it, or declaring the properties, throws, like a fatal [OutOfMemoryError],
+     * so the session is left without either, and the next execution declares them again in another compiler,
+     * not seeing the declaration which threw.
+     */
+    private suspend fun createRepl(): Repl? {
+        val disposable = Disposer.newDisposable("$name-repl").also {
+            Disposer.register(this.disposable, it)
         }
+        val created = try {
+            Repl(disposable).also { propertiesFailure = declareProperties(it) }
+        } catch (e: Throwable) {
+            runCatching { Disposer.dispose(disposable) }.exceptionOrNull()?.takeIf { it !== e }?.let(e::addSuppressed)
+            throw e
+        }
+        if (propertiesFailure != null) {
+            Disposer.dispose(disposable)
+            return null
+        }
+        repl = created
+        return created
     }
 
     /**
      * Declares the [properties] in the snippet preceding the ones of the session,
      * returning the failure of the declaration, if any, in the phase in which it failed.
      *
-     * A failed declaration is not retried, as its source is the same on every execution,
-     * and a declaration which failed to evaluate stays compiled in the history of the compiler.
+     * A failed declaration is not retried, as its source is the same on every execution.
      */
     private suspend fun declareProperties(repl: Repl): ScriptResult.Error? {
         if (properties.isEmpty()) return null
         val source = properties.joinToString("\n") { it.declaration(id) }
         // not cancelled by the caller, so its cancellation cannot fail the declaration for all the next executions
-        val result = repl.execute(source, "properties.kts", Job())
+        val result = repl.compileAndEvaluate(source, "properties.kts", Job())
         return (result as? ScriptResult.Error)?.let {
             ScriptResult.Error("The properties cannot be declared:\n${it.message}", it.phase)
         }

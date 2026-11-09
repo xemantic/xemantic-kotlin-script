@@ -36,6 +36,7 @@ import kotlin.test.Test
 import kotlin.test.assertFailsWith
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.test.runTest
 
 private class Hidden
@@ -576,6 +577,19 @@ class ScriptPropertiesTest {
                 have(phase == (first as ScriptResult.Error).phase)
                 have(message == first.message)
             }
+        }
+    }
+
+    /** See #157. */
+    @Test
+    fun `should release compiler of failed declaration of properties`() = runTest {
+        DefaultScriptSession(listOf(isolatedProperty()), Dispatchers.Default).use { session ->
+            // when
+            val result = session.execute("42")
+
+            // then
+            // nothing can be compiled in the compiler of the failed declaration, so only its failure is kept
+            assert(result is ScriptResult.Error && session.repl == null)
         }
     }
 
