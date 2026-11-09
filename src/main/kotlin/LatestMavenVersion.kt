@@ -40,6 +40,7 @@ import org.eclipse.aether.util.repository.DefaultAuthenticationSelector
 import org.eclipse.aether.util.repository.DefaultMirrorSelector
 import org.eclipse.aether.util.repository.DefaultProxySelector
 import org.eclipse.aether.util.version.GenericVersionScheme
+import org.eclipse.aether.version.VersionScheme
 import java.io.File
 import kotlin.script.experimental.dependencies.ExternalDependenciesResolver
 import kotlin.script.experimental.dependencies.RepositoryCoordinates
@@ -68,7 +69,7 @@ private val preReleaseToken = Regex(
 
 private val versionTokenSeparator = Regex("""[.\-_+]|(?<=\d)(?=\p{L})|(?<=\p{L})(?=\d)""")
 
-private val versionScheme = GenericVersionScheme()
+private val versionScheme: VersionScheme = GenericVersionScheme()
 
 /** The numeric release of a version, like the `0.8.0` of `0.8.0-0.6.x-compat`. */
 private val numericRelease = Regex("""^\d+(\.\d+)*""")

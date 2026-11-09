@@ -110,8 +110,8 @@ dependencies {
 // the versions of Maven Resolver and Maven must be the ones brought by kotlin-scripting-dependencies-maven,
 // otherwise the API and the implementation of Maven Resolver of 2 major versions are mixed on the classpath
 val expectedVersions = mapOf(
-    "org.apache.maven.resolver" to libs.versions.mavenResolver.get(),
-    "org.apache.maven" to libs.versions.maven.get()
+    "org.apache.maven.resolver" to ("mavenResolver" to libs.versions.mavenResolver.get()),
+    "org.apache.maven" to ("maven" to libs.versions.maven.get())
 )
 
 configurations.all {
@@ -119,10 +119,10 @@ configurations.all {
         if (requested.group == "org.ow2.asm") {
             useVersion(libs.versions.asm.get())
         }
-        expectedVersions[requested.group]?.let { expected ->
+        expectedVersions[requested.group]?.let { (key, expected) ->
             check(requested.version == expected) {
-                "$requested is requested, while gradle/libs.versions.toml declares the version $expected of ${requested.group}, " +
-                    "see the comment on mavenResolver there"
+                "$requested is requested, while gradle/libs.versions.toml declares $key = \"$expected\" for ${requested.group}, " +
+                    "see the comment on $key there"
             }
         }
     }
