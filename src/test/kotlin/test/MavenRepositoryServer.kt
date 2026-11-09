@@ -29,6 +29,7 @@ import io.ktor.server.response.respondBytes
 import io.ktor.server.routing.route
 import io.ktor.server.routing.routing
 import kotlinx.coroutines.runBlocking
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.io.encoding.Base64
 import kotlin.io.path.isRegularFile
@@ -37,14 +38,24 @@ import kotlin.io.path.readBytes
 /**
  * A local HTTP server of the [MavenRepository], at [url],
  * answering `401` to a request without the basic authentication of the [username] and [password],
- * and `500` to the next [failingRequests] authenticated ones.
+ * or of one of the [otherUsers], by their passwords,
+ * the [statuses] of the users given one, and `500` to the next [failingRequests] authenticated ones.
  */
 class MavenRepositoryServer(
     username: String,
-    password: String
+    password: String,
+    otherUsers: Map<String, String> = emptyMap()
 ) : AutoCloseable {
 
     private val credentials = "Basic " + Base64.encode("$username:$password".encodeToByteArray())
+
+    /** The users, by the basic authentication of their credentials. */
+    private val users = (mapOf(username to password) + otherUsers).entries.associate { (user, secret) ->
+        "Basic " + Base64.encode("$user:$secret".encodeToByteArray()) to user
+    }
+
+    /** The status answered to every authenticated request of a user, by the user, like `403` or `500`. */
+    val statuses: MutableMap<String, HttpStatusCode> = ConcurrentHashMap()
 
     private val failures = AtomicInteger()
 
@@ -57,10 +68,10 @@ class MavenRepositoryServer(
         get() = failures.get()
         set(value) = failures.set(value)
 
-    /** The number of the authenticated requests of a `maven-metadata.xml`. */
+    /** The number of the requests of a `maven-metadata.xml` authenticated as the [username]. */
     val metadataRequests: Int get() = metadataRequestCounter.get()
 
-    /** The number of the requests of a `maven-metadata.xml` with the basic authentication of other credentials. */
+    /** The number of the requests of a `maven-metadata.xml` with the basic authentication of unknown credentials. */
     val wronglyAuthenticatedMetadataRequests: Int get() = wronglyAuthenticatedMetadataRequestCounter.get()
 
     private val server = embeddedServer(CIO, host = "127.0.0.1", port = 0) {
@@ -71,16 +82,18 @@ class MavenRepositoryServer(
                     val path = call.parameters.getAll("path")!!.joinToString("/")
                     val file = MavenRepository.directory.resolve(path).normalize()
                     val authorization = call.request.header(HttpHeaders.Authorization)
-                    val authorized = authorization == credentials
+                    val user = users[authorization]
                     if (path.endsWith("/maven-metadata.xml")) when {
-                        authorized -> metadataRequestCounter.incrementAndGet()
-                        authorization != null -> wronglyAuthenticatedMetadataRequestCounter.incrementAndGet()
+                        authorization == credentials -> metadataRequestCounter.incrementAndGet()
+                        authorization != null && user == null -> wronglyAuthenticatedMetadataRequestCounter.incrementAndGet()
                     }
+                    val status = user?.let { statuses[it] }
                     when {
-                        !authorized -> {
+                        user == null -> {
                             call.response.header(HttpHeaders.WWWAuthenticate, "Basic realm=\"fixture\"")
                             call.respondBytes(ByteArray(0), status = HttpStatusCode.Unauthorized)
                         }
+                        status != null -> call.respondBytes(ByteArray(0), status = status)
                         failures.getAndUpdate { maxOf(it - 1, 0) } > 0 -> call.respondBytes(
                             ByteArray(0), status = HttpStatusCode.InternalServerError
                         )

@@ -22,6 +22,7 @@ import com.xemantic.kotlin.script.test.MavenRepository
 import com.xemantic.kotlin.script.test.MavenRepositoryServer
 import com.xemantic.kotlin.script.test.ProxyServer
 import com.xemantic.kotlin.test.assert
+import io.ktor.http.HttpStatusCode
 import org.apache.maven.repository.internal.MavenRepositorySystemUtils
 import org.apache.maven.settings.Mirror
 import org.apache.maven.settings.Proxy
@@ -398,6 +399,50 @@ class MavenVersionLookupTest {
 
             // then
             assert(result.exceptionOrNull()?.message?.contains("401") == true)
+            assert(superseded.isEmpty())
+        }
+    }
+
+    @Test
+    fun `should report server error of repository declared again with other credentials not found`() {
+        MavenRepositoryServer(username = "alice", password = "secret", otherUsers = mapOf("bob" to "secret")).use { server ->
+            // given
+            val lookup = MavenVersionLookup { settings() }
+            val alice = remoteRepository(server.url, "username=alice", "password=secret")
+            val bob = remoteRepository(server.url, "username=bob", "password=secret")
+            server.statuses["alice"] = HttpStatusCode.InternalServerError
+            val superseded = mutableListOf<RemoteRepository>()
+
+            // when
+            val result = runCatching {
+                lookup.latestVersion("com.xemantic.fixture", "missing", listOf(alice, bob)) {
+                    superseded += it
+                }
+            }
+
+            // then
+            assert(result.exceptionOrNull()?.message?.contains("500") == true)
+            assert(superseded.isEmpty())
+        }
+    }
+
+    @Test
+    fun `should not supersede repository forbidden to credentials by its other credentials`() {
+        MavenRepositoryServer(username = "alice", password = "secret", otherUsers = mapOf("bob" to "secret")).use { server ->
+            // given
+            val lookup = MavenVersionLookup { settings() }
+            val alice = remoteRepository(server.url, "username=alice", "password=secret")
+            val bob = remoteRepository(server.url, "username=bob", "password=secret")
+            server.statuses["bob"] = HttpStatusCode.Forbidden
+            val superseded = mutableListOf<RemoteRepository>()
+
+            // when
+            val latest = lookup.latestVersion("com.xemantic.fixture", "greeter", listOf(alice, bob)) {
+                superseded += it
+            }
+
+            // then
+            assert(latest?.version == "1.10")
             assert(superseded.isEmpty())
         }
     }

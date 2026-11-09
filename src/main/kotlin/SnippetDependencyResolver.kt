@@ -73,7 +73,7 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
                     // a repository declared again with the same options is looked up once,
                     // while declared again with other options, like corrected credentials, or without them,
                     // it is looked up with each, like the mavenResolver, which keeps every declaration, resolves from each,
-                    // until a declaration failing to be read is superseded by another one read, see versionOf
+                    // until a declaration refused its credentials is superseded by another one read, see versionOf
                     if (repositories.none { (_, it) -> it == repository }) {
                         repositories += repositoryCoordinates.string to repository
                     }
@@ -223,8 +223,9 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
      * It is kept for the session, so a later snippet declaring it again does not load another one.
      *
      * A repository declared with wrong credentials, and again with the corrected ones,
-     * is dropped once its declaration with the corrected credentials is read,
-     * so neither its failure hides the reason of a failed lookup, nor its credentials are sent again.
+     * is dropped once its declaration with the corrected credentials is read, while the wrong ones are refused with `401`,
+     * so neither its failure hides the reason of a failed lookup, nor its credentials are sent again by a later version lookup —
+     * the mavenResolver, keeping every declaration, still sends them, resolving the version found.
      */
     private fun versionOf(coordinates: String): LatestMavenVersion = latestVersions.getOrPut(coordinates) {
         val (groupId, artifactId) = coordinates.split(':')

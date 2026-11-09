@@ -26,6 +26,7 @@ import com.xemantic.kotlin.test.be
 import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
+import io.ktor.http.HttpStatusCode
 import java.lang.ref.WeakReference
 import kotlin.test.AfterTest
 import kotlin.test.Test
@@ -369,7 +370,7 @@ class MavenDependenciesTest {
     }
 
     @Test
-    fun `should not look up dependency declared without version with credentials of repository corrected since`() = runTest {
+    fun `should not look up metadata of dependency declared without version with wrong credentials of repository corrected since`() = runTest {
         MavenRepositoryServer(username = "alice", password = "secret").use { server ->
             // given
             session.execute("""
@@ -396,6 +397,34 @@ class MavenDependenciesTest {
                 have(value == "0.1-beta")
             }
             assert(server.wronglyAuthenticatedMetadataRequests == wronglyAuthenticatedRequests)
+        }
+    }
+
+    @Test
+    fun `should look up dependency declared without version in repository after its server error while declared again`() = runTest {
+        MavenRepositoryServer(username = "alice", password = "secret", otherUsers = mapOf("bob" to "secret")).use { server ->
+            // given
+            server.statuses["alice"] = HttpStatusCode.InternalServerError
+            session.execute("""
+                @file:Repository("${server.url}", options = ["username=alice", "password=secret"])
+                @file:Repository("${server.url}", options = ["username=bob", "password=secret"])
+                @file:DependsOn("com.xemantic.fixture:missing")
+                42
+            """.trimIndent())
+            server.statuses.clear()
+            server.statuses["bob"] = HttpStatusCode.Forbidden
+
+            // when
+            val result = session.execute("""
+                @file:DependsOn("com.xemantic.fixture:preview")
+                fixture.preview.Preview.version()
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == "0.1-beta")
+            }
         }
     }
 

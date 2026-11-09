@@ -19,6 +19,7 @@
 
 package com.xemantic.kotlin.script
 
+import org.apache.http.client.HttpResponseException
 import org.apache.maven.repository.internal.MavenRepositorySystemUtils
 import org.apache.maven.settings.Settings
 import org.eclipse.aether.RepositorySystem
@@ -206,9 +207,10 @@ internal class MavenVersionLookup(
      * or, in the offline mode, if none lists any, among the versions present in the local repository,
      * or `null`, if there is none, see [latestMavenVersion].
      *
-     * A repository failing to be read, like with wrong credentials, while another of the [repositories]
+     * A repository refusing its credentials with `401`, while another of the [repositories]
      * of the same id and URL is read, like with the corrected credentials, is superseded by it:
      * its failure is not reported, and it is passed to [superseded], so it is not looked up again.
+     * Any other failure, like `403`, which might be scoped to the artifact, or a transient `500`, supersedes none.
      *
      * @throws Exception if there is no version, and some repository, not superseded, cannot be read,
      *   reporting the repositories blocked by a mirror of the Maven settings before any other failure,
@@ -229,9 +231,8 @@ internal class MavenVersionLookup(
             null
         )
         val result = system.resolveVersionRange(newSession(), request)
-        val failures = result.exceptions.filter { it !is MetadataNotFoundException }
-        val stale = staleRepositories(looked, failures)
-        stale.forEach { superseded(it.first) }
+        val failures = supersede(looked, result.exceptions.filter { it !is MetadataNotFoundException })
+        failures.superseded.forEach(superseded)
         val versions = result.versions.map { it.toString() }.ifEmpty {
             if (settings.isOffline) localVersions(groupId, artifactId) else emptyList()
         }
@@ -239,27 +240,38 @@ internal class MavenVersionLookup(
             // the block is actionable configuration advice, so it is reported before the failures of the other repositories
             val blocked = result.exceptions.mapNotNull { failure -> failure.blockedMirror()?.let { it to failure } }
             if (blocked.isNotEmpty()) throw BlockedRepositoryException(blocked.map { it.first }, blocked.first().second)
-            val staleSettled = stale.map { it.second }
-            failures.firstOrNull { (it as? MetadataTransferException)?.repository !in staleSettled }?.let { throw it }
+            failures.reported.firstOrNull()?.let { throw it }
         }
         return latestMavenVersion(versions)
     }
 
     /**
-     * The declared repositories of the [looked] ones, paired with them as looked up, which failed to be read,
+     * The [failures] of the [looked] repositories, the declared ones paired with them as looked up, split into
+     * the declared repositories [superseded][LookupFailures.superseded], which refused their credentials with `401`,
      * while another of the same id and URL was read, like the same repository declared with the corrected credentials,
-     * or none, if some of the [failures] is not of a known repository.
+     * and the failures of the others, to be [reported][LookupFailures.reported].
+     * None is superseded if some of the failures does not name its repository, as it is unknown which ones were read.
      */
-    private fun staleRepositories(
+    private fun supersede(
         looked: List<Pair<RemoteRepository, RemoteRepository>>,
         failures: List<Exception>
-    ): List<Pair<RemoteRepository, RemoteRepository>> {
-        val failed = failures.map { (it as? MetadataTransferException)?.repository ?: return emptyList() }
-        val (unread, read) = looked.partition { it.second in failed }
-        return unread.filter { (declared, _) ->
-            read.any { (other, _) -> other.id == declared.id && other.url == declared.url }
+    ): LookupFailures {
+        val failed = failures.map {
+            (it as? MetadataTransferException)?.repository ?: return LookupFailures(emptyList(), failures)
         }
+        val unauthorized = failures.filter { it.isUnauthorized() }.map { (it as MetadataTransferException).repository }
+        val read = looked.filter { it.second !in failed }
+        val superseded = looked.filter { (declared, settled) ->
+            settled in unauthorized && read.any { (other, _) -> other.id == declared.id && other.url == declared.url }
+        }
+        val supersededSettled = superseded.map { it.second }
+        return LookupFailures(
+            superseded = superseded.map { it.first },
+            reported = failures.filterIndexed { index, _ -> failed[index] !in supersededSettled }
+        )
     }
+
+    private class LookupFailures(val superseded: List<RemoteRepository>, val reported: List<Exception>)
 
     /** The versions of the artifact in the local repository, also these resolved without its `maven-metadata.xml`. */
     private fun localVersions(groupId: String, artifactId: String): List<String> =
@@ -287,6 +299,10 @@ internal class MavenVersionLookup(
     }
 
 }
+
+/** Whether the repository refused the credentials, or their absence, with `401`, however deep it is wrapped. */
+private fun Throwable.isUnauthorized(): Boolean =
+    generateSequence(this) { it.cause }.any { it is HttpResponseException && it.statusCode == 401 }
 
 /** The protocols of the repositories supported by `MavenDependenciesResolver`. */
 private val supportedProtocol = Regex("https?|file")
