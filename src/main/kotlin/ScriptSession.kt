@@ -124,7 +124,9 @@ public interface ScriptSession : AutoCloseable {
      *
      * When the caller is cancelled, or the session is [closed][close], while the snippet is evaluated,
      * the thread of the session is interrupted, and the coroutines of [ScriptScope.await] are cancelled,
-     * so the snippet fails with an [ExecutionPhase.EVALUATION] error, returned to a caller which is not cancelled,
+     * so a blocking call of the snippet, like `Thread.sleep`, throws an [InterruptedException], and its `await` a [kotlinx.coroutines.CancellationException],
+     * which fail the snippet with an [ExecutionPhase.EVALUATION] error, returned to a caller which is not cancelled, unless the snippet catches them,
+     * and ends without blocking, or awaiting, again, as its evaluation stays cancelled,
      * while a snippet which neither blocks interruptibly, nor awaits, runs to its end.
      * A caller without a [Job] in its context, like `suspend fun main`, cannot cancel the evaluation, only closing the session can.
      * A caller with a dispatcher in its context resumes where its dispatcher resumes it,
@@ -154,7 +156,7 @@ public interface ScriptSession : AutoCloseable {
      * and releasing the compiler, the thread, and the values of the properties, once that snippet ends,
      * which might be the declaration of the properties, so they are declared also when the session is closed while declaring them,
      * while the snippet waiting for the declaration is rejected, like one executed after closing.
-     * The snippets and coroutines still running read the properties as before, as they were declared already.
+     * The snippets and coroutines still running keep reading the properties from the fields of their scripts, unaffected by the release.
      * Closing a closed session, also concurrently, has no effect,
      * and returns at once, also while the first closing is still cancelling the coroutines, or queueing the release.
      */
@@ -501,7 +503,8 @@ internal class DefaultScriptSession(
     private suspend fun declareProperties(repl: Repl): ScriptResult.Error? {
         if (properties.isEmpty()) return null
         val source = properties.joinToString("\n") { it.declaration(id) }
-        // not cancelled by the caller, so its cancellation cannot fail the declaration for all the next executions
+        // with its own job, so a cancellation of the caller cannot fail the declaration for all the next executions,
+        // while closing the session cancels it harmlessly, as it neither blocks, nor awaits, and the snippet waiting for it is rejected then, see execute
         val result = repl.compileAndEvaluate(source, "properties.kts", Job())
         return (result as? ScriptResult.Error)?.let {
             ScriptResult.Error("The properties cannot be declared:\n${it.message}", it.phase)
