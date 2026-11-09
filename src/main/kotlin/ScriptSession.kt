@@ -105,8 +105,10 @@ public interface ScriptSession : AutoCloseable {
      * so the snippet fails with an [ExecutionPhase.EVALUATION] error, returned to a caller which is not cancelled,
      * while a snippet which neither blocks interruptibly, nor awaits, runs to its end.
      * A caller without a [Job] in its context, like `suspend fun main`, cannot cancel the evaluation, only closing the session can.
-     * A caller without a dispatcher in its context, like `suspend fun main` as well, resumes on [Dispatchers.Default],
-     * as it has no thread to return to, never on the thread of the session, which the next snippet needs.
+     * A caller with a dispatcher in its context resumes where its dispatcher resumes it,
+     * which for [Dispatchers.Unconfined] is in place, on the thread of the session, blocking the next snippet until the caller suspends.
+     * A caller without a dispatcher, like `suspend fun main` as well, has no thread to return to, so it resumes on [Dispatchers.Default],
+     * which the coroutines launched by the snippets share by default, see [ScriptScope], so it should not block that thread for long.
      * A cancellation, or closing the session, while the snippet is compiled waits for the compilation to end,
      * as the compiler is never interrupted, and the snippet is evaluated then, cancelled already,
      * as the session would evaluate it before the next one anyway.
@@ -356,7 +358,8 @@ internal class DefaultScriptSession(
         snippet: String
     ): ScriptResult = mutex.withLock {
         check(!closed.get()) { "The session is closed" }
-        // a caller without a job, like `suspend fun main`, cannot cancel the evaluation
+        // a caller with a dispatcher but without a job cannot cancel the evaluation,
+        // while a caller without a dispatcher, like `suspend fun main`, has the job of the withContext of execute
         val callerJob = currentCoroutineContext()[Job] ?: Job()
         // a cancelled compilation would leave the compiled snippet to be evaluated before the next one
         val result = withContext(sessionDispatcher + NonCancellable) {

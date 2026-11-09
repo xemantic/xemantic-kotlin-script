@@ -1283,13 +1283,14 @@ class ScriptSessionTest {
         // when
         suspend {
             val result = session.execute("Thread.currentThread()")
-            (result as ScriptResult.Value).value to Thread.currentThread()
+            assert(result is ScriptResult.Value)
+            result.value to Thread.currentThread()
         }.startCoroutine(Continuation(EmptyCoroutineContext) {
             threads.complete(it)
         })
 
         // then
-        // bounded, so a deadlock fails the test instead of hanging the build
+        // bounded, so a hang fails the test instead of hanging the build
         val (sessionThread, callerThread) = threads.get(1, TimeUnit.MINUTES).getOrThrow()
         assert(callerThread !== sessionThread)
     }

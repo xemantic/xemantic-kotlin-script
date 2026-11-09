@@ -88,8 +88,9 @@ ScriptSession {
 * All the snippets of a session are compiled and evaluated on its own thread, one after another,
   so a snippet can use an API bound to the thread which created it.
   Snippets executed concurrently wait for their turn.
-  The caller of `execute` resumes on its own dispatcher, or on `Dispatchers.Default` if it has none, like `suspend fun main`,
-  never on the thread of the session.
+  The caller of `execute` resumes where its dispatcher resumes it,
+  or on `Dispatchers.Default` if it has no dispatcher, like `suspend fun main`,
+  while a caller on `Dispatchers.Unconfined` resumes in place, on the thread of the session.
   Separate sessions run in parallel, each with its own state,
   and each holding its own compiler, which loads the whole classpath, so close the sessions no longer needed.
 * The snippets are received by the `ScriptScope`, a `CoroutineScope` living as long as the session,
