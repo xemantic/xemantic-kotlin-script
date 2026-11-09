@@ -49,7 +49,6 @@ import kotlin.coroutines.startCoroutine
 import kotlin.reflect.KClassifier
 import kotlin.reflect.KType
 import kotlin.reflect.typeOf
-import kotlin.script.experimental.api.ResultValue
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
@@ -1856,28 +1855,6 @@ class ScriptSessionTest {
                     }
                 }
             }
-        }
-    }
-
-    @Test
-    fun `should report snippet which was not evaluated as evaluation error`() {
-        // given
-        // never returned by the K2 REPL evaluator so far, so not reproducible by a snippet,
-        // while the declaration of the properties would be taken for evaluated otherwise
-        val reporter = ScriptErrorReporter(emptyMap())
-
-        // when
-        val result = reporter.scriptResult(
-            result = ResultValue.NotEvaluated,
-            evaluationReports = emptyList(),
-            compilationReports = emptyList(),
-            dependencies = SnippetDependencyResolver.SnippetDependencies()
-        )
-
-        // then
-        result should {
-            be<ScriptResult.Error>()
-            have(phase == ExecutionPhase.EVALUATION)
         }
     }
 

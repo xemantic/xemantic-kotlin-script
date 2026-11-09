@@ -21,6 +21,7 @@ package com.xemantic.kotlin.script
 
 import java.util.Collections
 import java.util.IdentityHashMap
+import kotlin.script.experimental.api.ResultValue
 import kotlin.script.experimental.api.ScriptDiagnostic
 
 /** The longest sequence of frames collapsed when repeated, like of a mutual recursion. */
@@ -318,6 +319,36 @@ internal class ScriptErrorReporter(
         return best
     }
 
+}
+
+/**
+ * The [ScriptResult] of a snippet from the [result] of its evaluation,
+ * which is `null` if the evaluation failed without one, reported by the [evaluationReports] then,
+ * like [ResultValue.NotEvaluated], which is a failure as well,
+ * with the warnings of the [compilationReports], and the [dependencies] of the snippet.
+ *
+ * @throws VirtualMachineError thrown by the snippet, other than [StackOverflowError].
+ */
+internal fun ScriptErrorReporter.scriptResult(
+    result: ResultValue?,
+    evaluationReports: List<ScriptDiagnostic>,
+    compilationReports: List<ScriptDiagnostic>,
+    dependencies: SnippetDependencyResolver.SnippetDependencies
+): ScriptResult = when (result) {
+    is ResultValue.Value -> ScriptResult.Value(result.value, warnings(compilationReports), dependencies.resolvedVersions)
+    is ResultValue.Unit -> ScriptResult.Value(Unit, warnings(compilationReports), dependencies.resolvedVersions)
+    is ResultValue.Error -> {
+        val error = result.error
+        if (error.isFatal) throw error
+        ScriptResult.Error(
+            describe(error, dependencies.warnings + compilationReports),
+            ExecutionPhase.EVALUATION
+        )
+    }
+    is ResultValue.NotEvaluated, null -> ScriptResult.Error(
+        describe(evaluationReports.ifEmpty { dependencies.warnings + compilationReports }),
+        ExecutionPhase.EVALUATION
+    )
 }
 
 /** The names of the classes of the snippets without the snippet class, like `Color.BLUE` instead of `Snippet3.Color.BLUE`. */

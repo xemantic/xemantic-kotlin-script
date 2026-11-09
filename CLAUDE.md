@@ -104,4 +104,6 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   always qualify it, `exception.read(null) { cause }`, and test the chain at least two causes deep.
 - A test of cancellation must signal "started" from within the block to be cancelled, like inside `await { }`, not before it —
   otherwise the cancellation can arrive before the block starts, so its `finally` never runs, and the test is flaky.
+- Never give a private helper the name of a public method taking the lock, like an `execute` of `Repl` next to `ScriptSession.execute` —
+  a slip like `execute(source)` compiles, re-enters the non-reentrant mutex, and deadlocks.
 - Do not add content to this file that is already discoverable by reading the source or build scripts — that inflates context without adding signal, reducing AI agent task success rates (see [arxiv 2602.11988](https://arxiv.org/abs/2602.11988)).
