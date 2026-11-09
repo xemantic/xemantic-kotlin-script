@@ -701,6 +701,69 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should not hint at null property of platform type of snippet which failed in the evaluation`() = runTest {
+        // given
+        session.execute("""
+            val p = System.getProperty("no.such.property")
+            error("boom")
+        """.trimIndent())
+
+        // when
+        val result = session.execute("p.length")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.NullPointerException: Cannot invoke "String.length()" because the return value of "getP()" is null
+                  at <snippet body>(snippet2.kts:1)
+                  | p.length
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint at uninitialized delegated property of nullable type`() = runTest {
+        // given
+        session.execute("""
+            error("boom")
+            val s: String? by lazy { null }
+        """.trimIndent())
+
+        // when
+        val result = session.execute("s?.length")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            have(message.lines()[1] == "  hint: 's' is declared in snippet1.kts, which failed in the evaluation, so it might be left uninitialized, null despite its type - declare it again, together with the declarations reading it, as they keep reading the uninitialized one.")
+        }
+    }
+
+    @Test
+    fun `should hint at uninitialized property of getter of custom JVM name`() = runTest {
+        // given
+        session.execute("@get:JvmName(\"text\") val s: String = error(\"boom\")")
+
+        // when
+        val result = session.execute("s.length")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.NullPointerException: Cannot invoke "String.length()" because the return value of "text()" is null
+                  hint: 's' is declared in snippet1.kts, which failed in the evaluation, so it might be left uninitialized, null despite its type - declare it again, together with the declarations reading it, as they keep reading the uninitialized one.
+                  at <snippet body>(snippet2.kts:1)
+                  | s.length
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should not hint at null property of snippet which did not fail in the evaluation`() = runTest {
         // given
         session.execute("val s: String = error(\"boom\")")

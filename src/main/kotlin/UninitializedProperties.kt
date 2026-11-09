@@ -20,11 +20,20 @@ package com.xemantic.kotlin.script
 
 import io.github.oshai.kotlinlogging.KotlinLogging
 import java.lang.reflect.Modifier
+import kotlin.reflect.KProperty1
+import kotlin.reflect.full.declaredMemberProperties
+import kotlin.reflect.full.isSubtypeOf
+import kotlin.reflect.jvm.javaField
+import kotlin.reflect.jvm.javaGetter
+import kotlin.reflect.typeOf
 
 private val logger = KotlinLogging.logger {}
 
 /** The suffix of the field of a delegated property, like `s$delegate` of `val s by lazy { … }`. */
 private const val DELEGATE_SUFFIX = "\$delegate"
+
+/** The name of the property of the value of the last expression of a snippet, like `res0`, declared by the REPL, not by the snippet. */
+private val resultProperty = Regex("res\\d+")
 
 /**
  * The member read as `null` in the message of a [NullPointerException] of the JVM,
@@ -32,9 +41,12 @@ private const val DELEGATE_SUFFIX = "\$delegate"
  */
 private val nullMember = Regex("because (?:the return value of )?\"([^\"]+)\" is null")
 
+/** The type of `null`, a subtype of every type which takes `null`, also of a platform type, like `String!` of `System.getProperty`. */
+private val nullType = typeOf<Nothing?>()
+
 /**
- * The property of this [name], declared by the [snippet], like `snippet3.kts`, which failed in the evaluation,
- * while the property was `null`, most likely never initialized, despite its type.
+ * The property of this [name], declared by the [snippet], like `snippet3.kts`, which failed in the evaluation
+ * before initializing it, so it is `null`, despite its type.
  *
  * @property className the name of the class of the [snippet], like `Snippet3`.
  * @property getter the name of the getter of the property, like `getS`, if it is declared.
@@ -53,13 +65,12 @@ internal class UninitializedProperty(
 }
 
 /**
- * The properties of the snippets which failed in the evaluation, which were `null` then, despite their type,
- * most likely as the snippets failed before initializing them, while the later snippets still see them.
+ * The properties of the snippets which failed in the evaluation before initializing them, `null` despite their type,
+ * while the later snippets still see them.
  *
  * The properties of a snippet are the static fields of its class, read by the field, or by the getter,
  * like `Snippet1.s` or `Snippet1.getS()` in the message of a [NullPointerException] of the JVM,
  * while a delegated property fails in its getter, reading the `null` delegate, like `Snippet1.s$delegate`, to a local variable.
- * A property of a primitive type is never `null`, it is left zero, or `false`, instead.
  */
 internal class UninitializedProperties {
 
@@ -70,45 +81,65 @@ internal class UninitializedProperties {
     private val byDelegateGetter = HashMap<String, UninitializedProperty>()
 
     /**
-     * Keeps the properties of the [scriptClass] of the [snippet] which failed in the evaluation, which are `null`.
+     * Keeps, and returns, by their names, the properties of the [scriptClass] of the [snippet] which failed in the evaluation,
+     * which are left uninitialized: `null`, although their type does not take `null`, read by kotlin-reflect,
+     * as the K2 REPL compiler does not annotate the nullability, or delegated with a `null` delegate, whatever their type.
+     * A property of a nullable type, or of a platform type, like of `System.getProperty`, is `null` on purpose,
+     * a `lateinit` one throws when uninitialized, and the property of the result of the snippet, like `res0`,
+     * which is `null` as well, is not declared by the snippet,
+     * while a property of a primitive type is left zero, or `false`, which a value cannot be told from.
+     * Empty if the properties cannot be read.
      *
      * @throws VirtualMachineError thrown by the reflection, other than [StackOverflowError].
      */
     fun keep(
         scriptClass: Class<*>,
         snippet: String
-    ) {
-        try {
-            val methods by lazy {
-                scriptClass.declaredMethods.filter { it.parameterCount == 0 }.mapTo(HashSet()) { it.name }
-            }
-            scriptClass.declaredFields.filter { field ->
-                Modifier.isStatic(field.modifiers)
-                    && !field.type.isPrimitive
-                    // like the INSTANCE of the snippet
-                    && field.type != scriptClass
-                    // like the implicit receiver
-                    && '$' !in field.name.removeSuffix(DELEGATE_SUFFIX)
-                    && field.trySetAccessible()
-                    && field.get(null) == null
-            }.forEach { field ->
-                val delegated = field.name.endsWith(DELEGATE_SUFFIX)
-                val name = field.name.removeSuffix(DELEGATE_SUFFIX)
-                val getter = getterName(name).takeIf { it in methods }
-                val property = UninitializedProperty(name, snippet, scriptClass.name, getter)
-                byMember["${scriptClass.name}.${field.name}"] = property
-                if (getter != null) {
-                    if (delegated) {
-                        byDelegateGetter["${scriptClass.name}.$getter"] = property
-                    } else {
-                        byMember["${scriptClass.name}.$getter()"] = property
-                    }
-                }
-            }
-        } catch (e: Throwable) {
-            if (e.isFatal) throw e
-            logger.debug(e) { "$snippet: cannot read the properties of the snippet which failed" }
+    ): List<UninitializedProperty> = reading(snippet, emptyList()) {
+        scriptClass.kotlin.declaredMemberProperties.sortedBy { it.name }.mapNotNull { property ->
+            reading(snippet, null) { uninitialized(property, scriptClass, snippet) }
         }
+    }
+
+    private fun uninitialized(
+        property: KProperty1<*, *>,
+        scriptClass: Class<*>,
+        snippet: String
+    ): UninitializedProperty? {
+        // a property of a custom getter has no field, and a property of the snippet is static
+        val field = property.javaField?.takeIf { Modifier.isStatic(it.modifiers) } ?: return null
+        if (
+            property.isLateinit
+            || field.type.isPrimitive
+            // the result property is the only one with a public field, unless annotated with @JvmField
+            || (Modifier.isPublic(field.modifiers) && field.name.matches(resultProperty))
+        ) return null
+        val delegated = field.name.endsWith(DELEGATE_SUFFIX)
+        if (!delegated && nullType.isSubtypeOf(property.returnType)) return null
+        if (!field.trySetAccessible() || field.get(null) != null) return null
+        val getter = property.javaGetter?.name
+        val uninitialized = UninitializedProperty(property.name, snippet, scriptClass.name, getter)
+        byMember["${scriptClass.name}.${field.name}"] = uninitialized
+        if (getter != null) {
+            if (delegated) {
+                byDelegateGetter["${scriptClass.name}.$getter"] = uninitialized
+            } else {
+                byMember["${scriptClass.name}.$getter()"] = uninitialized
+            }
+        }
+        return uninitialized
+    }
+
+    private inline fun <T> reading(
+        snippet: String,
+        fallback: T,
+        read: () -> T
+    ): T = try {
+        read()
+    } catch (e: Throwable) {
+        if (e.isFatal) throw e
+        logger.debug(e) { "$snippet: cannot read the properties of the snippet which failed" }
+        fallback
     }
 
     /** The property read as `null` by the [exception] thrown at the [stackTrace], if it is one of these properties. */
@@ -121,15 +152,3 @@ internal class UninitializedProperties {
 
 }
 
-/**
- * The name of the JVM getter of the Kotlin property of this name, like `getTimeout` of `timeout`,
- * or the name itself, if it starts with `is` followed by a character other than an ASCII lowercase letter, like `isOk`,
- * with only an ASCII first letter capitalized, like `getä` of `ä`, as the Kotlin compiler does.
- */
-internal fun getterName(
-    property: String
-): String = if (property.length > 2 && property.startsWith("is") && property[2] !in 'a'..'z') {
-    property
-} else {
-    "get" + property.replaceFirstChar { if (it in 'a'..'z') it.uppercaseChar() else it }
-}
