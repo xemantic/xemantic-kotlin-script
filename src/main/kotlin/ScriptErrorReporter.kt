@@ -46,6 +46,9 @@ private val mangledMethod = Regex("[\\p{L}_][\\p{L}\\p{N}_]*-[\\p{L}\\p{N}_]{7}\
 /** The method evaluating the body of a snippet. */
 private const val SNIPPET_BODY_METHOD = "\$\$eval"
 
+/** The most properties named in the hint at the ones left uninitialized by a snippet, the first ones declared. */
+private const val MAX_NAMED_UNINITIALIZED = 5
+
 /**
  * Describes the failures of the snippets of a session in a form an LLM can act on,
  * pointing to the offending lines of the snippets.
@@ -54,12 +57,14 @@ private const val SNIPPET_BODY_METHOD = "\$\$eval"
  * @param snippetClassNames the simple names of the classes declared by the evaluated snippets.
  * @param uninitializedProperties the properties of the snippets which failed in the evaluation, `null` then.
  * @param inlinedFrames the frames of the code inlined into the snippets, of the lines beyond the end of a snippet.
+ * @param propertyAccessors the properties of the accessors of the classes of the snippets, named in the hints by the property.
  */
 internal class ScriptErrorReporter(
     private val snippets: Map<String, List<String>>,
     private val snippetClassNames: Set<String> = emptySet(),
     private val uninitializedProperties: UninitializedProperties = UninitializedProperties(),
-    private val inlinedFrames: InlinedFrames = InlinedFrames(snippets)
+    private val inlinedFrames: InlinedFrames = InlinedFrames(snippets),
+    private val propertyAccessors: PropertyAccessors = PropertyAccessors()
 ) {
 
     /**
@@ -79,15 +84,20 @@ internal class ScriptErrorReporter(
         it.severity == ScriptDiagnostic.Severity.WARNING
     }.takeIf { it.isNotEmpty() }?.let { describe(it) }
 
+    /**
+     * @param uninitialized the properties the snippet throwing the [throwable] left uninitialized, see [UninitializedProperties.keep].
+     */
     fun describe(
         throwable: Throwable,
-        warnings: List<ScriptDiagnostic> = emptyList()
+        warnings: List<ScriptDiagnostic> = emptyList(),
+        uninitialized: List<UninitializedProperty> = emptyList()
     ): String = buildString {
         appendThrowable(
             throwable = throwable,
             prefix = "",
             indent = "",
-            reported = Collections.newSetFromMap(IdentityHashMap())
+            reported = Collections.newSetFromMap(IdentityHashMap()),
+            uninitialized = uninitialized
         )
         warnings(warnings)?.let {
             append('\n')
@@ -147,12 +157,14 @@ internal class ScriptErrorReporter(
     /**
      * @param prefix the lead of the first line, with its indent, like `  Caused by: `, as the caller might continue a line.
      * @param indent the indent of the following lines, the frames, the suppressed exceptions and the causes.
+     * @param uninitialized the properties left uninitialized by the snippet throwing the [throwable], hinted at after it.
      */
     private fun StringBuilder.appendThrowable(
         throwable: Throwable,
         prefix: String,
         indent: String,
-        reported: MutableSet<Throwable>
+        reported: MutableSet<Throwable>,
+        uninitialized: List<UninitializedProperty> = emptyList()
     ): Boolean {
         append(prefix)
         if (throwable in reported) {
@@ -177,15 +189,10 @@ internal class ScriptErrorReporter(
         val stackTrace = throwable.read(emptyList()) { stackTrace.filterNotNull() }
         if (throwable is NullPointerException) {
             uninitializedProperties.readBy(throwable, stackTrace)?.let { property ->
-                append("$indent  hint: '${property.name}' is declared in ${property.snippet}, which failed in the evaluation,")
-                append(" so it might be left uninitialized, null despite its type")
-                append(" - declare it again, together with the declarations reading it,")
-                stackTrace.firstOrNull { it.fileName in snippets && !property.isGetter(it) }?.let { frame ->
-                    frame.declarationName()?.let { append(" like '$it' of ${frame.fileName},") }
-                }
-                append(" as they keep reading the uninitialized one.\n")
+                appendUninitializedReadHint(property, stackTrace, indent)
             }
         }
+        appendUninitializedHint(uninitialized, indent)
         appendFrames(stackTrace, indent)
         for (suppressed in throwable.read(emptyArray()) { suppressed }) {
             if (!appendThrowable(suppressed, "$indent  Suppressed: ", "$indent  ", reported)) return false
@@ -194,6 +201,66 @@ internal class ScriptErrorReporter(
             appendThrowable(it, "${indent}Caused by: ", indent, reported)
         } ?: true
     }
+
+    /**
+     * The hint at the [property] of an earlier snippet, read as `null` by the exception thrown at the [stackTrace],
+     * naming the declaration reading it, the first snippet frame of a declaration, like `greet`, so not a lambda, or the body of a snippet,
+     * and the declarations calling it, which keep calling the one reading the uninitialized property, even after redeclaring both,
+     * while a `var` is assigned instead, which all of them see.
+     */
+    private fun StringBuilder.appendUninitializedReadHint(
+        property: UninitializedProperty,
+        stackTrace: List<StackTraceElement>,
+        indent: String
+    ) {
+        val readers = stackTrace.filter {
+            it.fileName in snippets && !property.isGetter(it)
+        }.mapNotNull { frame ->
+            frame.declarationName()?.let { "'$it' of ${frame.fileName}" }
+        }.distinct()
+        append("$indent  hint: '${property.name}' is declared in ${property.snippet}, which failed in the evaluation,")
+        append(" so it might be left uninitialized, null despite its type - ")
+        if (property.mutable) {
+            append("assign it, instead of declaring it again, as the declarations reading it")
+            readers.firstOrNull()?.let { append(", like $it,") }
+            append(" keep reading the same one.\n")
+        } else {
+            append("declare it again, together with the declarations reading it,")
+            readers.firstOrNull()?.let { append(" like $it,") }
+            readers.drop(1).takeIf { it.isNotEmpty() }?.let { append(" and the ones calling them, like ${it.enumerated()},") }
+            append(" as they keep reading the uninitialized one.\n")
+        }
+    }
+
+    /**
+     * The hints at the properties left [uninitialized] by the snippet which failed, the `val`s, and then the `var`s,
+     * which are assigned instead of declaring them again, naming the first [MAX_NAMED_UNINITIALIZED] of each, and counting the rest.
+     */
+    private fun StringBuilder.appendUninitializedHint(
+        uninitialized: List<UninitializedProperty>,
+        indent: String
+    ) {
+        val (vals, vars) = uninitialized.partition { !it.mutable }
+        listOf(vals, vars).filter { it.isNotEmpty() }.forEach { properties ->
+            val plural = properties.size > 1
+            val them = if (plural) "them" else "it"
+            val one = if (plural) "ones" else "one"
+            val named = properties.take(MAX_NAMED_UNINITIALIZED).map { "'${it.name}'" }
+            val more = properties.size - named.size
+            append("$indent  hint: ${(named + listOfNotNull("$more more".takeIf { more > 0 })).enumerated()} ${if (plural) "are" else "is"} left uninitialized,")
+            append(" null despite ${if (plural) "their" else "its"} type, as the snippet failed before initializing $them,")
+            append(" while ${if (plural) "they stay" else "it stays"} declared - ")
+            if (properties.first().mutable) {
+                append("assign $them, instead of declaring $them again, as the declarations reading $them keep reading the same $one.\n")
+            } else {
+                append("declare $them again, together with the declarations reading $them, as they keep reading the uninitialized $one.\n")
+            }
+        }
+    }
+
+    /** Like `'a', 'b' and 'c'`. */
+    private fun List<String>.enumerated(): String =
+        if (size <= 1) joinToString() else dropLast(1).joinToString() + " and " + last()
 
     /**
      * The class and the message of the [throwable], with the later lines of a multi-line message
@@ -293,11 +360,15 @@ internal class ScriptErrorReporter(
 
     /**
      * The name of the declaration of this snippet frame, like `greet`, `Checker.check`, or `Config` of its initializer,
+     * the property of an accessor, like `t` of `getT`, see [PropertyAccessors],
      * or `null` for the body of a snippet, or a lambda, which is not a declaration to redeclare.
      */
     private fun StackTraceElement.declarationName(): String? = functionName().takeIf {
         it != "<snippet body>" && it != "<lambda>"
-    }?.removeSuffix(".<init>")?.removeSuffix(".<clinit>")
+    }?.removeSuffix(".<init>")?.removeSuffix(".<clinit>")?.let { name ->
+        val property = propertyAccessors.propertyOf(this) ?: return name
+        name.substring(0, name.lastIndexOf('.') + 1) + property
+    }
 
     /**
      * The length of the sequence of frames starting at the [index], and the number of its consecutive repetitions,
@@ -331,7 +402,8 @@ internal class ScriptErrorReporter(
  * The [ScriptResult] of a snippet from the [result] of its evaluation,
  * which is `null` if the evaluation failed without one, reported by the [evaluationReports] then,
  * like [ResultValue.NotEvaluated], which is a failure as well,
- * with the warnings of the [compilationReports], and the [dependencies] of the snippet.
+ * with the warnings of the [compilationReports], and the [dependencies] of the snippet,
+ * hinting at the properties the snippet left [uninitialized].
  *
  * @throws VirtualMachineError thrown by the snippet, other than [StackOverflowError].
  */
@@ -339,7 +411,8 @@ internal fun ScriptErrorReporter.scriptResult(
     result: ResultValue?,
     evaluationReports: List<ScriptDiagnostic>,
     compilationReports: List<ScriptDiagnostic>,
-    dependencies: SnippetDependencyResolver.SnippetDependencies
+    dependencies: SnippetDependencyResolver.SnippetDependencies,
+    uninitialized: List<UninitializedProperty> = emptyList()
 ): ScriptResult = when (result) {
     is ResultValue.Value -> ScriptResult.Value(result.value, warnings(compilationReports), dependencies.resolvedVersions)
     is ResultValue.Unit -> ScriptResult.Value(Unit, warnings(compilationReports), dependencies.resolvedVersions)
@@ -347,7 +420,7 @@ internal fun ScriptErrorReporter.scriptResult(
         val error = result.error
         if (error.isFatal) throw error
         ScriptResult.Error(
-            describe(error, dependencies.warnings + compilationReports),
+            describe(error, dependencies.warnings + compilationReports, uninitialized),
             ExecutionPhase.EVALUATION
         )
     }

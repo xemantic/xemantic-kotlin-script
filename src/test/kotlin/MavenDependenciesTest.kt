@@ -418,9 +418,23 @@ class MavenDependenciesTest {
     /**
      * The weak references to a closed session, and to the class loader of its dependency,
      * created outside of `runTest`, as a frame of its coroutine can keep a stale reference to the session.
+     * A snippet fails before initializing a property, and the next one reads it, so the hints reflect on the snippet classes,
+     * which the caches of kotlin-reflect must not keep.
      */
     private fun closedSessionWithDependency(): Pair<WeakReference<Any>, WeakReference<Any>> = runBlocking {
         val session = ScriptSession()
+        val failed = session.execute("""
+            class Foo
+            val s: String = error("boom")
+        """.trimIndent())
+        assert(failed is ScriptResult.Error && "hint: 's' is left uninitialized" in failed.message)
+        val read = session.execute("""
+            class Bar {
+                fun size(): Int = s.length
+            }
+            Bar().size()
+        """.trimIndent())
+        assert(read is ScriptResult.Error && "like 'Bar.size' of snippet2.kts" in read.message)
         val result = session.execute("""
             $repository
             @file:DependsOn("com.xemantic.fixture:greeter:1.0")

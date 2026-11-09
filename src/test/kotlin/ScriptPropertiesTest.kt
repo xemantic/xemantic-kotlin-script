@@ -542,7 +542,7 @@ class ScriptPropertiesTest {
 
     @Test
     fun `should report property which fails to evaluate`() = runTest {
-        ScriptSession(listOf(isolatedProperty())).use { session ->
+        ScriptSession(listOf(property("first", "x"), isolatedProperty(), property("last", "y"))).use { session ->
             // when
             val result = session.execute("42")
 
@@ -554,6 +554,8 @@ class ScriptPropertiesTest {
                     "The properties cannot be declared:\n" +
                             "java.lang.ClassCastException: class com.xemantic.kotlin.script.Isolated cannot be cast to class com.xemantic.kotlin.script.Isolated"
                 ))
+                // the properties left uninitialized by the failed declaration are the ones of the host, which the caller cannot redeclare
+                have(message.lines().none { it.trimStart().startsWith("hint:") })
             }
         }
     }

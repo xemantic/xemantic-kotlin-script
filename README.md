@@ -74,13 +74,20 @@ ScriptSession {
   which hold `null` then, despite their type, or zero, or `false`, if it is a primitive one, like `Int`, or `Boolean`.
   Redeclaring such a property is not enough, if a function, or a class, compiled against it reads it,
   like a `fun greet() = name.uppercase()` declared together with `val name: String = error("boom")`,
-  as it keeps reading the uninitialized one — it has to be redeclared as well.
-  When the JVM reports a `NullPointerException` naming such a property, like `s.length` after `val s: String = error("boom")`,
-  the error message gives a hint to declare the property again, together with the declarations reading it,
-  naming the one in the stack trace, like `greet`, if any.
-  There is no hint for a property of a primitive type, which reads as zero, or `false`, without failing,
-  for a value copied from the property before the failing read, like `val t = s` followed by `t.length`,
-  or when the JVM runs without the helpful `NullPointerException` messages (`-XX:-ShowCodeDetailsInExceptionMessages`).
+  as it keeps reading the uninitialized one — it has to be redeclared as well, with the declarations calling it,
+  while assigning a `var` is enough, as all of them read the same one.
+  The error message of the failing snippet names the properties it left `null` despite their type,
+  the first five `val`s and the first five `var`s, counting the rest,
+  with a hint to declare the `val`s again, together with the declarations reading them, and to assign the `var`s.
+  A `NullPointerException` of the JVM naming such a property later, like of `s.length` after `val s: String = error("boom")`,
+  gets the hint as well, naming the declarations reading it, and the ones calling them, found in the stack trace, like `greet`.
+  Neither hint covers a property of a primitive type, which reads as zero, or `false`, without failing,
+  nor a property of a nullable type, or of a platform type, like of `System.getProperty`, which is `null` by its type.
+  The later hint also needs the JVM to name the property in the message of the `NullPointerException`.
+  The JVM does not name it for a value copied from the property before the failing read, like `val t = s` followed by `t.length`,
+  nor for the property passed as an argument, rejected by the check of a non-null parameter (`Parameter specified as non-null is null`),
+  nor when it runs without the helpful `NullPointerException` messages (`-XX:-ShowCodeDetailsInExceptionMessages`).
+  A delegated property is the exception, as it is found by its getter in the stack trace instead.
 * Each snippet is a regular Kotlin script, compiled by the K2 REPL compiler of the Kotlin scripting API,
   against the whole classpath of the host application,
   so any class available to the host can be imported by a snippet.
