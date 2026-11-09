@@ -115,6 +115,14 @@ ScriptSession {
   The type is inferred from the value, including its type arguments,
   or can be given explicitly, e.g. `provide<String?>("name", null)` or `provide<Clock>("clock", fixedClock)`,
   to make the property nullable, or to expose it only as its supertype.
+  A mutable collection keeps its mutable type,
+  so `"names" provides mutableListOf("Alice")` lets the snippets modify the list shared with the host,
+  while `provide<List<String>>("names", names)` makes the snippets see it as read-only.
+  A read-only collection of the Kotlin standard library, like `emptyList()`, is rejected as a value of a mutable type,
+  while a frozen collection implementing the mutable interface, like the result of `buildList`, or a Java collection, like `Collections.unmodifiableList`,
+  is not detected, and fails when mutated.
+  Only `typeOf` and the types of the members keep the mutability,
+  while `MutableList::class.createType(...)` yields a read-only `List` type, as `MutableList::class` is the same class as `List::class`.
   A property list built dynamically can be passed instead, as `ScriptSession(listOf(property("greeting", "Hello")))`.
   Invalid properties are rejected with `IllegalArgumentException`:
   a name which is not a Kotlin identifier, a duplicate name, a value which is not of the type,

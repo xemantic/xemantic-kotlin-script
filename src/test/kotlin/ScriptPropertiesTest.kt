@@ -28,6 +28,7 @@ import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
 import java.net.URLClassLoader
+import kotlin.reflect.KType
 import kotlin.reflect.KTypeProjection
 import kotlin.reflect.full.createType
 import kotlin.reflect.typeOf
@@ -58,6 +59,25 @@ private fun isolatedProperty(): ScriptProperty<Any> {
     )
     val isolated = loader.loadClass(Isolated::class.java.name)
     return ScriptProperty("isolated", isolated.kotlin.createType(), isolated.getDeclaredConstructor().newInstance())
+}
+
+typealias MutableItems = MutableList<String>
+
+typealias Items<T> = MutableList<T>
+
+typealias Transform = (Int) -> Int
+
+class IndexHolder {
+    val index: MutableMap<String, List<Int>> = mutableMapOf()
+}
+
+/** The types of the members keep the typealiases, unlike the ones of [typeOf]. */
+class AliasHolder {
+    val items: MutableItems = mutableListOf()
+    val nested: List<MutableItems> = listOf()
+    val nullable: MutableItems? = null
+    val generic: Items<Transform> = mutableListOf()
+    val map: Map<Transform, MutableItems> = mapOf()
 }
 
 class ScriptPropertiesTest {
@@ -176,6 +196,140 @@ class ScriptPropertiesTest {
                 have(value == "foo4221")
             }
         }
+    }
+
+    @Test
+    fun `should provide properties of mutable collection types`() = runTest {
+        ScriptSession {
+            provide<MutableList<String>>("items", mutableListOf())
+            provide<MutableMap<String, MutableSet<Int>>>("index", mutableMapOf())
+        }.use { session ->
+            // when
+            val result = session.execute($$"""
+                items.add("foo")
+                index.getOrPut("foo") { mutableSetOf() }.add(42)
+                "$items $index"
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == "[foo] {foo=[42]}")
+            }
+        }
+    }
+
+    @Test
+    fun `should render mutable collection types in source`() {
+        // given
+        val types = listOf(
+            typeOf<MutableIterable<String>>(),
+            typeOf<MutableCollection<String>>(),
+            typeOf<MutableList<String>>(),
+            typeOf<MutableSet<String>>(),
+            typeOf<MutableMap<String, Int>>(),
+            typeOf<MutableMap.MutableEntry<String, Int>>(),
+            typeOf<MutableIterator<String>>(),
+            typeOf<MutableListIterator<String>>(),
+            typeOf<MutableList<*>?>(),
+            typeOf<Map<String, MutableList<out Number>?>>(),
+            typeOf<(MutableSet<Int>) -> MutableIterator<Int>>(),
+            typeOf<MutableItems>(),
+            IndexHolder::index.returnType
+        )
+
+        // when
+        val sources = types.map { it.toSource() }
+
+        // then
+        assert(sources == listOf(
+            "kotlin.collections.MutableIterable<kotlin.String>",
+            "kotlin.collections.MutableCollection<kotlin.String>",
+            "kotlin.collections.MutableList<kotlin.String>",
+            "kotlin.collections.MutableSet<kotlin.String>",
+            "kotlin.collections.MutableMap<kotlin.String, kotlin.Int>",
+            "kotlin.collections.MutableMap.MutableEntry<kotlin.String, kotlin.Int>",
+            "kotlin.collections.MutableIterator<kotlin.String>",
+            "kotlin.collections.MutableListIterator<kotlin.String>",
+            "kotlin.collections.MutableList<*>?",
+            "kotlin.collections.Map<kotlin.String, kotlin.collections.MutableList<out kotlin.Number>?>",
+            "kotlin.Function1<kotlin.collections.MutableSet<kotlin.Int>, kotlin.collections.MutableIterator<kotlin.Int>>",
+            "kotlin.collections.MutableList<kotlin.String>",
+            "kotlin.collections.MutableMap<kotlin.String, kotlin.collections.List<kotlin.Int>>"
+        ))
+    }
+
+    @Test
+    fun `should provide property of typealiased mutable collection type`() = runTest {
+        ScriptSession(listOf(ScriptProperty("items", AliasHolder::items.returnType, mutableListOf<String>()))).use { session ->
+            // when
+            val result = session.execute("""
+                items.add("foo")
+                items
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == listOf("foo"))
+            }
+        }
+    }
+
+    @Test
+    fun `should render typealiased mutable collection types in source`() {
+        // given
+        val types = listOf(
+            AliasHolder::items.returnType,
+            AliasHolder::nested.returnType,
+            AliasHolder::nullable.returnType,
+            AliasHolder::generic.returnType,
+            AliasHolder::map.returnType
+        )
+
+        // when
+        val sources = types.map { it.toSource() }
+
+        // then
+        assert(sources == listOf(
+            "kotlin.collections.MutableList<kotlin.String>",
+            "kotlin.collections.List<kotlin.collections.MutableList<kotlin.String>>",
+            "kotlin.collections.MutableList<kotlin.String>?",
+            "kotlin.collections.MutableList<kotlin.Function1<kotlin.Int, kotlin.Int>>",
+            "kotlin.collections.Map<kotlin.Function1<kotlin.Int, kotlin.Int>, kotlin.collections.MutableList<kotlin.String>>"
+        ))
+    }
+
+    @Test
+    fun `should render read-only collection types in source`() {
+        // given
+        val types = listOf(
+            typeOf<Iterable<String>>(),
+            typeOf<Collection<String>>(),
+            typeOf<List<String>>(),
+            typeOf<Set<String>>(),
+            typeOf<Map<String, Int>>(),
+            typeOf<Map.Entry<String, Int>>(),
+            typeOf<Iterator<String>>(),
+            typeOf<ListIterator<String>>(),
+            typeOf<java.util.ArrayList<String>>()
+        )
+
+        // when
+        val sources = types.map { it.toSource() }
+
+        // then
+        assert(sources == listOf(
+            "kotlin.collections.Iterable<kotlin.String>",
+            "kotlin.collections.Collection<kotlin.String>",
+            "kotlin.collections.List<kotlin.String>",
+            "kotlin.collections.Set<kotlin.String>",
+            "kotlin.collections.Map<kotlin.String, kotlin.Int>",
+            "kotlin.collections.Map.Entry<kotlin.String, kotlin.Int>",
+            "kotlin.collections.Iterator<kotlin.String>",
+            "kotlin.collections.ListIterator<kotlin.String>",
+            "java.util.ArrayList<kotlin.String>"
+        ))
     }
 
     @Test
@@ -471,6 +625,97 @@ class ScriptPropertiesTest {
 
         // then
         assert(exception.message == "Property 'foo' of type kotlin.String has a value of class java.lang.Integer")
+    }
+
+    @Test
+    fun `should reject read-only collection value of mutable collection type`() {
+        // given
+        val properties = listOf(
+            Triple("list", typeOf<MutableList<String>>(), emptyList<String>()),
+            Triple("map", typeOf<MutableMap<String, Int>>(), emptyMap<String, Int>()),
+            Triple("collection", typeOf<MutableCollection<String>>(), emptySet<String>()),
+            Triple("aliased", AliasHolder::items.returnType, emptyList<String>())
+        )
+
+        // when
+        val messages = properties.map { (name, type, value) ->
+            assertFailsWith<IllegalArgumentException> {
+                ScriptProperty(name, type, value)
+            }.message
+        }
+
+        // then
+        assert(messages == listOf(
+            "Property 'list' of type kotlin.collections.MutableList<kotlin.String> has a value of class kotlin.collections.EmptyList, which does not implement kotlin.collections.MutableList",
+            "Property 'map' of type kotlin.collections.MutableMap<kotlin.String, kotlin.Int> has a value of class kotlin.collections.EmptyMap, which does not implement kotlin.collections.MutableMap",
+            "Property 'collection' of type kotlin.collections.MutableCollection<kotlin.String> has a value of class kotlin.collections.EmptySet, which does not implement kotlin.collections.MutableCollection",
+            "Property 'aliased' of type com.xemantic.kotlin.script.MutableItems /* = kotlin.collections.MutableList<kotlin.String> */ has a value of class kotlin.collections.EmptyList, which does not implement kotlin.collections.MutableList"
+        ))
+    }
+
+    /** The list of `listOf("a", "b")` is a `java.util.Arrays.ArrayList`, which cannot grow, but can be modified in place. */
+    @Test
+    fun `should accept Java collection value of mutable collection type`() = runTest {
+        ScriptSession(listOf(ScriptProperty("items", typeOf<MutableList<String>>(), listOf("a", "b")))).use { session ->
+            // when
+            val result = session.execute("""
+                items[0] = "c"
+                items
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == listOf("c", "b"))
+            }
+        }
+    }
+
+    /** The result of `buildList` implements `MutableList`, but is frozen, which is not detected. */
+    @Test
+    fun `should accept frozen collection value of mutable collection type`() = runTest {
+        ScriptSession(listOf(ScriptProperty("items", typeOf<MutableList<String>>(), buildList { add("a") }))).use { session ->
+            // when
+            val result = session.execute("""
+                items.add("b")
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Error>()
+                have(phase == ExecutionPhase.EVALUATION)
+                have(UnsupportedOperationException::class.qualifiedName!! in message)
+            }
+        }
+    }
+
+    /** The type implemented by hand is seen by the members of the [KType] interface only, so it is read-only. */
+    @Test
+    fun `should accept property of hand-written collection type`() {
+        // given
+        val type = object : KType {
+            override val classifier = List::class
+            override val arguments = listOf(KTypeProjection.invariant(typeOf<String>()))
+            override val isMarkedNullable = false
+            override val annotations = emptyList<Annotation>()
+            override fun toString() = "kotlin.collections.List<kotlin.String>"
+        }
+
+        // when
+        val property = ScriptProperty("items", type, emptyList<String>())
+
+        // then
+        assert(property.type.toSource() == "kotlin.collections.List<kotlin.String>")
+    }
+
+    /** `MutableList::class` is `List::class`, so only [typeOf] and the types of the members keep the mutability. */
+    @Test
+    fun `should render type created from mutable collection class as read-only`() {
+        // when
+        val type = MutableList::class.createType(listOf(KTypeProjection.invariant(typeOf<String>())))
+
+        // then
+        assert(type.toSource() == "kotlin.collections.List<kotlin.String>")
     }
 
     @Test
