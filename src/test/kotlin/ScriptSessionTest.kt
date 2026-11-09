@@ -31,6 +31,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.asContextElement
 import kotlinx.coroutines.async
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
@@ -43,12 +44,15 @@ import kotlinx.coroutines.yield
 import java.lang.ref.WeakReference
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CyclicBarrier
+import java.util.concurrent.Executor
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.Continuation
+import kotlin.coroutines.ContinuationInterceptor
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.coroutines.startCoroutine
@@ -1950,6 +1954,54 @@ class ScriptSessionTest {
         } finally {
             executor.shutdown()
         }
+    }
+
+    /**
+     * A caller dispatched by an executor running its tasks inline reports a dispatch as needed,
+     * but would run the caller on the thread of the session, see #172.
+     */
+    @Test
+    fun `should not resume caller of inline executor dispatcher on the session thread`() {
+        // given
+        val inline = Executor(Runnable::run).asCoroutineDispatcher()
+
+        // when
+        val (sessionThread, callerThread) = runBlocking {
+            withContext(inline) {
+                val result = session.execute("Thread.currentThread()")
+                assert(result is ScriptResult.Value)
+                result.value to Thread.currentThread()
+            }
+        }
+
+        // then
+        assert(callerThread !== sessionThread)
+    }
+
+    /**
+     * A caller with a continuation interceptor which is not a dispatcher would resume in place, on the thread of the session, see #172.
+     */
+    @Test
+    fun `should not resume caller of non-dispatcher interceptor on the session thread`() {
+        // given
+        val interceptor = object : AbstractCoroutineContextElement(ContinuationInterceptor), ContinuationInterceptor {
+            override fun <T> interceptContinuation(continuation: Continuation<T>): Continuation<T> = continuation
+        }
+        val threads = CompletableFuture<Result<Pair<Any?, Thread>>>()
+
+        // when
+        suspend {
+            val result = session.execute("Thread.currentThread()")
+            assert(result is ScriptResult.Value)
+            result.value to Thread.currentThread()
+        }.startCoroutine(Continuation(interceptor) {
+            threads.complete(it)
+        })
+
+        // then
+        // bounded, so a hang fails the test instead of hanging the build
+        val (sessionThread, callerThread) = threads.get(1, TimeUnit.MINUTES).getOrThrow()
+        assert(callerThread !== sessionThread)
     }
 
     /**
