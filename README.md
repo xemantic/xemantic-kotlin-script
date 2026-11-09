@@ -121,6 +121,9 @@ ScriptSession {
   A read-only collection of the Kotlin standard library, like `emptyList()`, is rejected as a value of a mutable type,
   while a frozen collection implementing the mutable interface, like the result of `buildList`, or a Java collection, like `Collections.unmodifiableList`,
   is not detected, and fails when mutated.
+  Only the class of the value is checked against the type, as the type arguments are erased at runtime,
+  so a nested collection of another mutability than declared, like an `emptySet()` value in a `MutableMap<String, MutableSet<Int>>`,
+  is not detected either, and fails when mutated.
   Only `typeOf` and the types of the members keep the mutability,
   while `MutableList::class.createType(...)` yields a read-only `List` type, as `MutableList::class` is the same class as `List::class`.
   A property list built dynamically can be passed instead, as `ScriptSession(listOf(property("greeting", "Hello")))`.
