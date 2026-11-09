@@ -341,6 +341,68 @@ class MavenVersionLookupTest {
     }
 
     @Test
+    fun `should not find any version of missing artifact in repository declared again with corrected credentials`() {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // given
+            val lookup = MavenVersionLookup { settings() }
+            val wrong = remoteRepository(server.url, "username=alice", "password=wrong")
+            val corrected = remoteRepository(server.url, "username=alice", "password=secret")
+            val superseded = mutableListOf<RemoteRepository>()
+
+            // when
+            val latest = lookup.latestVersion("com.xemantic.fixture", "missing", listOf(wrong, corrected)) {
+                superseded += it
+            }
+
+            // then
+            assert(latest == null)
+            assert(superseded == listOf(wrong))
+        }
+    }
+
+    @Test
+    fun `should report superseded declaration of repository found with corrected credentials`() {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // given
+            val lookup = MavenVersionLookup { settings() }
+            val wrong = remoteRepository(server.url, "username=alice", "password=wrong")
+            val corrected = remoteRepository(server.url, "username=alice", "password=secret")
+            val superseded = mutableListOf<RemoteRepository>()
+
+            // when
+            val latest = lookup.latestVersion("com.xemantic.fixture", "greeter", listOf(wrong, corrected)) {
+                superseded += it
+            }
+
+            // then
+            assert(latest?.version == "1.10")
+            assert(superseded == listOf(wrong))
+        }
+    }
+
+    @Test
+    fun `should report failure of repository declared again with wrong credentials only`() {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // given
+            val lookup = MavenVersionLookup { settings() }
+            val wrong = remoteRepository(server.url, "username=alice", "password=wrong")
+            val alsoWrong = remoteRepository(server.url, "username=alice", "password=wrong2")
+            val superseded = mutableListOf<RemoteRepository>()
+
+            // when
+            val result = runCatching {
+                lookup.latestVersion("com.xemantic.fixture", "greeter", listOf(wrong, alsoWrong)) {
+                    superseded += it
+                }
+            }
+
+            // then
+            assert(result.exceptionOrNull()?.message?.contains("401") == true)
+            assert(superseded.isEmpty())
+        }
+    }
+
+    @Test
     fun `should look up latest version again after failure`() {
         MavenRepositoryServer(username = "alice", password = "secret").use { server ->
             // given

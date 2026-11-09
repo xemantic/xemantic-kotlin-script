@@ -50,6 +50,8 @@ class MavenRepositoryServer(
 
     private val metadataRequestCounter = AtomicInteger()
 
+    private val wronglyAuthenticatedMetadataRequestCounter = AtomicInteger()
+
     /** The number of the next authenticated requests answered with `500`. */
     var failingRequests: Int
         get() = failures.get()
@@ -58,6 +60,9 @@ class MavenRepositoryServer(
     /** The number of the authenticated requests of a `maven-metadata.xml`. */
     val metadataRequests: Int get() = metadataRequestCounter.get()
 
+    /** The number of the requests of a `maven-metadata.xml` with the basic authentication of other credentials. */
+    val wronglyAuthenticatedMetadataRequests: Int get() = wronglyAuthenticatedMetadataRequestCounter.get()
+
     private val server = embeddedServer(CIO, host = "127.0.0.1", port = 0) {
         routing {
             // also HEAD, which Maven sends to verify an artifact in the local repository downloaded from another one
@@ -65,8 +70,12 @@ class MavenRepositoryServer(
                 handle {
                     val path = call.parameters.getAll("path")!!.joinToString("/")
                     val file = MavenRepository.directory.resolve(path).normalize()
-                    val authorized = call.request.header(HttpHeaders.Authorization) == credentials
-                    if (authorized && path.endsWith("/maven-metadata.xml")) metadataRequestCounter.incrementAndGet()
+                    val authorization = call.request.header(HttpHeaders.Authorization)
+                    val authorized = authorization == credentials
+                    if (path.endsWith("/maven-metadata.xml")) when {
+                        authorized -> metadataRequestCounter.incrementAndGet()
+                        authorization != null -> wronglyAuthenticatedMetadataRequestCounter.incrementAndGet()
+                    }
                     when {
                         !authorized -> {
                             call.response.header(HttpHeaders.WWWAuthenticate, "Basic realm=\"fixture\"")

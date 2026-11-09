@@ -33,6 +33,7 @@ import org.eclipse.aether.resolution.VersionRangeRequest
 import org.eclipse.aether.spi.connector.RepositoryConnectorFactory
 import org.eclipse.aether.spi.connector.transport.TransporterFactory
 import org.eclipse.aether.transfer.MetadataNotFoundException
+import org.eclipse.aether.transfer.MetadataTransferException
 import org.eclipse.aether.transfer.NoRepositoryConnectorException
 import org.eclipse.aether.transport.file.FileTransporterFactory
 import org.eclipse.aether.transport.http.HttpTransporterFactory
@@ -205,22 +206,32 @@ internal class MavenVersionLookup(
      * or, in the offline mode, if none lists any, among the versions present in the local repository,
      * or `null`, if there is none, see [latestMavenVersion].
      *
-     * @throws Exception if there is no version, and some repository cannot be read,
+     * A repository failing to be read, like with wrong credentials, while another of the [repositories]
+     * of the same id and URL is read, like with the corrected credentials, is superseded by it:
+     * its failure is not reported, and it is passed to [superseded], so it is not looked up again.
+     *
+     * @throws Exception if there is no version, and some repository, not superseded, cannot be read,
      *   reporting the repositories blocked by a mirror of the Maven settings before any other failure,
      *   see [BlockedRepositoryException].
      */
     fun latestVersion(
         groupId: String,
         artifactId: String,
-        repositories: List<RemoteRepository>
+        repositories: List<RemoteRepository>,
+        superseded: (RemoteRepository) -> Unit = {}
     ): LatestMavenVersion? {
+        // each declared repository with the settings applied
+        val looked = repositories.mapNotNull { repository -> repository.withSettings()?.let { repository to it } }
         val request = VersionRangeRequest(
             // not [0,), which excludes the versions ordered below 0, like r09, v1.2 or M1
             DefaultArtifact(groupId, artifactId, "jar", "(,)"),
-            repositories.mapNotNull { it.withSettings() },
+            looked.map { it.second },
             null
         )
         val result = system.resolveVersionRange(newSession(), request)
+        val failures = result.exceptions.filter { it !is MetadataNotFoundException }
+        val stale = staleRepositories(looked, failures)
+        stale.forEach { superseded(it.first) }
         val versions = result.versions.map { it.toString() }.ifEmpty {
             if (settings.isOffline) localVersions(groupId, artifactId) else emptyList()
         }
@@ -228,9 +239,26 @@ internal class MavenVersionLookup(
             // the block is actionable configuration advice, so it is reported before the failures of the other repositories
             val blocked = result.exceptions.mapNotNull { failure -> failure.blockedMirror()?.let { it to failure } }
             if (blocked.isNotEmpty()) throw BlockedRepositoryException(blocked.map { it.first }, blocked.first().second)
-            result.exceptions.firstOrNull { it !is MetadataNotFoundException }?.let { throw it }
+            val staleSettled = stale.map { it.second }
+            failures.firstOrNull { (it as? MetadataTransferException)?.repository !in staleSettled }?.let { throw it }
         }
         return latestMavenVersion(versions)
+    }
+
+    /**
+     * The declared repositories of the [looked] ones, paired with them as looked up, which failed to be read,
+     * while another of the same id and URL was read, like the same repository declared with the corrected credentials,
+     * or none, if some of the [failures] is not of a known repository.
+     */
+    private fun staleRepositories(
+        looked: List<Pair<RemoteRepository, RemoteRepository>>,
+        failures: List<Exception>
+    ): List<Pair<RemoteRepository, RemoteRepository>> {
+        val failed = failures.map { (it as? MetadataTransferException)?.repository ?: return emptyList() }
+        val (unread, read) = looked.partition { it.second in failed }
+        return unread.filter { (declared, _) ->
+            read.any { (other, _) -> other.id == declared.id && other.url == declared.url }
+        }
     }
 
     /** The versions of the artifact in the local repository, also these resolved without its `maven-metadata.xml`. */
