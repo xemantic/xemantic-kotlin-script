@@ -505,6 +505,122 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should hint declaring the type when property of earlier snippet is unresolved in declaration of inferred type`() = runTest {
+        // given
+        session.execute("val name = \"x\"")
+
+        // when
+        val result = session.execute("""
+            fun getGreeting() = name.uppercase()
+            getGreeting()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:21: error: Unresolved reference 'name'.
+                  | fun getGreeting() = <error>name</error>.uppercase()
+                  hint: 'name' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = name.toString()` - declare the type, like `fun f(): String = name.toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when function of earlier snippet is unresolved in declaration of inferred type`() = runTest {
+        // given
+        session.execute("fun greet() = \"hi\"")
+
+        // when
+        val result = session.execute("""
+            fun loudGreeting() = greet().uppercase()
+            loudGreeting()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:22: error: Unresolved reference 'greet'.
+                  | fun loudGreeting() = <error>greet</error>().uppercase()
+                  hint: 'greet' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = greet().toString()` - declare the type, like `fun f(): String = greet().toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when property of snippet which failed in the evaluation is unresolved in declaration of inferred type`() = runTest {
+        // given
+        session.execute("""
+            val name = "x"
+            error("boom")
+        """.trimIndent())
+
+        // when
+        val result = session.execute("""
+            fun getGreeting() = name.uppercase()
+            getGreeting()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:21: error: Unresolved reference 'name'.
+                  | fun getGreeting() = <error>name</error>.uppercase()
+                  hint: 'name' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = name.toString()` - declare the type, like `fun f(): String = name.toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not hint declaring the type when misspelled name is unresolved in declaration of inferred type`() = runTest {
+        // given
+        session.execute("val name = \"x\"")
+
+        // when
+        val result = session.execute("""
+            fun getGreeting() = nmae.uppercase()
+            getGreeting()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:21: error: Unresolved reference 'nmae'.
+                  | fun getGreeting() = <error>nmae</error>.uppercase()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not hint declaring the type when property of snippet which failed to compile is unresolved`() = runTest {
+        // given
+        session.execute("val name: String = undefinedThing")
+
+        // when
+        val result = session.execute("""
+            fun getGreeting(): String = name.uppercase()
+            getGreeting()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:29: error: Unresolved reference 'name'.
+                  | fun getGreeting(): String = <error>name</error>.uppercase()
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should hint redeclaring value class property of earlier snippet`() = runTest {
         // given
         session.execute("val timeout = kotlin.time.Duration.parse(\"5s\")")

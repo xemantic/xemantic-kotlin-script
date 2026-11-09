@@ -73,6 +73,8 @@ import kotlin.script.experimental.jvm.jvm
 import kotlin.script.experimental.jvm.jvmTarget
 import kotlin.script.experimental.jvm.KJvmEvaluatedSnippet
 import kotlin.script.experimental.util.LinkedSnippet
+import kotlin.reflect.full.declaredMemberFunctions
+import kotlin.reflect.full.declaredMemberProperties
 
 private val logger = KotlinLogging.logger {}
 
@@ -234,6 +236,12 @@ internal class DefaultScriptSession(
     /** The simple names of the classes declared by the evaluated snippets. */
     private val snippetClassNames = HashSet<String>()
 
+    /** The names of the properties declared by the evaluated snippets, also of the provided ones. */
+    private val snippetPropertyNames = HashSet<String>()
+
+    /** The names of the functions declared by the evaluated snippets. */
+    private val snippetFunctionNames = HashSet<String>()
+
     /** The properties of the snippets which failed in the evaluation, `null` then. */
     private val uninitializedProperties = UninitializedProperties()
 
@@ -243,7 +251,9 @@ internal class DefaultScriptSession(
     /** The properties of the accessors of the classes of the snippets. */
     private val propertyAccessors = PropertyAccessors()
 
-    private val reporter = ScriptErrorReporter(snippets, snippetClassNames, uninitializedProperties, inlinedFrames, propertyAccessors)
+    private val reporter = ScriptErrorReporter(
+        snippets, snippetClassNames, snippetPropertyNames, snippetFunctionNames, uninitializedProperties, inlinedFrames, propertyAccessors
+    )
 
     private var snippetCount = 0
 
@@ -519,6 +529,20 @@ internal class DefaultScriptSession(
         }
     }
 
+    /**
+     * Keeps the names of the properties and the functions declared by the [scriptClass] of the snippet of this [name],
+     * read by kotlin-reflect, for the hint at the K2 REPL compiler not resolving them, or none, if they cannot be read.
+     */
+    private fun keepMemberNames(scriptClass: Class<*>, name: String) {
+        logger.readOr(Unit, { "$name: cannot read the members of the snippet" }) {
+            val kClass = scriptClass.kotlin
+            val properties = kClass.declaredMemberProperties.map { it.name }
+            val functions = kClass.declaredMemberFunctions.map { it.name }
+            snippetPropertyNames += properties
+            snippetFunctionNames += functions
+        }
+    }
+
     /** The [ScriptResult] of evaluating the snippet of this [name]. */
     private fun ResultWithDiagnostics<*>.toScriptResult(
         compilation: Compilation,
@@ -529,6 +553,7 @@ internal class DefaultScriptSession(
             ?.get()?.result
         result?.scriptClass?.java?.let { scriptClass ->
             scriptClass.declaredClasses.mapTo(snippetClassNames) { it.simpleName }
+            keepMemberNames(scriptClass, name)
             inlinedFrames.keep(scriptClass)
             propertyAccessors.keep(scriptClass)
         }

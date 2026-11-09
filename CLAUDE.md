@@ -80,6 +80,8 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   see `SnippetDependencyResolver.takeDependencies`.
   The classpath added by a refinement stays with the compiler even if the snippet fails to compile.
 - Known compiler bugs, each with a test pinning the hint: a class of an earlier snippet is unresolved in a declaration of an inferred type calling it,
+  and so is a property (also a provided one) or a function of an earlier snippet, but only when that declaration is used in the same snippet, while a property with an initializer, like `val x = name.length`, resolves it,
+  while a declaration of a snippet which failed to compile stays unresolved even with the type declared, so it gets no hint,
   a value class property or function of an earlier snippet is called by a mangled name, which is not declared (the provided properties work around it with `@get:JvmName`),
   an `inline` declaration cannot be called across snippets,
   the backend crashes on `val context: Int inline get() = coroutineContext.hashCode()`, which stands in for an internal failure of the compiler in `should report internal failure of the compiler and continue the session`.
