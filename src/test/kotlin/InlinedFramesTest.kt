@@ -324,6 +324,131 @@ class InlinedFramesTest {
     }
 
     @Test
+    fun `should resolve intermediate frame of nested suspend inline functions`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            suspend inline fun inner(): Nothing { delay(1); throw IllegalStateException("inner") }
+            suspend inline fun outer(): Nothing { delay(1); inner() }
+            suspend fun suspendingFrame(): StackTraceElement = try { outer() } catch (e: IllegalStateException) { e.stackTrace[0] }
+            val awaited = await { suspendingFrame() }
+            fun frame(): StackTraceElement = awaited
+        """.trimIndent())
+
+        // then
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "inner", "snippet1.kts", 1),
+                StackTraceElement("Snippet1", "outer", "snippet1.kts", 2),
+                StackTraceElement("Snippet1", "suspendingFrame", "snippet1.kts", 3)
+            )
+        )
+    }
+
+    @Test
+    fun `should resolve intermediate frame of nested suspend inline functions on separate lines`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            suspend inline fun inner(): Nothing {
+                delay(1)
+                throw IllegalStateException("inner")
+            }
+            suspend inline fun outer(): Nothing {
+                delay(1)
+                inner()
+            }
+            suspend fun suspendingFrame(): StackTraceElement = try { outer() } catch (e: IllegalStateException) { e.stackTrace[0] }
+            val awaited = await { suspendingFrame() }
+            fun frame(): StackTraceElement = awaited
+        """.trimIndent())
+
+        // then
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "inner", "snippet1.kts", 3),
+                StackTraceElement("Snippet1", "outer", "snippet1.kts", 7),
+                StackTraceElement("Snippet1", "suspendingFrame", "snippet1.kts", 9)
+            )
+        )
+    }
+
+    @Test
+    fun `should resolve call site of inline function receiving lambda called on a line without a line number of its own`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            inline fun inner(): Nothing = throw IllegalStateException("inner")
+            inline fun call(block: () -> Unit) {
+                block()
+            }
+            fun frame(): StackTraceElement {
+                try {
+                    val map = mapOf<Int, Int>()
+                    val value = map[1]
+                        ?: call {
+                            inner()
+                        }
+                    error("not thrown " + value)
+                } catch (e: IllegalStateException) {
+                    return e.stackTrace[0]
+                }
+            }
+        """.trimIndent())
+
+        // then
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "inner", "snippet1.kts", 1),
+                StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 10),
+                StackTraceElement("Snippet1", "call", "snippet1.kts", 3),
+                StackTraceElement("Snippet1", "frame", "snippet1.kts", 9)
+            )
+        )
+    }
+
+    @Test
+    fun `should analyze frame of inlined code once per method and line`() = runTest {
+        // given
+        execute(snippet)
+        val frame = execute("frame()") as StackTraceElement
+        val marker = execute("Marker()")!!
+        val analyzed = mutableListOf<StackTraceElement>()
+        val inlinedFrames = InlinedFrames(snippets, analyzing = { analyzed += it })
+        inlinedFrames.keep(marker.javaClass)
+
+        // when
+        // like the repeated frames of a recursion through inlined code overflowing the stack
+        val resolved = List(3) { inlinedFrames.resolve(StackTraceElement(frame.className, frame.methodName, frame.fileName, frame.lineNumber)) }
+
+        // then
+        assert(analyzed == listOf(frame))
+        assert(resolved.distinct().size == 1)
+        assert(
+            resolved.first() == listOf(
+                StackTraceElement("Snippet1", "boom", "snippet1.kts", 1),
+                StackTraceElement("Snippet1", "frame", "snippet1.kts", 3)
+            )
+        )
+    }
+
+    @Test
+    fun `should not resolve frame of inlined code whose analysis fails`() = runTest {
+        // given
+        execute(snippet)
+        val frame = execute("frame()") as StackTraceElement
+        val marker = execute("Marker()")!!
+        var analyses = 0
+        // stands in for an unexpected failure of the analysis of odd bytecode
+        val inlinedFrames = InlinedFrames(snippets, analyzing = { analyses++; throw IndexOutOfBoundsException("-1") })
+        inlinedFrames.keep(marker.javaClass)
+
+        // when
+        val resolved = List(2) { inlinedFrames.resolve(frame) }
+
+        // then
+        assert(resolved == listOf(null, null))
+        assert(analyses == 1)
+    }
+
+    @Test
     fun `should not resolve frame of a line within the snippet without reading its class`() = runTest {
         // given
         execute(snippet)
