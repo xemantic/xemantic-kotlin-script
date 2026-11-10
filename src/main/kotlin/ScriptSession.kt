@@ -336,11 +336,14 @@ internal class DefaultScriptSession(
                     phase = ExecutionPhase.COMPILATION
                 )
                 is ResultWithDiagnostics.Success -> {
+                    evaluatedSnippets.compiled(result.value.get(), name)
                     logger.debug { "$name: evaluating" }
                     val evaluation = scope.evaluate(callerJob) {
                         evaluator.eval(result.value, evaluationConfiguration)
                     }
-                    evaluation.toScriptResult(compilation, name)
+                    // before reporting it, as the report throws a fatal error, while the declarations of the snippets stay in the history
+                    val uninitialized = keep(evaluatedSnippets.takeEvaluated(evaluator.lastEvaluatedSnippet), name)
+                    evaluation.toScriptResult(compilation, uninitialized)
                 }
             }
         }
@@ -402,6 +405,9 @@ internal class DefaultScriptSession(
         }
 
         val evaluator = K2ReplEvaluator()
+
+        /** The compiled snippets, of which every one evaluated is kept, also when evaluated together with a later one. */
+        private val evaluatedSnippets = EvaluatedSnippets()
 
     }
 
@@ -541,24 +547,39 @@ internal class DefaultScriptSession(
         }
     }
 
-    /** The [ScriptResult] of evaluating the snippet of this [name]. */
+    /**
+     * Keeps the declarations of the [evaluated] snippets, also of the ones which failed in the evaluation,
+     * returning the uninitialized properties of the one of this [name], if it failed.
+     */
+    private fun keep(
+        evaluated: List<Pair<KJvmEvaluatedSnippet, String>>,
+        name: String
+    ): List<UninitializedProperty> {
+        var uninitialized = emptyList<UninitializedProperty>()
+        evaluated.forEach { (snippet, snippetName) ->
+            val result = snippet.result
+            result.scriptClass?.java?.let { scriptClass ->
+                snippetDeclarations.keep(scriptClass, snippetName)
+                inlinedFrames.keep(scriptClass)
+                propertyAccessors.keep(scriptClass)
+            }
+            // except for the properties of the session, which the caller cannot declare again, while the compiler is disposed anyway
+            (result as? ResultValue.Error)?.scriptClass?.java?.takeIf { snippetName != PROPERTIES_SNIPPET }?.let {
+                val properties = uninitializedProperties.keep(it, snippetName)
+                if (snippetName == name) uninitialized = properties
+            }
+        }
+        return uninitialized
+    }
+
+    /** The [ScriptResult] of evaluating a snippet, reporting its [uninitialized] properties, if it failed. */
     private fun ResultWithDiagnostics<*>.toScriptResult(
         compilation: Compilation,
-        name: String
+        uninitialized: List<UninitializedProperty>
     ): ScriptResult {
         @Suppress("UNCHECKED_CAST")
         val result = (valueOrNull() as? LinkedSnippet<KJvmEvaluatedSnippet>)
             ?.get()?.result
-        result?.scriptClass?.java?.let { scriptClass ->
-            snippetDeclarations.keep(scriptClass, name)
-            inlinedFrames.keep(scriptClass)
-            propertyAccessors.keep(scriptClass)
-        }
-        // before reporting it, as the report throws a fatal error, while the declarations of the snippet stay in the history,
-        // except for the properties of the session, which the caller cannot declare again, while the compiler is disposed anyway
-        val uninitialized = (result as? ResultValue.Error)?.scriptClass?.java?.takeIf { name != PROPERTIES_SNIPPET }?.let {
-            uninitializedProperties.keep(it, name)
-        } ?: emptyList()
         return reporter.scriptResult(result, reports, compilation.result.reports, compilation.dependencies, uninitialized)
     }
 
