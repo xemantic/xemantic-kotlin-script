@@ -24,9 +24,18 @@ import org.jetbrains.kotlin.codegen.inline.SMAP
 import org.jetbrains.kotlin.codegen.inline.SMAPParser
 import org.jetbrains.kotlin.codegen.inline.SourcePosition
 import org.jetbrains.org.objectweb.asm.ClassReader
+import org.jetbrains.org.objectweb.asm.Opcodes
+import org.jetbrains.org.objectweb.asm.tree.AbstractInsnNode
 import org.jetbrains.org.objectweb.asm.tree.ClassNode
+import org.jetbrains.org.objectweb.asm.tree.FieldInsnNode
+import org.jetbrains.org.objectweb.asm.tree.InsnNode
+import org.jetbrains.org.objectweb.asm.tree.IntInsnNode
+import org.jetbrains.org.objectweb.asm.tree.InvokeDynamicInsnNode
 import org.jetbrains.org.objectweb.asm.tree.LineNumberNode
+import org.jetbrains.org.objectweb.asm.tree.MethodInsnNode
 import org.jetbrains.org.objectweb.asm.tree.MethodNode
+import org.jetbrains.org.objectweb.asm.tree.MultiANewArrayInsnNode
+import org.jetbrains.org.objectweb.asm.tree.TypeInsnNode
 
 private val logger = KotlinLogging.logger {}
 
@@ -59,9 +68,11 @@ private const val INLINE_LAMBDA = "<lambda>"
  * Accessed on the thread of the session only, like the snippets.
  *
  * @param snippets the lines of the snippets by their names, like `snippet3.kts`.
+ * @param analyzing called before each analysis of a frame of inlined code, to test its memoization and its failure.
  */
 internal class InlinedFrames(
-    private val snippets: Map<String, List<String>>
+    private val snippets: Map<String, List<String>>,
+    private val analyzing: (frame: StackTraceElement) -> Unit = {}
 ) {
 
     private var classLoader: ClassLoader? = null
@@ -80,22 +91,35 @@ internal class InlinedFrames(
      * and by the frame of the outermost call site in the method of the [frame],
      * which is the [frame] itself if the call site is unknown,
      * or `null` if the [frame] is not of a snippet, its line is a line of the snippet itself or unknown,
-     * or the class of the [frame] cannot be read.
+     * or the class of the [frame] cannot be read, or its bytecode cannot be analyzed.
      *
      * The `KotlinDebug` stratum flattens nested inlining to the call site in the method,
      * so the calls of the nested inline functions are read from the ranges of their inline markers instead, see [SnippetClass.inlinedCalls].
+     * The frames are memoized by the method and the line of the [frame],
+     * as a recursion through inlined code, like the one overflowing the stack, repeats the same frame many times.
      */
     fun resolve(frame: StackTraceElement): List<StackTraceElement>? {
         val lines = snippets[frame.fileName] ?: return null
         // the class is not read for a frame which cannot be of inlined code
         if (frame.lineNumber <= lines.size) return null
         val snippetClass = snippetClass(frame.className) ?: return null
-        val smap = snippetClass.smap ?: return null
+        val key = frame.methodName to frame.lineNumber
+        if (key in snippetClass.frames) return snippetClass.frames[key]
+        // a failure on unexpected bytecode loses only the frames of the inlined code, not the report of the error
+        return logger.readOr(null, { "cannot resolve the inlined frames of $frame" }) {
+            analyzing(frame)
+            snippetClass.resolve(frame, lines.size)
+        }.also { snippetClass.frames[key] = it }
+    }
+
+    /** The frames of the [frame] of the code inlined into this class, see [resolve]. */
+    private fun SnippetClass.resolve(frame: StackTraceElement, snippetSize: Int): List<StackTraceElement>? {
+        val smap = smap ?: return null
         val range = smap.findRange(frame.lineNumber) ?: return null
         val inlined = range.mapDestToSource(frame.lineNumber)
         // the lines of the snippet itself are mapped to themselves
         if (inlined.file == frame.fileName && inlined.line == frame.lineNumber) return null
-        val calls = snippetClass.inlinedCalls(frame.methodName, frame.lineNumber)
+        val calls = inlinedCalls(frame.methodName, frame.lineNumber)
             ?: InlinedCalls(listOf(UNKNOWN_INLINE_FUNCTION to frame.lineNumber), methodLine = null)
         val inlinedFrames = calls.functions.mapNotNull { (function, line) ->
             smap.sourceOf(line)?.let { StackTraceElement(it.path.replace('/', '.'), function, it.file, it.line) }
@@ -104,7 +128,7 @@ internal class InlinedFrames(
         // the call site of the KotlinDebug stratum is the line of a lambda of the method, if the inlined code is called by it,
         // and only then the line of the method in effect before the outermost inline function is preferred
         val callSite = calls.methodLine?.takeIf { methodLine ->
-            methodLine in 1..lines.size && inlinedFrames.any {
+            methodLine in 1..snippetSize && inlinedFrames.any {
                 it.methodName == INLINE_LAMBDA && it.fileName == frame.fileName && it.lineNumber == debugCallSite
             }
         } ?: debugCallSite
@@ -141,7 +165,8 @@ private data class InlinedCalls(
 /**
  * A range of the inline marker variable of this [name] in this [slot], in scope from the instruction at the [start] index until the [end] one.
  *
- * The ranges of the same name and slot are not merged, as they are also of the copies of an inline function called twice by another one.
+ * The ranges of the same name and slot are not merged, as they are also of the copies of an inline function called twice by another one,
+ * while a single inlined body may be split into several ranges as well, see [SnippetClass.callLine].
  */
 private class InlineMarker(
     val name: String,
@@ -152,13 +177,19 @@ private class InlineMarker(
     operator fun contains(index: Int): Boolean = index in start..<end
 }
 
-/** The [markers] of the inlined bodies of a method, and its line numbers by their instruction indices, in the order of the instructions. */
+/**
+ * The [markers] of the inlined bodies of a method, and its line numbers in the order of the instructions:
+ * the [lineNumbers], the [lineStarts], the indices of the instructions starting them,
+ * and the [linePositions], the indices telling their scopes, see [lineScopePosition].
+ */
 private class InlinedMethod(
     val markers: List<InlineMarker>,
-    val lines: List<Pair<Int, Int>>
+    val lineNumbers: IntArray,
+    val lineStarts: IntArray,
+    val linePositions: IntArray
 )
 
-/** The SMAP of a snippet class, and the inline markers and the lines of its methods. */
+/** The SMAP of a snippet class, the inline markers and the lines of its methods, and the frames resolved so far. */
 private class SnippetClass(bytes: ByteArray) {
 
     /** The SMAP of the class, with the call sites of the `KotlinDebug` stratum, `null` if the class has none. */
@@ -166,6 +197,9 @@ private class SnippetClass(bytes: ByteArray) {
 
     /** The methods with inlined bodies by their names, several of overloads. */
     private val methods: Map<String, List<InlinedMethod>>
+
+    /** The frames resolved so far, `null` if none, by the method and the line of a frame, see [InlinedFrames.resolve]. */
+    val frames = HashMap<Pair<String, Int>, List<StackTraceElement>?>()
 
     init {
         // the node is not kept, only what the frames need
@@ -181,7 +215,7 @@ private class SnippetClass(bytes: ByteArray) {
 
     /**
      * The calls of the nested inline functions inlined at the [line] of this method,
-     * the innermost one named by the innermost marker in scope at the first instruction of the [line],
+     * the innermost one named by the innermost marker in scope at the position of the [line],
      * and each enclosing one calling it at its own line in effect right before the start of the nested scope,
      * not a line of another scope nested in it, like of an inline function called before, or of a lambda passed to it,
      * nor the `fake.kt` line, which the compiler may give to the initialization of an inline marker variable.
@@ -198,36 +232,51 @@ private class SnippetClass(bytes: ByteArray) {
      * @return `null` if the [line] is not in scope of any marker.
      */
     private fun InlinedMethod.inlinedCalls(line: Int): InlinedCalls? {
-        val candidates = lines.filter { it.first == line }.mapNotNull { (_, index) -> inlinedCalls(line, index) }
+        val candidates = lineNumbers.indices.filter { lineNumbers[it] == line }
+            .mapNotNull { inlinedCalls(line, linePositions[it]) }
         val first = candidates.firstOrNull() ?: return null
         return first.takeIf { candidates.all { it == first } }
             ?: InlinedCalls(first.functions.take(1), methodLine = null)
     }
 
-    private fun InlinedMethod.inlinedCalls(line: Int, index: Int): InlinedCalls? {
-        val scopes = markers.filter { index in it }.sortedWith(
+    private fun InlinedMethod.inlinedCalls(line: Int, position: Int): InlinedCalls? {
+        val scopes = markers.filter { position in it }.sortedWith(
             compareByDescending<InlineMarker> { it.start }.thenBy { it.end }.thenByDescending { it.slot }
         ).takeIf { it.isNotEmpty() } ?: return null
         val functions = buildList {
             add(scopes.first().name.inlineFunctionName() to line)
             scopes.zipWithNext { nested, scope ->
-                lineBefore(nested.start, scope)?.let { add(scope.name.inlineFunctionName() to it) }
+                callLine(nested, scope)?.let { add(scope.name.inlineFunctionName() to it) }
             }
         }
         return InlinedCalls(functions, lineBefore(scopes.last().start, scope = null))
     }
 
     /**
+     * The line of the [scope] calling the [nested] one, in effect right before its start,
+     * or, if the range of the [scope] has none, the last line of the closest earlier range of the same marker:
+     * the state machine of a suspend function splits the range of an inlined body at its suspension points,
+     * and the range resuming into the [nested] scope has no line of the [scope] of its own.
+     */
+    private fun InlinedMethod.callLine(nested: InlineMarker, scope: InlineMarker): Int? =
+        lineBefore(nested.start, scope) ?: markers
+            .filter { it.name == scope.name && it.slot == scope.slot && it.end <= scope.start }
+            .sortedByDescending { it.start }
+            .firstNotNullOfOrNull { lineBefore(it.end, it) }
+
+    /**
      * The line in effect within the [scope], the method itself if `null`, right before the instruction at the [index],
-     * not a line of another scope nested in it, nor a `fake.kt` line.
+     * positioned in the [scope], not in another scope nested in it, nor a `fake.kt` line.
      */
     private fun InlinedMethod.lineBefore(index: Int, scope: InlineMarker?): Int? {
         val from = scope?.start ?: 0
-        return lines.lastOrNull { (line, lineIndex) ->
-            lineIndex in from..<index
-                && markers.none { it !== scope && it.start >= from && lineIndex in it }
-                && smap?.sourceOf(line)?.path != FAKE_PATH
-        }?.first
+        return lineNumbers.indices.lastOrNull { i ->
+            val position = linePositions[i]
+            lineStarts[i] in from..<index
+                && (scope == null || position in scope)
+                && markers.none { it !== scope && it.start >= from && position in it }
+                && smap?.sourceOf(lineNumbers[i])?.path != FAKE_PATH
+        }?.let { lineNumbers[it] }
     }
 
 }
@@ -238,9 +287,44 @@ private fun MethodNode.inlinedMethod(): InlinedMethod? {
         it.name.startsWith(INLINE_FUNCTION_MARKER) || it.name.startsWith(INLINE_LAMBDA_MARKER)
     }.map { InlineMarker(it.name, it.index, instructions.indexOf(it.start), instructions.indexOf(it.end)) }
     if (markers.isEmpty()) return null
-    val lines = instructions.filterIsInstance<LineNumberNode>().map { it.line to instructions.indexOf(it.start) }
-    return InlinedMethod(markers, lines)
+    val lineNodes = instructions.filterIsInstance<LineNumberNode>()
+    val lineStarts = IntArray(lineNodes.size) { instructions.indexOf(lineNodes[it].start) }
+    val linePositions = IntArray(lineNodes.size) { lineScopePosition(lineStarts, it) }
+    return InlinedMethod(markers, IntArray(lineNodes.size) { lineNodes[it].line }, lineStarts, linePositions)
 }
+
+/**
+ * The index of the instruction telling the scope of the line of these [lineStarts] at the [line] index:
+ * the first instruction which may throw while the line is in effect, until the start of the next line,
+ * or the start of the line, if none may throw.
+ *
+ * The line may start outside the scope of the code it is given to,
+ * like at the label of the state machine of a suspend function resuming into an inlined body, before the initialization of its marker.
+ */
+private fun MethodNode.lineScopePosition(lineStarts: IntArray, line: Int): Int {
+    val start = lineStarts[line]
+    val until = (line + 1..<lineStarts.size).firstNotNullOfOrNull { next ->
+        lineStarts[next].takeIf { it > start }
+    } ?: instructions.size()
+    return (start..<until).firstOrNull { instructions[it].mayThrow() } ?: start
+}
+
+/** Whether this instruction may throw, or call a method which may throw, so its line may be the line of a frame. */
+private fun AbstractInsnNode.mayThrow(): Boolean = when (this) {
+    is MethodInsnNode, is InvokeDynamicInsnNode, is FieldInsnNode, is MultiANewArrayInsnNode -> true
+    is TypeInsnNode -> opcode != Opcodes.INSTANCEOF
+    is IntInsnNode -> opcode == Opcodes.NEWARRAY
+    is InsnNode -> opcode in THROWING_OPCODES
+        || opcode in Opcodes.IALOAD..Opcodes.SALOAD
+        || opcode in Opcodes.IASTORE..Opcodes.SASTORE
+    else -> false
+}
+
+/** The opcodes of an [InsnNode] which may throw, other than of an array access. */
+private val THROWING_OPCODES = setOf(
+    Opcodes.ATHROW, Opcodes.IDIV, Opcodes.LDIV, Opcodes.IREM, Opcodes.LREM,
+    Opcodes.ARRAYLENGTH, Opcodes.MONITORENTER, Opcodes.MONITOREXIT
+)
 
 /** The position in the source of this destination [line], `null` if the SMAP does not map it. */
 private fun SMAP.sourceOf(line: Int): SourcePosition? = findRange(line)?.mapDestToSource(line)
