@@ -1607,10 +1607,13 @@ class ScriptSessionTest {
         // then
         result should {
             be<ScriptResult.Error>()
+            // the frame of map, of the standard library, is not reported, as it is not the frame throwing
             message sameAs """
                 java.lang.IllegalStateException: in lambda
-                  at <snippet body>(snippet1.kts:2)
+                  at <lambda>(snippet1.kts:2)
                   |     error("in lambda")
+                  at <snippet body>(snippet1.kts:1)
+                  | listOf(1).map {
             """.trimIndent()
         }
     }
@@ -1668,6 +1671,57 @@ class ScriptSessionTest {
                   |     list.forEach {
                   at <snippet body>(snippet1.kts:7)
                   | check(numbers) { "too big" }
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report inline function of throw in the body of lambda passed to it`() = runTest {
+        // when
+        val result = session.execute("""
+            inline fun call(block: () -> Unit) {
+                block()
+            }
+            call {
+                throw IllegalStateException("in lambda")
+            }
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IllegalStateException: in lambda
+                  at <lambda>(snippet1.kts:5)
+                  |     throw IllegalStateException("in lambda")
+                  at call(snippet1.kts:2)
+                  |     block()
+                  at <snippet body>(snippet1.kts:4)
+                  | call {
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should name frame of inline property accessor like frame of property accessor`() = runTest {
+        // when
+        val result = session.execute("""
+            val x: Int inline get() = error("x")
+            x
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            // like getT of a property accessor which is not inline, see should name property of custom getter reading uninitialized property
+            message sameAs """
+                java.lang.IllegalStateException: x
+                  at getX(snippet1.kts:1)
+                  | val x: Int inline get() = error("x")
+                  at <snippet body>(snippet1.kts:2)
+                  | x
             """.trimIndent()
         }
     }
