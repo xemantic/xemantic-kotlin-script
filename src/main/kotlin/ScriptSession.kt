@@ -412,25 +412,35 @@ internal class DefaultScriptSession(
     ): ScriptResult {
         val callerThread = Thread.currentThread()
         checkNotClosed()
-        // the turn of the caller, released by onSessionThread, taken at once if it is free,
-        // so a caller resumed by the unlocking of another one, maybe in place on the thread it started on, is told apart
+        // the turn of the caller, taken at once if it is free,
+        // so a caller resumed by the unlocking of another one, maybe in place on the thread it started on, is told apart,
+        // while a caller taking it after all without suspending, as it is released meanwhile, counts as waiting,
+        // which only makes its rejection by the session closed meanwhile resume it from the resumeExecutor, see onSessionThread
         val waited = !mutex.tryLock()
         if (waited) mutex.lock()
-        // a caller without a job, like `suspend fun main`, cannot cancel the evaluation
-        val callerJob = currentCoroutineContext()[Job] ?: Job()
-        val result = onSessionThread(callerThread, waited) {
-            // checked on the thread, as the session could be closed before the block was submitted to it,
-            // with the disposal of the compiler queued before the block then,
-            // while a session closed later disposes the compiler only after this block, queued after it on the thread
-            checkNotClosed()
-            propertiesFailure ?: run {
-                val repl = repl ?: createRepl()
-                // a snippet of the session closed while the properties were declared would be evaluated cancelled already,
-                // so it is rejected instead, like one executed after closing, while the properties are declared, see close
+        // the turn is released by the code it is handed off to, see onSessionThread, or else here, whatever throws before
+        val handedOff = AtomicBoolean()
+        val result = try {
+            // a caller without a job, like `suspend fun main`, cannot cancel the evaluation
+            val callerJob = currentCoroutineContext()[Job] ?: Job()
+            onSessionThread(callerThread, waited, handedOff) {
+                // checked on the thread, as the session could be closed before the block was submitted to it,
+                // with the disposal of the compiler queued before the block then,
+                // while a session closed later disposes the compiler only after this block, queued after it on the thread
                 checkNotClosed()
-                // null only if declaring the properties failed just now, with their failure kept, see createRepl
-                repl?.compileAndEvaluate(snippet, "snippet${++snippetCount}.kts", callerJob) ?: propertiesFailure!!
+                propertiesFailure ?: run {
+                    val repl = repl ?: createRepl()
+                    // a snippet of the session closed while the properties were declared would be evaluated cancelled already,
+                    // so it is rejected instead, like one executed after closing, while the properties are declared, see close
+                    checkNotClosed()
+                    // null only if declaring the properties failed just now, with their failure kept, see createRepl
+                    repl?.compileAndEvaluate(snippet, "snippet${++snippetCount}.kts", callerJob) ?: propertiesFailure!!
+                }
             }
+        } catch (e: Throwable) {
+            // like a continuation interceptor of the caller failing, which would keep the turn forever otherwise
+            if (!handedOff.get()) mutex.unlock()
+            throw e
         }
         currentCoroutineContext().ensureActive()
         return result
@@ -438,7 +448,8 @@ internal class DefaultScriptSession(
 
     /**
      * Runs the [block] on the [thread], and returns its result, or throws its exception,
-     * releasing the turn of the caller, the lock of the [mutex] it holds.
+     * releasing the turn of the caller, the lock of the [mutex] it holds, by the code it is [handedOff] to,
+     * while the caller releases it itself if this function throws without handing it off.
      *
      * The block is run by `runBlocking` in the context of the caller, without its job and dispatcher,
      * so a thread context element of the caller, like a thread local as its `asContextElement`, is installed on the thread for the block,
@@ -457,18 +468,25 @@ internal class DefaultScriptSession(
      * while the snippet of the next caller might be the one freeing them.
      * So the next caller, if it would resume in place, is resumed on the thread, and submits its snippet from there.
      *
-     * A caller rejected by the session closed with the thread shut down is rejected in place, releasing the turn,
+     * A caller rejected by the session closed with the thread shut down is rejected in place,
      * unless it [waited] for the turn, and was resumed by the unlocking of another caller in place, on its thread:
      * then it is resumed from the [resumeExecutor] instead, releasing the turn there,
      * if it has no continuation interceptor, or [Dispatchers.Unconfined], also on the [callerThread] it called [execute] on,
      * or if it would resume in place on another thread, so a caller of a dispatcher which does not dispatch on its own thread,
      * like `Dispatchers.Main.immediate`, is rejected in place, when its dispatcher resumes it there.
      *
+     * The turn of a waiting caller rejected on the thread is released only from the [resumeExecutor] as well,
+     * as releasing it in place would resume the next waiting caller nested in it, rejected the same way,
+     * so the stack would grow with every waiting caller.
+     *
      * @throws IllegalStateException if the session is closed, with the thread shut down, before the block is submitted.
+     * @throws Throwable whatever else submitting the block to the thread throws, like an [OutOfMemoryError] of creating it,
+     * or the continuation interceptor of the caller, as it is.
      */
     private suspend fun <T> onSessionThread(
         callerThread: Thread,
         waited: Boolean,
+        handedOff: AtomicBoolean,
         block: suspend CoroutineScope.() -> T
     ): T {
         val callerContext = currentCoroutineContext()
@@ -476,6 +494,8 @@ internal class DefaultScriptSession(
         // always suspended, unless thrown, as a caller resumed before suspendCoroutine returns would continue on the current thread
         return suspendCoroutineUninterceptedOrReturn { uninterceptedContinuation ->
             val continuation = uninterceptedContinuation.intercepted()
+            // set before handing off, as the caller resumed there might read it at once, and reset if neither hand-off takes it
+            handedOff.set(true)
             try {
                 thread.execute {
                     val result = runCatching { runBlocking(context, block) }
@@ -500,12 +520,11 @@ internal class DefaultScriptSession(
                                 resumeOrFail(continuation, uninterceptedContinuation, Result.failure(failure))
                             }
                         }
-                if (resumedOff) {
-                    COROUTINE_SUSPENDED
-                } else {
-                    mutex.unlock()
+                if (!resumedOff) {
+                    handedOff.set(false)
                     throw failure
                 }
+                COROUTINE_SUSPENDED
             }
         }
     }

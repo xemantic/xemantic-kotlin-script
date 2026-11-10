@@ -3372,6 +3372,45 @@ class ScriptSessionTest {
     }
 
     /**
+     * A caller whose continuation interceptor fails to intercept its execution, after it took its turn,
+     * fails, but would keep the turn forever, so every next caller would wait for it, see #224.
+     */
+    @Test
+    fun `should release turn of caller whose interceptor fails`() {
+        // given
+        val failure = IllegalStateException("interceptContinuation failed")
+        val interceptions = AtomicInteger()
+        val interceptor = object : AbstractCoroutineContextElement(ContinuationInterceptor), ContinuationInterceptor {
+            override fun <T> interceptContinuation(continuation: Continuation<T>): Continuation<T> {
+                // the first interception starts the caller, the next one is the one of its execution, holding its turn
+                if (interceptions.incrementAndGet() == 2) throw failure
+                return continuation
+            }
+        }
+        val callerResult = CompletableFuture<Result<ScriptResult>>()
+        suspend {
+            session.execute("1")
+        }.startCoroutine(Continuation(interceptor) {
+            callerResult.complete(it)
+        })
+        assert(callerResult.get(1, TimeUnit.MINUTES).exceptionOrNull() === failure)
+
+        // when
+        val next = CompletableFuture.supplyAsync {
+            runBlocking {
+                session.execute("2")
+            }
+        }
+
+        // then
+        // bounded, so a hang fails the test instead of hanging the build
+        next.get(1, TimeUnit.MINUTES) should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
+    /**
      * A thread context element of the caller, like a thread local of a logging context as its `asContextElement`,
      * is installed on the thread of the session for the snippet, and removed after it, see #162.
      */
