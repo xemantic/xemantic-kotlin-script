@@ -341,8 +341,42 @@ private class InlinedMethod(
         new in range && init !in range && markers.any { range.first in it && init !in it }
     }
 
-    /** Whether an instruction of the [line] index may throw in the scope of a marker, see [lineThrows]. */
-    fun throwsInScope(line: Int): Boolean =
+    /**
+     * Whether each line is a line of the prologue of an inline function, positioned before its marker:
+     * the evaluation of a default argument, of a call of its `$default` method, is inlined with a line of the function before its marker,
+     * the line also positioned directly in the scope of the function, not in a lambda nested in it —
+     * the lines of each copy of an inline function are its own, while a lambda on the line of its call shares it, nested in the function.
+     * The prologue is positioned directly in the scopes enclosing the function, unlike an earlier copy of the same function,
+     * like of a function inlined twice, of a duplicated `finally` block, or a range of an inlined body split by a suspension point.
+     * The prologue of a function declaring its default arguments on a line its body does not use is not told apart.
+     */
+    private val prologues: BitSet by lazy(LazyThreadSafetyMode.NONE) {
+        val entriesByLine = lineNumbers.indices.groupBy { lineNumbers[it] }
+        BitSet(lineNumbers.size).apply {
+            lineNumbers.indices.forEach { line ->
+                val prologue = linePositions[line]
+                val isPrologue = markers.any { function ->
+                    !function.isLambda && prologue < function.start
+                        && markers.all { prologue !in it || function.start in it }
+                        && entriesByLine.getValue(lineNumbers[line]).any { j ->
+                            val position = linePositions[j]
+                            j != line && position in function
+                                && markers.none { it !== function && it.start >= function.start && position in it }
+                        }
+                }
+                if (isPrologue) set(line)
+            }
+        }
+    }
+
+    /** Whether the line of the [line] index is a line of the prologue of an inline function, see [prologues]. */
+    fun isPrologue(line: Int): Boolean = prologues[line]
+
+    /**
+     * Whether an instruction of the [line] index may throw, other than only by an allocation of the code of another line, see [lineThrows],
+     * also out of every marker, which tells that the line is not of a lambda alone, see [SnippetClass.lambdaCalls].
+     */
+    fun throwsByItsCode(line: Int): Boolean =
         lineThrows[line] == THROWS_IN_ONE_SCOPE || lineThrows[line] == THROWS_IN_SCOPES
 
     /** The markers in scope at the instruction of this [position], innermost first. */
@@ -421,7 +455,7 @@ private class SnippetClass(bytes: ByteArray) {
 
     /**
      * The calls of the lambda and of the inline functions enclosing the [line] of the snippet in the [method], of each copy of the lambda,
-     * see [lambdaCalls], in the only method of its name with an instruction at the [line] which may throw in the scope of a marker,
+     * see [lambdaCalls], in the only method of its name with an instruction at the [line] which may throw, see [InlinedMethod.throwsByItsCode],
      * while no overload without inlined bodies has the [line].
      */
     fun lambdaCalls(method: String, line: Int): List<List<Pair<String, Int>>>? {
@@ -436,9 +470,9 @@ private class SnippetClass(bytes: ByteArray) {
     fun inlinedCalls(method: String, line: Int): InlinedCalls? =
         methods[method]?.firstNotNullOfOrNull { it.inlinedCalls(line) }
 
-    /** Whether an instruction of this method at the [line] may throw in the scope of a marker. */
+    /** Whether an instruction of this method at the [line] may throw, see [InlinedMethod.throwsByItsCode]. */
     private fun InlinedMethod.throwsAt(line: Int): Boolean =
-        lineNumbers.indices.any { lineNumbers[it] == line && throwsInScope(it) }
+        lineNumbers.indices.any { lineNumbers[it] == line && throwsByItsCode(it) }
 
     /**
      * The calls of the lambda and of the inline functions enclosing the [line] of the snippet in this method, innermost first, of each copy of the lambda:
@@ -457,7 +491,7 @@ private class SnippetClass(bytes: ByteArray) {
      * @return `null` if the [line] is not within such a lambda, or it is not known which of its scopes throws.
      */
     private fun InlinedMethod.lambdaCalls(line: Int): List<List<Pair<String, Int>>>? {
-        val entries = lineNumbers.indices.filter { lineNumbers[it] == line && throwsInScope(it) }
+        val entries = lineNumbers.indices.filter { lineNumbers[it] == line && throwsByItsCode(it) }
         if (entries.isEmpty() || entries.any { lineThrows[it] == THROWS_IN_SCOPES }) return null
         val copies = entries.map { lineScopes[it].withoutInlineOnlyLambdas() }.distinct()
         val scopes = copies.first()
@@ -470,10 +504,23 @@ private class SnippetClass(bytes: ByteArray) {
      * These scopes without the lambdas of the `@InlineOnly` functions, which have no marker of their own,
      * like `run`, whose lambda is inlined with the lines of the scope enclosing it:
      * a lambda marker, like `$i$a$-run-Snippet1$frame$1`, names the function receiving it, and no enclosing marker is of that function.
+     *
+     * The name may be decorated, like `$i$a$-call$default-Snippet1$frame$1` of a call with a default argument next to `$i$f$call`,
+     * so the match is loose — a lambda wrongly kept is rejected as before, while a lambda wrongly dropped would lose its frames.
      */
     private fun List<InlineMarker>.withoutInlineOnlyLambdas(): List<InlineMarker> = filterIndexed { index, marker ->
-        !marker.isLambda || subList(index + 1, size).any { scope ->
-            !scope.isLambda && marker.name.startsWith("$INLINE_LAMBDA_MARKER-${scope.name.removePrefix(INLINE_FUNCTION_MARKER)}-")
+        !marker.isLambda || subList(index + 1, size).any { scope -> !scope.isLambda && marker.isLambdaOf(scope) }
+    }
+
+    /**
+     * Whether this lambda marker names the function of the [function] marker, followed by a `-` or a decoration starting with a `$`,
+     * also by the name without a suffix of a mangled one, like `name-a1b2c3d`.
+     */
+    private fun InlineMarker.isLambdaOf(function: InlineMarker): Boolean {
+        val name = function.name.removePrefix(INLINE_FUNCTION_MARKER)
+        return listOf(name, name.substringBefore('-')).any { prefix ->
+            val rest = this.name.removePrefix("$INLINE_LAMBDA_MARKER-")
+            rest.startsWith(prefix) && rest.getOrNull(prefix.length).let { it == '-' || it == '$' }
         }
     }
 
@@ -498,7 +545,8 @@ private class SnippetClass(bytes: ByteArray) {
      */
     private fun InlinedMethod.inlinedCalls(line: Int): InlinedCalls? {
         val entries = lineNumbers.indices.filter { lineNumbers[it] == line }
-        val candidates = entries.filter { lineThrows[it] != THROWS_OUT_OF_SCOPES }.mapNotNull { entry ->
+        // the code of a prologue is the code of the function it is inlined before, like its body on the same line
+        val candidates = entries.filter { lineThrows[it] != THROWS_OUT_OF_SCOPES && !isPrologue(it) }.mapNotNull { entry ->
             lineScopes[entry].takeIf { it.isNotEmpty() }?.let { scopes ->
                 InlinedCalls(callChain(line, scopes), lineBefore(scopes.last().start, scope = null))
             }
@@ -530,6 +578,8 @@ private class SnippetClass(bytes: ByteArray) {
      * the state machine of a suspend function splits the range of an inlined body at its suspension points,
      * and the range resuming into the [nested] scope may have no line of the [scope] of its own,
      * nor the range before it, like the one resuming from a suspension point within an earlier nested scope.
+     *
+     * The line of a prologue of a nested function, inlined before its marker, is not a line of the [scope], see [InlinedMethod.isPrologue].
      */
     private fun InlinedMethod.callLine(nested: InlineMarker, scope: InlineMarker): Int? =
         lineBefore(nested.start, scope) ?: generateSequence(splitRangeBefore(scope)) { splitRangeBefore(it) }
@@ -568,6 +618,7 @@ private class SnippetClass(bytes: ByteArray) {
         return lineNumbers.indices.lastOrNull { i ->
             val position = linePositions[i]
             lineStarts[i] < index
+                && !isPrologue(i)
                 && (scope == null || position in scope)
                 && markers.none { it !== scope && it.start >= from && position in it }
                 && smap?.sourceOf(lineNumbers[i])?.path != FAKE_PATH

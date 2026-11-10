@@ -996,6 +996,78 @@ class InlinedFramesTest {
     }
 
     @Test
+    fun `should resolve frames of error in the body of lambda passed to inline function with default argument`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            inline fun call(x: Int = 0, block: () -> Unit) { if (x >= 0) block() }
+            fun frame(): StackTraceElement = try {
+                call {
+                    error("x")
+                }
+                error("not thrown")
+            } catch (e: IllegalStateException) { e.stackTrace[0] }
+        """.trimIndent())
+
+        // then
+        // the marker of the lambda is named after the $default method, like $i$a$-call$default-Snippet1$frame$1
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 4),
+                StackTraceElement("Snippet1", "call", "snippet1.kts", 1),
+                StackTraceElement("Snippet1", "frame", "snippet1.kts", 3)
+            )
+        )
+    }
+
+    @Test
+    fun `should resolve frames of error in the body of lambda passed to inline function with default argument within lambda`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            inline fun call(x: Int = 0, block: () -> Unit) { if (x >= 0) block() }
+            inline fun outer(block: () -> Unit) { block() }
+            fun frame(): StackTraceElement = try {
+                outer { call {
+                    error("x") } }
+                error("not thrown")
+            } catch (e: IllegalStateException) { e.stackTrace[0] }
+        """.trimIndent())
+
+        // then
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 5),
+                StackTraceElement("Snippet1", "call", "snippet1.kts", 1),
+                StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 4),
+                StackTraceElement("Snippet1", "outer", "snippet1.kts", 2),
+                StackTraceElement("Snippet1", "frame", "snippet1.kts", 4)
+            )
+        )
+    }
+
+    @Test
+    fun `should resolve intermediate frame of nested inline function with default argument on the line of its body`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            inline fun inner(x: Int = 1): Nothing = throw IllegalStateException("x=" + x)
+            inline fun outer() {
+                println("outer")
+                inner()
+            }
+            fun frame(): StackTraceElement = try { outer(); error("not thrown") } catch (e: IllegalStateException) { e.stackTrace[0] }
+        """.trimIndent())
+
+        // then
+        // the default argument is evaluated before the marker of inner, with the line of its body, in the scope of outer
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "inner", "snippet1.kts", 1),
+                StackTraceElement("Snippet1", "outer", "snippet1.kts", 4),
+                StackTraceElement("Snippet1", "frame", "snippet1.kts", 6)
+            )
+        )
+    }
+
+    @Test
     fun `should resolve frames of throw in the body of lambda without the call site of the KotlinDebug stratum`() = runTest {
         // when
         val resolved = resolveTransformedClass("""
