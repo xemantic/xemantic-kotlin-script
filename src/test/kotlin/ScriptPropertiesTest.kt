@@ -1054,6 +1054,39 @@ class ScriptPropertiesTest {
         ))
     }
 
+    /**
+     * kotlin-reflect cannot resolve a local function, nor a Java static method of a mapped type,
+     * so their parameters are told by the compiled reference, see [ScriptProperty.type].
+     */
+    @Test
+    fun `should reject function reference value of another arity unresolved by kotlin-reflect`() {
+        // given
+        fun local(a: String, b: String): Int = a.length + b.length
+        @Suppress("RedundantSuspendModifier")
+        suspend fun localSuspend(a: String, b: String): Int = a.length + b.length
+        // the toString of such a reference fails, as it resolves the function, so they are not paired with their types
+        val types = listOf(
+            typeOf<KFunction1<String, Int>>(),
+            typeOf<KSuspendFunction1<String, Int>>(),
+            typeOf<KFunction2<Int, Int, String>>()
+        )
+        val functions = listOf<KFunction<*>>(::local, ::localSuspend, Integer::toHexString)
+
+        // when
+        val messages = types.indices.map { index ->
+            assertFailsWith<IllegalArgumentException> {
+                ScriptProperty("f", types[index], functions[index])
+            }.message
+        }
+
+        // then
+        assert(messages == listOf(
+            "Property 'f' of type ${types[0]} has a value of function local, which takes 2 parameters, while the type takes 1",
+            "Property 'f' of type ${types[1]} has a value of function localSuspend, which takes 2 parameters, while the type takes 1",
+            "Property 'f' of type ${types[2]} has a value of function toHexString, which takes 1 parameter, while the type takes 2"
+        ))
+    }
+
     /** A bound function reference does not take its bound receiver. */
     @Test
     fun `should accept bound function reference value of the arity of its type`() {
@@ -1178,7 +1211,10 @@ class ScriptPropertiesTest {
             typeOf<KFunction2<String, List<Int>, Int>?>() to false,
             typeOf<KFunction23<Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Unit>>() to false,
             typeOf<KSuspendFunction1<String, Int>>() to true,
-            typeOf<KSuspendFunction1<String, Int>?>() to true
+            typeOf<KSuspendFunction1<String, Int>?>() to true,
+            // KFunction0<Int>, produced by typeOf like KFunction<Int>, told by a value of no parameters
+            typeOf<KFunction0<Int>>() to false,
+            typeOf<KFunction<Int>?>() to true
         )
 
         // when
@@ -1190,18 +1226,22 @@ class ScriptPropertiesTest {
             "kotlin.reflect.KFunction2<kotlin.String, kotlin.collections.List<kotlin.Int>, kotlin.Int>?",
             "kotlin.reflect.KFunction23<${List(22) { "kotlin.Int" }.joinToString()}, kotlin.Int, kotlin.Unit>",
             "kotlin.reflect.KSuspendFunction1<kotlin.String, kotlin.Int>",
-            "kotlin.reflect.KSuspendFunction1<kotlin.String, kotlin.Int>?"
+            "kotlin.reflect.KSuspendFunction1<kotlin.String, kotlin.Int>?",
+            "kotlin.reflect.KFunction0<kotlin.Int>",
+            "kotlin.reflect.KSuspendFunction0<kotlin.Int>?"
         ))
     }
 
     /**
      * A function reference type not told apart from a suspend one by the value, like a nested one, is rendered as `KFunction<R>`,
      * which a reference of either is an instance of,
-     * also `KFunction0<Int>`, indistinguishable from `KFunction<Int>`.
+     * also `KFunction0<Int>`, indistinguishable from `KFunction<Int>` without the value.
      */
     @Test
     fun `should render function reference types not told apart by the value as KFunction`() {
         // given
+        // the projection of the return type, redundant in the source, is kept by typeOf
+        @Suppress("REDUNDANT_PROJECTION")
         val types = listOf(
             typeOf<KFunction1<String, Int>>(),
             typeOf<KSuspendFunction1<String, Int>?>(),
@@ -1514,17 +1554,88 @@ class ScriptPropertiesTest {
         }
     }
 
+    /**
+     * A function reference unresolved by kotlin-reflect, like of a local function, or of a Java static method of a mapped type,
+     * is told apart from a suspend one by its compiled class, see [ScriptProperty.type].
+     */
+    @Test
+    fun `should provide properties of function reference unresolved by kotlin-reflect`() = runTest {
+        // given
+        fun local(x: String): Int = x.length
+        @Suppress("RedundantSuspendModifier")
+        suspend fun localSuspend(x: String): Int = x.length * 2
+        ScriptSession(listOf(
+            property("f", ::local),
+            property("g", ::localSuspend),
+            property("hex", Integer::toHexString)
+        )).use { session ->
+            // when
+            val result = session.execute("""(f("ab") + await { g("ab") }).toString() + " " + hex(255)""")
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == "6 ff")
+            }
+        }
+    }
+
+    /** A `KFunction0<R>` type, produced by [typeOf] like `KFunction<R>`, is told by a value of no parameters, see [ScriptProperty.type]. */
+    @Test
+    fun `should provide properties of function reference of no parameters`() = runTest {
+        // given
+        fun local(): Int = 2
+        val bound: KFunction0<String> = "ab"::uppercase
+        ScriptSession(listOf(
+            property("f", ::answer),
+            property("g", ::suspendAnswer),
+            property("h", ::local),
+            property("i", bound)
+        )).use { session ->
+            // when
+            val result = session.execute("""(f() + await { g() } + h()).toString() + i()""")
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == "8AB")
+            }
+        }
+    }
+
+    /** A `KFunction<R>` type of a value of parameters stays as such, as the types of the parameters cannot be told. */
+    @Test
+    fun `should provide property of KFunction type of function reference of parameters`() = runTest {
+        ScriptSession(listOf(property<KFunction<Int>>("f", ::twice))).use { session ->
+            // when
+            val result = session.execute("""f.call("ab")""")
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == 4)
+            }
+        }
+    }
+
     /** A nested function reference type is declared as `KFunction<R>`, as the value cannot tell it from a suspend one. */
     @Test
     fun `should not let snippet call nested suspend function reference as non-suspend function`() = runTest {
         ScriptSession(listOf(property("fs", listOf(::suspendTwice)))).use { session ->
             // when
             val result = session.execute("""fs[0]("ab")""")
+            val name = session.execute("fs[0].name")
 
             // then
             result should {
                 be<ScriptResult.Error>()
                 have(phase == ExecutionPhase.COMPILATION)
+                // the call fails, not the declaration of the property
+                have(message.startsWith("snippet1.kts:1:1: error: "))
+            }
+            name should {
+                be<ScriptResult.Value>()
+                have(value == "suspendTwice")
             }
         }
     }
@@ -1634,6 +1745,11 @@ class ScriptPropertiesTest {
 fun twice(x: String): Int = x.length * 2
 
 suspend fun suspendTwice(x: String): Int = x.length * 2
+
+fun answer(): Int = 4
+
+@Suppress("RedundantSuspendModifier")
+suspend fun suspendAnswer(): Int = 2
 
 @Suppress("unused", "RedundantSuspendModifier")
 suspend fun suspendIgnore2(a: String, b: String) {}

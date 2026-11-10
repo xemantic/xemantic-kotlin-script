@@ -38,6 +38,8 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   Do not fall back to `assertEquals` / `assertTrue` / `assertNotNull` from `kotlin.test`, which discard that information.
 - A test that an object is garbage collected must not create it within `runTest`: a frame of its coroutine can keep a stale reference to it, so the test fails without a leak —
   see `should release closed session with its dependencies`.
+- Keep a function reference which kotlin-reflect cannot resolve, like of a local function or of `Integer::toHexString`, out of an `assert(expr)` expression:
+  power-assert renders it by its `toString`, which resolves the function and throws `KotlinReflectionInternalError`, hiding the actual failure.
 - Never assert on wall-clock time (a ratio or a bound): tests run under whatever CI load there is, and fail with no code change.
   To guard against, say, quadratic backtracking, feed an input large enough that the regression hangs for minutes while the correct code takes milliseconds.
 

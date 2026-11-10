@@ -30,13 +30,19 @@ public object ScriptPropertyValues {
 
     private val sessions = ConcurrentHashMap<Int, Map<String, Any?>>()
 
-    /** The value of the property of this [name] provided to the [session]. */
+    /**
+     * The value of the property of this [name] provided to the [session].
+     *
+     * It is public only because the declarations of the properties, compiled with the snippets, call it — not meant for the host.
+     */
     public fun get(session: Int, name: String): Any? =
         checkNotNull(sessions[session]) { "The session is closed" }[name]
 
     /**
      * The value of the property of this [name] provided to the [session], cast unchecked to its type [T],
      * so the caller casts it to the erased class of [T] only, like `FunctionN` of a function type of more than 22 parameters.
+     *
+     * It is public only because the declarations of the properties, compiled with the snippets, call it — not meant for the host.
      */
     @Suppress("UNCHECKED_CAST")
     public fun <T> getUnchecked(session: Int, name: String): T =

@@ -28,6 +28,7 @@ import org.jetbrains.kotlin.lexer.KtTokens
 import java.lang.reflect.Modifier
 import kotlin.jvm.functions.FunctionN
 import kotlin.jvm.internal.FunctionBase
+import kotlin.jvm.internal.FunctionReference
 import kotlin.reflect.KClass
 import kotlin.reflect.KFunction
 import kotlin.reflect.KType
@@ -66,7 +67,9 @@ import kotlin.reflect.typeOf
  *   while a type marked by `@ExtensionFunctionType` in its annotations, like the type of a member, keeps the receiver.
  *   Nor does it tell a suspend function reference type, like `KSuspendFunction1<String, Int>`, from `KFunction1<String, Int>`,
  *   so the snippets see the former if the value is a suspend function, and the latter otherwise.
- *   Only the value of the property itself is told apart, if kotlin-reflect can resolve its function, unlike a local one,
+ *   Only the value of the property itself is told apart, by kotlin-reflect,
+ *   or by the class of the compiled reference, if kotlin-reflect cannot resolve its function,
+ *   like a local one, or a Java static method of a mapped type, like `Integer::toHexString`,
  *   while a function reference type the value cannot tell, like a nested one, as in `List<KFunction1<String, Int>>`,
  *   is seen as `KFunction<Int>`, which a reference of either is an instance of.
  *   Such a widened type is safe only in a covariant position, so elsewhere the snippets see the type projected,
@@ -75,10 +78,12 @@ import kotlin.reflect.typeOf
  *   so they cannot pass a function of another kind to the host,
  *   while a function type of more than 22 parameters, which cannot be projected, is seen as `FunctionN<R>`.
  *   A `KFunction<Int>` type is seen as such everywhere, so the snippets can pass a reference of any function to a host taking it,
- *   though [typeOf] produces `KFunction0<Int>` alike, which the snippets see as `KFunction<Int>` too —
+ *   though [typeOf] produces `KFunction0<Int>` alike, so the type of the property itself is seen as `KFunction0<Int>`
+ *   if its value is a reference of no parameters, also a bound one, like `"foo"::uppercase`, called as `f()`,
+ *   or `KSuspendFunction0<Int>` of a suspend one,
+ *   while a nested one is seen as `KFunction<Int>` —
  *   a host taking a function of no parameters should take it as `() -> Int` instead.
- *   The value of a function reference type is checked to take as many parameters, if kotlin-reflect can resolve its function,
- *   while a local function of another arity fails only when the snippets call it.
+ *   The value of a function reference type is checked to take as many parameters, if they can be told, alike by kotlin-reflect or by the compiled reference.
  *   The value of a function type of more than 22 parameters is checked to take as many parameters,
  *   unless they cannot be told: a Kotlin lambda of more than 22 parameters does not implement `getArity`,
  *   so they are told by its `invoke` method of typed parameters instead, if it declares exactly one.
@@ -137,7 +142,7 @@ public class ScriptProperty<T>(
             // not checked by the cast of the declaration of the property, erased to KFunction
             if (type.isFunctionReferenceType()) {
                 val parameters = type.arguments.size - 1
-                runCatching { (value as KFunction<*>).parameters.size }.getOrNull()?.let { actual ->
+                (value as KFunction<*>).shape()?.parameters?.let { actual ->
                     require(actual == parameters) {
                         "Property '$name' of type $type has a value of function ${(value as KFunction<*>).name}, which takes $actual parameter${if (actual == 1) "" else "s"}, while the type takes $parameters"
                     }
@@ -207,13 +212,47 @@ internal fun ScriptProperty<*>.declaration(session: Int): String {
 
 /**
  * Whether the value of this property of a function reference type, like `KFunction1<String, Int>`, is a suspend function,
- * `false` if it is `null`, or `null` if it cannot be told, like of a local function, which kotlin-reflect cannot resolve.
+ * `false` if it is `null`, or `null` if it cannot be told, see [shape].
+ * Of a `KFunction<R>` type, which [typeOf] produces for `KFunction0<R>` alike, it is told only of a value of no parameters,
+ * and `null` otherwise, as the types of the parameters cannot be told.
  */
 private fun ScriptProperty<*>.isSuspendFunctionReference(): Boolean? = when {
-    !type.isFunctionReferenceType() -> null
-    value == null -> false
-    else -> runCatching { (value as KFunction<*>).isSuspend }.getOrNull()
+    type.isFunctionReferenceType() -> if (value == null) false else (value as KFunction<*>).shape()?.isSuspend
+    type.classifier == KFunction::class && value != null ->
+        (value as KFunction<*>).shape()?.takeIf { it.parameters == 0 }?.isSuspend
+    else -> null
 }
+
+/**
+ * The number of the parameters of a function reference, not counting a bound receiver, and whether it is a suspend function.
+ */
+private class FunctionShape(val parameters: Int, val isSuspend: Boolean)
+
+/**
+ * The shape of this function reference, told by kotlin-reflect,
+ * or by the class of the compiled reference, if kotlin-reflect cannot resolve its function,
+ * like a local one, or a Java static method of a mapped type, like `Integer::toHexString`,
+ * or `null` if neither can tell it.
+ */
+private fun KFunction<*>.shape(): FunctionShape? =
+    runCatching { FunctionShape(parameters.size, isSuspend) }.getOrNull()
+        ?: (this as? FunctionReference)?.let {
+            val isSuspend = it.javaClass.implements(SUSPEND_FUNCTION)
+            // the arity counts the continuation of a suspend function, but not a bound receiver
+            FunctionShape(it.arity - if (isSuspend) 1 else 0, isSuspend)
+        }
+
+/**
+ * The marker interface which the compiled reference of a suspend function implements,
+ * internal to the Kotlin standard library, so it is told by its name only.
+ */
+private const val SUSPEND_FUNCTION = "kotlin.coroutines.jvm.internal.SuspendFunction"
+
+/** Whether this class implements the interface of this [name], directly or not. */
+private fun Class<*>.implements(name: String): Boolean =
+    this.name == name
+            || interfaces.any { it.implements(name) }
+            || superclass?.implements(name) == true
 
 /** The JVM name of the getter of this property, like `getName`, or `isActive` of `isActive`. */
 private fun ScriptProperty<*>.getterName(): String =
@@ -228,7 +267,7 @@ private fun ScriptProperty<*>.getterName(): String =
  * a function reference type, like `KFunction1<String, Int>` of `KFunction`,
  * or a function type, like `(Int, …, Int) -> Unit` of `FunctionN`,
  * while a `KFunction` type of a single argument, the return type, is rendered as `KFunction<R>`,
- * though [typeOf] produces a `KFunction0<R>` alike, see [ScriptProperty.type].
+ * though [typeOf] produces a `KFunction0<R>` alike, unless told by the value, see [ScriptProperty.type].
  *
  * A function reference type of parameters which cannot be told apart, rendered as `KFunction<R>`, is a supertype of the actual one,
  * so it is rendered as such only in a covariant position, see [Position],
@@ -241,10 +280,12 @@ private fun ScriptProperty<*>.getterName(): String =
  * @param isSuspend whether this function reference type is of a suspend function, like `KSuspendFunction1<String, Int>`,
  *   which [typeOf] produces like `KFunction1<String, Int>`, so it can be told by the value only,
  *   or `null` if it cannot be told, like of a nested type, rendered then as `KFunction<Int>`, which a reference of either is an instance of.
+ *   Of a `KFunction<R>` type, a value other than `null` tells it is a function reference of no parameters,
+ *   rendered as `KFunction0<R>` or `KSuspendFunction0<R>`.
  */
 internal fun KType.toSource(isSuspend: Boolean? = null): String =
     // nothing fails to render in a covariant position, as it can be widened
-    if (isSuspend != null && isFunctionReferenceType()) {
+    if (isSuspend != null && classifier == KFunction::class && arguments.isNotEmpty()) {
         val kind = if (isSuspend) "KSuspendFunction" else "KFunction"
         "kotlin.reflect.$kind${arguments.size - 1}" +
                 arguments.toSource(functionReferenceVariances(), Position.OUT)!!.text +
