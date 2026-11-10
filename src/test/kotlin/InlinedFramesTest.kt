@@ -20,6 +20,12 @@ package com.xemantic.kotlin.script
 
 import com.xemantic.kotlin.test.assert
 import kotlinx.coroutines.test.runTest
+import org.jetbrains.org.objectweb.asm.ClassReader
+import org.jetbrains.org.objectweb.asm.ClassWriter
+import org.jetbrains.org.objectweb.asm.tree.ClassNode
+import org.jetbrains.org.objectweb.asm.tree.LineNumberNode
+import org.jetbrains.org.objectweb.asm.tree.MethodNode
+import java.io.ByteArrayInputStream
 import java.io.InputStream
 import kotlin.test.AfterTest
 import kotlin.test.Test
@@ -80,6 +86,39 @@ class InlinedFramesTest {
         val marker = execute("Marker()")!!
         val inlinedFrames = InlinedFrames(mapOf("snippet1.kts" to source.lines()))
         inlinedFrames.keep(marker.javaClass)
+        return inlinedFrames.resolve(frame)
+    }
+
+    /**
+     * The frames resolved of a frame of the [method] at the [line] of this [snippet], as if thrown there,
+     * the snippet followed by the class `Marker`, of the class loader of the snippet.
+     */
+    private suspend fun resolveFrameAt(snippet: String, method: String, line: Int): List<StackTraceElement>? {
+        val source = "$snippet\nclass Marker"
+        execute(source)
+        val marker = execute("Marker()")!!
+        val inlinedFrames = InlinedFrames(mapOf("snippet1.kts" to source.lines()))
+        inlinedFrames.keep(marker.javaClass)
+        return inlinedFrames.resolve(StackTraceElement("Snippet1", method, "snippet1.kts", line))
+    }
+
+    /**
+     * The frames resolved like by [resolveFrame], but of the class of the frame transformed by the [transform] of its [method],
+     * which stands in for bytecode the compiler has not been seen to produce.
+     */
+    private suspend fun resolveTransformedFrame(
+        snippet: String,
+        method: String,
+        transform: MethodNode.() -> Unit
+    ): List<StackTraceElement>? {
+        val source = "$snippet\nclass Marker"
+        execute(source)
+        val frame = execute("frame()") as StackTraceElement
+        val classLoader = TransformingClassLoader(execute("Marker()")!!.javaClass, "Snippet1") { node ->
+            node.methods.single { it.name == method }.transform()
+        }
+        val inlinedFrames = InlinedFrames(mapOf("snippet1.kts" to source.lines()))
+        inlinedFrames.keep(classLoader.marker)
         return inlinedFrames.resolve(frame)
     }
 
@@ -367,6 +406,102 @@ class InlinedFramesTest {
                 StackTraceElement("Snippet1", "inner", "snippet1.kts", 3),
                 StackTraceElement("Snippet1", "outer", "snippet1.kts", 7),
                 StackTraceElement("Snippet1", "suspendingFrame", "snippet1.kts", 9)
+            )
+        )
+    }
+
+    @Test
+    fun `should omit intermediate frame of suspend inline function without a line before the call in its split range`() = runTest {
+        // when
+        val resolved = resolveTransformedFrame(
+            """
+            suspend inline fun inner(x: Int) { if (x == 2) throw IllegalStateException("x=" + x) }
+            suspend inline fun outer(x: Int) {
+                delay(1)
+                inner(x)
+            }
+            suspend fun suspendingFrame(): StackTraceElement = try { outer(1); outer(2); error("not thrown") } catch (e: IllegalStateException) { e.stackTrace[0] }
+            val awaited = await { suspendingFrame() }
+            fun frame(): StackTraceElement = awaited
+            """.trimIndent(),
+            method = "suspendingFrame"
+        ) {
+            // the second copy of outer is split into a range before delay, and a range resuming after it, calling inner
+            val inners = markers("\$i\$f\$inner")
+            val secondOuter = markers("\$i\$f\$outer").filter { it.first > inners.first().last }
+            // only the line of the second copy of inner is left in its scopes, and no line of the first one shares it
+            removeLines { line ->
+                line in inners.first() || (secondOuter.any { line in it } && line !in inners.last())
+            }
+        }
+
+        // then
+        // the line of outer calling inner is unknown, as both ranges of its copy have no line,
+        // while the earlier ranges are of the first copy, so they do not tell it
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "inner", "snippet1.kts", 1),
+                StackTraceElement("Snippet1", "suspendingFrame", "snippet1.kts", 6)
+            )
+        )
+    }
+
+    @Test
+    fun `should resolve frames of linkage error of type check in the body of lambda passed to inline function`() = runTest {
+        // when
+        // a NoClassDefFoundError of the type checked, if its class cannot be loaded
+        val resolved = resolveFrameAt(
+            """
+            class Checked
+            inline fun call(block: () -> Unit) { block() }
+            fun check(value: Any): Boolean {
+                var checked = false
+                call {
+                    checked = value is Checked
+                }
+                return checked
+            }
+            """.trimIndent(),
+            method = "check",
+            line = 6
+        )
+
+        // then
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 6),
+                StackTraceElement("Snippet1", "call", "snippet1.kts", 2),
+                StackTraceElement("Snippet1", "check", "snippet1.kts", 5)
+            )
+        )
+    }
+
+    @Test
+    fun `should resolve frames of linkage error of class constant in the body of lambda passed to inline function`() = runTest {
+        // when
+        // a NoClassDefFoundError of the class, if it cannot be loaded
+        val resolved = resolveFrameAt(
+            """
+            class Constant
+            inline fun call(block: () -> Unit) { block() }
+            fun constant(): Class<*>? {
+                var type: Class<*>? = null
+                call {
+                    type = Constant::class.java
+                }
+                return type
+            }
+            """.trimIndent(),
+            method = "constant",
+            line = 6
+        )
+
+        // then
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 6),
+                StackTraceElement("Snippet1", "call", "snippet1.kts", 2),
+                StackTraceElement("Snippet1", "constant", "snippet1.kts", 5)
             )
         )
     }
@@ -723,7 +858,7 @@ class InlinedFramesTest {
         val frame = execute("frame()") as StackTraceElement
         val marker = execute("Marker()")!!
         val analyzed = mutableListOf<StackTraceElement>()
-        val inlinedFrames = InlinedFrames(snippets, analyzing = { analyzed += it })
+        val inlinedFrames = InlinedFrames(snippets).apply { analyzing = { analyzed += it } }
         inlinedFrames.keep(marker.javaClass)
 
         // when
@@ -749,7 +884,7 @@ class InlinedFramesTest {
         val marker = execute("Marker()")!!
         var analyses = 0
         // stands in for an unexpected failure of the analysis of odd bytecode
-        val inlinedFrames = InlinedFrames(snippets, analyzing = { analyses++; throw IndexOutOfBoundsException("-1") })
+        val inlinedFrames = InlinedFrames(snippets).apply { analyzing = { analyses++; throw IndexOutOfBoundsException("-1") } }
         inlinedFrames.keep(marker.javaClass)
 
         // when
@@ -758,6 +893,33 @@ class InlinedFramesTest {
         // then
         assert(resolved == listOf(null, null))
         assert(analyses == 1)
+    }
+
+    @Test
+    fun `should resolve frame of inlined code again after its analysis overflows the stack`() = runTest {
+        // given
+        execute(snippet)
+        val frame = execute("frame()") as StackTraceElement
+        val marker = execute("Marker()")!!
+        var analyses = 0
+        // stands in for an analysis on a stack too deep to complete it
+        val inlinedFrames = InlinedFrames(snippets).apply { analyzing = { if (++analyses == 1) throw StackOverflowError() } }
+        inlinedFrames.keep(marker.javaClass)
+
+        // when
+        val resolved = List(2) { inlinedFrames.resolve(frame) }
+
+        // then
+        assert(
+            resolved == listOf(
+                null,
+                listOf(
+                    StackTraceElement("Snippet1", "boom", "snippet1.kts", 1),
+                    StackTraceElement("Snippet1", "frame", "snippet1.kts", 3)
+                )
+            )
+        )
+        assert(analyses == 2)
     }
 
     @Test
@@ -825,4 +987,41 @@ private class CountingClassLoader(marker: Class<*>) : ClassLoader(marker.classLo
         return super.getResourceAsStream(name)
     }
 
+}
+
+/**
+ * A class loader reading the class file of the [className] transformed by the [transform],
+ * defining the [marker] class again, so that it is the class loader of its [marker].
+ */
+private class TransformingClassLoader(
+    marker: Class<*>,
+    private val className: String,
+    private val transform: (ClassNode) -> Unit
+) : ClassLoader(marker.classLoader) {
+
+    val marker: Class<*> = marker.classLoader.getResourceAsStream(marker.name.replace('.', '/') + ".class")!!
+        .use { it.readBytes() }
+        .let { defineClass(marker.name, it, 0, it.size) }
+
+    override fun getResourceAsStream(name: String): InputStream? {
+        val stream = super.getResourceAsStream(name)
+        if (name != className.replace('.', '/') + ".class") return stream
+        val node = ClassNode().also { node -> ClassReader(stream!!.use { it.readBytes() }).accept(node, 0) }
+        transform(node)
+        return ByteArrayInputStream(ClassWriter(0).also { node.accept(it) }.toByteArray())
+    }
+
+}
+
+/** The ranges of the instruction indices of the local variables of this method starting with the [prefix], by their start. */
+private fun MethodNode.markers(prefix: String): List<IntRange> = localVariables
+    .filter { it.name.startsWith(prefix) }
+    .map { instructions.indexOf(it.start)..<instructions.indexOf(it.end) }
+    .sortedBy { it.first }
+
+/** Removes the line numbers of this method whose index of the instruction starting the line matches the [predicate]. */
+private fun MethodNode.removeLines(predicate: (start: Int) -> Boolean) {
+    instructions.filterIsInstance<LineNumberNode>()
+        .filter { predicate(instructions.indexOf(it.start)) }
+        .forEach { instructions.remove(it) }
 }

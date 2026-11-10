@@ -101,15 +101,8 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   re-check it after every Kotlin upgrade, `InlinedFramesTest` and the inline function tests of `ScriptSessionTest` pin its behavior.
 - A `@kotlin.internal.InlineOnly` function of the standard library, like `require` or `let`, is inlined with the lines of its call site,
   only the other inline functions, like `first { }` or `forEach { }`, get the synthetic lines beyond the end of the snippet.
-- The `KotlinDebug` stratum maps every synthetic line to its call site but the `fake.kt` line (`kotlin/jvm/internal/FakeKt`),
-  which the compiler may give to the initialization of an inline marker variable (`ICONST_0; ISTORE`), so it cannot be the line of a frame throwing.
-- The same line may be inlined in several scopes, like the line of a `forEach { }` call in an inline function
-  and of its lambda body on the same line — the first scope in the bytecode names the function, so it is ambiguous by design.
-- A frame tells its line, not its instruction, and a line may be inlined in several copies — when they disagree, omit the intermediate frames rather than guess:
-  a wrong frame misleads more than a missing one.
-- The state machine of a suspend function splits the range of an inline marker at each suspension point,
-  and starts a line at the resuming label, before the initialization of the marker of the inlined body it belongs to —
-  see `should resolve intermediate frame of nested suspend inline functions`.
+- A frame tells its line, not its instruction, so when the bytecode does not tell which code of the line throws, omit the frames rather than guess:
+  a wrong frame misleads more than a missing one — see `should omit intermediate frame of inline function calling the same inline function twice`.
 
 ## Anti-patterns to avoid
 
