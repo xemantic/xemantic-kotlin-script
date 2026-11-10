@@ -60,6 +60,9 @@ class SnippetDeclarationsTest {
                     internal class InternalClass
                     internal var internalVariable = 1
                     class ClassOfInternalMember { internal val internalMember = 1 }
+                    var internalSetterProperty = 1
+                        internal set
+                    internal fun internalFunctionWithDefault(n: Int = 1) = n
                     Snippet1::class.java
                 """.trimIndent()) }
                 (result as ScriptResult.Value).value as Class<*>
@@ -175,6 +178,37 @@ class SnippetDeclarationsTest {
         assert(declarations.internalMember("Snippet1", $$"getInternalExtensionProperty$main", listOf("java.lang.String")) == InternalMember("internalExtensionProperty", "snippet1.kts"))
         assert(declarations.internalMember("Snippet1", "internalExtensionFunction", listOf("java.lang.String")) == InternalMember("internalExtensionFunction", "snippet1.kts"))
         assert(declarations.internalMember($$"Snippet1$ClassOfInternalMember", $$"getInternalMember$main", emptyList()) == InternalMember("ClassOfInternalMember.internalMember", "snippet1.kts"))
+    }
+
+    @Test
+    fun `should find internal setter of public property of snippet`() {
+        // when
+        val member = declarations.internalMember("Snippet1", $$"setInternalSetterProperty$main", listOf("int"))
+
+        // then
+        assert(member == InternalMember("internalSetterProperty", "snippet1.kts", internalSetter = true))
+    }
+
+    @Test
+    fun `should find internal function of snippet by its stub of default arguments`() {
+        // when
+        val member = declarations.internalMember(
+            "Snippet1", $$"internalFunctionWithDefault$default", listOf("Snippet1", "int", "int", "java.lang.Object")
+        )
+
+        // then
+        assert(member == InternalMember("internalFunctionWithDefault", "snippet1.kts"))
+    }
+
+    @Test
+    fun `should not find internal function of snippet by stub of default arguments of other parameters`() {
+        // when
+        val member = declarations.internalMember(
+            "Snippet1", $$"internalFunctionWithDefault$default", listOf("Snippet1", "long", "int", "java.lang.Object")
+        )
+
+        // then
+        assert(member == null)
     }
 
     @Test

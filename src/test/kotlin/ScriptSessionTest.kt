@@ -791,7 +791,7 @@ class ScriptSessionTest {
             have(phase == ExecutionPhase.EVALUATION)
             message sameAs """
                 java.lang.NoSuchMethodError: 'int secret()'
-                  hint: 'secret' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier.
+                  hint: 'secret' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and declare again the declarations calling it, like 'next' of snippet2.kts, as they keep calling the internal one.
                   at next(snippet2.kts:1)
                   | fun next(): Int = secret() + 1
                   at <snippet body>(snippet2.kts:2)
@@ -953,7 +953,7 @@ class ScriptSessionTest {
             have(phase == ExecutionPhase.EVALUATION)
             message sameAs """
                 java.lang.NoSuchMethodError: 'int getSecret${'$'}main()'
-                  hint: 'secret' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier.
+                  hint: 'secret' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and declare again the declarations calling it, like 'next' of snippet2.kts, as they keep calling the internal one.
                   at next(snippet2.kts:1)
                   | fun next(): Int = secret + 1
                   at <snippet body>(snippet2.kts:2)
@@ -1021,6 +1021,89 @@ class ScriptSessionTest {
                   hint: 'Box.open' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier.
                   at <snippet body>(snippet2.kts:1)
                   | Box().open()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call internal function of earlier snippet once declared public together with its callers as hinted`() = runTest {
+        // given
+        session.execute("internal fun secret() = 1")
+        session.execute("fun next(): Int = secret() + 1")
+        val failure = session.execute("""
+            fun outer(): Int = next() * 2
+            outer()
+        """.trimIndent())
+        failure should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.NoSuchMethodError: 'int secret()'
+                  hint: 'secret' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and declare again the declarations calling it, like 'next' of snippet2.kts, and the ones calling them, like 'outer' of snippet3.kts, as they keep calling the internal one.
+                  at next(snippet2.kts:1)
+                  | fun next(): Int = secret() + 1
+                  at outer(snippet3.kts:1)
+                  | fun outer(): Int = next() * 2
+                  at <snippet body>(snippet3.kts:2)
+                  | outer()
+            """.trimIndent()
+        }
+        session.execute("""
+            fun secret() = 1
+            fun next(): Int = secret() + 1
+            fun outer(): Int = next() * 2
+        """.trimIndent())
+
+        // when
+        val result = session.execute("outer()")
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 4)
+        }
+    }
+
+    @Test
+    fun `should hint declaring public internal setter of public property of earlier snippet`() = runTest {
+        // given
+        session.execute("""
+            var count = 0
+                internal set
+        """.trimIndent())
+
+        // when
+        val result = session.execute("count = 1")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.NoSuchMethodError: 'void setCount${'$'}main(int)'
+                  hint: the setter of 'count' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare the setter public, without the internal modifier.
+                  at <snippet body>(snippet2.kts:1)
+                  | count = 1
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring public internal function of earlier snippet called with default arguments`() = runTest {
+        // given
+        session.execute("internal fun secret(n: Int = 1) = n")
+
+        // when
+        val result = session.execute("secret() + 1")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.NoSuchMethodError: 'int secret${'$'}default(Snippet1, int, int, java.lang.Object)'
+                  hint: 'secret' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier.
+                  at <snippet body>(snippet2.kts:1)
+                  | secret() + 1
             """.trimIndent()
         }
     }

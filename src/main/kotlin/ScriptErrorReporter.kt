@@ -48,7 +48,7 @@ private val mangledMethod = Regex("[\\p{L}_][\\p{L}\\p{N}_]*-[\\p{L}\\p{N}_]{7}\
  * The method missing by the message of a [NoSuchMethodError], with its class, and its parameter types,
  * like `'int Snippet1$Box.open$main(int, java.lang.String)'`.
  */
-private val missingMethod = Regex("'\\S+ (\\S+)\\.([^.\\s(]+)\\(([^)]*)\\)'")
+private val missingMethod = Regex("'[^\\s'(]+ ([^\\s(]+)\\.([^.\\s(]+)\\(([^()]*)\\)'")
 
 /** The method evaluating the body of a snippet. */
 private const val SNIPPET_BODY_METHOD = "\$\$eval"
@@ -242,17 +242,16 @@ internal class ScriptErrorReporter(
             append(" cannot be called from another snippet, as the K2 REPL compiler mangles its name only when calling it")
             append(" - declare it in the same snippet, or wrap the value in a regular class.\n")
         }
+        // the exception class of a snippet might override it to contain nulls
+        val stackTrace = throwable.read(emptyList()) { stackTrace.filterNotNull() }
         if (throwable is NoSuchMethodError) {
             throwable.read(null) { message }?.let { missingMethod.matchEntire(it) }?.let { match ->
                 val (owner, method, parameters) = match.destructured
                 snippetDeclarations.internalMember(owner, method, parameters.split(", ").filter { it.isNotEmpty() })
             }?.let { member ->
-                append("$indent  hint: '${member.name}' is declared internal in ${member.snippet}, which a later snippet cannot call,")
-                append(" as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier.\n")
+                appendInternalMemberHint(member, stackTrace, indent)
             }
         }
-        // the exception class of a snippet might override it to contain nulls
-        val stackTrace = throwable.read(emptyList()) { stackTrace.filterNotNull() }
         if (throwable is NullPointerException) {
             uninitializedProperties.readBy(throwable, stackTrace)?.let { property ->
                 appendUninitializedReadHint(property, stackTrace, indent)
@@ -269,6 +268,33 @@ internal class ScriptErrorReporter(
     }
 
     /**
+     * The hint at the [member] of an earlier snippet, declared `internal`, which the exception thrown at the [stackTrace] failed to call,
+     * naming the declaration calling it, the first snippet frame of a declaration, and the declarations calling that one,
+     * which keep calling the `internal` one, even after declaring it again `public`, until declared again themselves.
+     */
+    private fun StringBuilder.appendInternalMemberHint(
+        member: InternalMember,
+        stackTrace: List<StackTraceElement>,
+        indent: String
+    ) {
+        val callers = stackTrace.declarations()
+        val (subject, declared) = if (member.internalSetter) "the setter of '${member.name}'" to "the setter" else "'${member.name}'" to "it"
+        append("$indent  hint: $subject is declared internal in ${member.snippet}, which a later snippet cannot call,")
+        append(" as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare $declared public, without the internal modifier")
+        callers.firstOrNull()?.let { append(", and declare again the declarations calling it, like $it") }
+        callers.drop(1).takeIf { it.isNotEmpty() }?.let { append(", and the ones calling them, like ${it.enumerated()}") }
+        if (callers.isNotEmpty()) append(", as they keep calling the internal one")
+        append(".\n")
+    }
+
+    /** The declarations of the snippet frames of this stack trace, like `'greet' of snippet2.kts`, see [declarationName]. */
+    private fun List<StackTraceElement>.declarations(): List<String> = filter {
+        it.fileName in snippets
+    }.mapNotNull { frame ->
+        frame.declarationName()?.let { "'$it' of ${frame.fileName}" }
+    }.distinct()
+
+    /**
      * The hint at the [property] of an earlier snippet, read as `null` by the exception thrown at the [stackTrace],
      * naming the declaration reading it, the first snippet frame of a declaration, like `greet`, so not a lambda, or the body of a snippet,
      * and the declarations calling it, which keep calling the one reading the uninitialized property, even after redeclaring both,
@@ -279,11 +305,7 @@ internal class ScriptErrorReporter(
         stackTrace: List<StackTraceElement>,
         indent: String
     ) {
-        val readers = stackTrace.filter {
-            it.fileName in snippets && !property.isGetter(it)
-        }.mapNotNull { frame ->
-            frame.declarationName()?.let { "'$it' of ${frame.fileName}" }
-        }.distinct()
+        val readers = stackTrace.filter { !property.isGetter(it) }.declarations()
         append("$indent  hint: '${property.name}' is declared in ${property.snippet}, which failed in the evaluation,")
         append(" so it might be left uninitialized, null despite its type - ")
         if (property.mutable) {

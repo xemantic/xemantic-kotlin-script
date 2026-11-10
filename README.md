@@ -227,12 +227,12 @@ The K2 REPL compiler is still experimental, and these of its bugs are reported t
   fails with `NoSuchMethodError` when called from another snippet,
   as the compiler calls it by its mangled name, like `getTimeout-UwyO8pc`, while it declares it without mangling.
   The provided properties of value class types are not affected, as their getters are declared with the mangled names.
-* An `internal` property, or function, declared in an earlier snippet,
+* An `internal` property, or function, or an `internal set` of a property, declared in an earlier snippet,
   also a member of a class declared there,
   fails with `NoSuchMethodError` when called from another snippet,
   as the compiler declares it under a name mangled with the module of its snippet, like `getSecret$snippet1_kts`,
   while it calls it by another name, like `getSecret$main`, or `secret` of a function.
-  It works once declared `public`.
+  It works once declared `public`, together with the declarations calling it declared again, as they keep calling the `internal` one.
 * An `inline` function, or property, declared in an earlier snippet cannot be called from another snippet,
   and the one referring to the `ScriptScope`, like `coroutineContext`, cannot be compiled at all,
   reported as an internal failure of the compiler.
