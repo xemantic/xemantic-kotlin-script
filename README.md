@@ -99,9 +99,13 @@ ScriptSession {
   so the compiler takes a deeply nested expression, of thousands of nesting levels,
   and a snippet can recurse deeper.
   The caller of `execute` resumes where its dispatcher resumes it, like the main thread for `Dispatchers.Main.immediate`,
-  or on `Dispatchers.Default` if it would resume in place, on the thread of the session:
+  or from `Dispatchers.Default` if it would resume in place, on the thread of the session:
   if it has no dispatcher, like `suspend fun main`, or one which does not dispatch, like `Dispatchers.Unconfined`,
-  or a continuation interceptor which is not a dispatcher.
+  it runs on `Dispatchers.Default` then,
+  and if it has a continuation interceptor which is not a dispatcher, the interceptor takes it over there,
+  like one posting it to its own thread.
+  Such a caller needs a free worker of `Dispatchers.Default` to resume,
+  so a snippet blocking all of them keeps it waiting.
   Only a dispatcher running its tasks on the dispatching thread, like `Executor(Runnable::run).asCoroutineDispatcher()`,
   resumes its caller on the thread of the session.
   Separate sessions run in parallel, each with its own state,
