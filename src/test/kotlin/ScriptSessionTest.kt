@@ -46,6 +46,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
 import java.lang.ref.WeakReference
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
@@ -2347,6 +2348,123 @@ class ScriptSessionTest {
 
         // then
         assert(waitingThread !== unlockingThread)
+    }
+
+    /**
+     * A caller of a dispatcher which does not dispatch on its own thread only, like `Dispatchers.Main.immediate`,
+     * waiting for the snippet of another caller, is resumed on its own thread by its dispatcher,
+     * so it is rejected by the session closed meanwhile there, without a hop through [Dispatchers.Default],
+     * which the snippets might all block, see #201.
+     */
+    @Test
+    fun `should reject waiting caller of immediate dispatcher without Dispatchers Default`() {
+        // given
+        val hops = AtomicInteger()
+        val started = CountDownLatch(1)
+        val session = DefaultScriptSession(
+            listOf(ScriptProperty("started", typeOf<CountDownLatch>(), started)),
+            Dispatchers.Default,
+            resumeExecutor = countingHops(hops)
+        )
+        val unlockingExecutor = Executors.newSingleThreadExecutor()
+        val executor = Executors.newSingleThreadExecutor()
+        val dispatcherThread = CompletableFuture.supplyAsync({ Thread.currentThread() }, executor).get()
+        val immediate = object : CoroutineDispatcher() {
+            override fun isDispatchNeeded(context: CoroutineContext) = Thread.currentThread() !== dispatcherThread
+            override fun dispatch(context: CoroutineContext, block: Runnable) = executor.execute(block)
+        }
+        try {
+            CoroutineScope(unlockingExecutor.asCoroutineDispatcher()).launch {
+                session.execute("started.countDown(); Thread.sleep(Long.MAX_VALUE)")
+            }
+            started.await()
+            val waitingResult = CompletableFuture<Result<ScriptResult>>()
+            // started in place on the thread of the dispatcher, so suspended on the lock held by the unlocking caller when it returns
+            val suspended = CompletableFuture.supplyAsync({
+                suspend {
+                    session.execute("42")
+                }.startCoroutine(Continuation(immediate) {
+                    waitingResult.complete(it)
+                })
+                !waitingResult.isDone
+            }, executor).get()
+            assert(suspended)
+            // the unlocking caller resumes only after the session is closed, with its thread shut down
+            val gate = CountDownLatch(1)
+            unlockingExecutor.execute { gate.await() }
+
+            // when
+            session.close()
+            gate.countDown()
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build
+            assert(waitingResult.get(1, TimeUnit.MINUTES).exceptionOrNull() is IllegalStateException)
+            assert(hops.get() == 0)
+        } finally {
+            session.close()
+            unlockingExecutor.shutdownNow()
+            executor.shutdown()
+        }
+    }
+
+    /**
+     * A caller without a dispatcher waiting for the snippet of another caller, resumed in place by the unlocking of that caller,
+     * leaves the thread of that caller before submitting its own snippet to the thread of the session, see #201.
+     */
+    @Test
+    fun `should submit snippet of waiting caller without a dispatcher off the thread of the unlocking caller`() {
+        // given
+        val started = CountDownLatch(1)
+        val released = CountDownLatch(1)
+        val submittingThreads = CopyOnWriteArrayList<Thread>()
+        val session = DefaultScriptSession(
+            listOf(
+                ScriptProperty("started", typeOf<CountDownLatch>(), started),
+                ScriptProperty("released", typeOf<CountDownLatch>(), released)
+            ),
+            Dispatchers.Default
+        ) { threadFactory ->
+            InterceptedExecutor(Executors.newSingleThreadExecutor(threadFactory)) { _, execute ->
+                submittingThreads += Thread.currentThread()
+                execute()
+            }
+        }
+        val executor = Executors.newSingleThreadExecutor()
+        val unlockingThread = CompletableFuture.supplyAsync({ Thread.currentThread() }, executor).get()
+        try {
+            val unlocking = CoroutineScope(executor.asCoroutineDispatcher()).async {
+                session.execute("started.countDown(); released.await(); 41")
+            }
+            started.await()
+            val waitingResult = CompletableFuture<Result<ScriptResult>>()
+            suspend {
+                session.execute("42")
+            }.startCoroutine(Continuation(EmptyCoroutineContext) {
+                waitingResult.complete(it)
+            })
+            // started in place, so suspended on the lock held by the unlocking caller
+            assert(!waitingResult.isDone)
+
+            // when
+            released.countDown()
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build
+            waitingResult.get(1, TimeUnit.MINUTES).getOrThrow() should {
+                be<ScriptResult.Value>()
+                have(value == 42)
+            }
+            runBlocking { unlocking.await() } should {
+                be<ScriptResult.Value>()
+                have(value == 41)
+            }
+            // the snippet of the unlocking caller, then the one of the waiting caller
+            assert(submittingThreads.size == 2 && submittingThreads[1] !== unlockingThread)
+        } finally {
+            session.close()
+            executor.shutdown()
+        }
     }
 
     /**
