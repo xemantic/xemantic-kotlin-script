@@ -232,7 +232,8 @@ The K2 REPL compiler is still experimental, and these of its bugs are reported t
   fails with `NoSuchMethodError` when called from another snippet,
   as the compiler declares it under a name mangled with the module of its snippet, like `getSecret$snippet1_kts`,
   while it calls it by another name, like `getSecret$main`, or `secret` of a function.
-  It works once declared `public`, together with the declarations calling it declared again, as they keep calling the `internal` one.
+  It works once declared `public`, together with the declarations calling it declared again, as they keep calling the `internal` one,
+  and with the values of a class declaring it created again, as they keep being of the class declaring it `internal`.
 * An `inline` function, or property, declared in an earlier snippet cannot be called from another snippet,
   and the one referring to the `ScriptScope`, like `coroutineContext`, cannot be compiled at all,
   reported as an internal failure of the compiler.

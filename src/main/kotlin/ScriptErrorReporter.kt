@@ -269,21 +269,36 @@ internal class ScriptErrorReporter(
 
     /**
      * The hint at the [member] of an earlier snippet, declared `internal`, which the exception thrown at the [stackTrace] failed to call,
-     * naming the declaration calling it, the first snippet frame of a declaration, and the declarations calling that one,
-     * which keep calling the `internal` one, even after declaring it again `public`, until declared again themselves.
+     * to declare it `public`, unless declared again by a later snippet already,
+     * and to create again the values of the class declaring it, which keep being of that class, even after declaring it again,
+     * and to declare again the declarations calling it, which keep calling the `internal` one, even after declaring it again:
+     * the declaration of the top snippet frame, and the ones calling it, up to the first frame not of a declaration, like a lambda,
+     * as the declaration calling a lambda might not call the `internal` one itself, like `fun call(f: () -> Int) = f()`.
      */
     private fun StringBuilder.appendInternalMemberHint(
         member: InternalMember,
         stackTrace: List<StackTraceElement>,
         indent: String
     ) {
-        val callers = stackTrace.declarations()
+        val callers = stackTrace.filter { it.fileName in snippets }.asSequence().map { frame ->
+            frame.declarationName()?.let { "'$it' of ${frame.fileName}" }
+        }.takeWhile { it != null }.filterNotNull().distinct().toList()
         val (subject, declared) = if (member.internalSetter) "the setter of '${member.name}'" to "the setter" else "'${member.name}'" to "it"
+        val advice = buildList {
+            if (!member.declaredAgain) add("declare $declared public, without the internal modifier")
+            member.declaringClass?.let {
+                add("create again the values of '$it', as the ones created before keep being of the class declaring it internal")
+            }
+            callers.firstOrNull()?.let { caller ->
+                val callersOfCaller = callers.drop(1).takeIf { it.isNotEmpty() }?.let { ", and the ones calling them, like ${it.enumerated()}" } ?: ""
+                add("declare again the declarations calling it, like $caller$callersOfCaller, as they keep calling the internal one")
+            }
+            if (isEmpty()) add("declare again the code calling it, as it keeps calling the internal one")
+        }
         append("$indent  hint: $subject is declared internal in ${member.snippet}, which a later snippet cannot call,")
-        append(" as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare $declared public, without the internal modifier")
-        callers.firstOrNull()?.let { append(", and declare again the declarations calling it, like $it") }
-        callers.drop(1).takeIf { it.isNotEmpty() }?.let { append(", and the ones calling them, like ${it.enumerated()}") }
-        if (callers.isNotEmpty()) append(", as they keep calling the internal one")
+        append(" as the K2 REPL compiler calls it by a JVM name it is not compiled to - ")
+        if (member.declaredAgain) append("it is declared again by a later snippet, so ")
+        append(advice.joinToString(", and "))
         append(".\n")
     }
 

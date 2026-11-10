@@ -74,8 +74,8 @@ internal class SnippetDeclarations {
 
     private val extensionFunctions = HashMap<String, MutableSet<ExtensionReceiver>>()
 
-    /** The classes of the snippets, with the names of the snippets, by the names of the classes, like `Snippet1`. */
-    private val snippetClasses = HashMap<String, Pair<Class<*>, String>>()
+    /** The classes of the snippets, with the names of the snippets, by the names of the classes, like `Snippet1`, in the order of the snippets. */
+    private val snippetClasses = LinkedHashMap<String, Pair<Class<*>, String>>()
 
     /** Keeps the [scriptClass] of the snippet of this [name], to be read once a name is looked up. */
     fun keep(scriptClass: Class<*>, name: String) {
@@ -116,11 +116,33 @@ internal class SnippetDeclarations {
                     }
                 }
             }?.let { (member, internalSetter) ->
-                val classes = owner.removePrefix(scriptClass.name).split('$').filter { it.isNotEmpty() }
-                InternalMember((classes + member.name).joinToString("."), snippet, internalSetter)
+                val nested = owner.removePrefix(scriptClass.name)
+                val classes = nested.split('$').filter { it.isNotEmpty() }
+                InternalMember(
+                    name = (classes + member.name).joinToString("."),
+                    snippet = snippet,
+                    internalSetter = internalSetter,
+                    declaringClass = classes.joinToString(".").ifEmpty { null },
+                    declaredAgain = isDeclaredAgain(member, scriptClass, nested)
+                )
             }
         }
     }
+
+    /**
+     * Whether a snippet kept after the one of the [scriptClass] declares a [member] of the same name and kind, accessible by a later snippet,
+     * in the snippet class, or in its class of the same [nested] name, like `$Box`,
+     * so a later snippet calls that one, while the code compiled before keeps calling the `internal` one.
+     */
+    private fun isDeclaredAgain(member: KCallable<*>, scriptClass: Class<*>, nested: String): Boolean =
+        snippetClasses.values.dropWhile { it.first != scriptClass }.drop(1).any { (laterClass, laterSnippet) ->
+            logger.readOr(false, { "$laterSnippet: cannot read the members of $laterClass$nested" }) {
+                val ownerClass = if (nested.isEmpty()) laterClass else Class.forName(laterClass.name + nested, false, laterClass.classLoader)
+                ownerClass.kotlin.members.any {
+                    it.name == member.name && (it is KProperty<*>) == (member is KProperty<*>) && it.isAccessibleByLaterSnippet(laterSnippet)
+                }
+            }
+        }
 
     /** Whether a class of this simple [name] is declared by a snippet, and is not `private`. */
     fun isClass(name: String): Boolean = name in read().classes
@@ -236,11 +258,16 @@ internal class SnippetDeclarations {
 /**
  * An `internal` member of the [snippet], named like `secret`, or qualified by the classes declaring it within the snippet, like `Box.open`,
  * or a property of an [internalSetter] only, like `var count = 0; internal set`.
+ *
+ * @param declaringClass the classes declaring the member within the snippet, like `Box`, `null` for a member of the snippet itself.
+ * @param declaredAgain whether a later snippet declares a member of the same name accessible by a later snippet, see [SnippetDeclarations.internalMember].
  */
 internal data class InternalMember(
     val name: String,
     val snippet: String,
-    val internalSetter: Boolean = false
+    val internalSetter: Boolean = false,
+    val declaringClass: String? = null,
+    val declaredAgain: Boolean = false
 )
 
 /**
