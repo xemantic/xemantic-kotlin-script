@@ -50,6 +50,8 @@ public sealed interface ScriptResult {
      *   or [Unit] if the snippet does not end with an expression.
      * @property warnings the compiler warnings, pointing to the offending lines of the snippet,
      *   or `null` if there are none. They might reveal a bug, even if the snippet succeeded.
+     *   They also report a repository declaration with credentials refused, superseded by another declaration of it,
+     *   which a later dependency, served only to these credentials, would fail without.
      * @property resolvedVersions the versions resolved for the dependencies declared by the snippet without version,
      *   like `org.jsoup:jsoup` resolved to `1.24.1`, by their coordinates, as an LLM might not know their API.
      *   Unlike the [warnings], they are worth showing to the LLM always.

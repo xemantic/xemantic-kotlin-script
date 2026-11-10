@@ -57,13 +57,13 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 - Expected compilation error messages in the tests are compiler-version specific, re-check them after every Kotlin upgrade.
 - A ktor test server serving Maven Resolver must answer `HEAD` without the body (`AutoHeadResponse`, not a `route { handle { } }` of any method) —
   its pooled HTTP client reads the body as the next response on the keep-alive connection and stalls for tens of seconds,
-  so a test times out under load only.
+  so a test times out under load only — see `should answer HEAD request without body on keep-alive connection`.
 - A `VirtualMachineError`, like an `OutOfMemoryError`, escaping a test does not fail it, but aborts the whole Gradle test executor (`Could not complete execution for Gradle Test Executor`) —
   catch it with `runCatching` and assert on it, also where only a regression would let it escape.
 - When the build fails on an `org.apache.maven(.resolver)` artifact requested in another version than the catalog's, after a Kotlin upgrade,
   `./gradlew dependencies --configuration runtimeClasspath | grep -E 'maven-resolver-api|maven-core'` shows the versions Kotlin brings now — the failure message names only the requested one.
   Never pin a newer Maven Resolver instead: a pin lifts only its own artifacts, so the API of 2.x meets the implementation of 1.9 on the classpath, which works by luck until a `NoSuchMethodError`.
-  Once Kotlin brings Resolver 2.x, re-check `isUnauthorized`, which recognizes a `401` by an exception of the 1.x `transport-http` only.
+  Once Kotlin brings Resolver 2.x, re-check `isUnauthorized`.
 
 ### The K2 REPL compiler (`K2ReplCompiler`)
 

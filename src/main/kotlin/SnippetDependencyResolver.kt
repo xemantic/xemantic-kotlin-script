@@ -62,57 +62,6 @@ internal class SnippetDependencyResolver(
     val classLoader = DependencyClassLoader(parent)
 
     /**
-     * The resolver of the dependencies in their versions, from the [declarations],
-     * replaced by a new one, once a declaration is superseded, see [versionOf].
-     */
-    private var mavenResolver = MavenDependenciesResolver()
-
-    /**
-     * The resolver, keeping the [declarations] added to the [mavenResolver].
-     * It delegates to the current [mavenResolver], unlike a delegation `by`, bound to the first one.
-     */
-    private val resolver = object : ExternalDependenciesResolver {
-
-        override fun acceptsRepository(repositoryCoordinates: RepositoryCoordinates): Boolean =
-            mavenResolver.acceptsRepository(repositoryCoordinates)
-
-        override fun acceptsArtifact(artifactCoordinates: String): Boolean =
-            mavenResolver.acceptsArtifact(artifactCoordinates)
-
-        override suspend fun resolve(
-            artifactsWithLocations: List<ArtifactWithLocation>,
-            options: ExternalDependenciesResolver.Options
-        ): ResultWithDiagnostics<List<File>> = mavenResolver.resolve(artifactsWithLocations, options)
-
-        override suspend fun resolve(
-            artifactCoordinates: String,
-            options: ExternalDependenciesResolver.Options,
-            sourceCodeLocation: SourceCode.LocationWithId?
-        ): ResultWithDiagnostics<List<File>> = mavenResolver.resolve(artifactCoordinates, options, sourceCodeLocation)
-
-        override fun addRepository(
-            repositoryCoordinates: RepositoryCoordinates,
-            options: ExternalDependenciesResolver.Options,
-            sourceCodeLocation: SourceCode.LocationWithId?
-        ): ResultWithDiagnostics<Boolean> = mavenResolver.addRepository(
-            repositoryCoordinates, options, sourceCodeLocation
-        ).also { result ->
-            if (result.valueOrNull() == true) {
-                remoteRepository(repositoryCoordinates, options)?.let { repository ->
-                    // a repository declared again with the same options is kept once,
-                    // while declared again with other options, like corrected credentials, or without them,
-                    // it is kept with each, like the mavenResolver, which keeps every declaration, resolves from each,
-                    // until a declaration refused its credentials is superseded by another one served, see versionOf
-                    if (declarations.none { it.repository == repository }) {
-                        declarations += Declaration(repositoryCoordinates, options, sourceCodeLocation, repository)
-                    }
-                }
-            }
-        }
-
-    }
-
-    /**
      * A repository declared by a snippet with `@file:Repository`, by its [coordinates], [options] and [location],
      * as added to the [mavenResolver], and as the [repository] looked up by the [versionLookup].
      */
@@ -123,8 +72,72 @@ internal class SnippetDependencyResolver(
         val repository: RemoteRepository
     )
 
-    /** The distinct repositories declared by the snippets so far, in the order of their declaration, with their options, like the credentials. */
+    /**
+     * The distinct repositories declared by the snippets so far, in the order of their declaration, with their options, like the credentials,
+     * but the superseded ones, see [versionOf] — the only state of the repositories, which the [mavenResolver] is derived from.
+     *
+     * A repository declared again with the same options is kept once,
+     * while declared again with other options, like corrected credentials, or without them, it is kept with each,
+     * and resolved from each, until a declaration refused its credentials is superseded by another one served.
+     */
     private val declarations = mutableListOf<Declaration>()
+
+    /**
+     * The resolver of the dependencies in their versions, given the [declarations] so far,
+     * or `null`, once they change, to be created again, as it cannot drop a declaration itself, see [mavenResolver].
+     */
+    private var currentMavenResolver: MavenDependenciesResolver? = null
+
+    /** The resolver of the dependencies in their versions, given the [declarations], which were all valid once added, so it accepts each again. */
+    private fun mavenResolver(): MavenDependenciesResolver = currentMavenResolver ?: MavenDependenciesResolver().apply {
+        declarations.forEach { addRepository(it.coordinates, it.options, it.location) }
+    }.also {
+        currentMavenResolver = it
+    }
+
+    /** The resolver of the annotations of a snippet, adding a repository it declares to the [declarations]. */
+    private val resolver = object : ExternalDependenciesResolver {
+
+        override fun acceptsRepository(repositoryCoordinates: RepositoryCoordinates): Boolean =
+            mavenResolver().acceptsRepository(repositoryCoordinates)
+
+        override fun acceptsArtifact(artifactCoordinates: String): Boolean =
+            mavenResolver().acceptsArtifact(artifactCoordinates)
+
+        override suspend fun resolve(
+            artifactsWithLocations: List<ArtifactWithLocation>,
+            options: ExternalDependenciesResolver.Options
+        ): ResultWithDiagnostics<List<File>> = mavenResolver().resolve(artifactsWithLocations, options)
+
+        override suspend fun resolve(
+            artifactCoordinates: String,
+            options: ExternalDependenciesResolver.Options,
+            sourceCodeLocation: SourceCode.LocationWithId?
+        ): ResultWithDiagnostics<List<File>> = mavenResolver().resolve(artifactCoordinates, options, sourceCodeLocation)
+
+        /**
+         * Validates the repository by adding it to a new `MavenDependenciesResolver`, which reports an invalid one,
+         * like an unset environment variable of its credentials,
+         * and adds it to the [declarations], if it is accepted, which `remoteRepository` declares alike.
+         */
+        override fun addRepository(
+            repositoryCoordinates: RepositoryCoordinates,
+            options: ExternalDependenciesResolver.Options,
+            sourceCodeLocation: SourceCode.LocationWithId?
+        ): ResultWithDiagnostics<Boolean> = MavenDependenciesResolver().addRepository(
+            repositoryCoordinates, options, sourceCodeLocation
+        ).also { result ->
+            if (result.valueOrNull() == true) {
+                remoteRepository(repositoryCoordinates, options)?.let { repository ->
+                    if (declarations.none { it.repository == repository }) {
+                        declarations += Declaration(repositoryCoordinates, options, sourceCodeLocation, repository)
+                        currentMavenResolver = null
+                    }
+                }
+            }
+        }
+
+    }
 
     /** The latest versions of the dependencies declared without version, by their coordinates, kept for the session. */
     private val latestVersions = HashMap<String, LatestMavenVersion>()
@@ -137,18 +150,24 @@ internal class SnippetDependencyResolver(
         val files: List<File>,
         val reports: List<ScriptDiagnostic>,
         val warnings: List<ScriptDiagnostic>,
+        val supersessions: List<ScriptDiagnostic>,
         val errors: List<ScriptDiagnostic>,
         val resolvedVersions: Map<String, String>
     )
 
     /**
      * The dependencies of a snippet: the [warnings] reporting the [resolvedVersions]
-     * of the dependencies declared without version, and the [errors], if any.
+     * of the dependencies declared without version, and the [supersessions], and the [errors], if any.
+     *
+     * @property supersessions the warnings of the repository declarations superseded by the snippet, see [versionOf],
+     *   also among the [warnings], to be reported even if the snippet succeeds,
+     *   unlike the warnings of the resolved versions, which the [resolvedVersions] report then.
      */
     class SnippetDependencies(
         val warnings: List<ScriptDiagnostic> = emptyList(),
         val errors: List<ScriptDiagnostic> = emptyList(),
-        val resolvedVersions: Map<String, String> = emptyMap()
+        val resolvedVersions: Map<String, String> = emptyMap(),
+        val supersessions: List<ScriptDiagnostic> = emptyList()
     )
 
     /** Adds the dependencies declared by the snippet of the [context] to its compilation classpath. */
@@ -174,7 +193,7 @@ internal class SnippetDependencyResolver(
      * also without the default imports, so the diagnostics of the failed compilation follow from it.
      */
     fun takeDependencies(): SnippetDependencies = (last?.let {
-        SnippetDependencies(it.warnings, it.errors, it.resolvedVersions)
+        SnippetDependencies(it.supersessions + it.warnings, it.errors, it.resolvedVersions, it.supersessions)
     } ?: SnippetDependencies()).also {
         last = null
     }
@@ -187,6 +206,7 @@ internal class SnippetDependencyResolver(
         val files = mutableListOf<File>()
         val reports = mutableListOf<ScriptDiagnostic>()
         val warnings = mutableListOf<ScriptDiagnostic>()
+        val supersessions = mutableListOf<ScriptDiagnostic>()
         val errors = mutableListOf<ScriptDiagnostic>()
         val resolvedVersions = LinkedHashMap<String, String>()
         // each coordinate resolved on its own, to report which one failed
@@ -198,7 +218,7 @@ internal class SnippetDependencyResolver(
                 else -> listOf(ScriptSourceAnnotation(annotation, location))
             }
         }.forEach { declared ->
-            val annotation = declared.withLatestVersion(lines, warnings, errors, resolvedVersions) ?: return@forEach
+            val annotation = declared.withLatestVersion(lines, warnings, supersessions, errors, resolvedVersions) ?: return@forEach
             // called on the thread of the session, while compiling, which is never interrupted
             when (val result = runBlocking { resolver.resolveFromScriptSourceAnnotations(listOf(annotation)) }) {
                 is ResultWithDiagnostics.Success -> {
@@ -210,7 +230,7 @@ internal class SnippetDependencyResolver(
         }
         // also the dependencies of a snippet failing to compile, which the compiler keeps on its classpath
         classLoader.add(files)
-        return Resolution(snippet, files, reports, warnings, errors, resolvedVersions)
+        return Resolution(snippet, files, reports, warnings, supersessions, errors, resolvedVersions)
     }
 
     /**
@@ -218,10 +238,12 @@ internal class SnippetDependencyResolver(
      * declared in its latest version instead, reported as a warning, as an LLM might not know its API,
      * and added to the [resolvedVersions],
      * or `null`, with the error added to the [errors], if it has no version.
+     * A repository declaration superseded by the lookup of its version is reported as a warning added to the [supersessions].
      */
     private fun ScriptSourceAnnotation<*>.withLatestVersion(
         lines: List<String>,
         warnings: MutableList<ScriptDiagnostic>,
+        supersessions: MutableList<ScriptDiagnostic>,
         errors: MutableList<ScriptDiagnostic>,
         resolvedVersions: MutableMap<String, String>
     ): ScriptSourceAnnotation<*>? {
@@ -229,7 +251,16 @@ internal class SnippetDependencyResolver(
         val coordinates = dependsOn.artifactsCoordinates.single()
         if (coordinates.split(':').size != 2) return this
         val latest = try {
-            versionOf(coordinates)
+            versionOf(coordinates) { superseded ->
+                // the lookup of a version is kept for the session, and the resolution of a snippet for its refinements, so it is reported once
+                supersessions += diagnostic(
+                    message = "Superseded the declaration of the repository '${superseded.coordinates.string}' " +
+                        "with the credentials refused (401) by its other declaration, so they are no longer sent — " +
+                        "declare it again to restore it",
+                    lines = lines,
+                    severity = ScriptDiagnostic.Severity.WARNING
+                )
+            }
         } catch (e: Exception) {
             val cause = (e.message ?: e.javaClass.name).withRepositoryUrls()
             errors += diagnostic("Unresolved dependency '$coordinates': $cause", lines)
@@ -263,28 +294,30 @@ internal class SnippetDependencyResolver(
      * once the corrected ones return the metadata of a dependency, while the wrong ones are refused with `401`,
      * see [MavenVersionLookup.latestVersion]:
      * neither a later version lookup, nor the resolution of any dependency in its version sends them again,
-     * as the [mavenResolver], which keeps every declaration, is replaced by a new one, given the other declarations again.
+     * as it is dropped from the [declarations], which the [mavenResolver] is derived from,
+     * and the dropped declaration is passed to [superseded], to be reported, as a dependency resolved later, which it alone serves,
+     * like a private one served to the credentials scoped to it, fails then.
      * Declaring it again with the wrong ones restores it, like any new declaration.
+     *
+     * Only the lookup of a version supersedes a declaration,
+     * so a session declaring every dependency in its version keeps sending the wrong credentials, while resolving each of them.
      */
-    private fun versionOf(coordinates: String): LatestMavenVersion = latestVersions.getOrPut(coordinates) {
+    private fun versionOf(
+        coordinates: String,
+        superseded: (Declaration) -> Unit
+    ): LatestMavenVersion = latestVersions.getOrPut(coordinates) {
         val (groupId, artifactId) = coordinates.split(':')
         val searched = declarations.map { it.coordinates.string to it.repository }.ifEmpty { listOf(mavenCentral.url to mavenCentral) }
-        versionLookup.latestVersion(groupId, artifactId, searched.map { it.second }, ::supersede) ?: throw IllegalStateException(
+        versionLookup.latestVersion(groupId, artifactId, searched.map { it.second }) { stale ->
+            declarations.filter { it.repository == stale }.forEach { declaration ->
+                declarations -= declaration
+                currentMavenResolver = null
+                superseded(declaration)
+            }
+        } ?: throw IllegalStateException(
             "Could not find any version of it in ${searched.map { it.first }.distinct().joinToString(", ")}" +
                 if (versionLookup.offline) ", in the offline mode of the Maven settings" else ""
         )
-    }
-
-    /**
-     * Drops the declaration of this [stale] repository, and replaces the [mavenResolver] by a new one,
-     * given the other [declarations] again, as it cannot drop a declaration itself.
-     * They were all valid once added, so the new one accepts each again.
-     */
-    private fun supersede(stale: RemoteRepository) {
-        if (!declarations.removeAll { it.repository == stale }) return
-        mavenResolver = MavenDependenciesResolver().apply {
-            declarations.forEach { addRepository(it.coordinates, it.options, it.location) }
-        }
     }
 
     /**
