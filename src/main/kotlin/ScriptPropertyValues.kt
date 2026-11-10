@@ -30,10 +30,17 @@ public object ScriptPropertyValues {
 
     private val sessions = ConcurrentHashMap<Int, Map<String, Any?>>()
 
-    /** The value of the property of this [name] provided to the [session], cast unchecked to its type [T]. */
+    /** The value of the property of this [name] provided to the [session]. */
+    public fun get(session: Int, name: String): Any? =
+        checkNotNull(sessions[session]) { "The session is closed" }[name]
+
+    /**
+     * The value of the property of this [name] provided to the [session], cast unchecked to its type [T],
+     * so the caller casts it to the erased class of [T] only, like `FunctionN` of a function type of more than 22 parameters.
+     */
     @Suppress("UNCHECKED_CAST")
-    public fun <T> get(session: Int, name: String): T =
-        checkNotNull(sessions[session]) { "The session is closed" }[name] as T
+    public fun <T> getUnchecked(session: Int, name: String): T =
+        get(session, name) as T
 
     internal fun register(session: Int, values: Map<String, Any?>) {
         sessions[session] = values

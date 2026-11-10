@@ -928,14 +928,66 @@ class ScriptPropertiesTest {
         assert(property.type == type)
     }
 
+    /** A function reference type is told apart from a suspend one by the value of the property, see [ScriptProperty.type]. */
     @Test
-    fun `should render function reference types and function types of more than 22 parameters in source`() {
+    fun `should render function reference types told apart by the value in source`() {
+        // given
+        val types = listOf(
+            typeOf<KFunction1<String, Int>>() to false,
+            typeOf<KFunction2<String, List<Int>, Int>?>() to false,
+            typeOf<KFunction23<Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Unit>>() to false,
+            typeOf<KSuspendFunction1<String, Int>>() to true,
+            typeOf<KSuspendFunction1<String, Int>?>() to true
+        )
+
+        // when
+        val sources = types.map { (type, isSuspend) -> type.toSource(isSuspend) }
+
+        // then
+        assert(sources == listOf(
+            "kotlin.reflect.KFunction1<kotlin.String, kotlin.Int>",
+            "kotlin.reflect.KFunction2<kotlin.String, kotlin.collections.List<kotlin.Int>, kotlin.Int>?",
+            "kotlin.reflect.KFunction23<${List(22) { "kotlin.Int" }.joinToString()}, kotlin.Int, kotlin.Unit>",
+            "kotlin.reflect.KSuspendFunction1<kotlin.String, kotlin.Int>",
+            "kotlin.reflect.KSuspendFunction1<kotlin.String, kotlin.Int>?"
+        ))
+    }
+
+    /**
+     * A function reference type not told apart from a suspend one by the value, like a nested one, is rendered as `KFunction<R>`,
+     * which a reference of either is an instance of,
+     * also `KFunction0<Int>`, indistinguishable from `KFunction<Int>`.
+     */
+    @Test
+    fun `should render function reference types not told apart by the value as KFunction`() {
         // given
         val types = listOf(
             typeOf<KFunction1<String, Int>>(),
-            typeOf<KFunction2<String, List<Int>, Int>?>(),
+            typeOf<KSuspendFunction1<String, Int>?>(),
             typeOf<List<KFunction1<String, Int>>>(),
-            typeOf<KFunction23<Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Unit>>(),
+            typeOf<Map<String, KSuspendFunction1<String, out Number>?>>(),
+            typeOf<KFunction0<Int>>(),
+            typeOf<KFunction<Int>>()
+        )
+
+        // when
+        val sources = types.map { it.toSource() }
+
+        // then
+        assert(sources == listOf(
+            "kotlin.reflect.KFunction<kotlin.Int>",
+            "kotlin.reflect.KFunction<kotlin.Int>?",
+            "kotlin.collections.List<kotlin.reflect.KFunction<kotlin.Int>>",
+            "kotlin.collections.Map<kotlin.String, kotlin.reflect.KFunction<out kotlin.Number>?>",
+            "kotlin.reflect.KFunction<kotlin.Int>",
+            "kotlin.reflect.KFunction<kotlin.Int>"
+        ))
+    }
+
+    @Test
+    fun `should render function types of more than 22 parameters in source`() {
+        // given
+        val types = listOf(
             typeOf<(Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> String?>(),
             typeOf<((Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> Unit)?>(),
             typeOf<List<(Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, (Int) -> Int) -> Unit>>(),
@@ -948,50 +1000,11 @@ class ScriptPropertiesTest {
         // then
         val ints22 = List(22) { "kotlin.Int" }.joinToString()
         assert(sources == listOf(
-            "kotlin.reflect.KFunction1<kotlin.String, kotlin.Int>",
-            "kotlin.reflect.KFunction2<kotlin.String, kotlin.collections.List<kotlin.Int>, kotlin.Int>?",
-            "kotlin.collections.List<kotlin.reflect.KFunction1<kotlin.String, kotlin.Int>>",
-            "kotlin.reflect.KFunction23<$ints22, kotlin.Int, kotlin.Unit>",
             "($ints22, kotlin.Int) -> kotlin.String?",
             "(($ints22, kotlin.Int) -> kotlin.Unit)?",
             "kotlin.collections.List<($ints22, kotlin.Function1<kotlin.Int, kotlin.Int>) -> kotlin.Unit>",
             "(kotlin.String, $ints22) -> kotlin.Unit"
         ))
-    }
-
-    /**
-     * A function reference type without parameters, like `KFunction0<Int>`, is indistinguishable from `KFunction<Int>`,
-     * so it is rendered as the latter, which any function reference is an instance of.
-     */
-    @Test
-    fun `should render function reference type of single argument as KFunction`() {
-        // when
-        val sources = listOf(typeOf<KFunction0<Int>>(), typeOf<KFunction<Int>>()).map { it.toSource() }
-
-        // then
-        assert(sources == listOf("kotlin.reflect.KFunction<kotlin.Int>", "kotlin.reflect.KFunction<kotlin.Int>"))
-    }
-
-    @Test
-    fun `should render hand-written function reference type without arguments as KFunction`() {
-        // given
-        val type = handWrittenType(KFunction::class, emptyList(), "kotlin.reflect.KFunction")
-
-        // when
-        val source = type.toSource()
-
-        // then
-        assert(source == "kotlin.reflect.KFunction?")
-    }
-
-    /** A suspend function reference type, like `KSuspendFunction1<String, Int>`, is indistinguishable from `KFunction1<String, Int>` by its [KType]. */
-    @Test
-    fun `should render suspend function reference type in source`() {
-        // when
-        val source = typeOf<KSuspendFunction1<String, Int>>().toSource(isSuspend = true)
-
-        // then
-        assert(source == "kotlin.reflect.KSuspendFunction1<kotlin.String, kotlin.Int>")
     }
 
     @Test
@@ -1057,6 +1070,67 @@ class ScriptPropertiesTest {
                 have(value == 276)
             }
         }
+    }
+
+    /** kotlin-reflect cannot resolve a local function, so it cannot tell whether it is a suspend one. */
+    @Test
+    fun `should provide properties of local function reference`() = runTest {
+        // given
+        fun local(x: String): Int = x.length
+        ScriptSession(listOf(property<Any>("any", ::local), property("f", ::local))).use { session ->
+            // when
+            val result = session.execute("(any as kotlin.reflect.KFunction<*>).name + \" \" + f.name")
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == "local local")
+            }
+        }
+    }
+
+    /** A nested function reference type is declared as `KFunction<R>`, as the value cannot tell it from a suspend one. */
+    @Test
+    fun `should not let snippet call nested suspend function reference as non-suspend function`() = runTest {
+        ScriptSession(listOf(property("fs", listOf(::suspendTwice)))).use { session ->
+            // when
+            val result = session.execute("""fs[0]("ab")""")
+
+            // then
+            result should {
+                be<ScriptResult.Error>()
+                have(phase == ExecutionPhase.COMPILATION)
+            }
+        }
+    }
+
+    /**
+     * The snippets check the value by the cast to its type, like the arity of a function, `as (String) -> Int`,
+     * unless the cast cannot pass, as of a function type of more than 22 parameters, see [declaration].
+     */
+    @Test
+    fun `should declare property by cast to its type unless of function type of more than 22 parameters`() {
+        // given
+        val big: ((Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> Unit)? = null
+        val properties = listOf(
+            property("transform", { x: String -> x.length }),
+            property("f", ::twice),
+            property("items", mutableListOf("foo")),
+            property("big", big)
+        )
+
+        // when
+        val declarations = properties.map { it.declaration(1) }
+
+        // then
+        val values = "com.xemantic.kotlin.script.ScriptPropertyValues"
+        val bigType = "((${List(23) { "kotlin.Int" }.joinToString()}) -> kotlin.Unit)?"
+        assert(declarations == listOf(
+            "val transform: kotlin.Function1<kotlin.String, kotlin.Int> = $values.get(1, \"transform\") as kotlin.Function1<kotlin.String, kotlin.Int>",
+            "val f: kotlin.reflect.KFunction1<kotlin.String, kotlin.Int> = $values.get(1, \"f\") as kotlin.reflect.KFunction1<kotlin.String, kotlin.Int>",
+            "val items: kotlin.collections.MutableList<kotlin.String> = $values.get(1, \"items\") as kotlin.collections.MutableList<kotlin.String>",
+            "val big: $bigType = $values.getUnchecked<$bigType>(1, \"big\")"
+        ))
     }
 
     /** The accessibility is checked first, as the reflection of a synthetic class, like the one of a lambda, may fail. */

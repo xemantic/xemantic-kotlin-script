@@ -24,6 +24,7 @@ public final class com/xemantic/kotlin/script/ScriptProperty {
 public final class com/xemantic/kotlin/script/ScriptPropertyValues {
 	public static final field INSTANCE Lcom/xemantic/kotlin/script/ScriptPropertyValues;
 	public final fun get (ILjava/lang/String;)Ljava/lang/Object;
+	public final fun getUnchecked (ILjava/lang/String;)Ljava/lang/Object;
 }
 
 public abstract interface class com/xemantic/kotlin/script/ScriptResult {

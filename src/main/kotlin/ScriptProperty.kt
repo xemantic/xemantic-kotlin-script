@@ -62,8 +62,11 @@ import kotlin.reflect.typeOf
  *   Note that [typeOf] does not retain the receiver of a function type,
  *   so a property of type `Int.() -> Int` is seen by the snippets as `(Int) -> Int`.
  *   Nor does it tell a suspend function reference type, like `KSuspendFunction1<String, Int>`, from `KFunction1<String, Int>`,
- *   so the snippets see the former if the value is a suspend function, and the latter otherwise,
- *   while `KFunction0<Int>` is seen as `KFunction<Int>`, which [typeOf] produces alike.
+ *   so the snippets see the former if the value is a suspend function, and the latter otherwise.
+ *   Only the value of the property itself is told apart, if kotlin-reflect can resolve its function, unlike a local one,
+ *   while a function reference type the value cannot tell, like a nested one, as in `List<KFunction1<String, Int>>`,
+ *   is seen as `KFunction<Int>`, which a reference of either is an instance of,
+ *   also `KFunction0<Int>`, which [typeOf] produces like `KFunction<Int>`.
  * @param value the value of the property, of the [type].
  */
 public class ScriptProperty<T>(
@@ -142,12 +145,13 @@ public inline fun <reified T> property(
  * as the K2 REPL compiler calls such a property declared in another snippet by the mangled name of its getter,
  * while it compiles the getter without mangling it, like `getTimeout`.
  *
- * The value is cast by the generic [ScriptPropertyValues.get] to its erased class only, already validated by [ScriptProperty],
- * as a cast to a function type, like `as (Int, …, Int) -> Unit`, checks the arity of the function,
+ * The value of a function type of more than 22 parameters is cast by [ScriptPropertyValues.getUnchecked]
+ * to its erased class only, `FunctionN`, already validated by [ScriptProperty],
+ * as a cast to the function type, like `as (Int, …, Int) -> Unit`, checks the arity of the function,
  * which a lambda of more than 22 parameters compiled by Kotlin does not implement.
  */
 internal fun ScriptProperty<*>.declaration(session: Int): String {
-    val type = this.type.toSource(isSuspend = (value as? KFunction<*>)?.isSuspend == true)
+    val type = this.type.toSource(isSuspend = isSuspendFunctionReference())
     val kClass = this.type.classifier as KClass<*>
     val jvmName = if (kClass.isValue) {
         val suffix = md5base64(
@@ -163,7 +167,23 @@ internal fun ScriptProperty<*>.declaration(session: Int): String {
     } else {
         ""
     }
-    return "${jvmName}val ${name.quoted()}: $type = ${ScriptPropertyValues::class.qualifiedName}.get<$type>($session, \"$name\")"
+    val values = ScriptPropertyValues::class.qualifiedName
+    val value = if (this.type.isBigArityFunctionType()) {
+        "$values.getUnchecked<$type>($session, \"$name\")"
+    } else {
+        "$values.get($session, \"$name\") as $type"
+    }
+    return "${jvmName}val ${name.quoted()}: $type = $value"
+}
+
+/**
+ * Whether the value of this property of a function reference type, like `KFunction1<String, Int>`, is a suspend function,
+ * `false` if it is `null`, or `null` if it cannot be told, like of a local function, which kotlin-reflect cannot resolve.
+ */
+private fun ScriptProperty<*>.isSuspendFunctionReference(): Boolean? = when {
+    !type.isFunctionReferenceType() -> null
+    value == null -> false
+    else -> runCatching { (value as KFunction<*>).isSuspend }.getOrNull()
 }
 
 /** The JVM name of the getter of this property, like `getName`, or `isActive` of `isActive`. */
@@ -180,16 +200,20 @@ private fun ScriptProperty<*>.getterName(): String =
  * as it is either a `KFunction<R>` or a `KFunction0<R>`, which [typeOf] produces alike.
  *
  * @param isSuspend whether this function reference type is of a suspend function, like `KSuspendFunction1<String, Int>`,
- *   which [typeOf] produces like `KFunction1<String, Int>`, so it can be told by the value only.
+ *   which [typeOf] produces like `KFunction1<String, Int>`, so it can be told by the value only,
+ *   or `null` if it cannot be told, like of a nested type, rendered then as `KFunction<Int>`, which a reference of either is an instance of.
  */
-internal fun KType.toSource(isSuspend: Boolean = false): String {
+internal fun KType.toSource(isSuspend: Boolean? = null): String {
     val kClass = classifier as KClass<*>
     val mutable = mutableCollectionType()
     val source = when {
         mutable != null -> mutable.name.quotedQualified() + arguments.toSource()
-        kClass == KFunction::class && arguments.size > 1 ->
-            "kotlin.reflect.${if (isSuspend) "KSuspendFunction" else "KFunction"}${arguments.size - 1}" + arguments.toSource()
-        kClass == FunctionN::class && arguments.size > 1 && arguments.all { it.variance == KVariance.INVARIANT } -> {
+        isFunctionReferenceType() -> when (isSuspend) {
+            null -> "kotlin.reflect.KFunction" + listOf(arguments.last()).toSource()
+            true -> "kotlin.reflect.KSuspendFunction${arguments.size - 1}" + arguments.toSource()
+            false -> "kotlin.reflect.KFunction${arguments.size - 1}" + arguments.toSource()
+        }
+        isBigArityFunctionType() -> {
             val parameters = arguments.dropLast(1).joinToString(prefix = "(", postfix = ")") { it.type!!.toSource() }
             val functionType = "$parameters -> ${arguments.last().type!!.toSource()}"
             if (isMarkedNullable) "($functionType)" else functionType
@@ -218,6 +242,14 @@ private fun KClass<*>.toSource(arguments: List<KTypeProjection>): String {
 
 private fun List<KTypeProjection>.toSource(): String =
     if (isEmpty()) "" else joinToString(prefix = "<", postfix = ">") { it.toSource() }
+
+/** Whether this is a function reference type of [typeOf], like `KFunction1<String, Int>`, with the parameter types as arguments. */
+private fun KType.isFunctionReferenceType(): Boolean =
+    classifier == KFunction::class && arguments.size > 1
+
+/** Whether this is a function type of more than 22 parameters, which can be written as such, i.e. of invariant arguments. */
+private fun KType.isBigArityFunctionType(): Boolean =
+    classifier == FunctionN::class && arguments.size > 1 && arguments.all { it.variance == KVariance.INVARIANT }
 
 /** This qualified name with each of its segments quoted in backticks where needed. */
 private fun String.quotedQualified(): String =
