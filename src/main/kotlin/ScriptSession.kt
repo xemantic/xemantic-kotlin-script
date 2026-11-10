@@ -510,20 +510,23 @@ internal class DefaultScriptSession(
                 COROUTINE_SUSPENDED
             } catch (e: Throwable) {
                 val failure = if (e is RejectedExecutionException) IllegalStateException(SESSION_CLOSED_MESSAGE) else e
-                val resumedOff = e is RejectedExecutionException
-                        && waited
-                        && isResumedInPlaceByUnlocking(callerContext, callerThread)
-                        && resumeOff {
-                            try {
-                                mutex.unlock()
-                            } finally {
-                                resumeOrFail(continuation, uninterceptedContinuation, Result.failure(failure))
+                var resumedOff = false
+                try {
+                    resumedOff = e is RejectedExecutionException
+                            && waited
+                            && isResumedInPlaceByUnlocking(callerContext, callerThread)
+                            && resumeOff {
+                                try {
+                                    mutex.unlock()
+                                } finally {
+                                    resumeOrFail(continuation, uninterceptedContinuation, Result.failure(failure))
+                                }
                             }
-                        }
-                if (!resumedOff) {
-                    handedOff.set(false)
-                    throw failure
+                } finally {
+                    // handed off only once the resumeExecutor took it, whatever throws, so the caller releases the turn otherwise
+                    if (!resumedOff) handedOff.set(false)
                 }
+                if (!resumedOff) throw failure
                 COROUTINE_SUSPENDED
             }
         }
@@ -589,14 +592,19 @@ internal class DefaultScriptSession(
     /**
      * Runs the [resume] of a caller by the [resumeExecutor].
      *
-     * @return `false` if the [resumeExecutor] rejects it, like [Dispatchers.Default] after `Dispatchers.shutdown()`.
+     * @return `false` if the [resumeExecutor] does not take it, rejecting it, like [Dispatchers.Default] after `Dispatchers.shutdown()`,
+     * or failing otherwise, like by an [OutOfMemoryError] of creating a worker, which is logged then,
+     * so the caller is resumed in place instead, rather than never.
      */
     private fun resumeOff(
         resume: () -> Unit
     ): Boolean = try {
         resumeExecutor.execute(resume)
         true
-    } catch (_: RejectedExecutionException) {
+    } catch (e: Throwable) {
+        if (e !is RejectedExecutionException) {
+            logger.warn(e) { "$name: resuming the caller off the thread failed, it is resumed in place" }
+        }
         false
     }
 
@@ -606,6 +614,8 @@ internal class DefaultScriptSession(
      * the [uninterceptedContinuation] with that failure, in place, as resuming it by the interceptor again would fail again,
      * while left unresumed, the caller would never return.
      * A fatal error, see [isFatal], is passed to the caller as well, like the one thrown by the snippet.
+     * A dispatcher which runs the resumption inline, on the dispatching thread, and throws only after it,
+     * gets the caller resumed twice, which cannot be told apart from a dispatcher failing before running it.
      */
     private fun <T> resumeOrFail(
         continuation: Continuation<T>,

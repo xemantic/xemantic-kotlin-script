@@ -3116,6 +3116,72 @@ class ScriptSessionTest {
     }
 
     /**
+     * A waiting caller without a dispatcher, rejected by the session closed before taking its snippet,
+     * is resumed from the resume executor, which might fail otherwise than by rejecting it,
+     * like by an [OutOfMemoryError] of creating a worker, so it is rejected in place then,
+     * and would keep its turn forever otherwise, so every next caller would wait for it, see #224.
+     */
+    @Test
+    fun `should release turn of waiting caller rejected while the resume executor fails`() {
+        // given
+        val waitingResult = CompletableFuture<Result<ScriptResult>>()
+        val rejections = AtomicInteger(2)
+        lateinit var session: ScriptSession
+        session = DefaultScriptSession(
+            emptyList(),
+            Dispatchers.Default,
+            resumeExecutor = { throw IllegalStateException("resumeExecutor failed") },
+            executor = { threadFactory ->
+                val delegate = Executors.newSingleThreadExecutor(threadFactory)
+                // stands in for the session closed before taking the snippets of both callers
+                object : ExecutorService by delegate {
+                    override fun execute(command: Runnable) {
+                        when (rejections.getAndDecrement()) {
+                            2 -> {
+                                // the first caller holds the turn, so the second one waits for it, suspended
+                                suspend {
+                                    session.execute("2")
+                                }.startCoroutine(Continuation(EmptyCoroutineContext) {
+                                    waitingResult.complete(it)
+                                })
+                                throw RejectedExecutionException()
+                            }
+                            1 -> throw RejectedExecutionException()
+                            else -> delegate.execute(command)
+                        }
+                    }
+                }
+            }
+        )
+        try {
+            val unlockingResult = runCatching {
+                runBlocking {
+                    session.execute("1")
+                }
+            }
+            assert(unlockingResult.exceptionOrNull() is IllegalStateException)
+            // bounded, so a hang fails the test instead of hanging the build
+            assert(waitingResult.get(1, TimeUnit.MINUTES).exceptionOrNull() is IllegalStateException)
+
+            // when
+            val next = CompletableFuture.supplyAsync {
+                runBlocking {
+                    session.execute("3")
+                }
+            }
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build
+            next.get(1, TimeUnit.MINUTES) should {
+                be<ScriptResult.Value>()
+                have(value == 3)
+            }
+        } finally {
+            session.close()
+        }
+    }
+
+    /**
      * A dispatcher always failing to tell whether it dispatches would leave its caller unresumed, holding the lock of the session,
      * so the caller is resumed without it, with its failure, see #224.
      */
