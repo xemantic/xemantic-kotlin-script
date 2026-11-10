@@ -38,7 +38,8 @@ private val snippetQualifiedName = Regex("(?:(?<=\\[L)|(?<![\\p{L}\\p{N}_.$]))Sn
 
 private val snippetClassName = Regex("Snippet\\d+")
 
-private val unresolvedReference = Regex("Unresolved reference '(.+)'\\.")
+/** An unresolved reference, with the receiver of an extension, if the reference is qualified, like `"a".shout()`. */
+private val unresolvedReference = Regex("Unresolved reference '(.+?)'( on receiver of type '.+')?\\.")
 
 /** The mangled name of a method taking or returning a value class, like `getTimeout-UwyO8pc`. */
 private val mangledMethod = Regex("[\\p{L}_][\\p{L}\\p{N}_]*-[\\p{L}\\p{N}_]{7}\\(")
@@ -54,18 +55,14 @@ private const val MAX_NAMED_UNINITIALIZED = 5
  * pointing to the offending lines of the snippets.
  *
  * @param snippets the lines of the snippets by their names, like `snippet3.kts`.
- * @param snippetClassNames the simple names of the classes declared by the evaluated snippets.
- * @param snippetPropertyNames the names of the properties declared by the evaluated snippets, also of the provided ones.
- * @param snippetFunctionNames the names of the functions declared by the evaluated snippets.
+ * @param snippetDeclarations the declarations of the evaluated snippets, also of the provided properties.
  * @param uninitializedProperties the properties of the snippets which failed in the evaluation, `null` then.
  * @param inlinedFrames the frames of the code inlined into the snippets, of the lines beyond the end of a snippet.
  * @param propertyAccessors the properties of the accessors of the classes of the snippets, named in the hints by the property.
  */
 internal class ScriptErrorReporter(
     private val snippets: Map<String, List<String>>,
-    private val snippetClassNames: Set<String> = emptySet(),
-    private val snippetPropertyNames: Set<String> = emptySet(),
-    private val snippetFunctionNames: Set<String> = emptySet(),
+    private val snippetDeclarations: SnippetDeclarations = SnippetDeclarations(),
     private val uninitializedProperties: UninitializedProperties = UninitializedProperties(),
     private val inlinedFrames: InlinedFrames = InlinedFrames(snippets),
     private val propertyAccessors: PropertyAccessors = PropertyAccessors()
@@ -152,25 +149,29 @@ internal class ScriptErrorReporter(
                 append("  | $sourceLine\n")
             }
         }
-        unresolvedReference.matchEntire(diagnostic.message)?.groupValues?.get(1)?.let { name ->
-            appendUnresolvedEarlierDeclarationHint(name)
+        unresolvedReference.matchEntire(diagnostic.message)?.let { match ->
+            appendUnresolvedEarlierDeclarationHint(match.groupValues[1], onReceiver = match.groupValues[2].isNotEmpty())
         }
     }
 
     /**
      * The hint at the K2 REPL compiler not resolving a class, a property or a function of this [name], declared by an earlier snippet,
-     * within a declaration of an inferred type used in the same snippet, which resolves once its type is declared.
-     * A declaration of a snippet which failed to compile is not kept, so not hinted at, as it stays unresolved also then.
+     * within a declaration of an inferred type used in the same snippet, which resolves once its type is declared,
+     * also an extension, called [onReceiver] of the type of the message, or on an implicit receiver.
+     * A declaration of a snippet which failed to compile is not kept, so not hinted at, as it stays unresolved also then,
+     * nor an inaccessible one, see [SnippetDeclarations].
      */
-    private fun StringBuilder.appendUnresolvedEarlierDeclarationHint(name: String) {
-        if (name in snippetClassNames) {
+    private fun StringBuilder.appendUnresolvedEarlierDeclarationHint(name: String, onReceiver: Boolean) {
+        if (!onReceiver && snippetDeclarations.isClass(name)) {
             append("  hint: '$name' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type,")
             append(" like `fun f(x: Any) = x is $name` - declare the type, like `fun f(x: Any): Boolean = x is $name`.\n")
             return
         }
-        val reference = when (name) {
-            in snippetPropertyNames -> name
-            in snippetFunctionNames -> "$name()"
+        val reference = when {
+            !onReceiver && snippetDeclarations.isProperty(name) -> name
+            !onReceiver && snippetDeclarations.isFunction(name) -> "$name(...)"
+            snippetDeclarations.isExtensionProperty(name) -> "receiver.$name"
+            snippetDeclarations.isExtensionFunction(name) -> "receiver.$name(...)"
             else -> return
         }
         append("  hint: '$name' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet,")
