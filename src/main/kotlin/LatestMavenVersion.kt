@@ -221,11 +221,15 @@ internal class MavenVersionLookup(
      * as it would hide the reason of the failed lookup.
      * Only on a stronger evidence of wrong credentials, a repository is superseded, passed to [superseded],
      * not to be looked up again, so its credentials are not sent again, which might lock the account:
-     * it is declared with credentials, refused with `401`, and another declaration of it lists the versions of the artifact.
-     * A `401` of a declaration without credentials is no evidence, as it might be the refusal of a private artifact
+     * it is looked up with credentials, also those of a `<server>` of the Maven settings, given by its id,
+     * refused with `401`, and another declaration of it lists the versions of the artifact.
+     * A `401` of a repository looked up without credentials is no evidence, as it might be the refusal of a private artifact
      * to the anonymous access, which still reads the public ones.
-     * The trade-off: a declaration with credentials scoped to some artifacts, or refused by a transient `401`,
-     * is superseded as well — declaring it again restores it.
+     * The trade-offs: a declaration with credentials scoped to some artifacts, or refused by a transient `401`,
+     * is superseded as well — declaring it again restores it;
+     * and the `401` of a declaration is not reported, while another declaration does not find the artifact,
+     * so a repository answering `404` instead of refusing an artifact, like some registries do to hide it,
+     * hides the `401` of a mistyped token as well.
      * Any other failure, like `403`, which might be scoped to the artifact, or a transient `500`, is reported, and supersedes none.
      *
      * @throws Exception if there is no version, and some repository cannot be read, other than by the `401` not reported,
@@ -285,17 +289,18 @@ internal class MavenVersionLookup(
         // also the metadata not found in the local repository, which names none
         val notFound = exceptions.filterIsInstance<MetadataNotFoundException>().mapNotNull { it.repository }
         val read = looked.map { it.second }.filter { repository -> failed.none { it.second == repository } }
-        val served = read.filter { it !in notFound }
+        val served = read - notFound.toSet()
         fun RemoteRepository.declaredAgainAs(other: RemoteRepository) = other != this && other.id == id && other.url == url
         val refusedWhileRead = failed.filter { (failure, repository) ->
             failure.isUnauthorized() && read.any { repository.declaredAgainAs(it) }
         }
-        val refusedWhileServed = refusedWhileRead.map { it.second }.filter { repository ->
-            repository.authentication != null && read.any { it in served && repository.declaredAgainAs(it) }
-        }
         return LookupFailures(
             reported = failed.filterNot { it in refusedWhileRead }.map { it.first },
-            superseded = looked.filter { it.second in refusedWhileServed }.map { it.first }
+            superseded = looked.filter { (_, repository) ->
+                repository.authentication != null &&
+                    refusedWhileRead.any { it.second == repository } &&
+                    served.any { repository.declaredAgainAs(it) }
+            }.map { it.first }
         )
     }
 
@@ -343,7 +348,13 @@ internal class MavenVersionLookup(
 
 }
 
-/** Whether the repository refused the credentials, or their absence, with `401`, however deep it is wrapped. */
+/**
+ * Whether the repository refused the credentials, or their absence, with `401`, however deep it is wrapped,
+ * as reported by the `transport-http` of Maven Resolver 1.x —
+ * the one of Maven Resolver 2.x reports it by its `HttpTransporterException` instead,
+ * so once a Kotlin upgrade brings it, no `401` is recognized, and no repository is superseded,
+ * which the tests of the supersession catch.
+ */
 private fun Throwable.isUnauthorized(): Boolean =
     generateSequence(this) { it.cause }.any { it is HttpResponseException && it.statusCode == 401 }
 

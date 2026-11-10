@@ -383,7 +383,7 @@ class MavenDependenciesTest {
                 @file:DependsOn("com.xemantic.fixture:greeting-card")
                 42
             """.trimIndent())
-            val wronglyAuthenticatedRequests = server.wronglyAuthenticatedMetadataRequests
+            val wronglyAuthenticatedRequests = server.wronglyAuthenticatedRequests
 
             // when
             val result = session.execute("""
@@ -396,7 +396,72 @@ class MavenDependenciesTest {
                 be<ScriptResult.Value>()
                 have(value == "0.1-beta")
             }
-            assert(server.wronglyAuthenticatedMetadataRequests == wronglyAuthenticatedRequests)
+            assert(server.wronglyAuthenticatedRequests == wronglyAuthenticatedRequests)
+        }
+    }
+
+    @Test
+    fun `should not resolve dependency with wrong credentials of repository corrected since`() = runTest {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // given
+            session.execute("""
+                @file:Repository("${server.url}", options = ["username=alice", "password=wrong"])
+                @file:DependsOn("com.xemantic.fixture:greeter")
+                42
+            """.trimIndent())
+            session.execute("""
+                @file:Repository("${server.url}", options = ["username=alice", "password=secret"])
+                @file:DependsOn("com.xemantic.fixture:greeting-card")
+                42
+            """.trimIndent())
+            val wronglyAuthenticatedRequests = server.wronglyAuthenticatedRequests
+
+            // when
+            val result = session.execute("""
+                @file:DependsOn("com.xemantic.fixture:preview:0.1-beta")
+                fixture.preview.Preview.version()
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == "0.1-beta")
+            }
+            assert(server.wronglyAuthenticatedRequests == wronglyAuthenticatedRequests)
+        }
+    }
+
+    @Test
+    fun `should look up dependency declared without version with wrong credentials of repository corrected since once declared again`() = runTest {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // given
+            val wrong = """@file:Repository("${server.url}", options = ["username=alice", "password=wrong"])"""
+            session.execute("""
+                $wrong
+                @file:DependsOn("com.xemantic.fixture:greeter")
+                42
+            """.trimIndent())
+            session.execute("""
+                @file:Repository("${server.url}", options = ["username=alice", "password=secret"])
+                @file:DependsOn("com.xemantic.fixture:greeting-card")
+                42
+            """.trimIndent())
+            val wronglyAuthenticatedRequests = server.wronglyAuthenticatedRequests
+
+            // when
+            val result = session.execute("""
+                $wrong
+                @file:DependsOn("com.xemantic.fixture:preview")
+                fixture.preview.Preview.version()
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == "0.1-beta")
+            }
+            // the superseded declaration is restored, as the credentials might have been changed on the server since
+            assert(server.wronglyAuthenticatedRequests > wronglyAuthenticatedRequests)
         }
     }
 
