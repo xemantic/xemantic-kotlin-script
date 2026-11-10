@@ -1008,6 +1008,25 @@ class ScriptPropertiesTest {
         assert(exception.message == "Property 'f' of type $type has a value of class ${value::class.java.name}, which takes 24 parameters, while the type takes 23")
     }
 
+    /** A class implementing `FunctionN` by hand tells its arity by `getArity`. */
+    @Test
+    fun `should reject hand-written FunctionN value of a single parameter of function type of more than 22 parameters`() {
+        // given
+        val type = typeOf<(Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> Unit>()
+        val value = object : FunctionN<Unit> {
+            override val arity = 1
+            override fun invoke(vararg args: Any?) {}
+        }
+
+        // when
+        val exception = assertFailsWith<IllegalArgumentException> {
+            ScriptProperty("f", type, value)
+        }
+
+        // then
+        assert(exception.message == "Property 'f' of type $type has a value of class ${value::class.java.name}, which takes 1 parameter, while the type takes 23")
+    }
+
     /** The arity of a lambda of more than 22 parameters is told by its `invoke` method, of a function reference by `getArity`. */
     @Test
     fun `should accept value of function type of more than 22 parameters of the same arity`() {
@@ -1108,6 +1127,7 @@ class ScriptPropertiesTest {
             typeOf<(MutableList<KFunction1<String, Int>>) -> Unit>(),
             typeOf<MutableList<KFunction1<String, Int>>>(),
             typeOf<MutableList<MutableList<KFunction<Int>>>>(),
+            typeOf<MutableList<MutableList<KFunction1<String, Int>>>>(),
             typeOf<Map<KFunction1<String, Int>, Int>>(),
             typeOf<MutableList<in KFunction1<String, Int>>>(),
             typeOf<(KFunction1<String, Int>, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> Unit>(),
@@ -1122,10 +1142,11 @@ class ScriptPropertiesTest {
         val ints22 = List(22) { "kotlin.Int" }.joinToString()
         assert(sources == listOf(
             "kotlin.Function1<*, kotlin.Int>",
-            "kotlin.Function1<*, kotlin.Int>",
+            "kotlin.Function1<kotlin.reflect.KFunction<kotlin.Int>, kotlin.Int>",
             "kotlin.Function1<kotlin.Function1<kotlin.reflect.KFunction<kotlin.Int>, kotlin.Unit>, kotlin.Unit>",
             "kotlin.Function1<*, kotlin.Unit>",
             "kotlin.collections.MutableList<out kotlin.reflect.KFunction<kotlin.Int>>",
+            "kotlin.collections.MutableList<kotlin.collections.MutableList<kotlin.reflect.KFunction<kotlin.Int>>>",
             "kotlin.collections.MutableList<out kotlin.collections.MutableList<out kotlin.reflect.KFunction<kotlin.Int>>>",
             "kotlin.collections.Map<out kotlin.reflect.KFunction<kotlin.Int>, kotlin.Int>",
             "kotlin.collections.MutableList<*>",
@@ -1169,6 +1190,33 @@ class ScriptPropertiesTest {
             results[2] should {
                 be<ScriptResult.Value>()
                 have(value == "twice")
+            }
+        }
+    }
+
+    /**
+     * A `KFunction<R>` type is taken as such, also where the snippets pass a value of it to the host,
+     * though [typeOf] produces it alike for `KFunction0<R>`, see [ScriptProperty.type].
+     */
+    @Test
+    fun `should let snippet pass any function reference to host of KFunction type`() = runTest {
+        // given
+        val describe = { f: KFunction<*> -> f.name }
+        ScriptSession(listOf(property("describe", describe), property("fs", mutableListOf<KFunction<Int>>(::twice)))).use { session ->
+            // when
+            val results = listOf(
+                session.execute("fun z(): Int = 1; describe(::z)"),
+                session.execute("fs.add(::z)")
+            )
+
+            // then
+            results[0] should {
+                be<ScriptResult.Value>()
+                have(value == "z")
+            }
+            results[1] should {
+                be<ScriptResult.Value>()
+                have(value == true)
             }
         }
     }

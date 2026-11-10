@@ -66,14 +66,18 @@ import kotlin.reflect.typeOf
  *   so the snippets see the former if the value is a suspend function, and the latter otherwise.
  *   Only the value of the property itself is told apart, if kotlin-reflect can resolve its function, unlike a local one,
  *   while a function reference type the value cannot tell, like a nested one, as in `List<KFunction1<String, Int>>`,
- *   is seen as `KFunction<Int>`, which a reference of either is an instance of,
- *   also `KFunction0<Int>`, which [typeOf] produces like `KFunction<Int>`.
+ *   is seen as `KFunction<Int>`, which a reference of either is an instance of.
  *   Such a widened type is safe only in a covariant position, so elsewhere the snippets see the type projected,
- *   like `MutableList<out KFunction<Int>>` of `MutableList<KFunction1<String, Int>>`, or `Function1<*, Int>` of `(KFunction1<String, Int>) -> Int`,
+ *   like `MutableList<out KFunction<Int>>` of `MutableList<KFunction1<String, Int>>`, `Function1<*, Int>` of `(KFunction1<String, Int>) -> Int`,
+ *   or `KFunction1<*, Int>` of `KFunction1<KFunction1<String, Int>, Int>`,
  *   so they cannot pass a function of another kind to the host,
  *   while a function type of more than 22 parameters, which cannot be projected, is seen as `FunctionN<R>`.
+ *   A `KFunction<Int>` type is seen as such everywhere, so the snippets can pass a reference of any function to a host taking it,
+ *   though [typeOf] produces `KFunction0<Int>` alike, which the snippets see as `KFunction<Int>` too —
+ *   a host taking a function of no parameters should take it as `() -> Int` instead.
  *   The value of a function type of more than 22 parameters is checked to take as many parameters,
- *   unless they cannot be told, like of a class implementing `FunctionN` by hand without a typed `invoke` method.
+ *   unless they cannot be told: a Kotlin lambda of more than 22 parameters does not implement `getArity`,
+ *   so they are told by its `invoke` method of typed parameters instead, if it declares exactly one.
  * @param value the value of the property, of the [type].
  */
 public class ScriptProperty<T>(
@@ -135,7 +139,7 @@ public class ScriptProperty<T>(
                 val parameters = type.arguments.size - 1
                 (value as Function<*>).arity()?.let { arity ->
                     require(arity == parameters) {
-                        "Property '$name' of type $type has a value of class ${value::class.java.name}, which takes $arity parameters, while the type takes $parameters"
+                        "Property '$name' of type $type has a value of class ${value::class.java.name}, which takes $arity parameter${if (arity == 1) "" else "s"}, while the type takes $parameters"
                     }
                 }
             }
@@ -210,12 +214,14 @@ private fun ScriptProperty<*>.getterName(): String =
 /**
  * This type as written in the Kotlin source, with the fully qualified names, quoted in backticks where needed.
  *
- * The types of the [arityErasedClasses] are rendered with their arity, like `KFunction1<String, Int>`,
+ * The types which [typeOf] produces with the parameter types and the return type as arguments,
+ * while their class takes only the return type, are rendered with their arity,
+ * a function reference type, like `KFunction1<String, Int>` of `KFunction`,
  * or a function type, like `(Int, …, Int) -> Unit` of `FunctionN`,
- * while a `KFunction` type of a single argument, the return type, is rendered as such,
- * as it is either a `KFunction<R>` or a `KFunction0<R>`, which [typeOf] produces alike.
+ * while a `KFunction` type of a single argument, the return type, is rendered as `KFunction<R>`,
+ * though [typeOf] produces a `KFunction0<R>` alike, see [ScriptProperty.type].
  *
- * A function reference type which cannot be told apart, rendered as `KFunction<R>`, is a supertype of the actual one,
+ * A function reference type of parameters which cannot be told apart, rendered as `KFunction<R>`, is a supertype of the actual one,
  * so it is rendered as such only in a covariant position, see [Position],
  * while elsewhere the type argument containing it is projected, with `out` in an invariant position, or with a star otherwise,
  * and a function type of more than 22 parameters, whose parameters cannot be projected, is rendered as `FunctionN<R>`.
@@ -265,13 +271,16 @@ private fun KType.toSource(isSuspend: Boolean?, position: Position): String? {
             val arity = arguments.size - 1
             val variances = List(arity) { KVariance.IN } + KVariance.OUT
             when (isSuspend) {
-                null -> widenedFunctionReferenceSource(position)
+                // KFunction<R>, a supertype of a reference of any arity, also a suspend one
+                null -> if (position == Position.OUT) {
+                    "kotlin.reflect.KFunction" + listOf(arguments.last()).toSource(listOf(KVariance.OUT), position)
+                } else {
+                    null
+                }
                 true -> arguments.toSource(variances, position)?.let { "kotlin.reflect.KSuspendFunction$arity$it" }
                 false -> arguments.toSource(variances, position)?.let { "kotlin.reflect.KFunction$arity$it" }
             }
         }
-        // a KFunction<R> type of typeOf might be of a KFunction0<R>, or of a KSuspendFunction0<R>
-        kClass == KFunction::class -> widenedFunctionReferenceSource(position)
         isBigArityFunctionType() -> {
             val parameters = arguments.dropLast(1).map { it.type!!.toSource(null, position.nested(KVariance.IN)) }
             val returnType = arguments.last().type!!.toSource(null, position.nested(KVariance.OUT))
@@ -289,14 +298,6 @@ private fun KType.toSource(isSuspend: Boolean?, position: Position): String? {
     }
     return source?.plus(if (isMarkedNullable) "?" else "")
 }
-
-/** This function reference type as `KFunction<R>`, a supertype of a reference of any arity, also a suspend one, so only in a covariant [position]. */
-private fun KType.widenedFunctionReferenceSource(position: Position): String? =
-    if (position == Position.OUT) {
-        "kotlin.reflect.KFunction" + listOf(arguments.last()).toSource(listOf(KVariance.OUT), position)
-    } else {
-        null
-    }
 
 /**
  * This class with the type [arguments] as written in the source in this [position], like `Outer<String>.Inner<Int>`,
