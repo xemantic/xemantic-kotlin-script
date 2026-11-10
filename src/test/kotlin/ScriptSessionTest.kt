@@ -46,7 +46,6 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
 import java.lang.ref.WeakReference
 import java.util.concurrent.CompletableFuture
-import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
@@ -2409,61 +2408,64 @@ class ScriptSessionTest {
     }
 
     /**
-     * A caller without a dispatcher waiting for the snippet of another caller, resumed in place by the unlocking of that caller,
-     * leaves the thread of that caller before submitting its own snippet to the thread of the session, see #201.
+     * A caller on [Dispatchers.Unconfined] waiting for the snippet of another caller, resumed in place by the unlocking of that caller,
+     * runs its snippet without a free worker of [Dispatchers.Default], needed only to resume it after the snippet,
+     * as the snippet might be the one freeing the workers, blocked by the coroutines of the earlier snippets, see #201.
      */
     @Test
-    fun `should submit snippet of waiting caller without a dispatcher off the thread of the unlocking caller`() {
+    fun `should run snippet of waiting caller on Dispatchers Unconfined without Dispatchers Default`() {
         // given
         val started = CountDownLatch(1)
-        val released = CountDownLatch(1)
-        val submittingThreads = CopyOnWriteArrayList<Thread>()
+        val proceed = CountDownLatch(1)
+        val ran = CountDownLatch(1)
+        // stands in for Dispatchers.Default with all its workers blocked until freed
+        val freed = CountDownLatch(1)
+        val saturated = Executors.newSingleThreadExecutor()
+        saturated.execute { freed.await() }
         val session = DefaultScriptSession(
             listOf(
                 ScriptProperty("started", typeOf<CountDownLatch>(), started),
-                ScriptProperty("released", typeOf<CountDownLatch>(), released)
+                ScriptProperty("proceed", typeOf<CountDownLatch>(), proceed),
+                ScriptProperty("ran", typeOf<CountDownLatch>(), ran)
             ),
-            Dispatchers.Default
-        ) { threadFactory ->
-            InterceptedExecutor(Executors.newSingleThreadExecutor(threadFactory)) { _, execute ->
-                submittingThreads += Thread.currentThread()
-                execute()
-            }
-        }
+            Dispatchers.Default,
+            resumeExecutor = saturated
+        )
         val executor = Executors.newSingleThreadExecutor()
-        val unlockingThread = CompletableFuture.supplyAsync({ Thread.currentThread() }, executor).get()
         try {
             val unlocking = CoroutineScope(executor.asCoroutineDispatcher()).async {
-                session.execute("started.countDown(); released.await(); 41")
+                session.execute("started.countDown(); proceed.await(); 1")
             }
             started.await()
             val waitingResult = CompletableFuture<Result<ScriptResult>>()
             suspend {
-                session.execute("42")
-            }.startCoroutine(Continuation(EmptyCoroutineContext) {
+                session.execute("ran.countDown(); 2")
+            }.startCoroutine(Continuation(Dispatchers.Unconfined) {
                 waitingResult.complete(it)
             })
             // started in place, so suspended on the lock held by the unlocking caller
             assert(!waitingResult.isDone)
 
             // when
-            released.countDown()
+            proceed.countDown()
 
             // then
             // bounded, so a hang fails the test instead of hanging the build
+            assert(ran.await(1, TimeUnit.MINUTES))
+            freed.countDown()
             waitingResult.get(1, TimeUnit.MINUTES).getOrThrow() should {
                 be<ScriptResult.Value>()
-                have(value == 42)
+                have(value == 2)
             }
             runBlocking { unlocking.await() } should {
                 be<ScriptResult.Value>()
-                have(value == 41)
+                have(value == 1)
             }
-            // the snippet of the unlocking caller, then the one of the waiting caller
-            assert(submittingThreads.size == 2 && submittingThreads[1] !== unlockingThread)
         } finally {
+            freed.countDown()
             session.close()
             executor.shutdown()
+            saturated.shutdown()
         }
     }
 
