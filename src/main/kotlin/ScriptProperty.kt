@@ -61,6 +61,9 @@ import kotlin.reflect.typeOf
  *   It cannot be a type parameter, or a platform type, like the types of the Java members obtained by reflection.
  *   Note that [typeOf] does not retain the receiver of a function type,
  *   so a property of type `Int.() -> Int` is seen by the snippets as `(Int) -> Int`.
+ *   Nor does it tell a suspend function reference type, like `KSuspendFunction1<String, Int>`, from `KFunction1<String, Int>`,
+ *   so the snippets see the former if the value is a suspend function, and the latter otherwise,
+ *   while `KFunction0<Int>` is seen as `KFunction<Int>`, which [typeOf] produces alike.
  * @param value the value of the property, of the [type].
  */
 public class ScriptProperty<T>(
@@ -138,9 +141,13 @@ public inline fun <reified T> property(
  * The getter of a property of a value class type is named explicitly, like `getTimeout-UwyO8pc`,
  * as the K2 REPL compiler calls such a property declared in another snippet by the mangled name of its getter,
  * while it compiles the getter without mangling it, like `getTimeout`.
+ *
+ * The value is cast by the generic [ScriptPropertyValues.get] to its erased class only, already validated by [ScriptProperty],
+ * as a cast to a function type, like `as (Int, …, Int) -> Unit`, checks the arity of the function,
+ * which a lambda of more than 22 parameters compiled by Kotlin does not implement.
  */
 internal fun ScriptProperty<*>.declaration(session: Int): String {
-    val type = this.type.toSource()
+    val type = this.type.toSource(isSuspend = (value as? KFunction<*>)?.isSuspend == true)
     val kClass = this.type.classifier as KClass<*>
     val jvmName = if (kClass.isValue) {
         val suffix = md5base64(
@@ -156,7 +163,7 @@ internal fun ScriptProperty<*>.declaration(session: Int): String {
     } else {
         ""
     }
-    return "${jvmName}val ${name.quoted()}: $type = ${ScriptPropertyValues::class.qualifiedName}.get($session, \"$name\") as $type"
+    return "${jvmName}val ${name.quoted()}: $type = ${ScriptPropertyValues::class.qualifiedName}.get<$type>($session, \"$name\")"
 }
 
 /** The JVM name of the getter of this property, like `getName`, or `isActive` of `isActive`. */
@@ -164,13 +171,30 @@ private fun ScriptProperty<*>.getterName(): String =
     if (name.length > 2 && name.startsWith("is") && !name[2].isLowerCase()) name
     else "get" + name.replaceFirstChar { it.titlecase() }
 
-/** This type as written in the Kotlin source, with the fully qualified names, quoted in backticks where needed. */
-internal fun KType.toSource(): String {
+/**
+ * This type as written in the Kotlin source, with the fully qualified names, quoted in backticks where needed.
+ *
+ * The types of the [arityErasedClasses] are rendered with their arity, like `KFunction1<String, Int>`,
+ * or a function type, like `(Int, …, Int) -> Unit` of `FunctionN`,
+ * while a `KFunction` type of a single argument, the return type, is rendered as such,
+ * as it is either a `KFunction<R>` or a `KFunction0<R>`, which [typeOf] produces alike.
+ *
+ * @param isSuspend whether this function reference type is of a suspend function, like `KSuspendFunction1<String, Int>`,
+ *   which [typeOf] produces like `KFunction1<String, Int>`, so it can be told by the value only.
+ */
+internal fun KType.toSource(isSuspend: Boolean = false): String {
+    val kClass = classifier as KClass<*>
     val mutable = mutableCollectionType()
-    val source = if (mutable != null) {
-        mutable.name.quotedQualified() + arguments.toSource()
-    } else {
-        (classifier as KClass<*>).toSource(arguments)
+    val source = when {
+        mutable != null -> mutable.name.quotedQualified() + arguments.toSource()
+        kClass == KFunction::class && arguments.size > 1 ->
+            "kotlin.reflect.${if (isSuspend) "KSuspendFunction" else "KFunction"}${arguments.size - 1}" + arguments.toSource()
+        kClass == FunctionN::class && arguments.size > 1 && arguments.all { it.variance == KVariance.INVARIANT } -> {
+            val parameters = arguments.dropLast(1).joinToString(prefix = "(", postfix = ")") { it.type!!.toSource() }
+            val functionType = "$parameters -> ${arguments.last().type!!.toSource()}"
+            if (isMarkedNullable) "($functionType)" else functionType
+        }
+        else -> kClass.toSource(arguments)
     }
     return source + if (isMarkedNullable) "?" else ""
 }

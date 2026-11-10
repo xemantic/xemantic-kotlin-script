@@ -29,7 +29,10 @@ import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
 import java.net.URLClassLoader
 import kotlin.reflect.KClassifier
+import kotlin.reflect.KFunction
+import kotlin.reflect.KFunction0
 import kotlin.reflect.KFunction1
+import kotlin.reflect.KFunction2
 import kotlin.reflect.KFunction23
 import kotlin.reflect.KSuspendFunction1
 import kotlin.reflect.KType
@@ -925,6 +928,137 @@ class ScriptPropertiesTest {
         assert(property.type == type)
     }
 
+    @Test
+    fun `should render function reference types and function types of more than 22 parameters in source`() {
+        // given
+        val types = listOf(
+            typeOf<KFunction1<String, Int>>(),
+            typeOf<KFunction2<String, List<Int>, Int>?>(),
+            typeOf<List<KFunction1<String, Int>>>(),
+            typeOf<KFunction23<Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Unit>>(),
+            typeOf<(Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> String?>(),
+            typeOf<((Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> Unit)?>(),
+            typeOf<List<(Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, (Int) -> Int) -> Unit>>(),
+            typeOf<String.(Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> Unit>()
+        )
+
+        // when
+        val sources = types.map { it.toSource() }
+
+        // then
+        val ints22 = List(22) { "kotlin.Int" }.joinToString()
+        assert(sources == listOf(
+            "kotlin.reflect.KFunction1<kotlin.String, kotlin.Int>",
+            "kotlin.reflect.KFunction2<kotlin.String, kotlin.collections.List<kotlin.Int>, kotlin.Int>?",
+            "kotlin.collections.List<kotlin.reflect.KFunction1<kotlin.String, kotlin.Int>>",
+            "kotlin.reflect.KFunction23<$ints22, kotlin.Int, kotlin.Unit>",
+            "($ints22, kotlin.Int) -> kotlin.String?",
+            "(($ints22, kotlin.Int) -> kotlin.Unit)?",
+            "kotlin.collections.List<($ints22, kotlin.Function1<kotlin.Int, kotlin.Int>) -> kotlin.Unit>",
+            "(kotlin.String, $ints22) -> kotlin.Unit"
+        ))
+    }
+
+    /**
+     * A function reference type without parameters, like `KFunction0<Int>`, is indistinguishable from `KFunction<Int>`,
+     * so it is rendered as the latter, which any function reference is an instance of.
+     */
+    @Test
+    fun `should render function reference type of single argument as KFunction`() {
+        // when
+        val sources = listOf(typeOf<KFunction0<Int>>(), typeOf<KFunction<Int>>()).map { it.toSource() }
+
+        // then
+        assert(sources == listOf("kotlin.reflect.KFunction<kotlin.Int>", "kotlin.reflect.KFunction<kotlin.Int>"))
+    }
+
+    @Test
+    fun `should render hand-written function reference type without arguments as KFunction`() {
+        // given
+        val type = handWrittenType(KFunction::class, emptyList(), "kotlin.reflect.KFunction")
+
+        // when
+        val source = type.toSource()
+
+        // then
+        assert(source == "kotlin.reflect.KFunction?")
+    }
+
+    /** A suspend function reference type, like `KSuspendFunction1<String, Int>`, is indistinguishable from `KFunction1<String, Int>` by its [KType]. */
+    @Test
+    fun `should render suspend function reference type in source`() {
+        // when
+        val source = typeOf<KSuspendFunction1<String, Int>>().toSource(isSuspend = true)
+
+        // then
+        assert(source == "kotlin.reflect.KSuspendFunction1<kotlin.String, kotlin.Int>")
+    }
+
+    @Test
+    fun `should provide property of function reference`() = runTest {
+        ScriptSession(listOf(property("f", ::twice))).use { session ->
+            // when
+            val result = session.execute("""f.name + " " + f.call("foo") + " " + f("ab")""")
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == "twice 6 4")
+            }
+        }
+    }
+
+    @Test
+    fun `should provide property of suspend function reference`() = runTest {
+        ScriptSession(listOf(property("f", ::suspendTwice))).use { session ->
+            // when
+            val result = session.execute("""f.name + " " + f.isSuspend + " " + await { f("ab") }""")
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == "suspendTwice true 4")
+            }
+        }
+    }
+
+    @Test
+    fun `should provide property of nullable function reference of type of suspend function reference`() = runTest {
+        ScriptSession(listOf(property<KSuspendFunction1<String, Int>?>("f", null))).use { session ->
+            // when
+            val result = session.execute("f?.name")
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == null)
+            }
+        }
+    }
+
+    @Test
+    fun `should provide property of function type of more than 22 parameters`() = runTest {
+        // given
+        val sum: ((Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> Int)? =
+            { a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w ->
+                a + b + c + d + e + f + g + h + i + j + k + l + m + n + o + p + q + r + s + t + u + v + w
+            }
+        ScriptSession(listOf(property("sum", sum))).use { session ->
+            // when
+            // FunctionN<Int>, as declared before, takes vararg arguments of any type, but is not a function type
+            val result = session.execute("""
+                val typed: ((${List(23) { "Int" }.joinToString()}) -> Int)? = sum
+                typed?.invoke(${(1..23).joinToString()})
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == 276)
+            }
+        }
+    }
+
     /** The accessibility is checked first, as the reflection of a synthetic class, like the one of a lambda, may fail. */
     @Test
     fun `should reject property of hand-written type of lambda class before its type arguments`() {
@@ -997,8 +1131,10 @@ class ScriptPropertiesTest {
 
 }
 
-@Suppress("unused") // referenced as a value of function reference types
-private fun twice(x: String): Int = x.length * 2
+/** Public, so it can be called by reflection, like `f.call("foo")` of a property of its reference. */
+fun twice(x: String): Int = x.length * 2
+
+suspend fun suspendTwice(x: String): Int = x.length * 2
 
 /** A nullable [KType] implemented by hand, seen by the members of the interface only. */
 private fun handWrittenType(
