@@ -44,6 +44,12 @@ private val unresolvedReference = Regex("Unresolved reference '(.+?)'(?: on rece
 /** The mangled name of a method taking or returning a value class, like `getTimeout-UwyO8pc`. */
 private val mangledMethod = Regex("[\\p{L}_][\\p{L}\\p{N}_]*-[\\p{L}\\p{N}_]{7}\\(")
 
+/**
+ * The method missing by the message of a [NoSuchMethodError], with its class, and its parameter types,
+ * like `'int Snippet1$Box.open$main(int, java.lang.String)'`.
+ */
+private val missingMethod = Regex("'\\S+ (\\S+)\\.([^.\\s(]+)\\(([^)]*)\\)'")
+
 /** The method evaluating the body of a snippet. */
 private const val SNIPPET_BODY_METHOD = "\$\$eval"
 
@@ -235,6 +241,15 @@ internal class ScriptErrorReporter(
             append("$indent  hint: a property or a function of a value class type, like Duration, declared in an earlier snippet,")
             append(" cannot be called from another snippet, as the K2 REPL compiler mangles its name only when calling it")
             append(" - declare it in the same snippet, or wrap the value in a regular class.\n")
+        }
+        if (throwable is NoSuchMethodError) {
+            throwable.read(null) { message }?.let { missingMethod.matchEntire(it) }?.let { match ->
+                val (owner, method, parameters) = match.destructured
+                snippetDeclarations.internalMember(owner, method, parameters.split(", ").filter { it.isNotEmpty() })
+            }?.let { member ->
+                append("$indent  hint: '${member.name}' is declared internal in ${member.snippet}, which a later snippet cannot call,")
+                append(" as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier.\n")
+            }
         }
         // the exception class of a snippet might override it to contain nulls
         val stackTrace = throwable.read(emptyList()) { stackTrace.filterNotNull() }
