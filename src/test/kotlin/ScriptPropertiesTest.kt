@@ -28,6 +28,7 @@ import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
 import java.net.URLClassLoader
+import kotlin.jvm.functions.FunctionN
 import kotlin.reflect.KClassifier
 import kotlin.reflect.KFunction
 import kotlin.reflect.KFunction0
@@ -908,11 +909,138 @@ class ScriptPropertiesTest {
             typeOf<KFunction23<Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Unit>>()
         )
 
+        val values = listOf(::twice, ::suspendTwice, ::ignore23)
+
         // when
-        val properties = types.map { ScriptProperty("f", it, ::twice) }
+        val properties = types.zip(values) { type, value -> ScriptProperty("f", type, value) }
 
         // then
         assert(properties.map { it.type } == types)
+    }
+
+    /**
+     * `KFunction` takes at least the return type, and `FunctionN` either only the return type, as `FunctionN<R>`,
+     * or the invariant parameter types and the return type of a function type of more than 22 parameters.
+     */
+    @Test
+    fun `should reject property of hand-written type of function reference or function type class with wrong arguments`() {
+        // given
+        val int = KTypeProjection.invariant(typeOf<Int>())
+        val kFunction = handWrittenType(KFunction::class, emptyList(), "kotlin.reflect.KFunction")
+        val types = listOf(
+            kFunction,
+            handWrittenType(List::class, listOf(KTypeProjection.covariant(kFunction)), "kotlin.collections.List<out kotlin.reflect.KFunction>"),
+            handWrittenType(FunctionN::class, emptyList(), "kotlin.jvm.functions.FunctionN"),
+            handWrittenType(FunctionN::class, List(3) { int }, "kotlin.jvm.functions.FunctionN<kotlin.Int, kotlin.Int, kotlin.Int>"),
+            handWrittenType(FunctionN::class, List(23) { KTypeProjection.contravariant(typeOf<Int>()) } + int, "FunctionN<in kotlin.Int, …, kotlin.Int>")
+        )
+
+        // when
+        val exceptions = types.map { type ->
+            assertFailsWith<IllegalArgumentException> {
+                ScriptProperty("foo", type, null)
+            }
+        }
+
+        // then
+        val kFunctionTakes = "while kotlin.reflect.KFunction takes 1 or more - provide it as a complete type, e.g. with typeOf"
+        val functionNTakes = "while kotlin.jvm.functions.FunctionN takes 1, or 24 or more invariant ones of a function type - provide it as a complete type, e.g. with typeOf"
+        assert(exceptions.map { it.message } == listOf(
+            "Property 'foo' is of type kotlin.reflect.KFunction, which has 0 type arguments, $kFunctionTakes",
+            "Property 'foo' is of type kotlin.reflect.KFunction, which has 0 type arguments, $kFunctionTakes",
+            "Property 'foo' is of type kotlin.jvm.functions.FunctionN, which has 0 type arguments, $functionNTakes",
+            "Property 'foo' is of type kotlin.jvm.functions.FunctionN<kotlin.Int, kotlin.Int, kotlin.Int>, which has 3 type arguments, $functionNTakes",
+            "Property 'foo' is of type FunctionN<in kotlin.Int, …, kotlin.Int>, which has 24 type arguments, $functionNTakes"
+        ))
+    }
+
+    @Test
+    fun `should provide property of FunctionN type of the return type only`() = runTest {
+        // given
+        val type = typeOf<FunctionN<Int>?>()
+        ScriptSession(listOf(ScriptProperty("f", type, null))).use { session ->
+            // when
+            val result = session.execute("f?.arity")
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == null)
+            }
+        }
+    }
+
+    /** A file facade, like `CollectionsKt`, is public in the bytecode, but not a class the source could refer to. */
+    @Test
+    fun `should reject property of hand-written type of file facade`() {
+        // given
+        val facades = listOf(
+            Class.forName("kotlin.collections.CollectionsKt"),
+            Class.forName("com.xemantic.kotlin.script.ScriptPropertiesTestKt")
+        )
+
+        // when
+        val exceptions = facades.map { facade ->
+            assertFailsWith<IllegalArgumentException> {
+                ScriptProperty("foo", handWrittenType(facade.kotlin, emptyList(), facade.name), null)
+            }
+        }
+
+        // then
+        assert(exceptions.map { it.message } == facades.map {
+            "Property 'foo' is of type ${it.name}, which is not accessible to the snippets - provide it as a public type"
+        })
+    }
+
+    @Test
+    fun `should reject value of function type of more than 22 parameters of another arity`() {
+        // given
+        val type = typeOf<(Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> Unit>()
+        val value: (Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> Unit =
+            { _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ -> }
+
+        // when
+        val exception = assertFailsWith<IllegalArgumentException> {
+            ScriptProperty("f", type, value)
+        }
+
+        // then
+        assert(exception.message == "Property 'f' of type $type has a value of class ${value::class.java.name}, which takes 24 parameters, while the type takes 23")
+    }
+
+    /** A class implementing `FunctionN` by hand tells its arity by `getArity`. */
+    @Test
+    fun `should reject hand-written FunctionN value of a single parameter of function type of more than 22 parameters`() {
+        // given
+        val type = typeOf<(Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> Unit>()
+        val value = object : FunctionN<Unit> {
+            override val arity = 1
+            override fun invoke(vararg args: Any?) {}
+        }
+
+        // when
+        val exception = assertFailsWith<IllegalArgumentException> {
+            ScriptProperty("f", type, value)
+        }
+
+        // then
+        assert(exception.message == "Property 'f' of type $type has a value of class ${value::class.java.name}, which takes 1 parameter, while the type takes 23")
+    }
+
+    /** The arity of a lambda of more than 22 parameters is told by its `invoke` method, of a function reference by `getArity`. */
+    @Test
+    fun `should accept value of function type of more than 22 parameters of the same arity`() {
+        // given
+        val lambda: (Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> Unit =
+            { _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ -> }
+        val reference: (Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> Unit =
+            ::ignore23
+
+        // when
+        val properties = listOf(property("lambda", lambda), property("reference", reference))
+
+        // then
+        assert(properties.map { it.value } == listOf(lambda, reference))
     }
 
     /** The classifier of a function type of more than 22 parameters is `FunctionN`, which takes only the return type. */
@@ -982,6 +1110,115 @@ class ScriptPropertiesTest {
             "kotlin.reflect.KFunction<kotlin.Int>",
             "kotlin.reflect.KFunction<kotlin.Int>"
         ))
+    }
+
+    /**
+     * A function reference type not told apart from a suspend one is widened to `KFunction<R>` only in a covariant position,
+     * while elsewhere the type is projected, with `out` in an invariant position, or with a star in a contravariant one,
+     * so the snippets cannot pass a function of another kind to the host.
+     */
+    @Test
+    fun `should render function reference types not told apart by the value only where widening is safe`() {
+        // given
+        val types = listOf(
+            typeOf<(KFunction1<String, Int>) -> Int>(),
+            typeOf<(KFunction<Int>) -> Int>(),
+            typeOf<((KFunction1<String, Int>) -> Unit) -> Unit>(),
+            typeOf<(MutableList<KFunction1<String, Int>>) -> Unit>(),
+            typeOf<MutableList<KFunction1<String, Int>>>(),
+            typeOf<MutableList<MutableList<KFunction<Int>>>>(),
+            typeOf<MutableList<MutableList<KFunction1<String, Int>>>>(),
+            typeOf<Map<KFunction1<String, Int>, Int>>(),
+            typeOf<MutableList<in KFunction1<String, Int>>>(),
+            typeOf<(KFunction1<String, Int>, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> Unit>(),
+            typeOf<List<(KFunction1<String, Int>, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> Unit>>(),
+            typeOf<(Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> KFunction1<String, Int>>()
+        )
+
+        // when
+        val sources = types.map { it.toSource() }
+
+        // then
+        val ints22 = List(22) { "kotlin.Int" }.joinToString()
+        assert(sources == listOf(
+            "kotlin.Function1<*, kotlin.Int>",
+            "kotlin.Function1<kotlin.reflect.KFunction<kotlin.Int>, kotlin.Int>",
+            "kotlin.Function1<kotlin.Function1<kotlin.reflect.KFunction<kotlin.Int>, kotlin.Unit>, kotlin.Unit>",
+            "kotlin.Function1<*, kotlin.Unit>",
+            "kotlin.collections.MutableList<out kotlin.reflect.KFunction<kotlin.Int>>",
+            "kotlin.collections.MutableList<kotlin.collections.MutableList<kotlin.reflect.KFunction<kotlin.Int>>>",
+            "kotlin.collections.MutableList<out kotlin.collections.MutableList<out kotlin.reflect.KFunction<kotlin.Int>>>",
+            "kotlin.collections.Map<out kotlin.reflect.KFunction<kotlin.Int>, kotlin.Int>",
+            "kotlin.collections.MutableList<*>",
+            "kotlin.jvm.functions.FunctionN<kotlin.Unit>",
+            "kotlin.collections.List<kotlin.jvm.functions.FunctionN<kotlin.Unit>>",
+            "($ints22, kotlin.Int) -> kotlin.reflect.KFunction<kotlin.Int>"
+        ))
+    }
+
+    /** Only the value of the property itself tells its function reference type apart, not a nested one. */
+    @Test
+    fun `should render nested function reference type in parameter of told apart function reference type as star`() {
+        // when
+        val source = typeOf<KFunction1<KFunction1<String, Int>, Int>>().toSource(isSuspend = false)
+
+        // then
+        assert(source == "kotlin.reflect.KFunction1<*, kotlin.Int>")
+    }
+
+    @Test
+    fun `should not let snippet pass function of another kind to host of nested function reference type`() = runTest {
+        // given
+        val handler = { f: KFunction1<String, Int> -> f("x") }
+        ScriptSession(listOf(property("handler", handler), property("fs", mutableListOf(::twice)))).use { session ->
+            // when
+            val results = listOf(
+                session.execute("fun z(): Int = 1; handler(::z)"),
+                session.execute("fs.add(::z)"),
+                session.execute("fs[0].name")
+            )
+
+            // then
+            results[0] should {
+                be<ScriptResult.Error>()
+                have(phase == ExecutionPhase.COMPILATION)
+            }
+            results[1] should {
+                be<ScriptResult.Error>()
+                have(phase == ExecutionPhase.COMPILATION)
+            }
+            results[2] should {
+                be<ScriptResult.Value>()
+                have(value == "twice")
+            }
+        }
+    }
+
+    /**
+     * A `KFunction<R>` type is taken as such, also where the snippets pass a value of it to the host,
+     * though [typeOf] produces it alike for `KFunction0<R>`, see [ScriptProperty.type].
+     */
+    @Test
+    fun `should let snippet pass any function reference to host of KFunction type`() = runTest {
+        // given
+        val describe = { f: KFunction<*> -> f.name }
+        ScriptSession(listOf(property("describe", describe), property("fs", mutableListOf<KFunction<Int>>(::twice)))).use { session ->
+            // when
+            val results = listOf(
+                session.execute("fun z(): Int = 1; describe(::z)"),
+                session.execute("fs.add(::z)")
+            )
+
+            // then
+            results[0] should {
+                be<ScriptResult.Value>()
+                have(value == "z")
+            }
+            results[1] should {
+                be<ScriptResult.Value>()
+                have(value == true)
+            }
+        }
     }
 
     @Test
@@ -1209,6 +1446,13 @@ class ScriptPropertiesTest {
 fun twice(x: String): Int = x.length * 2
 
 suspend fun suspendTwice(x: String): Int = x.length * 2
+
+/** A function of more than 22 parameters, whose reference is a `KFunction23`. */
+@Suppress("unused")
+fun ignore23(
+    a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, h: Int, i: Int, j: Int, k: Int, l: Int,
+    m: Int, n: Int, o: Int, p: Int, q: Int, r: Int, s: Int, t: Int, u: Int, v: Int, w: Int
+) {}
 
 /** A nullable [KType] implemented by hand, seen by the members of the interface only. */
 private fun handWrittenType(
