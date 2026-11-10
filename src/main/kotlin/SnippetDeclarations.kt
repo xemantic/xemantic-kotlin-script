@@ -32,7 +32,6 @@ import kotlin.reflect.full.declaredMemberExtensionProperties
 import kotlin.reflect.full.declaredMemberFunctions
 import kotlin.reflect.full.declaredMemberProperties
 import kotlin.reflect.full.extensionReceiverParameter
-import kotlin.reflect.jvm.javaField
 import kotlin.reflect.jvm.javaGetter
 import kotlin.reflect.jvm.javaMethod
 
@@ -47,7 +46,8 @@ private val nonIdentifierCharacter = Regex("[^\\p{L}\\p{N}_]")
  *
  * A `private` declaration is left out, as it cannot be accessed by a later snippet at all,
  * and so is an `internal` property or function, as a later snippet calls it by a name it is not compiled to,
- * failing at runtime, see [isAccessibleByLaterSnippet].
+ * failing at runtime, and so is a `const val` or a `@JvmField` property, failing in any declaration,
+ * see [isAccessibleByLaterSnippet].
  *
  * The classes of the snippets are kept, and their members read by kotlin-reflect only when a name is looked up,
  * which is after a compilation error, as reading them takes long.
@@ -154,10 +154,12 @@ internal class SnippetDeclarations {
      * a `private` member is private, or has no accessor, like a `private val` of a field only,
      * while an `internal` one is public, but its name is mangled with the module, the [snippet], like `getCount$snippet1_kts`,
      * which a later snippet does not call, like `getCount$main`.
+     * A property is told by its getter only: one of a field only, also a public `const val` or `@JvmField` one, is not accessible,
+     * as a later snippet fails on it in any declaration, the compiler crashing on the former, and reading the latter as an instance field, which is static.
      */
     private fun KCallable<*>.isAccessibleByLaterSnippet(snippet: String): Boolean {
         val jvmMember: Member? = when (this) {
-            is KProperty<*> -> javaGetter ?: javaField
+            is KProperty<*> -> javaGetter
             is KFunction<*> -> javaMethod
             else -> null
         }

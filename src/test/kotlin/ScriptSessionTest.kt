@@ -956,6 +956,95 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should not hint declaring the type when const property of earlier snippet is unresolved in declaration of inferred type`() = runTest {
+        // given
+        session.execute("const val LIMIT = 1")
+
+        // when
+        val result = session.execute("""
+            fun next() = LIMIT + 1
+            next()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:14: error: Unresolved reference 'LIMIT'.
+                  | fun next() = <error>LIMIT</error> + 1
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should fail compiling const property of earlier snippet also in declaration of declared type`() = runTest {
+        // given
+        session.execute("const val LIMIT = 1")
+
+        // when
+        val result = session.execute("""
+            fun next(): Int = LIMIT + 1
+            next()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            have(message.startsWith("error: The compiler failed internally"))
+            have("InterpreterMethodNotFoundError: Unknown function: LIMIT(Snippet1)" in message)
+        }
+    }
+
+    @Test
+    fun `should not hint declaring the type when JvmField property of earlier snippet is unresolved in declaration of inferred type`() = runTest {
+        // given
+        session.execute("@JvmField val limit = 1")
+
+        // when
+        val result = session.execute("""
+            fun next() = limit + 1
+            next()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:14: error: Unresolved reference 'limit'.
+                  | fun next() = <error>limit</error> + 1
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should fail reading JvmField property of earlier snippet also in declaration of declared type`() = runTest {
+        // given
+        session.execute("@JvmField val limit = 1")
+
+        // when
+        val result = session.execute("""
+            fun next(): Int = limit + 1
+            next()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IncompatibleClassChangeError: Expected non-static field limit
+                  at next(snippet2.kts:1)
+                  | fun next(): Int = limit + 1
+                  at <snippet body>(snippet2.kts:2)
+                  | next()
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should not hint declaring the type when misspelled name is unresolved in declaration of inferred type`() = runTest {
         // given
         session.execute("val name = \"x\"")

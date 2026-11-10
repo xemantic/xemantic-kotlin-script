@@ -88,6 +88,8 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   and so is a property (also a provided one), a function, or an extension (reported `on receiver of type` on an explicit receiver) of an earlier snippet, but only when that declaration is used in the same snippet, while a property with an initializer, like `val x = name.length`, resolves it,
   while a declaration of a snippet which failed to compile stays unresolved even with the type declared, so it gets no hint,
   an `internal` property or function of an earlier snippet is called by a name it is not compiled to, failing with a `NoSuchMethodError` even with the type declared, so it gets no hint,
+  a `const val` of an earlier snippet crashes the backend wherever a later snippet reads it (`InterpreterMethodNotFoundError`),
+  and a `@JvmField` property is read as an instance field, while it is static, failing with an `IncompatibleClassChangeError` — so neither gets a hint,
   a value class property or function of an earlier snippet is called by a mangled name, which is not declared (the provided properties work around it with `@get:JvmName`),
   an `inline` declaration cannot be called across snippets,
   the backend crashes on `val context: Int inline get() = coroutineContext.hashCode()`, which stands in for an internal failure of the compiler in `should report internal failure of the compiler and continue the session`.
