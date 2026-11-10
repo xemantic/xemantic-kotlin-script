@@ -102,6 +102,7 @@ dependencies {
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.xemantic.kotlin.test)
     testImplementation(libs.ktor.server.cio)
+    testImplementation(libs.ktor.server.auto.head.response)
     testImplementation(libs.ktor.client.cio)
     // only the tests bind an SLF4J backend, a library leaves this choice to the application
     testRuntimeOnly(libs.logback.classic)

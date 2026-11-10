@@ -20,16 +20,15 @@ package com.xemantic.kotlin.script.test
 
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
-import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
+import io.ktor.server.application.install
 import io.ktor.server.cio.CIO
 import io.ktor.server.engine.embeddedServer
+import io.ktor.server.plugins.autohead.AutoHeadResponse
 import io.ktor.server.request.header
-import io.ktor.server.request.httpMethod
 import io.ktor.server.response.header
-import io.ktor.server.response.respond
 import io.ktor.server.response.respondBytes
-import io.ktor.server.routing.route
+import io.ktor.server.routing.get
 import io.ktor.server.routing.routing
 import kotlinx.coroutines.runBlocking
 import java.util.concurrent.ConcurrentHashMap
@@ -45,12 +44,10 @@ import kotlin.io.path.readBytes
  * the [statuses] of the users given one, and `500` to the next [failingRequests] authenticated ones.
  */
 class MavenRepositoryServer(
-    username: String,
+    private val username: String,
     password: String,
     otherUsers: Map<String, String> = emptyMap()
 ) : AutoCloseable {
-
-    private val credentials = "Basic " + Base64.encode("$username:$password".encodeToByteArray())
 
     /** The users, by the basic authentication of their credentials. */
     private val users = (mapOf(username to password) + otherUsers).entries.associate { (user, secret) ->
@@ -64,7 +61,7 @@ class MavenRepositoryServer(
 
     private val metadataRequestCounter = AtomicInteger()
 
-    private val wronglyAuthenticatedMetadataRequestCounter = AtomicInteger()
+    private val wronglyAuthenticatedRequestCounter = AtomicInteger()
 
     /** The number of the next authenticated requests answered with `500`. */
     var failingRequests: Int
@@ -74,39 +71,34 @@ class MavenRepositoryServer(
     /** The number of the requests of a `maven-metadata.xml` authenticated as the [username]. */
     val metadataRequests: Int get() = metadataRequestCounter.get()
 
-    /** The number of the requests of a `maven-metadata.xml` with the basic authentication of unknown credentials. */
-    val wronglyAuthenticatedMetadataRequests: Int get() = wronglyAuthenticatedMetadataRequestCounter.get()
+    /** The number of the requests, of any file, with the basic authentication of unknown credentials. */
+    val wronglyAuthenticatedRequests: Int get() = wronglyAuthenticatedRequestCounter.get()
 
     private val server = embeddedServer(CIO, host = "127.0.0.1", port = 0) {
+        // answers HEAD, which Maven sends to verify an artifact in the local repository downloaded from another one, without the body
+        install(AutoHeadResponse)
         routing {
-            // also HEAD, which Maven sends to verify an artifact in the local repository downloaded from another one
-            route("/{path...}") {
-                handle {
-                    val path = call.parameters.getAll("path")!!.joinToString("/")
-                    val file = MavenRepository.directory.resolve(path).normalize()
-                    val authorization = call.request.header(HttpHeaders.Authorization)
-                    val user = users[authorization]
-                    if (path.endsWith("/maven-metadata.xml")) when {
-                        authorization == credentials -> metadataRequestCounter.incrementAndGet()
-                        authorization != null && user == null -> wronglyAuthenticatedMetadataRequestCounter.incrementAndGet()
+            get("/{path...}") {
+                val path = call.parameters.getAll("path")!!.joinToString("/")
+                val file = MavenRepository.directory.resolve(path).normalize()
+                val authorization = call.request.header(HttpHeaders.Authorization)
+                val user = users[authorization]
+                if (user == username && path.endsWith("/maven-metadata.xml")) metadataRequestCounter.incrementAndGet()
+                if (authorization != null && user == null) wronglyAuthenticatedRequestCounter.incrementAndGet()
+                val status = user?.let { statuses[it] }
+                when {
+                    user == null -> {
+                        call.response.header(HttpHeaders.WWWAuthenticate, "Basic realm=\"fixture\"")
+                        call.respondBytes(ByteArray(0), status = HttpStatusCode.Unauthorized)
                     }
-                    val status = user?.let { statuses[it] }
-                    when {
-                        user == null -> {
-                            call.response.header(HttpHeaders.WWWAuthenticate, "Basic realm=\"fixture\"")
-                            call.respondBytes(ByteArray(0), status = HttpStatusCode.Unauthorized)
-                        }
-                        status != null -> call.respondBytes(ByteArray(0), status = status)
-                        failures.getAndUpdate { maxOf(it - 1, 0) } > 0 -> call.respondBytes(
-                            ByteArray(0), status = HttpStatusCode.InternalServerError
-                        )
-                        !file.startsWith(MavenRepository.directory) || !file.isRegularFile() -> call.respondBytes(
-                            ByteArray(0), status = HttpStatusCode.NotFound
-                        )
-                        // without a body, which would be read as the response to the next request on the connection
-                        call.request.httpMethod == HttpMethod.Head -> call.respond(HttpStatusCode.OK)
-                        else -> call.respondBytes(file.readBytes(), ContentType.Application.OctetStream)
-                    }
+                    status != null -> call.respondBytes(ByteArray(0), status = status)
+                    failures.getAndUpdate { maxOf(it - 1, 0) } > 0 -> call.respondBytes(
+                        ByteArray(0), status = HttpStatusCode.InternalServerError
+                    )
+                    !file.startsWith(MavenRepository.directory) || !file.isRegularFile() -> call.respondBytes(
+                        ByteArray(0), status = HttpStatusCode.NotFound
+                    )
+                    else -> call.respondBytes(file.readBytes(), ContentType.Application.OctetStream)
                 }
             }
         }

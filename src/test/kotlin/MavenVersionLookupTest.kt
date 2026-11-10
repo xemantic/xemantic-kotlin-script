@@ -406,6 +406,34 @@ class MavenVersionLookupTest {
     }
 
     @Test
+    fun `should report superseded declaration of repository with wrong credentials of server in settings found with corrected credentials`() {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // given
+            val lookup = MavenVersionLookup {
+                settings {
+                    addServer(Server().apply {
+                        id = "fixture"
+                        username = "alice"
+                        password = "wrong"
+                    })
+                }
+            }
+            val stale = remoteRepository(server.url, "maven_repository_id=fixture")
+            val corrected = remoteRepository(server.url, "maven_repository_id=fixture", "username=alice", "password=secret")
+            val superseded = mutableListOf<RemoteRepository>()
+
+            // when
+            val latest = lookup.latestVersion("com.xemantic.fixture", "greeter", listOf(stale, corrected)) {
+                superseded += it
+            }
+
+            // then
+            assert(latest?.version == "1.10")
+            assert(superseded == listOf(stale))
+        }
+    }
+
+    @Test
     fun `should report failure of repository declared again with wrong credentials only`() {
         MavenRepositoryServer(username = "alice", password = "secret").use { server ->
             // given
