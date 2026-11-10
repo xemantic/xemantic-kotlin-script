@@ -522,6 +522,158 @@ class InlinedFramesTest {
     }
 
     @Test
+    fun `should resolve frames of error in the body of lambda passed to inline function`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            inline fun pre(block: () -> Unit) {
+                println("before")
+                block()
+            }
+            fun frame(): StackTraceElement {
+                try {
+                    pre {
+                        error("lambda")
+                    }
+                } catch (e: IllegalStateException) {
+                    return e.stackTrace[0]
+                }
+                error("not thrown")
+            }
+        """.trimIndent())
+
+        // then
+        // the exception created by error is allocated in the lambda before the line of the lambda starts, within the line calling it
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 8),
+                StackTraceElement("Snippet1", "pre", "snippet1.kts", 3),
+                StackTraceElement("Snippet1", "frame", "snippet1.kts", 7)
+            )
+        )
+    }
+
+    @Test
+    fun `should resolve frames of error in the body of lambda passed to inline function without a line before calling it`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            inline fun call(block: () -> Unit) {
+                block()
+            }
+            fun frame(): StackTraceElement {
+                try {
+                    call {
+                        error("lambda")
+                    }
+                } catch (e: IllegalStateException) {
+                    return e.stackTrace[0]
+                }
+                error("not thrown")
+            }
+        """.trimIndent())
+
+        // then
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 7),
+                StackTraceElement("Snippet1", "call", "snippet1.kts", 2),
+                StackTraceElement("Snippet1", "frame", "snippet1.kts", 6)
+            )
+        )
+    }
+
+    @Test
+    fun `should resolve frames of error in the body of lambda passed to inline function calling it in try block`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            inline fun tr(block: () -> Unit) {
+                try {
+                    block()
+                } finally {
+                    println("finally")
+                }
+            }
+            fun frame(): StackTraceElement {
+                try {
+                    tr {
+                        error("lambda")
+                    }
+                } catch (e: IllegalStateException) {
+                    return e.stackTrace[0]
+                }
+                error("not thrown")
+            }
+        """.trimIndent())
+
+        // then
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 11),
+                StackTraceElement("Snippet1", "tr", "snippet1.kts", 3),
+                StackTraceElement("Snippet1", "frame", "snippet1.kts", 10)
+            )
+        )
+    }
+
+    @Test
+    fun `should resolve frames of error in the body of lambda passed to suspend inline function`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            suspend inline fun sc(block: () -> Unit) {
+                delay(1)
+                block()
+            }
+            suspend fun suspendingFrame(): StackTraceElement {
+                try {
+                    sc {
+                        error("lambda")
+                    }
+                } catch (e: IllegalStateException) {
+                    return e.stackTrace[0]
+                }
+                error("not thrown")
+            }
+            val awaited = await { suspendingFrame() }
+            fun frame(): StackTraceElement = awaited
+        """.trimIndent())
+
+        // then
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 8),
+                StackTraceElement("Snippet1", "sc", "snippet1.kts", 3),
+                StackTraceElement("Snippet1", "suspendingFrame", "snippet1.kts", 7)
+            )
+        )
+    }
+
+    @Test
+    fun `should resolve intermediate frames of error in the body of lambda passed to inline function within inline function`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            inline fun pre(block: () -> Unit) {
+                println("before")
+                block()
+            }
+            inline fun wrapper() {
+                pre {
+                    error("lambda")
+                }
+            }
+            fun frame(): StackTraceElement = try { wrapper(); error("not thrown") } catch (e: IllegalStateException) { e.stackTrace[0] }
+        """.trimIndent())
+
+        // then
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 7),
+                StackTraceElement("Snippet1", "pre", "snippet1.kts", 3),
+                StackTraceElement("Snippet1", "wrapper", "snippet1.kts", 6),
+                StackTraceElement("Snippet1", "frame", "snippet1.kts", 10)
+            )
+        )
+    }
+
+    @Test
     fun `should not resolve frame of throw in the body of lambda on a line which may throw also outside of it`() = runTest {
         // when
         val resolved = resolveFrame("""

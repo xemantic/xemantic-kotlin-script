@@ -97,8 +97,7 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 - The SMAP is parsed by the compiler's own `SMAPParser`, an internal API like the K2 REPL compiler —
   re-check it after every Kotlin upgrade, `InlinedFramesTest` and the inline function tests of `ScriptSessionTest` pin its behavior.
 - A `@kotlin.internal.InlineOnly` function of the standard library, like `require` or `let`, is inlined with the lines of its call site,
-  only the other inline functions, like `first { }` or `forEach { }`, get the synthetic lines beyond the end of the snippet —
-  but not the body of a lambda passed to them, which keeps the lines of the snippet, so only the inline markers in scope tell it is inlined.
+  only the other inline functions, like `first { }` or `forEach { }`, get the synthetic lines beyond the end of the snippet.
 - The `KotlinDebug` stratum maps every synthetic line to its call site but the `fake.kt` line (`kotlin/jvm/internal/FakeKt`),
   which the compiler may give to the initialization of an inline marker variable (`ICONST_0; ISTORE`), so it cannot be the line of a frame throwing.
 - The same line may be inlined in several scopes, like the line of a `forEach { }` call in an inline function

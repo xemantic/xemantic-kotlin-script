@@ -36,6 +36,7 @@ import org.jetbrains.org.objectweb.asm.tree.MethodInsnNode
 import org.jetbrains.org.objectweb.asm.tree.MethodNode
 import org.jetbrains.org.objectweb.asm.tree.MultiANewArrayInsnNode
 import org.jetbrains.org.objectweb.asm.tree.TypeInsnNode
+import java.util.BitSet
 
 private val logger = KotlinLogging.logger {}
 
@@ -86,7 +87,7 @@ internal class InlinedFrames(
     }
 
     /**
-     * The frames of the [frame] of inlined code, its line beyond the end of its snippet:
+     * The frames of the [frame] of inlined code, its line beyond the end of its snippet, or within a lambda inlined into it, see [resolveLambda]:
      * the frame of the inlined function, followed by the frames of the inline functions calling it, if nested,
      * and by the frame of the outermost call site in the method of the [frame],
      * which is the [frame] itself if the call site is unknown,
@@ -94,7 +95,7 @@ internal class InlinedFrames(
      * or the class of the [frame] cannot be read, or its bytecode cannot be analyzed.
      *
      * The body of a lambda passed to an inline function keeps the lines of the snippet,
-     * so the frame of a line of the snippet is resolved as well, if the line lies within an inlined lambda, see [resolveLambda].
+     * so the class is read for the frame of any line of the snippet, which is resolved if the line lies within an inlined lambda.
      *
      * The `KotlinDebug` stratum flattens nested inlining to the call site in the method,
      * so the calls of the nested inline functions are read from the ranges of their inline markers instead, see [SnippetClass.inlinedCalls].
@@ -103,7 +104,7 @@ internal class InlinedFrames(
      */
     fun resolve(frame: StackTraceElement): List<StackTraceElement>? {
         val lines = snippets[frame.fileName] ?: return null
-        // the class is not read for a frame which cannot be of inlined code
+        // the class is not read for a frame without a line
         if (frame.lineNumber < 1) return null
         val snippetClass = snippetClass(frame.className) ?: return null
         val key = frame.methodName to frame.lineNumber
@@ -207,16 +208,59 @@ private class InlineMarker(
 /**
  * The [markers] of the inlined bodies of a method, and its line numbers in the order of the instructions:
  * the [lineNumbers], the [lineStarts], the indices of the instructions starting them,
- * the [linePositions], the indices telling their scopes, see [lineScopePosition],
- * and the [lineThrows], telling the scopes of the instructions of each line which may throw, see [lineThrows].
+ * of the [instructionCount] instructions of the method, of which the [throwing] ones may throw, see [mayThrow].
+ * The scopes of the lines are computed on the first frame of the method resolved.
  */
 private class InlinedMethod(
     val markers: List<InlineMarker>,
     val lineNumbers: IntArray,
     val lineStarts: IntArray,
-    val linePositions: IntArray,
-    val lineThrows: ByteArray
-)
+    private val throwing: BitSet,
+    private val instructionCount: Int
+) {
+
+    /**
+     * The index of the instruction telling the scope of each line:
+     * the first instruction which may throw while the line is in effect, until the start of the next line,
+     * or the start of the line, if none may throw.
+     *
+     * The line may start outside the scope of the code it is given to,
+     * like at the label of the state machine of a suspend function resuming into an inlined body, before the initialization of its marker.
+     */
+    val linePositions: IntArray by lazy(LazyThreadSafetyMode.NONE) {
+        IntArray(lineStarts.size) { line ->
+            val range = lineRange(line)
+            throwing.nextSetBit(range.first).takeIf { it in range } ?: range.first
+        }
+    }
+
+    /**
+     * Whether the instructions of each line may throw:
+     * [THROWS_NOWHERE] if none, [THROWS_IN_ONE_SCOPE] if all of them are in scope of the same [markers], or [THROWS_IN_SCOPES].
+     */
+    val lineThrows: ByteArray by lazy(LazyThreadSafetyMode.NONE) {
+        ByteArray(lineStarts.size) { line ->
+            val scopes = lineRange(line).filter { throwing[it] }
+                .map { position -> markers.filter { position in it } }
+                .distinct()
+            when (scopes.size) {
+                0 -> THROWS_NOWHERE
+                1 -> THROWS_IN_ONE_SCOPE
+                else -> THROWS_IN_SCOPES
+            }
+        }
+    }
+
+    /** The indices of the instructions of the [line] index, until the start of the next line. */
+    private fun lineRange(line: Int): IntRange {
+        val start = lineStarts[line]
+        val until = (line + 1..<lineStarts.size).firstNotNullOfOrNull { next ->
+            lineStarts[next].takeIf { it > start }
+        } ?: instructionCount
+        return start..<until
+    }
+
+}
 
 /** No instruction of the line may throw, see [InlinedMethod.lineThrows]. */
 private const val THROWS_NOWHERE: Byte = 0
@@ -265,24 +309,7 @@ private class SnippetClass(bytes: ByteArray) {
     fun inlinedCalls(method: String, line: Int): InlinedCalls? =
         methods[method]?.firstNotNullOfOrNull { it.inlinedCalls(line) }
 
-    /**
-     * The calls of the nested inline functions inlined at the [line] of this method,
-     * the innermost one named by the innermost marker in scope at the position of the [line],
-     * and each enclosing one calling it at its own line in effect right before the start of the nested scope,
-     * not a line of another scope nested in it, like of an inline function called before, or of a lambda passed to it,
-     * nor the `fake.kt` line, which the compiler may give to the initialization of an inline marker variable.
-     * The line of an enclosing scope not found, like of an inline function without a line before the call of the nested one,
-     * gives it no frame, and the call of the outermost scope gives the [InlinedCalls.methodLine].
-     *
-     * The same line may be inlined in several scopes, like the copies of an inline function called twice by another one,
-     * which share the lines of the same outermost call site, while the frame tells only its line, not its instruction,
-     * so the enclosing calls are given only if all the scopes of the [line] agree on them.
-     *
-     * A lambda argument is a scope as well, called by the inline function receiving it, and calling the nested one in its body,
-     * while an `@InlineOnly` function of the standard library, like `require`, has no marker, its body inlined with the lines of its call site.
-     *
-     * @return `null` if the [line] is not in scope of any marker.
-     */
+    /** Whether an instruction of this method at the [line] may throw. */
     private fun InlinedMethod.throwsAt(line: Int): Boolean =
         lineNumbers.indices.any { lineNumbers[it] == line && lineThrows[it] != THROWS_NOWHERE }
 
@@ -306,6 +333,24 @@ private class SnippetClass(bytes: ByteArray) {
         return inlinedCalls(line, scopes).takeIf { it.functions.size == scopes.size }
     }
 
+    /**
+     * The calls of the nested inline functions inlined at the [line] of this method,
+     * the innermost one named by the innermost marker in scope at the position of the [line],
+     * and each enclosing one calling it at its own line in effect right before the start of the nested scope,
+     * not a line of another scope nested in it, like of an inline function called before, or of a lambda passed to it,
+     * nor the `fake.kt` line, which the compiler may give to the initialization of an inline marker variable.
+     * The line of an enclosing scope not found, like of an inline function without a line before the call of the nested one,
+     * gives it no frame, and the call of the outermost scope gives the [InlinedCalls.methodLine].
+     *
+     * The same line may be inlined in several scopes, like the copies of an inline function called twice by another one,
+     * which share the lines of the same outermost call site, while the frame tells only its line, not its instruction,
+     * so the enclosing calls are given only if all the scopes of the [line] agree on them.
+     *
+     * A lambda argument is a scope as well, called by the inline function receiving it, and calling the nested one in its body,
+     * while an `@InlineOnly` function of the standard library, like `require`, has no marker, its body inlined with the lines of its call site.
+     *
+     * @return `null` if the [line] is not in scope of any marker.
+     */
     private fun InlinedMethod.inlinedCalls(line: Int): InlinedCalls? {
         val candidates = lineNumbers.indices.filter { lineNumbers[it] == line }
             .mapNotNull { inlinedCalls(line, linePositions[it]) }
@@ -371,50 +416,21 @@ private fun MethodNode.inlinedMethod(): InlinedMethod? {
     if (markers.isEmpty()) return null
     val lineNodes = instructions.filterIsInstance<LineNumberNode>()
     val lineStarts = IntArray(lineNodes.size) { instructions.indexOf(lineNodes[it].start) }
-    val linePositions = IntArray(lineNodes.size) { lineScopePosition(lineStarts, it) }
-    val lineThrows = ByteArray(lineNodes.size) { lineThrows(lineStarts, it, markers) }
-    return InlinedMethod(markers, IntArray(lineNodes.size) { lineNodes[it].line }, lineStarts, linePositions, lineThrows)
+    val throwing = BitSet(instructions.size())
+    instructions.forEachIndexed { index, instruction -> if (instruction.mayThrow()) throwing.set(index) }
+    return InlinedMethod(markers, IntArray(lineNodes.size) { lineNodes[it].line }, lineStarts, throwing, instructions.size())
 }
 
 /**
- * Whether the instructions of the line of these [lineStarts] at the [line] index may throw:
- * [THROWS_NOWHERE] if none, [THROWS_IN_ONE_SCOPE] if all of them are in scope of the same [markers], or [THROWS_IN_SCOPES].
- */
-private fun MethodNode.lineThrows(lineStarts: IntArray, line: Int, markers: List<InlineMarker>): Byte {
-    val scopes = lineRange(lineStarts, line).filter { instructions[it].mayThrow() }
-        .map { position -> markers.filter { position in it } }
-        .distinct()
-    return when (scopes.size) {
-        0 -> THROWS_NOWHERE
-        1 -> THROWS_IN_ONE_SCOPE
-        else -> THROWS_IN_SCOPES
-    }
-}
-
-/** The indices of the instructions of the line of these [lineStarts] at the [line] index, until the start of the next line. */
-private fun MethodNode.lineRange(lineStarts: IntArray, line: Int): IntRange {
-    val start = lineStarts[line]
-    val until = (line + 1..<lineStarts.size).firstNotNullOfOrNull { next ->
-        lineStarts[next].takeIf { it > start }
-    } ?: instructions.size()
-    return start..<until
-}
-
-/**
- * The index of the instruction telling the scope of the line of these [lineStarts] at the [line] index:
- * the first instruction which may throw while the line is in effect, until the start of the next line,
- * or the start of the line, if none may throw.
+ * Whether this instruction may throw, or call a method which may throw, so its line may be the line of a frame.
  *
- * The line may start outside the scope of the code it is given to,
- * like at the label of the state machine of a suspend function resuming into an inlined body, before the initialization of its marker.
+ * A `NEW` is not considered: the compiler may allocate an object before the line of the code creating it starts,
+ * like the exception of a lambda starting with `error("…")`, allocated within the line of the inline function calling the lambda,
+ * which would put that line in the scope of the lambda — while the constructor called after the `NEW` has the line of the code creating it.
  */
-private fun MethodNode.lineScopePosition(lineStarts: IntArray, line: Int): Int =
-    lineRange(lineStarts, line).let { range -> range.firstOrNull { instructions[it].mayThrow() } ?: range.first }
-
-/** Whether this instruction may throw, or call a method which may throw, so its line may be the line of a frame. */
 private fun AbstractInsnNode.mayThrow(): Boolean = when (this) {
     is MethodInsnNode, is InvokeDynamicInsnNode, is FieldInsnNode, is MultiANewArrayInsnNode -> true
-    is TypeInsnNode -> opcode != Opcodes.INSTANCEOF
+    is TypeInsnNode -> opcode != Opcodes.INSTANCEOF && opcode != Opcodes.NEW
     is IntInsnNode -> opcode == Opcodes.NEWARRAY
     is InsnNode -> opcode in THROWING_OPCODES
         || opcode in Opcodes.IALOAD..Opcodes.SALOAD

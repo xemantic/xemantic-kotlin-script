@@ -1704,6 +1704,63 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should report inline function of error in the body of lambda passed to it`() = runTest {
+        // when
+        val result = session.execute("""
+            inline fun pre(block: () -> Unit) {
+                println("before")
+                block()
+            }
+            pre {
+                error("in lambda")
+            }
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IllegalStateException: in lambda
+                  at <lambda>(snippet1.kts:6)
+                  |     error("in lambda")
+                  at pre(snippet1.kts:3)
+                  |     block()
+                  at <snippet body>(snippet1.kts:5)
+                  | pre {
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report inline function of error in the body of lambda passed to it without a line before calling it`() = runTest {
+        // when
+        val result = session.execute("""
+            inline fun call(block: () -> Unit) {
+                block()
+            }
+            call {
+                error("in lambda")
+            }
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IllegalStateException: in lambda
+                  at <lambda>(snippet1.kts:5)
+                  |     error("in lambda")
+                  at call(snippet1.kts:2)
+                  |     block()
+                  at <snippet body>(snippet1.kts:4)
+                  | call {
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should name frame of inline property accessor like frame of property accessor`() = runTest {
         // when
         val result = session.execute("""
