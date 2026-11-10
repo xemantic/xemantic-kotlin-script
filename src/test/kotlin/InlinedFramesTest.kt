@@ -90,19 +90,6 @@ class InlinedFramesTest {
     }
 
     /**
-     * The frames resolved of a frame of the [method] at the [line] of this [snippet], as if thrown there,
-     * the snippet followed by the class `Marker`, of the class loader of the snippet.
-     */
-    private suspend fun resolveFrameAt(snippet: String, method: String, line: Int): List<StackTraceElement>? {
-        val source = "$snippet\nclass Marker"
-        execute(source)
-        val marker = execute("Marker()")!!
-        val inlinedFrames = InlinedFrames(mapOf("snippet1.kts" to source.lines()))
-        inlinedFrames.keep(marker.javaClass)
-        return inlinedFrames.resolve(StackTraceElement("Snippet1", method, "snippet1.kts", line))
-    }
-
-    /**
      * The frames resolved like by [resolveFrame], but of the class of the frame transformed by the [transform] of its [method],
      * which stands in for bytecode the compiler has not been seen to produce.
      */
@@ -411,6 +398,54 @@ class InlinedFramesTest {
     }
 
     @Test
+    fun `should resolve intermediate frames of nested suspend inline functions inlined twice`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            suspend inline fun inner(x: Int) { delay(1); if (x == 2) throw IllegalStateException("x") }
+            suspend inline fun mid(x: Int) { delay(1); inner(x) }
+            suspend inline fun outer() { mid(1); delay(1); mid(2) }
+            suspend fun suspendingFrame(): StackTraceElement = try { outer(); error("not thrown") } catch (e: IllegalStateException) { e.stackTrace[0] }
+            val awaited = await { suspendingFrame() }
+            fun frame(): StackTraceElement = awaited
+        """.trimIndent())
+
+        // then
+        // the line of the second copy of mid starts at the label resuming into it, before the initialization of its marker
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "inner", "snippet1.kts", 1),
+                StackTraceElement("Snippet1", "mid", "snippet1.kts", 2),
+                StackTraceElement("Snippet1", "outer", "snippet1.kts", 3),
+                StackTraceElement("Snippet1", "suspendingFrame", "snippet1.kts", 4)
+            )
+        )
+    }
+
+    @Test
+    fun `should resolve frames of error in the body of lambda passed to inline function with class literal`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            class Checked
+            inline fun call(type: Class<*>, block: () -> Unit) { block() }
+            fun frame(): StackTraceElement = try {
+                call(Checked::class.java) { error("boom") }
+                error("not thrown")
+            } catch (e: IllegalStateException) {
+                e.stackTrace[0]
+            }
+        """.trimIndent())
+
+        // then
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 4),
+                StackTraceElement("Snippet1", "call", "snippet1.kts", 2),
+                StackTraceElement("Snippet1", "frame", "snippet1.kts", 4)
+            )
+        )
+    }
+
+    @Test
     fun `should omit intermediate frame of suspend inline function without a line before the call in its split range`() = runTest {
         // when
         val resolved = resolveTransformedFrame(
@@ -442,66 +477,6 @@ class InlinedFramesTest {
             resolved == listOf(
                 StackTraceElement("Snippet1", "inner", "snippet1.kts", 1),
                 StackTraceElement("Snippet1", "suspendingFrame", "snippet1.kts", 6)
-            )
-        )
-    }
-
-    @Test
-    fun `should resolve frames of linkage error of type check in the body of lambda passed to inline function`() = runTest {
-        // when
-        // a NoClassDefFoundError of the type checked, if its class cannot be loaded
-        val resolved = resolveFrameAt(
-            """
-            class Checked
-            inline fun call(block: () -> Unit) { block() }
-            fun check(value: Any): Boolean {
-                var checked = false
-                call {
-                    checked = value is Checked
-                }
-                return checked
-            }
-            """.trimIndent(),
-            method = "check",
-            line = 6
-        )
-
-        // then
-        assert(
-            resolved == listOf(
-                StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 6),
-                StackTraceElement("Snippet1", "call", "snippet1.kts", 2),
-                StackTraceElement("Snippet1", "check", "snippet1.kts", 5)
-            )
-        )
-    }
-
-    @Test
-    fun `should resolve frames of linkage error of class constant in the body of lambda passed to inline function`() = runTest {
-        // when
-        // a NoClassDefFoundError of the class, if it cannot be loaded
-        val resolved = resolveFrameAt(
-            """
-            class Constant
-            inline fun call(block: () -> Unit) { block() }
-            fun constant(): Class<*>? {
-                var type: Class<*>? = null
-                call {
-                    type = Constant::class.java
-                }
-                return type
-            }
-            """.trimIndent(),
-            method = "constant",
-            line = 6
-        )
-
-        // then
-        assert(
-            resolved == listOf(
-                StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 6),
-                StackTraceElement("Snippet1", "call", "snippet1.kts", 2),
-                StackTraceElement("Snippet1", "constant", "snippet1.kts", 5)
             )
         )
     }

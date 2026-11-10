@@ -24,17 +24,13 @@ import org.jetbrains.kotlin.codegen.inline.SMAP
 import org.jetbrains.kotlin.codegen.inline.SMAPParser
 import org.jetbrains.kotlin.codegen.inline.SourcePosition
 import org.jetbrains.org.objectweb.asm.ClassReader
-import org.jetbrains.org.objectweb.asm.ConstantDynamic
-import org.jetbrains.org.objectweb.asm.Handle
 import org.jetbrains.org.objectweb.asm.Opcodes
-import org.jetbrains.org.objectweb.asm.Type
 import org.jetbrains.org.objectweb.asm.tree.AbstractInsnNode
 import org.jetbrains.org.objectweb.asm.tree.ClassNode
 import org.jetbrains.org.objectweb.asm.tree.FieldInsnNode
 import org.jetbrains.org.objectweb.asm.tree.InsnNode
 import org.jetbrains.org.objectweb.asm.tree.IntInsnNode
 import org.jetbrains.org.objectweb.asm.tree.InvokeDynamicInsnNode
-import org.jetbrains.org.objectweb.asm.tree.LdcInsnNode
 import org.jetbrains.org.objectweb.asm.tree.LineNumberNode
 import org.jetbrains.org.objectweb.asm.tree.LookupSwitchInsnNode
 import org.jetbrains.org.objectweb.asm.tree.MethodInsnNode
@@ -54,6 +50,9 @@ private const val INLINE_LAMBDA_MARKER = "\$i\$a\$"
 
 /** The path of the `fake.kt` file of the SMAP, which the compiler may give to the initialization of an inline marker variable. */
 private const val FAKE_PATH = "kotlin/jvm/internal/FakeKt"
+
+/** The field of the continuation of a suspend function, which its state machine switches on to resume. */
+private const val STATE_MACHINE_LABEL = "label"
 
 /** The function of inlined code without a marker in scope at its line. */
 private const val UNKNOWN_INLINE_FUNCTION = "<inlined>"
@@ -239,7 +238,8 @@ private class InlineMarker(
  * The [markers] of the inlined bodies of a method, and its line numbers in the order of the instructions:
  * the [lineNumbers], the [lineStarts], the indices of the instructions starting them,
  * of the [instructionCount] instructions of the method, of which the [throwing] ones may throw, see [mayThrow],
- * and the [resumeLabels], the indices of the labels of its switches, like the ones a state machine of a suspend function resumes at.
+ * and the [resumeLabels], the indices of the labels the state machine of a suspend function resumes at,
+ * the targets of a switch on a field named `label`, so also of a `when` on such a field accessed directly, which is not told apart.
  * The scopes of the lines are computed on the first frame of the method resolved.
  */
 private class InlinedMethod(
@@ -329,6 +329,9 @@ private class SnippetClass(bytes: ByteArray) {
     /** The names of the methods without inlined bodies, which might be overloads of the [methods]. */
     private val methodsWithoutMarkers: Set<String>
 
+    /** The path of the snippet in the SMAP, of its first line, which is never inlined code. */
+    private val snippetPath: String? by lazy(LazyThreadSafetyMode.NONE) { smap?.sourceOf(1)?.path }
+
     init {
         // the node is not kept, only what the frames need
         val node = ClassNode().also { ClassReader(bytes).accept(it, ClassReader.SKIP_FRAMES) }
@@ -387,7 +390,8 @@ private class SnippetClass(bytes: ByteArray) {
      *
      * The same line may be inlined in several scopes, like the copies of an inline function called twice by another one,
      * which share the lines of the same outermost call site, while the frame tells only its line, not its instruction,
-     * so the enclosing calls are given only if all the scopes of the [line] agree on them.
+     * so the enclosing calls are given only if all the scopes of the [line] agree on them —
+     * on the lines of the source they are mapped to, as each copy of an inline function inlined into another one has lines of its own.
      *
      * A lambda argument is a scope as well, called by the inline function receiving it, and calling the nested one in its body,
      * while an `@InlineOnly` function of the standard library, like `require`, has no marker, its body inlined with the lines of its call site.
@@ -398,9 +402,16 @@ private class SnippetClass(bytes: ByteArray) {
         val candidates = lineNumbers.indices.filter { lineNumbers[it] == line }
             .mapNotNull { inlinedCalls(line, linePositions[it]) }
         val first = candidates.firstOrNull() ?: return null
-        return first.takeIf { candidates.all { it == first } }
+        val source = first.inSource()
+        return first.takeIf { candidates.all { it.inSource() == source } }
             ?: InlinedCalls(first.functions.take(1), methodLine = null)
     }
+
+    /** These calls by the functions and the positions in the source of their lines, to tell whether the calls of several scopes agree. */
+    private fun InlinedCalls.inSource(): List<Any?> =
+        functions.map { (function, line) ->
+            smap?.sourceOf(line)?.let { Triple(function, it.path, it.line) } ?: (function to line)
+        } + methodLine
 
     private fun InlinedMethod.inlinedCalls(line: Int, position: Int): InlinedCalls? =
         scopesAt(position).takeIf { it.isNotEmpty() }?.let { inlinedCalls(line, it) }
@@ -451,18 +462,31 @@ private class SnippetClass(bytes: ByteArray) {
 
     /**
      * The line in effect within the [scope], the method itself if `null`, right before the instruction at the [index],
-     * positioned in the [scope], not in another scope nested in it, nor a `fake.kt` line.
+     * positioned in the [scope], not in another scope nested in it, nor a `fake.kt` line,
+     * nor a line of the method itself, if the [scope] is an inline function.
+     *
+     * The line may start before the [scope], if positioned in it, see [InlinedMethod.linePositions]:
+     * in a suspend function, the first line of an inlined body may start at the label the code continues at after a suspension point,
+     * before the initialization of its marker, and be the only line of the [scope] in all the ranges of its body split by the state machine —
+     * see `should resolve intermediate frames of nested suspend inline functions inlined twice`.
+     * The state machine gives its own code within an inlined body, like returning when suspended, a line of the method,
+     * which is not a line of an inline function.
      */
     private fun InlinedMethod.lineBefore(index: Int, scope: InlineMarker?): Int? {
         val from = scope?.start ?: 0
         return lineNumbers.indices.lastOrNull { i ->
             val position = linePositions[i]
-            lineStarts[i] in from..<index
+            lineStarts[i] < index
                 && (scope == null || position in scope)
                 && markers.none { it !== scope && it.start >= from && position in it }
                 && smap?.sourceOf(lineNumbers[i])?.path != FAKE_PATH
+                && (scope == null || scope.isLambda || !isMethodLine(lineNumbers[i]))
         }?.let { lineNumbers[it] }
     }
+
+    /** Whether the [line] is a line of the snippet itself, mapped to itself by the SMAP, not a line of inlined code. */
+    private fun isMethodLine(line: Int): Boolean =
+        smap?.sourceOf(line)?.let { it.line == line && it.path == snippetPath } ?: true
 
 }
 
@@ -478,9 +502,11 @@ private fun MethodNode.inlinedMethod(): InlinedMethod? {
     val resumeLabels = BitSet(instructions.size())
     instructions.forEachIndexed { index, instruction ->
         if (instruction.mayThrow()) throwing.set(index)
-        val labels = when (instruction) {
-            is TableSwitchInsnNode -> instruction.labels
-            is LookupSwitchInsnNode -> instruction.labels
+        // the state machine switches on the label field of its continuation, unlike a `when`, which reads a getter of a property
+        val labels = when {
+            (instruction.previous as? FieldInsnNode)?.name != STATE_MACHINE_LABEL -> emptyList()
+            instruction is TableSwitchInsnNode -> instruction.labels
+            instruction is LookupSwitchInsnNode -> instruction.labels
             else -> emptyList()
         }
         labels.forEach { resumeLabels.set(instructions.indexOf(it)) }
@@ -496,12 +522,13 @@ private fun MethodNode.inlinedMethod(): InlinedMethod? {
  * A `NEW` is not considered: the compiler may allocate an object before the line of the code creating it starts,
  * like the exception of a lambda starting with `error("…")`, allocated within the line of the inline function calling the lambda,
  * which would put that line in the scope of the lambda — while the constructor called after the `NEW` has the line of the code creating it.
- * An `INSTANCEOF`, or an `LDC` of a class, a method type or handle, or a dynamic constant, may throw a `LinkageError`, if it cannot be resolved.
+ * Neither is an `INSTANCEOF`, nor an `LDC` of a class: they throw only a `LinkageError` of a class which cannot be loaded,
+ * while a class literal or a type check passed to an inline function on the line of the lambda it receives,
+ * like `call(Checked::class.java) { error("boom") }`, would put the line in two scopes, losing the frames of the lambda.
  */
 private fun AbstractInsnNode.mayThrow(): Boolean = when (this) {
     is MethodInsnNode, is InvokeDynamicInsnNode, is FieldInsnNode, is MultiANewArrayInsnNode -> true
-    is TypeInsnNode -> opcode != Opcodes.NEW
-    is LdcInsnNode -> cst is Type || cst is Handle || cst is ConstantDynamic
+    is TypeInsnNode -> opcode != Opcodes.INSTANCEOF && opcode != Opcodes.NEW
     is IntInsnNode -> opcode == Opcodes.NEWARRAY
     is InsnNode -> opcode in THROWING_OPCODES
         || opcode in Opcodes.IALOAD..Opcodes.SALOAD

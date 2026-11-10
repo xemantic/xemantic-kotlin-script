@@ -103,6 +103,9 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   only the other inline functions, like `first { }` or `forEach { }`, get the synthetic lines beyond the end of the snippet.
 - A frame tells its line, not its instruction, so when the bytecode does not tell which code of the line throws, omit the frames rather than guess:
   a wrong frame misleads more than a missing one — see `should omit intermediate frame of inline function calling the same inline function twice`.
+- The state machine of a suspend function splits an inlined body into several ranges of its marker, may start its only line before the first of them,
+  and puts lines of the method itself within them — a probe with a suspend inline function inlined just once misses all of it,
+  see `should resolve intermediate frames of nested suspend inline functions inlined twice`.
 
 ## Anti-patterns to avoid
 
