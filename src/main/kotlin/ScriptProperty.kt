@@ -61,7 +61,9 @@ import kotlin.reflect.typeOf
  *   where all the classes must be accessible to the snippets, i.e. public and not local.
  *   It cannot be a type parameter, or a platform type, like the types of the Java members obtained by reflection.
  *   Note that [typeOf] does not retain the receiver of a function type,
- *   so a property of type `Int.() -> Int` is seen by the snippets as `(Int) -> Int`.
+ *   so a property of type `Int.() -> Int` is seen by the snippets as `(Int) -> Int`, called as `f(1)`, not `1.f()`,
+ *   also of more than 22 parameters,
+ *   while a type marked by `@ExtensionFunctionType` in its annotations, like the type of a member, keeps the receiver.
  *   Nor does it tell a suspend function reference type, like `KSuspendFunction1<String, Int>`, from `KFunction1<String, Int>`,
  *   so the snippets see the former if the value is a suspend function, and the latter otherwise.
  *   Only the value of the property itself is told apart, if kotlin-reflect can resolve its function, unlike a local one,
@@ -75,6 +77,8 @@ import kotlin.reflect.typeOf
  *   A `KFunction<Int>` type is seen as such everywhere, so the snippets can pass a reference of any function to a host taking it,
  *   though [typeOf] produces `KFunction0<Int>` alike, which the snippets see as `KFunction<Int>` too —
  *   a host taking a function of no parameters should take it as `() -> Int` instead.
+ *   The value of a function reference type is checked to take as many parameters, if kotlin-reflect can resolve its function,
+ *   while a local function of another arity fails only when the snippets call it.
  *   The value of a function type of more than 22 parameters is checked to take as many parameters,
  *   unless they cannot be told: a Kotlin lambda of more than 22 parameters does not implement `getArity`,
  *   so they are told by its `invoke` method of typed parameters instead, if it declares exactly one.
@@ -113,12 +117,8 @@ public class ScriptProperty<T>(
                 "Property '$name' is of type $it, which is not of a class - provide it as a class type, e.g. with typeOf"
             )
         }
-        type.mismatchedArguments()?.let { (mismatched, expected) ->
-            val arguments = mismatched.arguments.size
-            throw IllegalArgumentException(
-                "Property '$name' is of type $mismatched, which has $arguments type argument${if (arguments == 1) "" else "s"}, " +
-                        "while ${(mismatched.classifier as KClass<*>).qualifiedName} takes $expected - provide it as a complete type, e.g. with typeOf"
-            )
+        type.invalidArguments()?.let { (invalid, reason) ->
+            throw IllegalArgumentException("Property '$name' is of type $invalid, $reason, e.g. with typeOf")
         }
         if (value == null) {
             require(type.isMarkedNullable) {
@@ -132,6 +132,15 @@ public class ScriptProperty<T>(
             type.mutableCollectionType()?.let {
                 require(it.isInstance(value)) {
                     "Property '$name' of type $type has a value of class ${value::class.java.name}, which does not implement ${it.name}"
+                }
+            }
+            // not checked by the cast of the declaration of the property, erased to KFunction
+            if (type.isFunctionReferenceType()) {
+                val parameters = type.arguments.size - 1
+                runCatching { (value as KFunction<*>).parameters.size }.getOrNull()?.let { actual ->
+                    require(actual == parameters) {
+                        "Property '$name' of type $type has a value of function ${(value as KFunction<*>).name}, which takes $actual parameter${if (actual == 1) "" else "s"}, while the type takes $parameters"
+                    }
                 }
             }
             // not checked by the declaration of the property, see declaration
@@ -226,13 +235,23 @@ private fun ScriptProperty<*>.getterName(): String =
  * while elsewhere the type argument containing it is projected, with `out` in an invariant position, or with a star otherwise,
  * and a function type of more than 22 parameters, whose parameters cannot be projected, is rendered as `FunctionN<R>`.
  *
+ * A function type marked by `@ExtensionFunctionType` in its annotations is rendered with its receiver,
+ * like `@kotlin.ExtensionFunctionType kotlin.Function2<Int, Int, Unit>`, or `Int.(…) -> Unit` of more than 22 parameters.
+ *
  * @param isSuspend whether this function reference type is of a suspend function, like `KSuspendFunction1<String, Int>`,
  *   which [typeOf] produces like `KFunction1<String, Int>`, so it can be told by the value only,
  *   or `null` if it cannot be told, like of a nested type, rendered then as `KFunction<Int>`, which a reference of either is an instance of.
  */
 internal fun KType.toSource(isSuspend: Boolean? = null): String =
     // nothing fails to render in a covariant position, as it can be widened
-    toSource(isSuspend, Position.OUT)!!
+    if (isSuspend != null && isFunctionReferenceType()) {
+        val kind = if (isSuspend) "KSuspendFunction" else "KFunction"
+        "kotlin.reflect.$kind${arguments.size - 1}" +
+                arguments.toSource(functionReferenceVariances(), Position.OUT)!!.text +
+                if (isMarkedNullable) "?" else ""
+    } else {
+        toSource(Position.OUT)!!.text
+    }
 
 /**
  * The position of a type in the type of the property, which tells whether the snippets may see a supertype of it.
@@ -261,43 +280,76 @@ private enum class Position {
 
 }
 
+/**
+ * A type as written in the source.
+ *
+ * @param text the source of the type.
+ * @param isExact whether it is the type itself, not widened to a supertype, nor projected, in a covariant position,
+ *   which is the case if it contains no function reference type of parameters,
+ *   so it is rendered alike in any position, while otherwise it fails to render in an invariant one.
+ */
+private class Source(val text: String, val isExact: Boolean)
+
 /** This type as written in the source in this [position], or `null` if it cannot be rendered exactly where it has to be. */
-private fun KType.toSource(isSuspend: Boolean?, position: Position): String? {
-    val kClass = classifier as KClass<*>
+private fun KType.toSource(position: Position): Source? {
     val mutable = mutableCollectionType()
     val source = when {
-        mutable != null -> arguments.toSource(mutable.variances, position)?.let { mutable.name.quotedQualified() + it }
-        isFunctionReferenceType() -> {
-            val arity = arguments.size - 1
-            val variances = List(arity) { KVariance.IN } + KVariance.OUT
-            when (isSuspend) {
-                // KFunction<R>, a supertype of a reference of any arity, also a suspend one
-                null -> if (position == Position.OUT) {
-                    "kotlin.reflect.KFunction" + listOf(arguments.last()).toSource(listOf(KVariance.OUT), position)
-                } else {
-                    null
-                }
-                true -> arguments.toSource(variances, position)?.let { "kotlin.reflect.KSuspendFunction$arity$it" }
-                false -> arguments.toSource(variances, position)?.let { "kotlin.reflect.KFunction$arity$it" }
-            }
+        mutable != null -> arguments.toSource(mutable.variances, position)?.let {
+            Source(mutable.name.quotedQualified() + it.text, it.isExact)
         }
-        isBigArityFunctionType() -> {
-            val parameters = arguments.dropLast(1).map { it.type!!.toSource(null, position.nested(KVariance.IN)) }
-            val returnType = arguments.last().type!!.toSource(null, position.nested(KVariance.OUT))
-            when {
-                null !in parameters && returnType != null -> {
-                    val functionType = "${parameters.joinToString(prefix = "(", postfix = ")")} -> $returnType"
-                    if (isMarkedNullable) "($functionType)" else functionType
-                }
-                // the supertype of all the function types of more than 22 parameters
-                position == Position.OUT -> "kotlin.jvm.functions.FunctionN<${arguments.last().type!!.toSource()}>"
-                else -> null
-            }
+        // KFunction<R>, a supertype of a reference of any arity, also a suspend one
+        isFunctionReferenceType() -> if (position == Position.OUT) {
+            val returnType = listOf(arguments.last()).toSource(listOf(KVariance.OUT), position)!!
+            Source("kotlin.reflect.KFunction" + returnType.text, isExact = false)
+        } else {
+            null
         }
-        else -> kClass.toSource(arguments, position)
+        isBigArityFunctionType() -> bigArityFunctionTypeToSource(position)
+        else -> (classifier as KClass<*>).toSource(arguments, position)?.let {
+            if (isExtensionFunctionType()) Source("@kotlin.ExtensionFunctionType " + it.text, it.isExact) else it
+        }
     }
-    return source?.plus(if (isMarkedNullable) "?" else "")
+    return source?.let { Source(it.text + if (isMarkedNullable) "?" else "", it.isExact) }
 }
+
+/**
+ * This function type of more than 22 parameters as written in the source in this [position],
+ * like `(Int, …, Int) -> Unit`, or `Int.(…) -> Unit` if it has a receiver,
+ * or `FunctionN<R>` in a covariant position, if its parameters cannot be rendered exactly, as they cannot be projected,
+ * or `null` otherwise.
+ */
+private fun KType.bigArityFunctionTypeToSource(position: Position): Source? {
+    val parameters = arguments.dropLast(1).map { it.type!!.toSource(position.nested(KVariance.IN)) }
+    // never null in a covariant position
+    val returnType = arguments.last().type!!.toSource(position.nested(KVariance.OUT))
+    return when {
+        parameters.all { it != null } && returnType != null -> {
+            val sources = parameters.map { it!! }
+            val functionType = if (isExtensionFunctionType()) {
+                // a function type, also an annotated one, is parenthesized as a receiver
+                val receiver = sources.first().text.let { if (it.startsWith('(') || it.startsWith('@')) "($it)" else it }
+                receiver + "." + sources.drop(1).joinToString(prefix = "(", postfix = ")") { it.text } + " -> " + returnType.text
+            } else {
+                sources.joinToString(prefix = "(", postfix = ")") { it.text } + " -> " + returnType.text
+            }
+            Source(if (isMarkedNullable) "($functionType)" else functionType, sources.all { it.isExact } && returnType.isExact)
+        }
+        // the supertype of all the function types of more than 22 parameters
+        position == Position.OUT -> Source("kotlin.jvm.functions.FunctionN<${returnType!!.text}>", isExact = false)
+        else -> null
+    }
+}
+
+/**
+ * Whether this function type has a receiver, its first parameter,
+ * which [typeOf] does not retain, unlike kotlin-reflect for the type of a member.
+ * Only a function type of parameters is marked so, like `Function2<Int, Int, Unit>` of `Int.(Int) -> Unit`,
+ * while the member type of a function type of more than 22 parameters is `FunctionN<R>`, without them.
+ */
+private fun KType.isExtensionFunctionType(): Boolean =
+    arguments.size > 1
+            && (classifier == FunctionN::class || (classifier as KClass<*>).qualifiedName == "kotlin.Function${arguments.size - 1}")
+            && annotations.any { it is ExtensionFunctionType }
 
 /**
  * This class with the type [arguments] as written in the source in this [position], like `Outer<String>.Inner<Int>`,
@@ -307,15 +359,15 @@ private fun KType.toSource(isSuspend: Boolean?, position: Position): String? {
  * followed by the ones of its outer classes, from the enclosing one outwards, like `Inner<Int, String>` of `Outer<String>.Inner<Int>`,
  * while in the source each class takes its own arguments.
  */
-private fun KClass<*>.toSource(arguments: List<KTypeProjection>, position: Position): String? {
+private fun KClass<*>.toSource(arguments: List<KTypeProjection>, position: Position): Source? {
     val own = arguments.take(typeParameters.size).toSource(typeParameters.map { it.variance }, position) ?: return null
     return if (isInner) {
         java.declaringClass.kotlin.toSource(arguments.drop(typeParameters.size), position)?.let {
-            it + "." + simpleName!!.quoted() + own
+            Source(it.text + "." + simpleName!!.quoted() + own.text, it.isExact && own.isExact)
         }
     } else {
         // validated to be accessible, so neither local nor anonymous
-        qualifiedName!!.quotedQualified() + own
+        Source(qualifiedName!!.quotedQualified() + own.text, own.isExact)
     }
 }
 
@@ -323,36 +375,46 @@ private fun KClass<*>.toSource(arguments: List<KTypeProjection>, position: Posit
  * These type arguments of the type parameters declared of these [variances] as written in the source in this [position],
  * or `null` if any of them cannot be rendered.
  */
-private fun List<KTypeProjection>.toSource(variances: List<KVariance>, position: Position): String? =
+private fun List<KTypeProjection>.toSource(variances: List<KVariance>, position: Position): Source? =
     if (isEmpty()) {
-        ""
+        Source("", isExact = true)
     } else {
-        mapIndexed { index, argument ->
+        val sources = mapIndexed { index, argument ->
             argument.toSource(variances[index], position) ?: return null
-        }.joinToString(prefix = "<", postfix = ">")
+        }
+        Source(sources.joinToString(prefix = "<", postfix = ">") { it.text }, sources.all { it.isExact })
     }
 
 /**
  * This type argument of a type parameter declared of this [variance] as written in the source in this [position],
  * projected if its type cannot be rendered exactly where it has to be, provided the projection is a supertype,
  * i.e. in a covariant position, or `null` otherwise.
+ *
+ * An invariant type argument in a covariant position is rendered once, in the covariant position,
+ * as an exact type is rendered alike in the invariant one, and any other fails there,
+ * so the subtree is not rendered again on each level of nesting.
  */
-private fun KTypeProjection.toSource(variance: KVariance, position: Position): String? {
-    val type = type ?: return "*"
+private fun KTypeProjection.toSource(variance: KVariance, position: Position): Source? {
+    val type = type ?: return Source("*", isExact = true)
     val projection = this.variance!!
     val effective = if (projection == KVariance.INVARIANT) variance else projection
+    if (position == Position.OUT && effective == KVariance.INVARIANT) {
+        val source = type.toSource(position)!!
+        return if (source.isExact) source else Source("out " + source.text, isExact = false)
+    }
     val prefix = when (projection) {
         KVariance.INVARIANT -> ""
         KVariance.IN -> "in "
         KVariance.OUT -> "out "
     }
-    type.toSource(null, position.nested(effective))?.let { return prefix + it }
-    return when {
-        position != Position.OUT -> null
-        effective == KVariance.INVARIANT -> "out " + type.toSource()
-        else -> "*"
-    }
+    type.toSource(position.nested(effective))?.let { return Source(prefix + it.text, it.isExact) }
+    // only a contravariant type argument fails in a covariant position
+    return if (position == Position.OUT) Source("*", isExact = false) else null
 }
+
+/** The declared variances of the type arguments of this function reference type, contravariant of the parameters, covariant of the return type. */
+private fun KType.functionReferenceVariances(): List<KVariance> =
+    List(arguments.size - 1) { KVariance.IN } + KVariance.OUT
 
 /** Whether this is a function reference type of [typeOf], like `KFunction1<String, Int>`, with the parameter types as arguments. */
 private fun KType.isFunctionReferenceType(): Boolean =
@@ -467,35 +529,56 @@ private fun KType.nonClassType(): KType? =
 
 /**
  * The first of this type, or of its type arguments, whose type arguments do not match the type parameters of its class,
- * like the one of a [KType] implemented by hand, paired with the description of the expected number of them,
+ * like the one of a [KType] implemented by hand, paired with the reason, and the advice how to provide it,
  * provided all their classifiers are classes, accessible to the snippets.
+ *
+ * The type arguments must be as many as the type parameters,
+ * and a projected one must not conflict with the variance of its type parameter, like `in` of `List<out E>`,
+ * as a type like `List<in String>` does not compile.
  *
  * The classes of the types produced by [typeOf] with the parameter types and the return type as arguments,
  * while the class takes only the return type, take more:
  * `KFunction` of a function reference type, like `KFunction1<String, Int>` or `KSuspendFunction1<String, Int>`,
- * and `FunctionN` of a function type of more than 22 parameters, which, unless the plain `FunctionN<R>`,
+ * of the contravariant parameter types and the covariant return type, as `KFunction1<in P1, out R>`,
+ * and `FunctionN` of a function type of more than 22 parameters, which, unless the plain `FunctionN<R>` of the covariant return type,
  * has 23 parameters at least, a receiver included, of invariant types.
  */
-private fun KType.mismatchedArguments(): Pair<KType, String>? {
-    val expected = when (val kClass = classifier as KClass<*>) {
+private fun KType.invalidArguments(): Pair<KType, String>? {
+    val kClass = classifier as KClass<*>
+    val expected = when (kClass) {
         KFunction::class -> "1 or more".takeIf { arguments.isEmpty() }
         FunctionN::class -> "1, or 24 or more invariant ones of a function type".takeUnless {
             arguments.size == 1 || isBigArityFunctionType()
         }
-        else -> kClass.typeParameterCount().takeIf { it != arguments.size }?.toString()
+        else -> kClass.typeParameterVariances().size.takeIf { it != arguments.size }?.toString()
     }
-    if (expected != null) return this to expected
-    return arguments.firstNotNullOfOrNull { it.type?.mismatchedArguments() }
+    if (expected != null) {
+        val count = arguments.size
+        return this to "which has $count type argument${if (count == 1) "" else "s"}, " +
+                "while ${kClass.qualifiedName} takes $expected - provide it as a complete type"
+    }
+    val variances = when {
+        kClass == KFunction::class -> functionReferenceVariances()
+        kClass == FunctionN::class && arguments.size == 1 -> listOf(KVariance.OUT)
+        kClass == FunctionN::class -> List(arguments.size) { KVariance.INVARIANT }
+        else -> mutableCollectionType()?.variances ?: kClass.typeParameterVariances()
+    }
+    arguments.zip(variances).firstOrNull { (argument, variance) ->
+        argument.variance == KVariance.IN && variance == KVariance.OUT || argument.variance == KVariance.OUT && variance == KVariance.IN
+    }?.let { (argument, variance) ->
+        return this to "whose type argument $argument conflicts with the ${variance.name.lowercase()} variance of its type parameter - provide it as a valid type"
+    }
+    return arguments.firstNotNullOfOrNull { it.type?.invalidArguments() }
 }
 
 /**
- * The number of the type parameters of this class, and of its outer classes, if it is an inner class, as the arguments of its type.
+ * The variances of the type parameters of this class, and of its outer classes, if it is an inner class, in the order of the arguments of its type.
  *
- * `KClass.createType` checks the same, but only for the type arguments of kotlin-reflect, failing on a [KType] implemented by hand,
+ * `KClass.createType` checks their number, but only for the type arguments of kotlin-reflect, failing on a [KType] implemented by hand,
  * like a nested type argument of one, and without telling the expected number but in its message.
  */
-private fun KClass<*>.typeParameterCount(): Int =
-    typeParameters.size + if (isInner) java.declaringClass?.kotlin?.typeParameterCount() ?: 0 else 0
+private fun KClass<*>.typeParameterVariances(): List<KVariance> =
+    typeParameters.map { it.variance } + if (isInner) java.declaringClass?.kotlin?.typeParameterVariances() ?: emptyList() else emptyList()
 
 /** The first class of this type, or of its type arguments, which the snippets cannot refer to. */
 private fun KType.inaccessibleClass(): Class<*>? =

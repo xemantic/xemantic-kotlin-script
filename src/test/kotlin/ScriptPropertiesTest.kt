@@ -110,6 +110,20 @@ class Generic<T>(val value: T) {
 
 }
 
+/** The types of the members keep the receiver of a function type, unlike the ones of [typeOf]. */
+class ReceiverHolder {
+    val plus: Int.(Int) -> Int = { this + it }
+}
+
+/** A function type of more than 22 parameters with a receiver, as kotlin-reflect does not produce one with its parameter types. */
+private fun bigArityExtensionFunctionType(isMarkedNullable: Boolean): KType = handWrittenType(
+    FunctionN::class,
+    List(23) { KTypeProjection.invariant(typeOf<Int>()) } + KTypeProjection.invariant(typeOf<Int>()),
+    "kotlin.Int.(${List(22) { "kotlin.Int" }.joinToString()}) -> kotlin.Int",
+    isMarkedNullable,
+    ReceiverHolder::plus.returnType.annotations
+)
+
 class ScriptPropertiesTest {
 
     @Test
@@ -954,6 +968,105 @@ class ScriptPropertiesTest {
         ))
     }
 
+    /**
+     * A type argument projected against the variance of its type parameter, like `List<in String>`, does not compile,
+     * also of the parameter types of `KFunction`, which are contravariant, and of the return type of `KFunction` and `FunctionN`, which is covariant.
+     */
+    @Test
+    fun `should reject property of hand-written type with type argument projection conflicting with its type parameter`() {
+        // given
+        val int = KTypeProjection.invariant(typeOf<Int>())
+        val types = listOf(
+            handWrittenType(KFunction::class, listOf(KTypeProjection.covariant(typeOf<String>()), int), "kotlin.reflect.KFunction1<out kotlin.String, kotlin.Int>"),
+            handWrittenType(KFunction::class, listOf(int, KTypeProjection.contravariant(typeOf<Int>())), "kotlin.reflect.KFunction1<kotlin.Int, in kotlin.Int>"),
+            handWrittenType(KFunction::class, listOf(KTypeProjection.contravariant(typeOf<Int>())), "kotlin.reflect.KFunction<in kotlin.Int>"),
+            handWrittenType(FunctionN::class, listOf(KTypeProjection.contravariant(typeOf<Int>())), "kotlin.jvm.functions.FunctionN<in kotlin.Int>"),
+            handWrittenType(List::class, listOf(KTypeProjection.contravariant(typeOf<String>())), "kotlin.collections.List<in kotlin.String>"),
+            handWrittenType(
+                Map::class,
+                listOf(int, KTypeProjection.invariant(handWrittenType(List::class, listOf(KTypeProjection.contravariant(typeOf<String>())), "kotlin.collections.List<in kotlin.String>"))),
+                "kotlin.collections.Map<kotlin.Int, kotlin.collections.List<in kotlin.String>>"
+            )
+        )
+
+        // when
+        val exceptions = types.map { type ->
+            assertFailsWith<IllegalArgumentException> {
+                ScriptProperty("foo", type, null)
+            }
+        }
+
+        // then
+        val advice = "provide it as a valid type, e.g. with typeOf"
+        assert(exceptions.map { it.message } == listOf(
+            "Property 'foo' is of type kotlin.reflect.KFunction1<out kotlin.String, kotlin.Int>, whose type argument out kotlin.String conflicts with the in variance of its type parameter - $advice",
+            "Property 'foo' is of type kotlin.reflect.KFunction1<kotlin.Int, in kotlin.Int>, whose type argument in kotlin.Int conflicts with the out variance of its type parameter - $advice",
+            "Property 'foo' is of type kotlin.reflect.KFunction<in kotlin.Int>, whose type argument in kotlin.Int conflicts with the out variance of its type parameter - $advice",
+            "Property 'foo' is of type kotlin.jvm.functions.FunctionN<in kotlin.Int>, whose type argument in kotlin.Int conflicts with the out variance of its type parameter - $advice",
+            "Property 'foo' is of type kotlin.collections.List<in kotlin.String>, whose type argument in kotlin.String conflicts with the out variance of its type parameter - $advice",
+            "Property 'foo' is of type kotlin.collections.List<in kotlin.String>, whose type argument in kotlin.String conflicts with the out variance of its type parameter - $advice"
+        ))
+    }
+
+    /** The projections agreeing with the variance of the type parameter are redundant, but compile. */
+    @Test
+    fun `should provide property of hand-written type of function reference with projections agreeing with its type parameters`() = runTest {
+        // given
+        val type = handWrittenType(
+            KFunction::class,
+            listOf(KTypeProjection.contravariant(typeOf<String>()), KTypeProjection.STAR, KTypeProjection.covariant(typeOf<Int>())),
+            "kotlin.reflect.KFunction2<in kotlin.String, *, out kotlin.Int>"
+        )
+        ScriptSession(listOf(ScriptProperty("foo", type, null))).use { session ->
+            // when
+            val result = session.execute("foo?.name")
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == null)
+            }
+        }
+    }
+
+    /** kotlin-reflect resolves the function of the value, unless it is a local one, see [ScriptProperty.type]. */
+    @Test
+    fun `should reject function reference value of another arity`() {
+        // given
+        val values = listOf<Pair<KType, KFunction<*>>>(
+            typeOf<KFunction1<String, Int>>() to ::ignore23,
+            typeOf<KFunction2<String, String, Int>>() to ::twice,
+            typeOf<KSuspendFunction1<String, Int>>() to ::suspendIgnore2
+        )
+
+        // when
+        val exceptions = values.map { (type, value) ->
+            assertFailsWith<IllegalArgumentException> {
+                ScriptProperty("f", type, value)
+            }
+        }
+
+        // then
+        assert(exceptions.map { it.message } == listOf(
+            "Property 'f' of type ${values[0].first} has a value of function ignore23, which takes 23 parameters, while the type takes 1",
+            "Property 'f' of type ${values[1].first} has a value of function twice, which takes 1 parameter, while the type takes 2",
+            "Property 'f' of type ${values[2].first} has a value of function suspendIgnore2, which takes 2 parameters, while the type takes 1"
+        ))
+    }
+
+    /** A bound function reference does not take its bound receiver. */
+    @Test
+    fun `should accept bound function reference value of the arity of its type`() {
+        // given
+        val value: KFunction1<Any?, String> = "foo"::plus
+
+        // when
+        val property = property("f", value)
+
+        // then
+        assert(property.value == value)
+    }
+
     @Test
     fun `should provide property of FunctionN type of the return type only`() = runTest {
         // given
@@ -1173,23 +1286,29 @@ class ScriptPropertiesTest {
         ScriptSession(listOf(property("handler", handler), property("fs", mutableListOf(::twice)))).use { session ->
             // when
             val results = listOf(
-                session.execute("fun z(): Int = 1; handler(::z)"),
+                session.execute("fun z(): Int = 1"),
+                session.execute("handler(::z)"),
                 session.execute("fs.add(::z)"),
-                session.execute("fs[0].name")
+                session.execute("fs[0].name + ::z.name")
             )
 
             // then
             results[0] should {
-                be<ScriptResult.Error>()
-                have(phase == ExecutionPhase.COMPILATION)
+                be<ScriptResult.Value>()
             }
             results[1] should {
                 be<ScriptResult.Error>()
                 have(phase == ExecutionPhase.COMPILATION)
+                have("Unresolved reference 'z'" !in message)
             }
             results[2] should {
+                be<ScriptResult.Error>()
+                have(phase == ExecutionPhase.COMPILATION)
+                have("Unresolved reference 'z'" !in message)
+            }
+            results[3] should {
                 be<ScriptResult.Value>()
-                have(value == "twice")
+                have(value == "twicez")
             }
         }
     }
@@ -1242,6 +1361,75 @@ class ScriptPropertiesTest {
             "kotlin.collections.List<($ints22, kotlin.Function1<kotlin.Int, kotlin.Int>) -> kotlin.Unit>",
             "(kotlin.String, $ints22) -> kotlin.Unit"
         ))
+    }
+
+    /**
+     * A function type marked by `@ExtensionFunctionType`, like the type of a member, is rendered with its receiver,
+     * also of more than 22 parameters, which only a hand-written type has as type arguments.
+     */
+    @Test
+    fun `should render function types marked as extension function types with receiver in source`() {
+        // given
+        val types = listOf(
+            ReceiverHolder::plus.returnType,
+            bigArityExtensionFunctionType(isMarkedNullable = false),
+            bigArityExtensionFunctionType(isMarkedNullable = true)
+        )
+
+        // when
+        val sources = types.map { it.toSource() }
+
+        // then
+        val ints22 = List(22) { "kotlin.Int" }.joinToString()
+        assert(sources == listOf(
+            "@kotlin.ExtensionFunctionType kotlin.Function2<kotlin.Int, kotlin.Int, kotlin.Int>",
+            "kotlin.Int.($ints22) -> kotlin.Int",
+            "(kotlin.Int.($ints22) -> kotlin.Int)?"
+        ))
+    }
+
+    @Test
+    fun `should provide properties of function types with receiver`() = runTest {
+        // given
+        val plus = ReceiverHolder().plus
+        val sum: Int.(Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> Int =
+            { b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w ->
+                this + b + c + d + e + f + g + h + i + j + k + l + m + n + o + p + q + r + s + t + u + v + w
+            }
+        val properties = listOf(
+            ScriptProperty("add", ReceiverHolder::plus.returnType, plus),
+            ScriptProperty("sum", bigArityExtensionFunctionType(isMarkedNullable = false), sum)
+        )
+        ScriptSession(properties).use { session ->
+            // when
+            val result = session.execute("1.add(2) + 1.sum(${(2..23).joinToString()})")
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == 3 + 276)
+            }
+        }
+    }
+
+    /** [typeOf] does not retain the receiver of a function type, see [ScriptProperty.type]. */
+    @Test
+    fun `should provide property of function type of more than 22 parameters with receiver of typeOf without receiver`() = runTest {
+        // given
+        val sum: Int.(Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> Int =
+            { b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w ->
+                this + b + c + d + e + f + g + h + i + j + k + l + m + n + o + p + q + r + s + t + u + v + w
+            }
+        ScriptSession(listOf(property("sum", sum))).use { session ->
+            // when
+            val result = session.execute("sum(${(1..23).joinToString()})")
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == 276)
+            }
+        }
     }
 
     @Test
@@ -1447,6 +1635,9 @@ fun twice(x: String): Int = x.length * 2
 
 suspend fun suspendTwice(x: String): Int = x.length * 2
 
+@Suppress("unused", "RedundantSuspendModifier")
+suspend fun suspendIgnore2(a: String, b: String) {}
+
 /** A function of more than 22 parameters, whose reference is a `KFunction23`. */
 @Suppress("unused")
 fun ignore23(
@@ -1454,15 +1645,17 @@ fun ignore23(
     m: Int, n: Int, o: Int, p: Int, q: Int, r: Int, s: Int, t: Int, u: Int, v: Int, w: Int
 ) {}
 
-/** A nullable [KType] implemented by hand, seen by the members of the interface only. */
+/** A [KType] implemented by hand, nullable unless told otherwise, seen by the members of the interface only. */
 private fun handWrittenType(
     classifier: KClassifier?,
     arguments: List<KTypeProjection> = emptyList(),
-    name: String
+    name: String,
+    isMarkedNullable: Boolean = true,
+    annotations: List<Annotation> = emptyList()
 ): KType = object : KType {
     override val classifier = classifier
     override val arguments = arguments
-    override val isMarkedNullable = true
-    override val annotations = emptyList<Annotation>()
+    override val isMarkedNullable = isMarkedNullable
+    override val annotations = annotations
     override fun toString() = name
 }
