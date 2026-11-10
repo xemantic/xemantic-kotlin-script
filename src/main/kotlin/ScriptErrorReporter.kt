@@ -57,7 +57,7 @@ private const val MAX_NAMED_UNINITIALIZED = 5
  * @param snippets the lines of the snippets by their names, like `snippet3.kts`.
  * @param snippetDeclarations the declarations of the evaluated snippets, also of the provided properties.
  * @param uninitializedProperties the properties of the snippets which failed in the evaluation, `null` then.
- * @param inlinedFrames the frames of the code inlined into the snippets, of the lines beyond the end of a snippet.
+ * @param inlinedFrames the frames of the code inlined into the snippets, of the lines beyond the end of a snippet, or of an inlined lambda.
  * @param propertyAccessors the properties of the accessors of the classes of the snippets, named in the hints by the property.
  */
 internal class ScriptErrorReporter(
@@ -342,8 +342,8 @@ internal class ScriptErrorReporter(
     /**
      * The frames of the snippets, preceded by the frame throwing the exception, if it is not one of them,
      * like `java.lang.Class.getDeclaredField(Class.java:2794)`,
-     * with a frame of inlined code, its line beyond the end of the snippet, resolved to the frames
-     * of the inlined function and of its call site, see [InlinedFrames],
+     * with a frame of inlined code, its line beyond the end of the snippet, or within an inlined lambda,
+     * resolved to the frames of the inlined function and of its call site, see [InlinedFrames],
      * and with the repeated sequences of frames, like of a recursion, collapsed.
      */
     private fun StringBuilder.appendFrames(
