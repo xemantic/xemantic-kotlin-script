@@ -19,11 +19,15 @@
 package com.xemantic.kotlin.script
 
 import com.xemantic.kotlin.test.assert
+import org.apache.maven.settings.Settings
+import kotlin.io.path.createTempDirectory
+import kotlin.io.path.writeText
 import kotlin.test.Test
 
 /**
  * The shortening of the repositories in the messages of Maven, which the resolver reports,
- * also of Maven Central, which cannot be reached by a deterministic test, see [withRepositoryUrls].
+ * also of Maven Central, which cannot be reached by a deterministic test, see [withRepositoryUrls],
+ * and the release of the resolver.
  */
 class SnippetDependencyResolverTest {
 
@@ -81,6 +85,51 @@ class SnippetDependencyResolverTest {
             shortened == "Could not transfer metadata com.xemantic.fixture:greeter/maven-metadata.xml " +
                 "from/to http://127.0.0.1:8080/: status code: 401, reason phrase: Unauthorized (401)"
         )
+    }
+
+    /** See #209. */
+    @Test
+    fun `should close version lookup once closed`() {
+        // given
+        val resolver = SnippetDependencyResolver(javaClass.classLoader)
+
+        // when
+        resolver.close()
+
+        // then
+        val failure = runCatching {
+            resolver.versionLookup.latestVersion("com.xemantic.fixture", "greeter", emptyList())
+        }.exceptionOrNull()
+        assert(failure is IllegalStateException && failure.message == "The version lookup is closed")
+    }
+
+    /** See #209. */
+    @Test
+    fun `should close class loader even if closing version lookup fails`() {
+        // given a version lookup, which fails to shut down the repository system created by its lookup
+        val localRepository = createTempDirectory("maven-local").toFile()
+        val dependencies = createTempDirectory("dependencies")
+        dependencies.resolve("marker.txt").writeText("marker")
+        val versionLookup = MavenVersionLookup(
+            settingsFactory = { Settings().apply { this.localRepository = localRepository.path } },
+            repositorySystemFactory = {
+                newRepositorySystem().apply { addOnSystemEndedHandler { error("Shutdown failed") } }
+            }
+        )
+        val resolver = SnippetDependencyResolver(javaClass.classLoader, versionLookup)
+        versionLookup.latestVersion("com.xemantic.fixture", "greeter", emptyList())
+        resolver.classLoader.add(listOf(dependencies.toFile()))
+        val markerBefore = resolver.classLoader.getResource("marker.txt")
+
+        // when
+        val failure = runCatching { resolver.close() }.exceptionOrNull()
+
+        // then
+        assert(markerBefore != null)
+        assert(failure?.suppressed?.map { it.message } == listOf("Shutdown failed"))
+        assert(resolver.classLoader.getResource("marker.txt") == null)
+        localRepository.deleteRecursively()
+        dependencies.toFile().deleteRecursively()
     }
 
 }

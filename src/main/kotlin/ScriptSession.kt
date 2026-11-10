@@ -235,7 +235,7 @@ internal class DefaultScriptSession(
 
     private val disposable = Disposer.newDisposable(name)
 
-    private val dependencyResolver = SnippetDependencyResolver(classLoader)
+    internal val dependencyResolver = SnippetDependencyResolver(classLoader)
 
     /** The lines of the snippets by their names, like `snippet3.kts`, accessed on the [thread] only. */
     private val snippets = HashMap<String, List<String>>()
@@ -600,9 +600,18 @@ internal class DefaultScriptSession(
         // released after the last evaluation on the thread, which might be the declaration of the properties reading them,
         // and before the disposal, so its failure cannot keep them
         thread.execute {
-            ScriptPropertyValues.unregister(id)
-            Disposer.dispose(disposable)
-            dependencyResolver.close()
+            // each one released even if an earlier one fails, which is logged, as no caller awaits the release,
+            // while a fatal error is thrown, to the uncaught exception handler of the thread
+            try {
+                releaseAll(
+                    { ScriptPropertyValues.unregister(id) },
+                    { Disposer.dispose(disposable) },
+                    dependencyResolver::close
+                )
+            } catch (e: Throwable) {
+                if (e.isFatal) throw e
+                logger.warn(e) { "$name: releasing the session failed" }
+            }
         }
         thread.shutdown()
     }
@@ -618,6 +627,17 @@ private const val PROPERTIES_SNIPPET = "properties.kts"
  */
 internal val Throwable.isFatal: Boolean
     get() = this is VirtualMachineError && this !is StackOverflowError
+
+/**
+ * Runs each of these [releases], even if an earlier one throws,
+ * then throws the first fatal failure, see [isFatal], or else the first failure, if any, with the other ones suppressed.
+ */
+internal fun releaseAll(vararg releases: () -> Unit) {
+    val failures = releases.mapNotNull { release -> runCatching(release).exceptionOrNull() }.distinct()
+    val thrown = failures.firstOrNull { it.isFatal } ?: failures.firstOrNull() ?: return
+    failures.filter { it !== thrown }.forEach(thrown::addSuppressed)
+    throw thrown
+}
 
 /**
  * The result of the [read], or the [fallback], if it throws, logged by this logger with the [message] at the debug level,
