@@ -38,7 +38,8 @@ private val snippetQualifiedName = Regex("(?:(?<=\\[L)|(?<![\\p{L}\\p{N}_.$]))Sn
 
 private val snippetClassName = Regex("Snippet\\d+")
 
-private val unresolvedReference = Regex("Unresolved reference '(.+)'\\.")
+/** An unresolved reference, with the receiver of an extension, if the reference is qualified, like `"a".shout()`. */
+private val unresolvedReference = Regex("Unresolved reference '(.+?)'(?: on receiver of type '(.+)')?\\.")
 
 /** The mangled name of a method taking or returning a value class, like `getTimeout-UwyO8pc`. */
 private val mangledMethod = Regex("[\\p{L}_][\\p{L}\\p{N}_]*-[\\p{L}\\p{N}_]{7}\\(")
@@ -54,18 +55,14 @@ private const val MAX_NAMED_UNINITIALIZED = 5
  * pointing to the offending lines of the snippets.
  *
  * @param snippets the lines of the snippets by their names, like `snippet3.kts`.
- * @param snippetClassNames the simple names of the classes declared by the evaluated snippets.
- * @param snippetPropertyNames the names of the properties declared by the evaluated snippets, also of the provided ones.
- * @param snippetFunctionNames the names of the functions declared by the evaluated snippets.
+ * @param snippetDeclarations the declarations of the evaluated snippets, also of the provided properties.
  * @param uninitializedProperties the properties of the snippets which failed in the evaluation, `null` then.
  * @param inlinedFrames the frames of the code inlined into the snippets, of the lines beyond the end of a snippet.
  * @param propertyAccessors the properties of the accessors of the classes of the snippets, named in the hints by the property.
  */
 internal class ScriptErrorReporter(
     private val snippets: Map<String, List<String>>,
-    private val snippetClassNames: Set<String> = emptySet(),
-    private val snippetPropertyNames: Set<String> = emptySet(),
-    private val snippetFunctionNames: Set<String> = emptySet(),
+    private val snippetDeclarations: SnippetDeclarations = SnippetDeclarations(),
     private val uninitializedProperties: UninitializedProperties = UninitializedProperties(),
     private val inlinedFrames: InlinedFrames = InlinedFrames(snippets),
     private val propertyAccessors: PropertyAccessors = PropertyAccessors()
@@ -152,29 +149,60 @@ internal class ScriptErrorReporter(
                 append("  | $sourceLine\n")
             }
         }
-        unresolvedReference.matchEntire(diagnostic.message)?.groupValues?.get(1)?.let { name ->
-            appendUnresolvedEarlierDeclarationHint(name)
+        unresolvedReference.matchEntire(diagnostic.message)?.let { match ->
+            appendUnresolvedEarlierDeclarationHint(match.groupValues[1], receiverType = match.groups[2]?.value)
         }
     }
 
     /**
      * The hint at the K2 REPL compiler not resolving a class, a property or a function of this [name], declared by an earlier snippet,
-     * within a declaration of an inferred type used in the same snippet, which resolves once its type is declared.
-     * A declaration of a snippet which failed to compile is not kept, so not hinted at, as it stays unresolved also then.
+     * within a declaration of an inferred type used in the same snippet, which resolves once its type is declared,
+     * also an extension, called on the receiver of the [receiverType] of the message, if its receiver accepts it,
+     * or on an implicit receiver, hinted at conditionally, as the receivers in scope are not known.
+     * A declaration of a snippet which failed to compile is not kept, so not hinted at, as it stays unresolved also then,
+     * nor an inaccessible one, see [SnippetDeclarations].
      */
-    private fun StringBuilder.appendUnresolvedEarlierDeclarationHint(name: String) {
-        if (name in snippetClassNames) {
+    private fun StringBuilder.appendUnresolvedEarlierDeclarationHint(name: String, receiverType: String?) {
+        if (receiverType != null) {
+            val reference = when {
+                snippetDeclarations.extensionPropertyReceivers(name).any { it.accepts(receiverType) } -> "receiver.$name"
+                snippetDeclarations.extensionFunctionReceivers(name).any { it.accepts(receiverType) } -> "receiver.$name(...)"
+                else -> return
+            }
+            appendDeclareTypeHint(name, "fun f() = $reference.toString()", "fun f(): String = $reference.toString()")
+            return
+        }
+        if (snippetDeclarations.isClass(name)) {
             append("  hint: '$name' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type,")
             append(" like `fun f(x: Any) = x is $name` - declare the type, like `fun f(x: Any): Boolean = x is $name`.\n")
             return
         }
-        val reference = when (name) {
-            in snippetPropertyNames -> name
-            in snippetFunctionNames -> "$name()"
-            else -> return
+        when {
+            snippetDeclarations.isProperty(name) -> {
+                appendDeclareTypeHint(name, "fun f() = $name.toString()", "fun f(): String = $name.toString()")
+                return
+            }
+            snippetDeclarations.isFunction(name) -> {
+                appendDeclareTypeHint(name, "fun f() = $name(...).toString()", "fun f(): String = $name(...).toString()")
+                return
+            }
         }
+        val propertyReceivers = snippetDeclarations.extensionPropertyReceivers(name)
+        val (receivers, reference) = if (propertyReceivers.isNotEmpty()) {
+            propertyReceivers to name
+        } else {
+            snippetDeclarations.extensionFunctionReceivers(name) to "$name(...)"
+        }
+        val receiver = receivers.firstOrNull() ?: return
+        val ofType = if (receivers.size == 1) "of this type" else "of one of these types"
+        append("  hint: '$name' is an extension of ${receivers.joinToString(" or ")} declared in an earlier snippet")
+        append(" - if it is called on an implicit receiver $ofType, the K2 REPL compiler does not resolve it within a declaration of an inferred type used in the same snippet,")
+        append(" like `fun $receiver.f() = $reference.toString()` - declare the type, like `fun $receiver.f(): String = $reference.toString()`.\n")
+    }
+
+    private fun StringBuilder.appendDeclareTypeHint(name: String, inferred: String, declared: String) {
         append("  hint: '$name' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet,")
-        append(" like `fun f() = $reference.toString()` - declare the type, like `fun f(): String = $reference.toString()`.\n")
+        append(" like `$inferred` - declare the type, like `$declared`.\n")
     }
 
     /**
