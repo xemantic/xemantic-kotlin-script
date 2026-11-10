@@ -53,6 +53,8 @@ import kotlin.script.experimental.jvm.updateClasspath
  * The resolved JARs are added to the [classLoader] of the snippets at once,
  * as the compiler keeps them on its classpath even if the snippet declaring them fails to compile,
  * so the next snippets can call them, while the evaluator would load them only for an evaluated snippet.
+ *
+ * @property versionLookup the lookup of the latest version of a dependency, exposed only for the tests.
  */
 internal class SnippetDependencyResolver(
     parent: ClassLoader,
