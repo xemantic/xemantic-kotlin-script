@@ -42,8 +42,11 @@ import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
+import org.jetbrains.kotlin.com.intellij.openapi.Disposable
+import org.jetbrains.kotlin.com.intellij.openapi.util.Disposer
 import java.lang.ref.WeakReference
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
@@ -2880,6 +2883,36 @@ class ScriptSessionTest {
             session.execute("1")
         }
         assert(exception.message == "The session is closed")
+    }
+
+    /** See #209. */
+    @Test
+    fun `should release dependency resolver of session closed while disposal of its compiler fails`() = runTest {
+        // given a session, with a disposable of its compiler failing to dispose
+        val threads = CopyOnWriteArrayList<Thread>()
+        val uncaught = CopyOnWriteArrayList<Throwable>()
+        val failingSession = DefaultScriptSession(emptyList(), Dispatchers.Default) { threadFactory ->
+            Executors.newSingleThreadExecutor { runnable ->
+                threadFactory.newThread(runnable).apply {
+                    setUncaughtExceptionHandler { _, e -> uncaught += e }
+                    threads += this
+                }
+            }
+        }
+        failingSession.execute("1")
+        Disposer.register(failingSession.repl!!.disposable, Disposable { error("Disposal failed") })
+
+        // when
+        failingSession.close()
+
+        // then
+        threads.forEach { it.join(TimeUnit.MINUTES.toMillis(1)) }
+        val lookup = runCatching {
+            failingSession.dependencyResolver.versionLookup.latestVersion("com.xemantic.fixture", "greeter", emptyList())
+        }.exceptionOrNull()
+        assert(threads.none { it.isAlive })
+        assert(lookup is IllegalStateException && lookup.message == "The version lookup is closed")
+        assert(uncaught.isEmpty())
     }
 
     /**

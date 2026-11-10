@@ -113,6 +113,13 @@ internal fun latestMavenVersion(
     return LatestMavenVersion(latest, stable = !latest.isPreRelease())
 }
 
+/** A new repository system of Maven Resolver, with the transports of the HTTP and file repositories. */
+internal fun newRepositorySystem(): RepositorySystem = @Suppress("DEPRECATION") MavenRepositorySystemUtils.newServiceLocator().apply {
+    addService(RepositoryConnectorFactory::class.java, BasicRepositoryConnectorFactory::class.java)
+    addService(TransporterFactory::class.java, HttpTransporterFactory::class.java)
+    addService(TransporterFactory::class.java, FileTransporterFactory::class.java)
+}.repositorySystem()
+
 /**
  * Looks up the latest version of a Maven artifact with Maven Resolver,
  * set up like `MavenDependenciesResolver` resolves the artifact in the version found:
@@ -120,32 +127,20 @@ internal fun latestMavenVersion(
  * It also honors their offline mode and their blocked mirrors, which `MavenDependenciesResolver` does not,
  * and reaches a mirror through the proxy, which `MavenDependenciesResolver` bypasses, see [withSettings].
  * Closing it shuts down its repository system, see [close].
+ *
+ * It is not thread-safe: it is confined to the thread of the session, which compiles the snippets, and closes it after the last one.
  */
 internal class MavenVersionLookup(
+    private val repositorySystemFactory: () -> RepositorySystem = ::newRepositorySystem,
     settingsFactory: () -> Settings = ::createMavenSettings
 ) : AutoCloseable {
 
     private val settings by lazy(settingsFactory)
 
     /** The repository system, created by the first lookup, so a lookup never used creates none to shut down. */
-    private var system: RepositorySystem? = null
+    private val repositorySystem = lazy(LazyThreadSafetyMode.NONE, repositorySystemFactory)
 
     private var closed = false
-
-    /**
-     * The repository system, created by the first lookup.
-     *
-     * @throws IllegalStateException if the lookup is closed.
-     */
-    @Synchronized
-    private fun system(): RepositorySystem {
-        check(!closed) { "The version lookup is closed" }
-        return system ?: @Suppress("DEPRECATION") MavenRepositorySystemUtils.newServiceLocator().apply {
-            addService(RepositoryConnectorFactory::class.java, BasicRepositoryConnectorFactory::class.java)
-            addService(TransporterFactory::class.java, HttpTransporterFactory::class.java)
-            addService(TransporterFactory::class.java, FileTransporterFactory::class.java)
-        }.repositorySystem().also { system = it }
-    }
 
     /** The active proxy of the Maven settings, if any. */
     private val proxySelector by lazy {
@@ -244,7 +239,8 @@ internal class MavenVersionLookup(
         repositories: List<RemoteRepository>,
         superseded: (RemoteRepository) -> Unit = {}
     ): LatestMavenVersion? {
-        val system = system()
+        check(!closed) { "The version lookup is closed" }
+        val system = repositorySystem.value
         // each declared repository with the settings applied
         val looked = repositories.mapNotNull { repository -> repository.withSettings()?.let { repository to it } }
         val request = VersionRangeRequest(
@@ -309,14 +305,15 @@ internal class MavenVersionLookup(
      * Shuts down the repository system, if any lookup created it, releasing its resources, like the named locks,
      * and refuses the next lookups.
      * Closing a closed lookup has no effect.
-     * A lookup in progress would complete with the repository system shut down, which Maven Resolver 1.9 still serves,
-     * but none is, as the [SnippetDependencyResolver] is closed on the thread of the session, after its last compilation.
+     *
+     * If the shutdown fails, its failure is thrown, while the lookup stays closed, and closing it again does not retry the shutdown,
+     * as Maven Resolver runs every handler of the shutdown, even if an earlier one fails, collecting their failures,
+     * and only once, so a retry would release nothing more.
      */
-    @Synchronized
     override fun close() {
         if (closed) return
         closed = true
-        system?.shutdown()
+        if (repositorySystem.isInitialized()) repositorySystem.value.shutdown()
     }
 
     /** The versions of the artifact in the local repository, also these resolved without its `maven-metadata.xml`. */

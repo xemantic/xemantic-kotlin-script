@@ -53,7 +53,10 @@ import kotlin.script.experimental.jvm.updateClasspath
  * as the compiler keeps them on its classpath even if the snippet declaring them fails to compile,
  * so the next snippets can call them, while the evaluator would load them only for an evaluated snippet.
  */
-internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
+internal class SnippetDependencyResolver(
+    parent: ClassLoader,
+    val versionLookup: MavenVersionLookup = MavenVersionLookup()
+) : AutoCloseable {
 
     val classLoader = DependencyClassLoader(parent)
 
@@ -87,8 +90,6 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
      * as added to the [mavenResolver], with their options, like the credentials.
      */
     private val repositories = mutableListOf<Pair<String, RemoteRepository>>()
-
-    private val versionLookup = MavenVersionLookup()
 
     /** The latest versions of the dependencies declared without version, by their coordinates, kept for the session. */
     private val latestVersions = HashMap<String, LatestMavenVersion>()
@@ -281,12 +282,12 @@ internal class SnippetDependencyResolver(parent: ClassLoader) : AutoCloseable {
         )
     }
 
+    /**
+     * Closes the [versionLookup] and the [classLoader], also if closing the former fails,
+     * throwing the failure of either, see [releaseAll].
+     */
     override fun close() {
-        try {
-            versionLookup.close()
-        } finally {
-            classLoader.close()
-        }
+        releaseAll(versionLookup::close, classLoader::close)
     }
 
     class DependencyClassLoader(parent: ClassLoader) : URLClassLoader(emptyArray(), parent) {

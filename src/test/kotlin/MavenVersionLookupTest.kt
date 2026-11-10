@@ -37,6 +37,7 @@ import org.eclipse.aether.spi.connector.transport.Transporter
 import org.eclipse.aether.spi.connector.transport.TransporterFactory
 import org.eclipse.aether.transfer.NoRepositoryConnectorException
 import java.nio.file.Path
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.io.path.createDirectories
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.writeText
@@ -553,6 +554,12 @@ class MavenVersionLookupTest {
         assert(latest == null)
     }
 
+    /**
+     * It passes also without shutting down the repository system with the lookup, see #174,
+     * as the session of each lookup has no `RepositoryCache`, so the transport shuts down its connection pool once the repository is read,
+     * see [MavenVersionLookup.latestVersion] —
+     * it guards against a future `RepositoryCache` shared by the lookups, which would keep the connections until the shutdown.
+     */
     @Test
     fun `should release connections of lookup once looked up`() {
         MavenRepositoryServer(username = "alice", password = "secret").use { server ->
@@ -602,6 +609,38 @@ class MavenVersionLookupTest {
         val failure = runCatching {
             lookup.latestVersion("com.xemantic.fixture", "greeter", listOf(remoteRepository(MavenRepository.url)))
         }.exceptionOrNull()
+        assert(failure is IllegalStateException && failure.message == "The version lookup is closed")
+    }
+
+    /** See #209. */
+    @Test
+    fun `should refuse to look up latest version once closed by failed shutdown, without shutting down again`() {
+        // given a repository system, created by a lookup, which fails to shut down
+        val shutdowns = AtomicInteger()
+        val lookup = MavenVersionLookup(
+            settingsFactory = { settings() },
+            repositorySystemFactory = {
+                newRepositorySystem().apply {
+                    addOnSystemEndedHandler {
+                        shutdowns.incrementAndGet()
+                        error("Shutdown failed")
+                    }
+                }
+            }
+        )
+        val repositories = listOf(remoteRepository(MavenRepository.url))
+        val latest = lookup.latestVersion("com.xemantic.fixture", "greeter", repositories)
+
+        // when
+        val closing = runCatching { lookup.close() }.exceptionOrNull()
+        val closingAgain = runCatching { lookup.close() }.exceptionOrNull()
+
+        // then
+        val failure = runCatching { lookup.latestVersion("com.xemantic.fixture", "greeter", repositories) }.exceptionOrNull()
+        assert(latest?.version == "1.10")
+        assert(closing?.suppressed?.map { it.message } == listOf("Shutdown failed"))
+        assert(closingAgain == null)
+        assert(shutdowns.get() == 1)
         assert(failure is IllegalStateException && failure.message == "The version lookup is closed")
     }
 
