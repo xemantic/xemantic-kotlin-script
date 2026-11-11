@@ -19,10 +19,14 @@
 
 package com.xemantic.kotlin.script
 
+import io.github.oshai.kotlinlogging.KotlinLogging
 import java.util.Collections
 import java.util.IdentityHashMap
 import kotlin.script.experimental.api.ResultValue
 import kotlin.script.experimental.api.ScriptDiagnostic
+import kotlin.script.experimental.api.SourceCode
+
+private val logger = KotlinLogging.logger {}
 
 /** The message of a failure without any diagnostic. */
 private const val NO_DIAGNOSTIC_MESSAGE = "Failed without any diagnostic message."
@@ -56,6 +60,57 @@ private val typeArgumentsCall = Regex("""^<\s*[\p{L}_*][\p{L}\p{N}_.,?*\s]*(?:<[
 
 /** Whether this code, following a reference, calls it, with a `(`, a trailing lambda, or type arguments, see [typeArgumentsCall]. */
 private fun String.startsCall(): Boolean = startsWith("(") || startsWith("{") || typeArgumentsCall.containsMatchIn(this)
+
+/**
+ * How an unresolved reference is used in the source:
+ * [onExplicitReceiver] if it follows a `.`, like `1.tagged()`, but not a range `..`,
+ * [callable] if it follows a `::`, like `String::shout`, both `false` if the code before it cannot be told,
+ * [called] if a `(`, a trailing lambda, or type arguments followed by either follow it, see [startsCall],
+ * otherwise `null`, as it might be called still, like an infix function, `"a" and "b"`, or with type arguments of a function type, `echo<() -> Int>(f)`,
+ * which cannot be told from a comparison, `size < 3`, by the source alone,
+ * and [onIntegerLiteral] if it follows an integer literal without a suffix, like `1.tagged()`, whose type a compiler message does not render.
+ */
+private class UnresolvedReference(val onExplicitReceiver: Boolean, val callable: Boolean, val called: Boolean?, val onIntegerLiteral: Boolean)
+
+/** An integer literal without a suffix, followed by a `.`, ending the code before a reference, like `1.` or `0xFF.`, but not `1.0.`. */
+private val integerLiteralReceiver = Regex("(?<![\\p{L}\\p{N}_.])(?:0[xXbB][0-9a-fA-F_]+|\\p{N}[\\p{N}_]*)\\.$")
+
+/** The types of an integer literal receiver, `Long` if it is too big for an `Int`. */
+private val integerLiteralTypes = listOf("Int", "Long")
+
+/**
+ * The code before the [column] of the [line] of these lines, or of the nearest line before it of any code, if the [line] starts there,
+ * without a trailing line comment, `null` if it cannot be told, as it might be within a comment or a multiline string.
+ */
+private fun List<String>.codeBefore(line: Int, column: Int): String? {
+    val prefix = this[line].take(column)
+    if (prefix.isNotBlank()) return if ("/*" in prefix || "*/" in prefix) null else prefix.trimEnd()
+    for (index in line - 1 downTo 0) {
+        val code = this[index].withoutLineComment() ?: return null
+        // a line of a block comment, which ends at the nearest line of it, or a line of a KDoc
+        if ("/*" in code || "*/" in code || code.trimStart().startsWith("*")) return null
+        if (code.isNotBlank()) return code.trimEnd()
+    }
+    return ""
+}
+
+/** This line of code without its trailing line comment, outside a string, `null` if it has a multiline string. */
+private fun String.withoutLineComment(): String? {
+    if ("\"\"\"" in this) return null
+    var quote: Char? = null
+    var index = 0
+    while (index < length) {
+        val char = this[index]
+        when {
+            quote != null && char == '\\' -> index++
+            quote != null -> if (char == quote) quote = null
+            char == '"' || char == '\'' -> quote = char
+            char == '/' && getOrNull(index + 1) == '/' -> return substring(0, index)
+        }
+        index++
+    }
+    return this
+}
 
 /** An unresolved reference, with the receiver of an extension, if the reference is qualified, like `"a".shout()`. */
 private val unresolvedReference = Regex("Unresolved reference '(.+?)'(?: on receiver of type '(.+)')?\\.")
@@ -200,62 +255,123 @@ internal class ScriptErrorReporter(
         if (exception != null && diagnostic.severity >= ScriptDiagnostic.Severity.ERROR) {
             appendConstPropertyHint(exception)
         }
-        unresolvedReference.matchEntire(diagnostic.message)?.let { match ->
-            // whether the reference is called, like `limit()`, `limit { }` or `echo<Int>(1)`, told by the source following it
-            val called = location?.end?.let { end ->
-                lines?.getOrNull(end.line - 1)?.drop((end.col - 1).coerceAtLeast(0))?.trimStart()?.ifEmpty { null }
-            }?.startsCall()
-            appendUnresolvedEarlierDeclarationHint(match.groupValues[1], receiverType = match.groups[2]?.value, called)
+        // a hint failing is left out, not to lose the report
+        append(logger.readOr("", { "cannot hint at the unresolved reference of: ${diagnostic.message}" }) {
+            buildString { appendUnresolvedReferenceHint(diagnostic.message, location, lines) }
+        })
+    }
+
+    private fun StringBuilder.appendUnresolvedReferenceHint(message: String, location: SourceCode.Location?, lines: List<String>?) {
+        unresolvedReference.matchEntire(message)?.let { match ->
+            val name = match.groupValues[1]
+            val line = location?.let { lines?.getOrNull(it.start.line - 1) }
+            val column = location?.start?.col?.minus(1)
+            val reference = if (line != null && column != null && column in 0..line.length) {
+                val before = lines.orEmpty().codeBefore(location.start.line - 1, column)
+                val after = line.substring(column).removePrefix("`$name`").removePrefix(name).trimStart()
+                UnresolvedReference(
+                    onExplicitReceiver = before != null && before.endsWith(".") && !before.endsWith(".."),
+                    callable = before != null && before.endsWith("::"),
+                    called = if (after.startsCall()) true else null,
+                    onIntegerLiteral = before != null && integerLiteralReceiver.containsMatchIn(before)
+                )
+            } else null
+            appendUnresolvedEarlierDeclarationHint(name, receiverType = match.groups[2]?.value, reference)
         }
     }
 
     /**
      * The hint at the K2 REPL compiler not resolving a class, a property or a function of this [name], declared by an earlier snippet,
      * within a declaration of an inferred type used in the same snippet, which resolves once its type is declared,
-     * also an extension, called on the receiver of the [receiverType] of the message, if its receiver accepts it,
-     * or on an implicit receiver, hinted at conditionally, as the receivers in scope are not known.
+     * also an extension, called on the receiver of the [receiverType] of the message, if its receiver accepts it.
+     * The compiler does not render the type of an integer literal receiver, like `1.tagged()`, nor any implicit receiver,
+     * also when no receiver of the type of the extension is in scope at all, so the hint is conditional then,
+     * on the compiler reporting the mismatch of the receiver once the type is declared, which the hint makes no worse.
+     * The form of an extension, a property or a function, is told by the [reference] in the source, if any.
      * A declaration of a snippet which failed to compile is not kept, so not hinted at, as it stays unresolved also then,
      * nor an inaccessible one, see [SnippetDeclarations].
-     * A reference [called], also with type arguments, see [startsCall], is hinted at as a function first, and only then as a property, like one of a function type,
+     * A reference called, see [UnresolvedReference.called], also with type arguments, see [startsCall], is hinted at as a function first, and only then as a property, like one of a function type,
      * unless an inaccessible function of the name is declared, which the compiler calls instead,
      * and one not called as a property only, also a `const val` or a `@JvmField` one, see [appendPropertyHint],
-     * or as a function, if no property of the name is declared, as it might be called still, like with type arguments of a function type, `echo<() -> Int>(f)`,
-     * both if it is not known whether it is called.
+     * both, the property first, if it is not known whether it is called.
      */
-    private fun StringBuilder.appendUnresolvedEarlierDeclarationHint(name: String, receiverType: String?, called: Boolean?) {
+    private fun StringBuilder.appendUnresolvedEarlierDeclarationHint(name: String, receiverType: String?, reference: UnresolvedReference?) {
+        // a callable reference to an extension of a snippet is not resolved also with the type declared, as a member and an extension at the same time
+        val callable = reference?.callable == true
+        val called = reference?.called
         if (receiverType != null) {
-            val reference = when {
-                snippetDeclarations.extensionPropertyReceivers(name).any { it.accepts(receiverType) } -> "receiver.$name"
-                snippetDeclarations.extensionFunctionReceivers(name).any { it.accepts(receiverType) } -> "receiver.$name(...)"
-                else -> return
+            if (callable) return
+            appendExplicitReceiverHint(name, listOf(receiverType), called, certain = true)
+            return
+        }
+        val onExplicitReceiver = reference?.onExplicitReceiver == true
+        if (!onExplicitReceiver) {
+            if (snippetDeclarations.isClass(name)) {
+                append("  hint: '$name' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type,")
+                append(" like `fun f(x: Any) = x is $name` - declare the type, like `fun f(x: Any): Boolean = x is $name`.\n")
+                return
             }
-            appendDeclareTypeHint(name, "fun f() = $reference.toString()", "fun f(): String = $reference.toString()")
+            if (called != true && appendPropertyHint(name)) return
+            // not known to be called, it is still called if no property of the name is declared
+            if ((called == true || snippetDeclarations.property(name) == null) && snippetDeclarations.isFunction(name)) {
+                appendDeclareTypeHint(name, "fun f() = $name(...).toString()", "fun f(): String = $name(...).toString()")
+                return
+            }
+            // a call of an inaccessible function of the name, which the compiler calls rather than a property of a function type, fails also then
+            if (called == true && !snippetDeclarations.isAnyFunction(name) && appendPropertyHint(name)) return
+        }
+        if (callable) return
+        if (reference?.onIntegerLiteral == true) {
+            appendExplicitReceiverHint(name, integerLiteralTypes, called, certain = false)
             return
         }
-        if (snippetDeclarations.isClass(name)) {
-            append("  hint: '$name' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type,")
-            append(" like `fun f(x: Any) = x is $name` - declare the type, like `fun f(x: Any): Boolean = x is $name`.\n")
-            return
-        }
-        if (called != true && appendPropertyHint(name)) return
-        // not known to be called, it is still called if no property of the name is declared
-        if ((called != false || snippetDeclarations.property(name) == null) && snippetDeclarations.isFunction(name)) {
-            appendDeclareTypeHint(name, "fun f() = $name(...).toString()", "fun f(): String = $name(...).toString()")
-            return
-        }
-        // a call of an inaccessible function of the name, which the compiler calls rather than a property of a function type, fails also then
-        if (called == true && !snippetDeclarations.isAnyFunction(name) && appendPropertyHint(name)) return
         val propertyReceivers = snippetDeclarations.extensionPropertyReceivers(name)
-        val (receivers, reference) = if (propertyReceivers.isNotEmpty()) {
-            propertyReceivers to name
-        } else {
-            snippetDeclarations.extensionFunctionReceivers(name) to "$name(...)"
-        }
-        val receiver = receivers.firstOrNull() ?: return
+        val functionReceivers = snippetDeclarations.extensionFunctionReceivers(name)
+        val isCall = called ?: propertyReceivers.isEmpty()
+        // the receivers of the form of the reference first, the other ones being possible as well, like a property of a function type called
+        val receivers = if (isCall) functionReceivers + propertyReceivers else propertyReceivers + functionReceivers
+        if (receivers.isEmpty()) return
+        val calledOn = if (isCall) "$name(...)" else name
         val ofType = if (receivers.size == 1) "of this type" else "of one of these types"
-        append("  hint: '$name' is an extension of ${receivers.joinToString(" or ")} declared in an earlier snippet")
-        append(" - if it is called on an implicit receiver $ofType, the K2 REPL compiler does not resolve it within a declaration of an inferred type used in the same snippet,")
-        append(" like `fun $receiver.f() = $reference.toString()` - declare the type, like `fun $receiver.f(): String = $reference.toString()`.\n")
+        append("  hint: '$name' is an extension of ${receivers.joinToString(" or ")} declared in an earlier snippet,")
+        append(" which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet,")
+        if (onExplicitReceiver) {
+            append(" like `fun f() = receiver.$calledOn.toString()` - declare the type, like `fun f(): String = receiver.$calledOn.toString()`,")
+            append(" and the compiler tells if the receiver is not $ofType.\n")
+        } else {
+            val declaration = receivers.first().declaration
+            val receiver = declaration ?: "Receiver"
+            append(" even on an implicit receiver $ofType, like `fun $receiver.f() = $calledOn.toString()` - declare the type, like `fun $receiver.f(): String = $calledOn.toString()`,")
+            if (declaration == null) append(" Receiver being the type of the receiver,")
+            append(" and the compiler tells if there is no such receiver.\n")
+        }
+    }
+
+    /**
+     * The hint at an extension of this [name] called on an explicit receiver of one of these [types], as rendered by a compiler message,
+     * by the extensions whose receiver accepts it, see [ExtensionReceiver.acceptance],
+     * hinted at as a function if [called], or if no extension property accepts it, as one of a function type is also called.
+     * The hint is conditional, on the compiler reporting the mismatch of the receiver once the type is declared,
+     * unless a receiver surely accepts the type, and the type is [certain], not of an integer literal, which might be a `Long`.
+     */
+    private fun StringBuilder.appendExplicitReceiverHint(name: String, types: List<String>, called: Boolean?, certain: Boolean) {
+        fun Set<ExtensionReceiver>.accepting() = associateWith { receiver -> types.maxOf { receiver.acceptance(it) } }
+            .filterValues { it != Acceptance.REJECTED }
+        val properties = snippetDeclarations.extensionPropertyReceivers(name).accepting()
+        val functions = snippetDeclarations.extensionFunctionReceivers(name).accepting()
+        if (properties.isEmpty() && functions.isEmpty()) return
+        val isCall = called == true || properties.isEmpty()
+        val calledOn = if (isCall) "receiver.$name(...)" else "receiver.$name"
+        if (certain && (properties.containsValue(Acceptance.ACCEPTED) || functions.containsValue(Acceptance.ACCEPTED))) {
+            appendDeclareTypeHint(name, "fun f() = $calledOn.toString()", "fun f(): String = $calledOn.toString()")
+            return
+        }
+        val receivers = if (isCall) functions.keys + properties.keys else properties.keys + functions.keys
+        val ofType = if (receivers.size == 1) "of this type" else "of one of these types"
+        append("  hint: '$name' is an extension of ${receivers.joinToString(" or ")} declared in an earlier snippet,")
+        append(" which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet,")
+        append(" like `fun f() = $calledOn.toString()` - declare the type, like `fun f(): String = $calledOn.toString()`,")
+        append(" and the compiler tells if the receiver is not $ofType.\n")
     }
 
     /**

@@ -30,12 +30,15 @@ import kotlin.reflect.KMutableProperty
 import kotlin.reflect.KParameter
 import kotlin.reflect.KProperty
 import kotlin.reflect.KType
+import kotlin.reflect.KTypeProjection
 import kotlin.reflect.KTypeParameter
+import kotlin.reflect.KVariance
 import kotlin.reflect.full.declaredMemberExtensionFunctions
 import kotlin.reflect.full.declaredMemberExtensionProperties
 import kotlin.reflect.full.declaredMemberFunctions
 import kotlin.reflect.full.declaredMemberProperties
 import kotlin.reflect.full.extensionReceiverParameter
+import kotlin.reflect.full.withNullability
 import kotlin.reflect.jvm.javaField
 import kotlin.reflect.jvm.javaGetter
 import kotlin.reflect.jvm.javaMethod
@@ -457,36 +460,335 @@ internal data class InternalMember(
 )
 
 /**
- * The receiver of an extension declared by a snippet, of the simple [name] of its class, like `String` or `Entry`,
- * or of the upper bound of a type parameter, `Any` if unbounded, taking `null` if [nullable].
+ * A qualifier of a rendered type, a package, like `kotlin.collections.` of `kotlin.collections.Map.Entry`,
+ * or the class of a snippet, see [snippetQualifier], which a later snippet does not name.
+ */
+private val qualifier = Regex("(?<![\\p{L}\\p{N}_.])(?:[a-z_][\\p{L}\\p{N}_]*\\.)+|${snippetQualifier.pattern}")
+
+/** The expansion of a type alias, as kotlin-reflect renders it after the alias, like ` /* = java.lang.StringBuilder */`. */
+private const val ALIAS_EXPANSION_START = " /* = "
+
+private const val ALIAS_EXPANSION_END = " */"
+
+/** The name of a class, also of a nested one, like `Map.Entry`, unlike a function type, like `(Int) -> Int`. */
+private val className = Regex("[\\w.]+")
+
+/**
+ * The supertypes of the well-known types of `kotlin.*`, and of the JVM types of the collection functions, like `ArrayList` of `arrayListOf`,
+ * by the names a compiler message renders them with,
+ * a read-only type not a subtype of the mutable one, like `List` of `MutableList`, unlike their JVM classes.
+ * A subtype not listed, like a class of a snippet, is not accepted, as its supertypes cannot be told by its name.
+ */
+private val wellKnownSupertypes: Map<String, Set<String>> = buildMap {
+    put("String", setOf("CharSequence", "Comparable", "Serializable"))
+    listOf("Char", "Boolean").forEach { put(it, setOf("Comparable", "Serializable")) }
+    listOf("Byte", "Short", "Int", "Long", "Float", "Double").forEach { put(it, setOf("Number", "Comparable", "Serializable")) }
+    put("Collection", setOf("Iterable"))
+    put("List", setOf("Collection", "Iterable"))
+    put("Set", setOf("Collection", "Iterable"))
+    put("MutableIterable", setOf("Iterable"))
+    put("MutableCollection", setOf("Collection", "MutableIterable", "Iterable"))
+    put("MutableList", setOf("List", "MutableCollection", "Collection", "MutableIterable", "Iterable"))
+    put("MutableSet", setOf("Set", "MutableCollection", "Collection", "MutableIterable", "Iterable"))
+    put("MutableMap", setOf("Map"))
+    put("MutableMap.MutableEntry", setOf("Map.Entry"))
+    put("ArrayList", getValue("MutableList"))
+    put("HashSet", getValue("MutableSet"))
+    put("LinkedHashSet", getValue("MutableSet") + "HashSet")
+    put("HashMap", getValue("MutableMap"))
+    put("LinkedHashMap", getValue("MutableMap") + "HashMap")
+    put("StringBuilder", setOf("CharSequence", "Appendable"))
+}
+
+/**
+ * The final types of [wellKnownSupertypes] listing each of their supertypes named there,
+ * so not a subtype of another type named there, unlike `StringBuilder`, which is `Comparable` only since Java 11.
+ */
+private val closedWellKnownTypes = setOf("String", "Char", "Boolean", "Byte", "Short", "Int", "Long", "Float", "Double")
+
+/**
+ * The mutable collection types of invariant type parameters, which kotlin-reflect reads as the read-only ones of covariant type parameters,
+ * like `MutableList` as `List`, as they share their JVM class.
+ */
+private val invariantMutableTypes = setOf(
+    "MutableCollection", "MutableList", "MutableSet", "MutableMap", "MutableMap.MutableEntry", "MutableListIterator"
+)
+
+/** The names of the types of [wellKnownSupertypes], the subtypes and the supertypes. */
+private val wellKnownTypes = wellKnownSupertypes.keys + wellKnownSupertypes.values.flatten()
+
+/** Whether an extension can be called on a receiver of a type, see [ExtensionReceiver.acceptance]. */
+internal enum class Acceptance {
+
+    /** It cannot. */
+    REJECTED,
+
+    /** It might, which is not told by the rendering of the type, like `List<Text>` of `List<CharSequence>`, `Text` declared by a later snippet. */
+    POSSIBLE,
+
+    /** It can. */
+    ACCEPTED
+
+}
+
+/**
+ * The receiver of an extension declared by a snippet, of the [name] of its class without the package, like `String` or `Map.Entry`,
+ * with its [typeArguments], `*` for a star projection, or `null` for a type parameter, both matching any,
+ * or of a function type, like `(Int) -> Int` or `List<Int>.() -> Int`, or of the upper bound of a type parameter, `Any` if unbounded,
+ * taking `null` if [nullable].
+ *
+ * @param variances the variance of each of the [typeArguments], of its projection, like `out Number`, or of the type parameter of its class,
+ * like `out E` of `List`, `null` if not known, [KVariance.INVARIANT] if not given.
  */
 internal data class ExtensionReceiver(
     val name: String,
-    val nullable: Boolean
+    val typeArguments: List<String?> = emptyList(),
+    val nullable: Boolean = false,
+    val variances: List<KVariance?> = emptyList()
 ) {
 
     /**
-     * Whether an extension of this receiver can be called on the receiver of this [type], as rendered by a compiler message,
-     * like `List<Int>`, `Map.Entry<Int, Int>` or `String?`, matched by the simple name of its class only,
-     * so not on a subtype, like `MutableList<Int>` of `List`, which cannot be told by the name.
+     * The receiver as declared by an extension, like `Map.Entry<String, Int>` or `((Int) -> Int)?`,
+     * `null` if a type argument is not known, as a type parameter is not declared by an extension of a later snippet.
      */
-    fun accepts(type: String): Boolean {
-        val typeNullable = type.endsWith("?")
-        val typeName = type.removeSuffix("?").removeSuffix("!").substringBefore('<').substringAfterLast('.')
-        return (name == "Any" || name == typeName) && (nullable || !typeNullable)
+    val declaration: String? get() = when {
+        typeArguments.any { it == null } -> null
+        name.matches(className) -> toString()
+        else -> if (nullable) "($name)?" else "($name)"
     }
 
-    override fun toString(): String = if (nullable) "$name?" else name
+    /** Whether an extension of this receiver can be called on the receiver of a type, as rendered by a compiler [message], see [acceptance]. */
+    fun accepts(message: String): Boolean = acceptance(message) == Acceptance.ACCEPTED
+
+    /**
+     * Whether an extension of this receiver can be called on the receiver of a type, as rendered by a compiler [message],
+     * like `List<Int>`, `Map.Entry<Int, Int>`, `String?` or `Snippet1.Point`, a class of a snippet named by the class of the snippet,
+     * of the same class, or of a well-known subtype, see [wellKnownSupertypes], or by any type of an intersection type, like `Comparable<*> & Serializable`,
+     * and of type arguments accepted by the ones of this receiver, see [argumentAcceptance], if of as many,
+     * or only [possibly][Acceptance.POSSIBLE] if of other ones, like `Comparable<String>` of `String`.
+     * Another class is not accepted, as a subtype not well-known cannot be told by its name,
+     * unless the receiver is [nested] as a covariant type argument, where it is only rejected if it is surely not a subtype,
+     * a class of [closedWellKnownTypes] by another class of [wellKnownTypes].
+     */
+    fun acceptance(message: String, nested: Boolean = false): Acceptance {
+        val type = message.replace(snippetQualifier, "")
+        val intersection = type.splitAtTopLevel(" & ")
+        if (intersection.size > 1) return intersection.maxOf { acceptance(it, nested) }
+        val unwrapped = type.removeSuffix("?").let { if (it.isParenthesized()) it.substring(1, it.length - 1) else null }
+        // a function type is nullable if parenthesized, like `((Int) -> String?)?`, not by the nullable result of `(Int) -> String?`
+        val typeNullable = type.endsWith("?") && (unwrapped != null || !type.isFunctionType())
+        if (typeNullable && !nullable) return Acceptance.REJECTED
+        if (name == "Any") return Acceptance.ACCEPTED
+        val base = unwrapped ?: if (typeNullable) type.removeSuffix("?") else type.removeSuffix("!")
+        val typeName = base.substringBefore('<')
+        val otherClass = if (nested && !(typeName in closedWellKnownTypes && name in wellKnownTypes)) Acceptance.POSSIBLE else Acceptance.REJECTED
+        if (base.isFunctionType() || !typeName.matches(className)) return if (base == name) Acceptance.ACCEPTED else otherClass
+        val arguments = typeArgumentsOf(base)
+        return when (name) {
+            typeName -> argumentsAcceptance(arguments)
+            in wellKnownSupertypes[typeName].orEmpty() -> when {
+                arguments.size == typeArguments.size -> argumentsAcceptance(arguments)
+                typeArguments.all { it == null || it == "*" } -> Acceptance.ACCEPTED
+                else -> Acceptance.POSSIBLE
+            }
+            else -> otherClass
+        }
+    }
+
+    private fun argumentsAcceptance(arguments: List<String>): Acceptance =
+        if (arguments.size != typeArguments.size) Acceptance.REJECTED else typeArguments.indices.minOfOrNull { index ->
+            argumentAcceptance(typeArguments[index], arguments[index], variances.getOrElse(index) { KVariance.INVARIANT })
+        } ?: Acceptance.ACCEPTED
+
+    /**
+     * Whether the [expected] type argument of this receiver, of the [variance] of the type parameter of its class, accepts the [actual] one:
+     * the same, or, if covariant, like `out E` of `List`, or projected `out`, like `MutableList<out Number>`, its subtype,
+     * like `Int` of `Number`, see [acceptance], or only possibly if contravariant, or the variance is not known.
+     */
+    private fun argumentAcceptance(expected: String?, actual: String, variance: KVariance?): Acceptance {
+        if (expected == null || expected == "*") return Acceptance.ACCEPTED
+        val (projection, type) = when {
+            expected.startsWith("out ") -> KVariance.OUT to expected.removePrefix("out ")
+            expected.startsWith("in ") -> KVariance.IN to expected.removePrefix("in ")
+            else -> variance to expected
+        }
+        // a platform type, like `String!`, is also of its nullable and non-null type
+        val argument = actual.removeSuffix("!")
+        if (expected == argument || type == argument) return Acceptance.ACCEPTED
+        return when (projection) {
+            KVariance.INVARIANT -> Acceptance.REJECTED
+            KVariance.OUT -> receiverOf(type).acceptance(
+                when {
+                    argument == "*" -> "Any?"
+                    argument.startsWith("out ") -> argument.removePrefix("out ")
+                    else -> argument
+                },
+                nested = true
+            )
+            else -> Acceptance.POSSIBLE
+        }
+    }
+
+    override fun toString(): String {
+        val arguments = if (typeArguments.isEmpty()) "" else typeArguments.joinToString(", ", "<", ">") { it ?: "*" }
+        val type = name + arguments
+        return when {
+            !nullable -> type
+            name.matches(className) -> "$type?"
+            else -> "($type)?"
+        }
+    }
 
     companion object {
 
-        /** The receiver of this [type], `null` if it is not a class, nor a type parameter of a single bound of a class, like a function type. */
+        /**
+         * The receiver of this [type], `null` if it is not a class, nor a type parameter of a single bound of a class,
+         * nor a function type of no type parameter, like `(T) -> Unit`, which could not be matched by its rendering.
+         */
         fun of(type: KType): ExtensionReceiver? = when (val classifier = type.classifier) {
-            is KClass<*> -> classifier.simpleName?.let { ExtensionReceiver(it, type.isMarkedNullable) }
+            is KClass<*> -> {
+                val rendered = type.withNullability(false).toString().unqualified()
+                val name = rendered.substringBefore('<')
+                when {
+                    // not matched if a type alias cannot be expanded, or its type arguments are not the ones of the expansion
+                    ALIAS_EXPANSION_START.trim() in rendered -> null
+                    type.hasTypeParameter() && (rendered.isFunctionType() || !name.matches(className)) -> null
+                    // like `List<Int>.() -> Int`, of a function class, `Function1`, but not of its type arguments
+                    rendered.isFunctionType() || !name.matches(className) -> ExtensionReceiver(rendered, nullable = type.isMarkedNullable)
+                    else -> type.arguments.takeIf { it.size == typeArgumentsOf(rendered).size }?.let { arguments ->
+                        ExtensionReceiver(
+                            name = name,
+                            typeArguments = arguments.map { it.render() },
+                            nullable = type.isMarkedNullable,
+                            variances = arguments.mapIndexed { index, argument ->
+                                when (argument.variance) {
+                                    // a mutable collection type shares its class with the read-only one, like `List` of `MutableList`, but its type parameters are invariant
+                                    KVariance.INVARIANT -> if (name in invariantMutableTypes) KVariance.INVARIANT else classifier.typeParameters.getOrNull(index)?.variance
+                                    else -> argument.variance
+                                }
+                            }
+                        )
+                    }
+                }
+            }
             is KTypeParameter -> classifier.upperBounds.singleOrNull()?.let { bound ->
                 of(bound)?.let { it.copy(nullable = it.nullable || type.isMarkedNullable) }
             }
             else -> null
+        }
+
+        /**
+         * The receiver of this rendered [type], a type argument of a receiver, like `Collection<Int>` or `(Int) -> Int`,
+         * of type arguments of variances not known.
+         */
+        private fun receiverOf(type: String): ExtensionReceiver {
+            val unwrapped = type.removeSuffix("?").let { if (it.isParenthesized()) it.substring(1, it.length - 1) else null }
+            val nullable = type.endsWith("?") && (unwrapped != null || !type.isFunctionType())
+            val base = unwrapped ?: if (nullable) type.removeSuffix("?") else type
+            val name = base.substringBefore('<')
+            if (base.isFunctionType() || !name.matches(className)) return ExtensionReceiver(base, nullable = nullable)
+            val arguments = typeArgumentsOf(base)
+            return ExtensionReceiver(name, arguments, nullable, variances = arguments.map { null })
+        }
+
+        /** The rendering of this type argument, like `out Number` or `*`, `null` if it has a type parameter. */
+        private fun KTypeProjection.render(): String? = if (type?.hasTypeParameter() == true) null else toString().unqualified()
+
+        private fun KType.hasTypeParameter(): Boolean =
+            classifier is KTypeParameter || arguments.any { it.type?.hasTypeParameter() == true }
+
+        private fun String.unqualified(): String = expandAliases().replace(qualifier, "")
+
+        /**
+         * This rendered type with each type alias replaced by its expansion, the innermost first,
+         * like `java.lang.StringBuilder` of `kotlin.text.StringBuilder /* = java.lang.StringBuilder */`,
+         * as a compiler message renders the type of an expression by its expansion,
+         * left as is if an alias cannot be told for sure, like one of a function type argument.
+         */
+        private fun String.expandAliases(): String {
+            var rendered = this
+            while (true) {
+                val start = rendered.lastIndexOf(ALIAS_EXPANSION_START)
+                if (start < 0) return rendered
+                val end = rendered.indexOf(ALIAS_EXPANSION_END, start + ALIAS_EXPANSION_START.length)
+                if (end < 0) return this
+                var aliasStart = start
+                if (rendered.getOrNull(aliasStart - 1) == '>') {
+                    var depth = 0
+                    do {
+                        when (rendered[--aliasStart]) {
+                            '>' -> depth++
+                            '<' -> depth--
+                            '-', '(', ')' -> return this
+                        }
+                    } while (depth > 0 && aliasStart > 0)
+                    if (depth != 0) return this
+                }
+                while (aliasStart > 0 && rendered[aliasStart - 1].let { it.isLetterOrDigit() || it == '_' || it == '.' }) aliasStart--
+                if (aliasStart == start) return this
+                rendered = rendered.substring(0, aliasStart) +
+                    rendered.substring(start + ALIAS_EXPANSION_START.length, end) +
+                    rendered.substring(end + ALIAS_EXPANSION_END.length)
+            }
+        }
+
+        /** Whether this rendered type is wrapped in a pair of parentheses, like `((Int) -> Int)`, but not `(Int) -> (Int)`. */
+        private fun String.isParenthesized(): Boolean {
+            if (!startsWith("(") || !endsWith(")")) return false
+            var depth = 0
+            forEachIndexed { index, char ->
+                when (char) {
+                    '(' -> depth++
+                    ')' -> if (--depth == 0) return index == length - 1
+                }
+            }
+            return false
+        }
+
+        /**
+         * Whether this rendered type is a function type, like `(Int) -> String?` or `List<Int>.() -> Int`,
+         * an arrow of its own, not of a type argument.
+         */
+        private fun String.isFunctionType(): Boolean {
+            var depth = 0
+            forEachIndexed { index, char ->
+                when (char) {
+                    '<', '(' -> depth++
+                    ')' -> depth--
+                    '>' -> if (index > 0 && this[index - 1] == '-') { if (depth == 0) return true } else depth--
+                }
+            }
+            return false
+        }
+
+        /** The type arguments of this rendered [type], like `Int` and `(Int, Int) -> Int` of `Map<Int, (Int, Int) -> Int>`. */
+        private fun typeArgumentsOf(type: String): List<String> {
+            if (!type.endsWith(">")) return emptyList()
+            return type.substring(type.indexOf('<') + 1, type.length - 1).splitAtTopLevel(",").map { it.trim() }
+        }
+
+        /** This rendered type split at each [delimiter] outside of type arguments and parentheses, like `A & B<C & D>` into `A` and `B<C & D>`. */
+        private fun String.splitAtTopLevel(delimiter: String): List<String> {
+            val result = mutableListOf<String>()
+            var depth = 0
+            var start = 0
+            var index = 0
+            while (index < length) {
+                when (this[index]) {
+                    '<', '(' -> depth++
+                    ')' -> depth--
+                    '>' -> if (index == 0 || this[index - 1] != '-') depth--
+                }
+                if (depth == 0 && startsWith(delimiter, index)) {
+                    result += substring(start, index)
+                    index += delimiter.length
+                    start = index
+                } else {
+                    index++
+                }
+            }
+            result += substring(start)
+            return result
         }
 
     }

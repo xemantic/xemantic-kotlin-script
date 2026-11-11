@@ -712,7 +712,7 @@ class ScriptSessionTest {
             message sameAs """
                 snippet2.kts:1:23: error: Unresolved reference 'shout'.
                   | fun String.loudly() = <error>shout</error>()
-                  hint: 'shout' is an extension of String declared in an earlier snippet - if it is called on an implicit receiver of this type, the K2 REPL compiler does not resolve it within a declaration of an inferred type used in the same snippet, like `fun String.f() = shout(...).toString()` - declare the type, like `fun String.f(): String = shout(...).toString()`.
+                  hint: 'shout' is an extension of String declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, even on an implicit receiver of this type, like `fun String.f() = shout(...).toString()` - declare the type, like `fun String.f(): String = shout(...).toString()`, and the compiler tells if there is no such receiver.
             """.trimIndent()
         }
     }
@@ -871,7 +871,7 @@ class ScriptSessionTest {
             message sameAs """
                 snippet2.kts:1:22: error: Unresolved reference 'shout'.
                   | fun loudGreeting() = <error>shout</error>()
-                  hint: 'shout' is an extension of String declared in an earlier snippet - if it is called on an implicit receiver of this type, the K2 REPL compiler does not resolve it within a declaration of an inferred type used in the same snippet, like `fun String.f() = shout(...).toString()` - declare the type, like `fun String.f(): String = shout(...).toString()`.
+                  hint: 'shout' is an extension of String declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, even on an implicit receiver of this type, like `fun String.f() = shout(...).toString()` - declare the type, like `fun String.f(): String = shout(...).toString()`, and the compiler tells if there is no such receiver.
             """.trimIndent()
         }
     }
@@ -940,6 +940,1227 @@ class ScriptSessionTest {
                 snippet2.kts:1:29: error: Unresolved reference 'describe' on receiver of type 'List<Int>'.
                   | fun described() = listOf(1).<error>describe</error>()
                   hint: 'describe' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.describe(...).toString()` - declare the type, like `fun f(): String = receiver.describe(...).toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should report receiver type mismatch when extension function of earlier snippet is called without receiver in declaration of declared type`() = runTest {
+        // given
+        session.execute("fun String.shout() = uppercase()")
+
+        // when
+        val result = session.execute("""
+            fun loudGreeting(): String = shout()
+            loudGreeting()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:30: error: Candidate 'fun String.shout(): String' is inapplicable because of a receiver type mismatch.
+                  | fun loudGreeting(): String = <error>shout</error>()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extension function of earlier snippet is unresolved on integer literal in declaration of inferred type`() = runTest {
+        // given
+        session.execute("fun Any.tagged() = \"<\$this>\"")
+
+        // when
+        val result = session.execute("""
+            fun tag() = 1.tagged()
+            tag()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:15: error: Unresolved reference 'tagged'.
+                  | fun tag() = 1.<error>tagged</error>()
+                  hint: 'tagged' is an extension of Any declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.tagged(...).toString()` - declare the type, like `fun f(): String = receiver.tagged(...).toString()`, and the compiler tells if the receiver is not of this type.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call extension function of earlier snippet on integer literal in declaration of declared type`() = runTest {
+        // given
+        session.execute("fun Any.tagged() = \"<\$this>\"")
+
+        // when
+        val result = session.execute("""
+            fun tag(): String = 1.tagged().toString()
+            tag()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "<1>")
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extension function of earlier snippet sharing name with extension property is unresolved on integer literal`() = runTest {
+        // given
+        session.execute("val String.weight get() = length")
+        session.execute("fun Int.weight() = this * 2")
+
+        // when
+        val result = session.execute("""
+            fun heavy() = 5.weight()
+            heavy()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet3.kts:1:17: error: Unresolved reference 'weight'.
+                  | fun heavy() = 5.<error>weight</error>()
+                  hint: 'weight' is an extension of Int declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.weight(...).toString()` - declare the type, like `fun f(): String = receiver.weight(...).toString()`, and the compiler tells if the receiver is not of this type.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call extension function of earlier snippet sharing name with extension property in declaration of declared type`() = runTest {
+        // given
+        session.execute("val String.weight get() = length")
+        session.execute("fun Int.weight() = this * 2")
+
+        // when
+        val result = session.execute("""
+            fun heavy(): String = 5.weight().toString()
+            heavy()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "10")
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extension function of earlier snippet sharing name with extension property is unresolved on implicit receiver`() = runTest {
+        // given
+        session.execute("val String.weight get() = length")
+        session.execute("fun Int.weight() = this * 2")
+
+        // when
+        val result = session.execute("""
+            fun Int.heavy() = weight()
+            5.heavy()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet3.kts:1:19: error: Unresolved reference 'weight'.
+                  | fun Int.heavy() = <error>weight</error>()
+                  hint: 'weight' is an extension of Int or String declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, even on an implicit receiver of one of these types, like `fun Int.f() = weight(...).toString()` - declare the type, like `fun Int.f(): String = weight(...).toString()`, and the compiler tells if there is no such receiver.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call extension function of earlier snippet sharing name with extension property on implicit receiver in declaration of declared type`() = runTest {
+        // given
+        session.execute("val String.weight get() = length")
+        session.execute("fun Int.weight() = this * 2")
+
+        // when
+        val result = session.execute("""
+            fun Int.f(): String = weight().toString()
+            5.f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "10")
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extension property of earlier snippet sharing name with extension function is unresolved on implicit receiver`() = runTest {
+        // given
+        session.execute("val String.weight get() = length")
+        session.execute("fun Int.weight() = this * 2")
+
+        // when
+        val result = session.execute("""
+            fun String.heavy() = weight
+            "abc".heavy()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet3.kts:1:22: error: Unresolved reference 'weight'.
+                  | fun String.heavy() = <error>weight</error>
+                  hint: 'weight' is an extension of String or Int declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, even on an implicit receiver of one of these types, like `fun String.f() = weight.toString()` - declare the type, like `fun String.f(): String = weight.toString()`, and the compiler tells if there is no such receiver.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type with placeholder when extension property of earlier snippet of generic receiver is unresolved on implicit receiver`() = runTest {
+        // given
+        session.execute("val <T> List<T>.middle get() = this[size / 2]")
+
+        // when
+        val result = session.execute("""
+            fun List<Int>.center() = middle
+            listOf(1, 2, 3).center()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:26: error: Unresolved reference 'middle'.
+                  | fun List<Int>.center() = <error>middle</error>
+                  hint: 'middle' is an extension of List<*> declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, even on an implicit receiver of this type, like `fun Receiver.f() = middle.toString()` - declare the type, like `fun Receiver.f(): String = middle.toString()`, Receiver being the type of the receiver, and the compiler tells if there is no such receiver.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should read extension property of earlier snippet of generic receiver in declaration of declared type`() = runTest {
+        // given
+        session.execute("val <T> List<T>.middle get() = this[size / 2]")
+
+        // when
+        val result = session.execute("""
+            fun List<Int>.f(): String = middle.toString()
+            listOf(1, 2, 3).f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "2")
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type of nested class when extension function of earlier snippet is unresolved on implicit receiver`() = runTest {
+        // given
+        session.execute("fun Map.Entry<String, Int>.label() = \"\$key=\$value\"")
+
+        // when
+        val result = session.execute("""
+            fun Map.Entry<String, Int>.labelled() = label()
+            mapOf("a" to 1).entries.first().labelled()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:41: error: Unresolved reference 'label'.
+                  | fun Map.Entry<String, Int>.labelled() = <error>label</error>()
+                  hint: 'label' is an extension of Map.Entry<String, Int> declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, even on an implicit receiver of this type, like `fun Map.Entry<String, Int>.f() = label(...).toString()` - declare the type, like `fun Map.Entry<String, Int>.f(): String = label(...).toString()`, and the compiler tells if there is no such receiver.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call extension function of earlier snippet on implicit receiver of nested class in declaration of declared type`() = runTest {
+        // given
+        session.execute("fun Map.Entry<String, Int>.label() = \"\$key=\$value\"")
+
+        // when
+        val result = session.execute("""
+            fun Map.Entry<String, Int>.f(): String = label().toString()
+            mapOf("a" to 1).entries.first().f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "a=1")
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extension function of earlier snippet is unresolved on receiver of subtype in declaration of inferred type`() = runTest {
+        // given
+        session.execute("fun Collection<Int>.total() = sum()")
+
+        // when
+        val result = session.execute("""
+            fun f() = listOf(1, 2).total()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:24: error: Unresolved reference 'total' on receiver of type 'List<Int>'.
+                  | fun f() = listOf(1, 2).<error>total</error>()
+                  hint: 'total' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.total(...).toString()` - declare the type, like `fun f(): String = receiver.total(...).toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call extension function of earlier snippet on receiver of subtype in declaration of declared type`() = runTest {
+        // given
+        session.execute("fun Collection<Int>.total() = sum()")
+
+        // when
+        val result = session.execute("""
+            fun f(): String = listOf(1, 2).total().toString()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "3")
+        }
+    }
+
+    @Test
+    fun `should not hint declaring the type when extension function of earlier snippet of mutable receiver is unresolved on read-only receiver`() = runTest {
+        // given
+        session.execute("fun MutableList<Int>.grow() = add(1)")
+
+        // when
+        val result = session.execute("""
+            fun f() = listOf(1).grow()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:21: error: Unresolved reference 'grow' on receiver of type 'List<Int>'.
+                  | fun f() = listOf(1).<error>grow</error>()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extension function of earlier snippet of mutable receiver is unresolved in declaration of inferred type`() = runTest {
+        // given
+        session.execute("fun MutableList<Int>.grow() = add(1)")
+
+        // when
+        val result = session.execute("""
+            fun f() = mutableListOf(1).grow()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:28: error: Unresolved reference 'grow' on receiver of type 'MutableList<Int>'.
+                  | fun f() = mutableListOf(1).<error>grow</error>()
+                  hint: 'grow' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.grow(...).toString()` - declare the type, like `fun f(): String = receiver.grow(...).toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extensions of earlier snippet of covariant type argument of supertype are unresolved in declaration of inferred type`() = runTest {
+        // given
+        session.execute("""
+            fun Map<String, Any>.toJson() = entries.joinToString { "${'$'}{it.key}=${'$'}{it.value}" }
+            fun List<out Number>.total() = sumOf { it.toInt() }
+            fun List<Any>.count2() = size
+            fun Pair<Any, Any>.both() = "${'$'}first${'$'}second"
+        """.trimIndent())
+
+        // when
+        val results = listOf(
+            "fun a() = mapOf(\"a\" to 1).toJson()\na()",
+            "fun b() = listOf(1).total()\nb()",
+            "fun c() = listOf(1, \"a\").count2()\nc()",
+            "fun d() = (1 to \"a\").both()\nd()"
+        ).map { session.execute(it) }
+
+        // then
+        results.joinToString("\n\n") { (it as ScriptResult.Error).message } sameAs """
+                snippet2.kts:1:27: error: Unresolved reference 'toJson' on receiver of type 'Map<String, Int>'.
+                  | fun a() = mapOf("a" to 1).<error>toJson</error>()
+                  hint: 'toJson' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.toJson(...).toString()` - declare the type, like `fun f(): String = receiver.toJson(...).toString()`.
+
+                snippet3.kts:1:21: error: Unresolved reference 'total' on receiver of type 'List<Int>'.
+                  | fun b() = listOf(1).<error>total</error>()
+                  hint: 'total' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.total(...).toString()` - declare the type, like `fun f(): String = receiver.total(...).toString()`.
+
+                snippet4.kts:1:26: error: Unresolved reference 'count2' on receiver of type 'List<Comparable<*> & Serializable>'.
+                  | fun c() = listOf(1, "a").<error>count2</error>()
+                  hint: 'count2' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.count2(...).toString()` - declare the type, like `fun f(): String = receiver.count2(...).toString()`.
+
+                snippet5.kts:1:22: error: Unresolved reference 'both' on receiver of type 'Pair<Int, String>'.
+                  | fun d() = (1 to "a").<error>both</error>()
+                  hint: 'both' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.both(...).toString()` - declare the type, like `fun f(): String = receiver.both(...).toString()`.
+            """.trimIndent()
+    }
+
+    @Test
+    fun `should call extensions of earlier snippet of covariant type argument of supertype in declaration of declared type`() = runTest {
+        // given
+        session.execute("""
+            fun Map<String, Any>.toJson() = entries.joinToString { "${'$'}{it.key}=${'$'}{it.value}" }
+            fun List<out Number>.total() = sumOf { it.toInt() }
+            fun List<Any>.count2() = size
+            fun Pair<Any, Any>.both() = "${'$'}first${'$'}second"
+        """.trimIndent())
+
+        // when
+        val result = session.execute("""
+            fun f(): String = listOf(mapOf("a" to 1).toJson(), listOf(1).total(), listOf(1, "a").count2(), (1 to "a").both()).toString()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "[a=1, 1, 2, 1a]")
+        }
+    }
+
+    @Test
+    fun `should hint conditionally when extension function of earlier snippet of covariant type argument is unresolved on receiver of type argument not known`() = runTest {
+        // given
+        session.execute("fun List<CharSequence>.joined() = joinToString(\"\")")
+
+        // when
+        val result = session.execute("""
+            class Text : CharSequence by "x"
+            fun f() = listOf(Text()).joined()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:2:26: error: Unresolved reference 'joined' on receiver of type 'List<Snippet2.Text>'.
+                  | fun f() = listOf(Text()).<error>joined</error>()
+                  hint: 'joined' is an extension of List<CharSequence> declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.joined(...).toString()` - declare the type, like `fun f(): String = receiver.joined(...).toString()`, and the compiler tells if the receiver is not of this type.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call extension function of earlier snippet of covariant type argument on receiver of type argument not known in declaration of declared type`() = runTest {
+        // given
+        session.execute("fun List<CharSequence>.joined() = joinToString(\"\")")
+
+        // when
+        val result = session.execute("""
+            class Text : CharSequence by "x"
+            fun f(): String = listOf(Text()).joined().toString()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "x")
+        }
+    }
+
+    @Test
+    fun `should not hint declaring the type when extension function of earlier snippet of covariant type argument is unresolved on receiver of final type argument of other supertypes`() = runTest {
+        // given
+        session.execute("fun List<Number>.total() = sumOf { it.toInt() }")
+
+        // when
+        val result = session.execute("""
+            fun f() = listOf("a").total()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:23: error: Unresolved reference 'total' on receiver of type 'List<String>'.
+                  | fun f() = listOf("a").<error>total</error>()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extensions of earlier snippet are unresolved on receiver of well-known concrete subtype`() = runTest {
+        // given
+        session.execute("""
+            fun Collection<Int>.total() = sum()
+            val CharSequence.size2 get() = length
+        """.trimIndent())
+
+        // when
+        val results = listOf(
+            "fun a() = arrayListOf(1).total()\na()",
+            "fun b() = StringBuilder(\"ab\").size2\nb()"
+        ).map { session.execute(it) }
+
+        // then
+        results.joinToString("\n\n") { (it as ScriptResult.Error).message } sameAs """
+                snippet2.kts:1:26: error: Unresolved reference 'total' on receiver of type 'ArrayList<Int>'.
+                  | fun a() = arrayListOf(1).<error>total</error>()
+                  hint: 'total' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.total(...).toString()` - declare the type, like `fun f(): String = receiver.total(...).toString()`.
+
+                snippet3.kts:1:31: error: Unresolved reference 'size2' on receiver of type 'StringBuilder'.
+                  | fun b() = StringBuilder("ab").<error>size2</error>
+                  hint: 'size2' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.size2.toString()` - declare the type, like `fun f(): String = receiver.size2.toString()`.
+            """.trimIndent()
+    }
+
+    @Test
+    fun `should call extensions of earlier snippet on receiver of well-known concrete subtype in declaration of declared type`() = runTest {
+        // given
+        session.execute("""
+            fun Collection<Int>.total() = sum()
+            val CharSequence.size2 get() = length
+        """.trimIndent())
+
+        // when
+        val result = session.execute("""
+            fun f(): String = listOf(arrayListOf(1).total(), StringBuilder("ab").size2).toString()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "[1, 2]")
+        }
+    }
+
+    @Test
+    fun `should not hint declaring the type when extension function of earlier snippet of other receiver is unresolved on integer literal`() = runTest {
+        // given
+        session.execute("fun String.big() = uppercase()")
+
+        // when
+        val result = session.execute("""
+            fun f() = 1.big()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:13: error: Unresolved reference 'big'.
+                  | fun f() = 1.<error>big</error>()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extension function of earlier snippet of function type with receiver is unresolved on implicit receiver`() = runTest {
+        // given
+        session.execute("fun (List<Int>.() -> Pair<String, Int>).run2() = listOf(1).this().second")
+
+        // when
+        val result = session.execute("""
+            fun (List<Int>.() -> Pair<String, Int>).f() = run2()
+            val pairOf: List<Int>.() -> Pair<String, Int> = { "a" to size }
+            pairOf.f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:47: error: Unresolved reference 'run2'.
+                  | fun (List<Int>.() -> Pair<String, Int>).f() = <error>run2</error>()
+                  hint: 'run2' is an extension of List<Int>.() -> Pair<String, Int> declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, even on an implicit receiver of this type, like `fun (List<Int>.() -> Pair<String, Int>).f() = run2(...).toString()` - declare the type, like `fun (List<Int>.() -> Pair<String, Int>).f(): String = run2(...).toString()`, and the compiler tells if there is no such receiver.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call extension function of earlier snippet of function type with receiver on implicit receiver in declaration of declared type`() = runTest {
+        // given
+        session.execute("fun (List<Int>.() -> Pair<String, Int>).run2() = listOf(1).this().second")
+
+        // when
+        val result = session.execute("""
+            fun (List<Int>.() -> Pair<String, Int>).f(): String = run2().toString()
+            val pairOf: List<Int>.() -> Pair<String, Int> = { "a" to size }
+            pairOf.f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "1")
+        }
+    }
+
+    @Test
+    fun `should not hint declaring the type when property of earlier snippet is unresolved on integer literal`() = runTest {
+        // given
+        session.execute("val greeting = \"hi\"")
+
+        // when
+        val result = session.execute("""
+            fun f() = 1.greeting
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:13: error: Unresolved reference 'greeting'.
+                  | fun f() = 1.<error>greeting</error>
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when property of earlier snippet is unresolved as end of range in declaration of inferred type`() = runTest {
+        // given
+        session.execute("val count = 3")
+
+        // when
+        val result = session.execute("""
+            fun f() = (0..count).toList()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:15: error: Unresolved reference 'count'.
+                  | fun f() = (0..<error>count</error>).toList()
+                  hint: 'count' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = count.toString()` - declare the type, like `fun f(): String = count.toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when property of earlier snippet is unresolved as end of open range in declaration of inferred type`() = runTest {
+        // given
+        session.execute("val count = 3")
+
+        // when
+        val result = session.execute("""
+            fun f() = (0..<count).toList()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:16: error: Unresolved reference 'count'.
+                  | fun f() = (0..<<error>count</error>).toList()
+                  hint: 'count' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = count.toString()` - declare the type, like `fun f(): String = count.toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when property of earlier snippet is unresolved after comment ending with period`() = runTest {
+        // given
+        session.execute("val count = 3")
+
+        // when
+        val result = session.execute("""
+            fun f() =
+                // the count.
+                count
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:3:5: error: Unresolved reference 'count'.
+                  |     <error>count</error>
+                  hint: 'count' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = count.toString()` - declare the type, like `fun f(): String = count.toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint implicit receiver when extension function of earlier snippet is unresolved after comment ending with period`() = runTest {
+        // given
+        session.execute("fun String.shout() = uppercase()")
+
+        // when
+        val result = session.execute("""
+            fun f() = with("a") {
+                // Shout it.
+                shout()
+            }
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:11: error: Cannot infer type for type parameter 'R'. Specify it explicitly.
+                  | fun f() = <error>with</error>("a") {
+
+                snippet2.kts:3:5: error: Unresolved reference 'shout'.
+                  |     <error>shout</error>()
+                  hint: 'shout' is an extension of String declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, even on an implicit receiver of this type, like `fun String.f() = shout(...).toString()` - declare the type, like `fun String.f(): String = shout(...).toString()`, and the compiler tells if there is no such receiver.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not hint declaring the type when extension function of earlier snippet is unresolved in callable reference`() = runTest {
+        // given
+        session.execute("fun String.shout() = uppercase()")
+
+        // when
+        val result = session.execute("""
+            fun f() = listOf("a").map(String::shout)
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:23: error: Cannot infer type for type parameter 'R'. Specify it explicitly.
+                  | fun f() = listOf("a").<error>map</error>(String::shout)
+
+                snippet2.kts:1:35: error: Unresolved reference 'shout'.
+                  | fun f() = listOf("a").map(String::<error>shout</error>)
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extension property of function type of earlier snippet is called on explicit receiver in declaration of inferred type`() = runTest {
+        // given
+        session.execute("val String.onClick: () -> String get() = { \"clicked \$this\" }")
+
+        // when
+        val result = session.execute("""
+            fun f() = "a".onClick()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:15: error: Unresolved reference 'onClick' on receiver of type 'String'.
+                  | fun f() = "a".<error>onClick</error>()
+                  hint: 'onClick' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.onClick(...).toString()` - declare the type, like `fun f(): String = receiver.onClick(...).toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call extension property of function type of earlier snippet on explicit receiver in declaration of declared type`() = runTest {
+        // given
+        session.execute("val String.onClick: () -> String get() = { \"clicked \$this\" }")
+
+        // when
+        val result = session.execute("""
+            fun f(): String = "a".onClick().toString()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "clicked a")
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extension function of earlier snippet is unresolved with type arguments in declaration of inferred type`() = runTest {
+        // given
+        session.execute("fun <T> List<T>.second() = this[1]")
+
+        // when
+        val result = session.execute("""
+            fun f() = listOf(1, 2).second<Int>()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:24: error: Unresolved reference 'second' on receiver of type 'List<Int>'.
+                  | fun f() = listOf(1, 2).<error>second</error><Int>()
+                  hint: 'second' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.second(...).toString()` - declare the type, like `fun f(): String = receiver.second(...).toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call extension function of earlier snippet with type arguments in declaration of declared type`() = runTest {
+        // given
+        session.execute("fun <T> List<T>.second() = this[1]")
+
+        // when
+        val result = session.execute("""
+            fun f(): String = listOf(1, 2).second<Int>().toString()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "2")
+        }
+    }
+
+    @Test
+    fun `should call infix extension function of earlier snippet in declaration of declared type`() = runTest {
+        // given
+        session.execute("infix fun String.and(other: String) = this + other")
+
+        // when
+        val result = session.execute("""
+            fun f(): String = ("a" and "b").toString()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "ab")
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when infix extension function of earlier snippet is unresolved in declaration of inferred type`() = runTest {
+        // given
+        session.execute("infix fun String.and(other: String) = this + other")
+
+        // when
+        val result = session.execute("""
+            fun f() = "a" and "b"
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:15: error: Unresolved reference 'and' on receiver of type 'String'.
+                  | fun f() = "a" <error>and</error> "b"
+                  hint: 'and' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.and(...).toString()` - declare the type, like `fun f(): String = receiver.and(...).toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extension function of earlier snippet is unresolved on receiver of class of earlier snippet`() = runTest {
+        // given
+        session.execute("class Point(val x: Int)")
+        session.execute("fun Point.norm() = x")
+
+        // when
+        val result = session.execute("""
+            val p = Point(1)
+            fun f() = p.norm()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet3.kts:2:13: error: Unresolved reference 'norm' on receiver of type 'Snippet1.Point'.
+                  | fun f() = p.<error>norm</error>()
+                  hint: 'norm' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.norm(...).toString()` - declare the type, like `fun f(): String = receiver.norm(...).toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extension function of earlier snippet is unresolved on receiver of generic class of earlier snippet`() = runTest {
+        // given
+        session.execute("class Box<T>(val v: T)")
+        session.execute("fun Box<Int>.twice() = v * 2")
+
+        // when
+        val result = session.execute("""
+            val b = Box(1)
+            fun f() = b.twice()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet3.kts:2:13: error: Unresolved reference 'twice' on receiver of type 'Snippet1.Box<Int>'.
+                  | fun f() = b.<error>twice</error>()
+                  hint: 'twice' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.twice(...).toString()` - declare the type, like `fun f(): String = receiver.twice(...).toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extension function of earlier snippet is unresolved on receiver of nested class of earlier snippet`() = runTest {
+        // given
+        session.execute("class Box { class Inner }")
+        session.execute("fun Box.Inner.name() = \"inner\"")
+
+        // when
+        val result = session.execute("""
+            val i = Box.Inner()
+            fun f() = i.name()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet3.kts:2:13: error: Unresolved reference 'name' on receiver of type 'Snippet1.Box.Inner'.
+                  | fun f() = i.<error>name</error>()
+                  hint: 'name' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.name(...).toString()` - declare the type, like `fun f(): String = receiver.name(...).toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extension property of earlier snippet of type alias receiver is unresolved in declaration of inferred type`() = runTest {
+        // given
+        session.execute("val StringBuilder.size2 get() = length")
+
+        // when
+        val result = session.execute("""
+            val sb = StringBuilder("ab")
+            fun f() = sb.size2
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:2:14: error: Unresolved reference 'size2' on receiver of type 'StringBuilder'.
+                  | fun f() = sb.<error>size2</error>
+                  hint: 'size2' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.size2.toString()` - declare the type, like `fun f(): String = receiver.size2.toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extension function of earlier snippet of Exception receiver is unresolved in declaration of inferred type`() = runTest {
+        // given
+        session.execute("fun Exception.brief() = message")
+
+        // when
+        val result = session.execute("""
+            val e = Exception("x")
+            fun f() = e.brief()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:2:13: error: Unresolved reference 'brief' on receiver of type 'Exception'.
+                  | fun f() = e.<error>brief</error>()
+                  hint: 'brief' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.brief(...).toString()` - declare the type, like `fun f(): String = receiver.brief(...).toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extension function of earlier snippet of type alias of earlier snippet is unresolved in declaration of inferred type`() = runTest {
+        // given
+        session.execute("typealias Name = String")
+        session.execute("fun Name.greet() = \"hi \$this\"")
+
+        // when
+        val result = session.execute("""
+            fun f() = "a".greet()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet3.kts:1:15: error: Unresolved reference 'greet' on receiver of type 'String'.
+                  | fun f() = "a".<error>greet</error>()
+                  hint: 'greet' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.greet(...).toString()` - declare the type, like `fun f(): String = receiver.greet(...).toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint expansion of type alias when extension property of earlier snippet is unresolved on implicit receiver`() = runTest {
+        // given
+        session.execute("val StringBuilder.size2 get() = length")
+
+        // when
+        val result = session.execute("""
+            fun StringBuilder.f() = size2
+            StringBuilder("ab").f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:25: error: Unresolved reference 'size2'.
+                  | fun StringBuilder.f() = <error>size2</error>
+                  hint: 'size2' is an extension of StringBuilder declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, even on an implicit receiver of this type, like `fun StringBuilder.f() = size2.toString()` - declare the type, like `fun StringBuilder.f(): String = size2.toString()`, and the compiler tells if there is no such receiver.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when function of earlier snippet is unresolved in callable reference`() = runTest {
+        // given
+        session.execute("fun double(x: Int) = x * 2")
+
+        // when
+        val result = session.execute("""
+            fun f() = listOf(1).map(::double)
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:21: error: Cannot infer type for type parameter 'R'. Specify it explicitly.
+                  | fun f() = listOf(1).<error>map</error>(::double)
+
+                snippet2.kts:1:27: error: Unresolved reference 'double'.
+                  | fun f() = listOf(1).map(::<error>double</error>)
+                  hint: 'double' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = double(...).toString()` - declare the type, like `fun f(): String = double(...).toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when property of earlier snippet is unresolved in callable reference`() = runTest {
+        // given
+        session.execute("val count = 3")
+
+        // when
+        val result = session.execute("""
+            fun f() = ::count
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:13: error: Unresolved reference 'count'.
+                  | fun f() = ::<error>count</error>
+                  hint: 'count' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = count.toString()` - declare the type, like `fun f(): String = count.toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when property of earlier snippet is unresolved after line ending with comment ending with period`() = runTest {
+        // given
+        session.execute("val count = 3")
+
+        // when
+        val result = session.execute("""
+            fun f() = // the count.
+                count
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:2:5: error: Unresolved reference 'count'.
+                  |     <error>count</error>
+                  hint: 'count' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = count.toString()` - declare the type, like `fun f(): String = count.toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when function of earlier snippet is unresolved after line ending with comment ending with period`() = runTest {
+        // given
+        session.execute("fun greet() = \"hi\"")
+
+        // when
+        val result = session.execute("""
+            fun loud() = run { // make it loud.
+                greet()
+            }
+            loud()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:14: error: Cannot infer type for type parameter 'R'. Specify it explicitly.
+                  | fun loud() = <error>run</error> { // make it loud.
+
+                snippet2.kts:2:5: error: Unresolved reference 'greet'.
+                  |     <error>greet</error>()
+                  hint: 'greet' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = greet(...).toString()` - declare the type, like `fun f(): String = greet(...).toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint implicit receiver when extension function of earlier snippet is unresolved after line ending with comment ending with period`() = runTest {
+        // given
+        session.execute("fun String.shout() = uppercase()")
+
+        // when
+        val result = session.execute("""
+            fun f() = with("a") { // shout it.
+                shout()
+            }
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:11: error: Cannot infer type for type parameter 'R'. Specify it explicitly.
+                  | fun f() = <error>with</error>("a") { // shout it.
+
+                snippet2.kts:2:5: error: Unresolved reference 'shout'.
+                  |     <error>shout</error>()
+                  hint: 'shout' is an extension of String declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, even on an implicit receiver of this type, like `fun String.f() = shout(...).toString()` - declare the type, like `fun String.f(): String = shout(...).toString()`, and the compiler tells if there is no such receiver.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when property of earlier snippet is unresolved after block comment ending with period`() = runTest {
+        // given
+        session.execute("val count = 3")
+
+        // when
+        val result = session.execute("""
+            fun f() =
+                /*
+                the count.
+                */
+                count
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:5:5: error: Unresolved reference 'count'.
+                  |     <error>count</error>
+                  hint: 'count' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = count.toString()` - declare the type, like `fun f(): String = count.toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extension property of earlier snippet is unresolved in comparison on explicit receiver`() = runTest {
+        // given
+        session.execute("val String.size2 get() = length")
+
+        // when
+        val result = session.execute("""
+            fun f(s: String) = when { s.size2 < 3 -> { "short" } else -> "long" }
+            f("a")
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:29: error: Unresolved reference 'size2' on receiver of type 'String'.
+                  | fun f(s: String) = when { s.<error>size2</error> < 3 -> { "short" } else -> "long" }
+                  hint: 'size2' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.size2.toString()` - declare the type, like `fun f(): String = receiver.size2.toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extension property of earlier snippet is unresolved in comparison on implicit receiver`() = runTest {
+        // given
+        session.execute("val String.size2 get() = length")
+
+        // when
+        val result = session.execute("""
+            fun String.f() = when { size2 < 3 -> { 1 } else -> 2 }
+            "a".f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:25: error: Unresolved reference 'size2'.
+                  | fun String.f() = when { <error>size2</error> < 3 -> { 1 } else -> 2 }
+                  hint: 'size2' is an extension of String declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, even on an implicit receiver of this type, like `fun String.f() = size2.toString()` - declare the type, like `fun String.f(): String = size2.toString()`, and the compiler tells if there is no such receiver.
             """.trimIndent()
         }
     }
