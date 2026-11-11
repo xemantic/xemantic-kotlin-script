@@ -40,6 +40,7 @@ import kotlin.reflect.KFunction0
 import kotlin.reflect.KFunction1
 import kotlin.reflect.KFunction2
 import kotlin.reflect.KFunction23
+import kotlin.reflect.KParameter
 import kotlin.reflect.KSuspendFunction1
 import kotlin.reflect.KType
 import kotlin.reflect.KTypeProjection
@@ -121,6 +122,19 @@ class Generic<T>(val value: T) {
 class ReceiverHolder {
     val plus: Int.(Int) -> Int = { this + it }
 }
+
+/** The types of the members of suspend function types, which [typeOf] does not support. */
+class SuspendHolder {
+    val add: suspend Int.(Int) -> Int = { this + it }
+    val twice: (suspend (Int) -> Int)? = { it * 2 }
+    val answer: suspend () -> Int = { 42 }
+    val lengths: List<suspend (String) -> Int> = listOf { it.length }
+    val callReference: suspend (KFunction1<String, Int>) -> Int = { it("abc") }
+    val callSuspend: suspend (suspend () -> Int).() -> Int = { this() }
+}
+
+/** A class whose constructor reference takes 1 parameter. */
+class Wrapper(val value: String)
 
 /** A function type of more than 22 parameters with a receiver, as kotlin-reflect does not produce one with its parameter types. */
 private fun bigArityExtensionFunctionType(isMarkedNullable: Boolean): KType = handWrittenType(
@@ -994,7 +1008,9 @@ class ScriptPropertiesTest {
             handWrittenType(List::class, listOf(KTypeProjection.covariant(kFunction)), "kotlin.collections.List<out kotlin.reflect.KFunction>"),
             handWrittenType(FunctionN::class, emptyList(), "kotlin.jvm.functions.FunctionN"),
             handWrittenType(FunctionN::class, List(3) { int }, "kotlin.jvm.functions.FunctionN<kotlin.Int, kotlin.Int, kotlin.Int>"),
-            handWrittenType(FunctionN::class, List(23) { KTypeProjection.contravariant(typeOf<Int>()) } + int, "FunctionN<in kotlin.Int, …, kotlin.Int>")
+            handWrittenType(FunctionN::class, List(23) { KTypeProjection.contravariant(typeOf<Int>()) } + int, "FunctionN<in kotlin.Int, …, kotlin.Int>"),
+            // not a suspend function type, which only kotlin-reflect produces of one fewer argument than its class takes
+            handWrittenType(Function1::class, listOf(int), "kotlin.Function1<kotlin.Int>")
         )
 
         // when
@@ -1012,7 +1028,8 @@ class ScriptPropertiesTest {
             "Property 'foo' is of type kotlin.reflect.KFunction, which has 0 type arguments, $kFunctionTakes",
             "Property 'foo' is of type kotlin.jvm.functions.FunctionN, which has 0 type arguments, $functionNTakes",
             "Property 'foo' is of type kotlin.jvm.functions.FunctionN<kotlin.Int, kotlin.Int, kotlin.Int>, which has 3 type arguments, $functionNTakes",
-            "Property 'foo' is of type FunctionN<in kotlin.Int, …, kotlin.Int>, which has 24 type arguments, $functionNTakes"
+            "Property 'foo' is of type FunctionN<in kotlin.Int, …, kotlin.Int>, which has 24 type arguments, $functionNTakes",
+            "Property 'foo' is of type kotlin.Function1<kotlin.Int>, which has 1 type argument, while kotlin.Function1 takes 2 - provide it as a complete type, e.g. with typeOf"
         ))
     }
 
@@ -1136,17 +1153,68 @@ class ScriptPropertiesTest {
         ))
     }
 
-    /** A bound function reference does not take its bound receiver. */
+    /** A constructor reference is named by its class, not by the JVM name of the constructor, `<init>`. */
     @Test
-    fun `should accept bound function reference value of the arity of its type`() {
+    fun `should reject constructor reference value of another arity naming its class`() {
         // given
-        val value: KFunction1<Any?, String> = "foo"::plus
+        class Local(val a: String)
+        val type = typeOf<KFunction2<String, String, Any>>()
+        val constructors = listOf<KFunction<Any>>(::Wrapper, ::Local, Wrapper::class.constructors.single())
 
         // when
-        val property = property("f", value)
+        val messages = constructors.map { constructor ->
+            assertFailsWith<IllegalArgumentException> {
+                ScriptProperty("f", type, constructor)
+            }.message
+        }
 
         // then
-        assert(property.value == value)
+        val takes = "which takes 1 parameter, while the type takes 2"
+        assert(messages == listOf(
+            "Property 'f' of type $type has a value of constructor of class ${Wrapper::class.java.name}, $takes",
+            "Property 'f' of type $type has a value of constructor of class ${Local::class.java.name}, $takes",
+            "Property 'f' of type $type has a value of constructor of class ${Wrapper::class.java.name}, $takes"
+        ))
+    }
+
+    /**
+     * Only the failure of kotlin-reflect to resolve the function is skipped, while a [VirtualMachineError] is thrown,
+     * caught by [runCatching], as it would abort the Gradle test executor.
+     */
+    @Test
+    fun `should throw virtual machine error of telling the parameters of function reference value`() {
+        // given
+        class Failing(function: KFunction<Int>, val error: VirtualMachineError) : KFunction<Int> by function {
+            override val parameters: List<KParameter> get() = throw error
+        }
+        val errors = listOf(OutOfMemoryError("exhausted"), StackOverflowError("overflown"))
+
+        // when
+        val failures = errors.map { error ->
+            runCatching {
+                ScriptProperty("f", typeOf<KFunction1<String, Int>>(), Failing(::twice, error))
+            }.exceptionOrNull()
+        }
+
+        // then
+        assert(failures == errors)
+    }
+
+    /** A bound function reference does not take its bound receiver. */
+    @Test
+    fun `should provide property of bound function reference value of the arity of its type`() = runTest {
+        // given
+        val plus: KFunction1<Any?, String> = "foo"::plus
+        ScriptSession(listOf(property("f", plus))).use { session ->
+            // when
+            val result = session.execute("f(1) + f.name")
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == "foo1plus")
+            }
+        }
     }
 
     @Test
@@ -1497,6 +1565,64 @@ class ScriptPropertiesTest {
             result should {
                 be<ScriptResult.Value>()
                 have(value == 3 + 276)
+            }
+        }
+    }
+
+    /**
+     * A suspend function type, which only the type of a member has, as [typeOf] does not support it,
+     * is of the class of its arity counting the continuation, like `Function3` of `suspend Int.(Int) -> Int`,
+     * with the parameter types and the return type as arguments only, so it is rendered as written,
+     * or as `Function<R>` in a covariant position, if its parameters cannot be rendered exactly.
+     */
+    @Test
+    fun `should render suspend function types in source`() {
+        // given
+        val types = listOf(
+            SuspendHolder::add,
+            SuspendHolder::twice,
+            SuspendHolder::answer,
+            SuspendHolder::lengths,
+            SuspendHolder::callReference,
+            SuspendHolder::callSuspend
+        ).map { it.returnType }
+
+        // when
+        val sources = types.map { it.toSource() }
+
+        // then
+        assert(sources == listOf(
+            "suspend kotlin.Int.(kotlin.Int) -> kotlin.Int",
+            "(suspend (kotlin.Int) -> kotlin.Int)?",
+            "suspend () -> kotlin.Int",
+            "kotlin.collections.List<suspend (kotlin.String) -> kotlin.Int>",
+            "kotlin.Function<kotlin.Int>",
+            "suspend (suspend () -> kotlin.Int).() -> kotlin.Int"
+        ))
+    }
+
+    @Test
+    fun `should provide properties of suspend function types`() = runTest {
+        // given
+        val holder = SuspendHolder()
+        val properties = listOf(
+            SuspendHolder::add,
+            SuspendHolder::twice,
+            SuspendHolder::answer,
+            SuspendHolder::lengths,
+            SuspendHolder::callReference,
+            SuspendHolder::callSuspend
+        ).map { ScriptProperty(it.name, it.returnType, it.get(holder)) }
+        ScriptSession(properties).use { session ->
+            // when
+            val result = session.execute(
+                "await { 1.add(2) + twice!!(3) + answer() + lengths.first()(\"ab\") + answer.callSuspend() }"
+            )
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == 3 + 6 + 42 + 2 + 42)
             }
         }
     }
