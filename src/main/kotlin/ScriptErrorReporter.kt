@@ -430,6 +430,9 @@ internal class ScriptErrorReporter(
      * with a frame of inlined code, its line beyond the end of the snippet, or within an inlined lambda,
      * resolved to the frames of the inlined function and of its call site, see [InlinedFrames],
      * and with the repeated sequences of frames, like of a recursion, collapsed.
+     *
+     * A resolved frame of an inline function of a library, like `forEach` calling the lambda which throws, is dropped like any frame of a library below the top one:
+     * it has no line of a snippet to show, while the frame of the snippet calling it shows the line of the call.
      */
     private fun StringBuilder.appendFrames(
         stackTrace: List<StackTraceElement>,

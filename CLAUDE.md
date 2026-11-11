@@ -110,6 +110,9 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   It gets no `$i$f$` marker, but its lambda argument still gets a `$i$a$-run-…` one, naming a function no enclosing marker is of.
 - A `finally` block is compiled twice, for the normal and the exceptional path, with the same lines and markers of the same names —
   so are the copies of a lambda inlined twice: compare markers by name, not by identity.
+- The evaluation of a default argument is inlined before the marker of the function, in the scope calling it, and when the default argument always throws, the body is dead code without a marker at all —
+  only the lines the `$default` method has before its own marker tell it, see `Declarations`.
+  Count only the methods with a marker of their own as declaring a line: the constructor of a snippet class has line 1 as well.
 - A frame tells its line, not its instruction, so when the bytecode does not tell which code of the line throws, omit the frames rather than guess:
   a wrong frame misleads more than a missing one — see `should omit intermediate frame of inline function calling the same inline function twice`.
 - The state machine of a suspend function splits an inlined body into several ranges of its marker, may start its only line before the first of them,
