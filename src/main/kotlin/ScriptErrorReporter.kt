@@ -24,6 +24,15 @@ import java.util.IdentityHashMap
 import kotlin.script.experimental.api.ResultValue
 import kotlin.script.experimental.api.ScriptDiagnostic
 
+/** The message of a failure without any diagnostic. */
+private const val NO_DIAGNOSTIC_MESSAGE = "Failed without any diagnostic message."
+
+/** The line of the snippet of this source path, like `snippet3.kts:2`, as the diagnostics and the frames name it. */
+internal fun snippetLine(
+    sourcePath: String,
+    line: Int
+): String = "${sourcePath.substringAfterLast('/')}:$line"
+
 /** The longest sequence of frames collapsed when repeated, like of a mutual recursion. */
 private const val MAX_REPEATED_FRAMES = 16
 
@@ -86,7 +95,7 @@ internal class ScriptErrorReporter(
     ): String = inlinedFrames.report().let { report ->
         diagnostics.reportable().map { describe(it, report) }
     }.distinct().joinToString("\n").trimEnd().ifEmpty {
-        "error: Failed without any diagnostic message."
+        "error: $NO_DIAGNOSTIC_MESSAGE"
     }
 
     /** The warnings of the [diagnostics], or `null`, if there are none. */
@@ -131,7 +140,7 @@ internal class ScriptErrorReporter(
         val lines = diagnostic.sourcePath?.let { path -> snippets[path.substringAfterLast('/')] }
         val name = diagnostic.sourcePath?.substringAfterLast('/')
         if (location != null && lines != null && name != null) {
-            append("$name:${location.start.line}:${location.start.col}: ")
+            append("${snippetLine(name, location.start.line)}:${location.start.col}: ")
         }
         append(diagnostic.severity.name.lowercase())
         append(": ")
@@ -591,7 +600,7 @@ internal fun ScriptErrorReporter.scriptResult(
 /** These reports of a failed evaluation, preceded by an error, if none of them is one, so the warnings following them do not read as the failure. */
 private fun List<ScriptDiagnostic>.withFailure(): List<ScriptDiagnostic> =
     if (any { it.severity >= ScriptDiagnostic.Severity.ERROR }) this else listOf(
-        ScriptDiagnostic(ScriptDiagnostic.unspecifiedError, "Failed without any diagnostic message.")
+        ScriptDiagnostic(ScriptDiagnostic.unspecifiedError, NO_DIAGNOSTIC_MESSAGE)
     ) + this
 
 /**

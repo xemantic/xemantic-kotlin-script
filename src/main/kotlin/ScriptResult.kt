@@ -48,8 +48,8 @@ public sealed interface ScriptResult {
      *
      * @property value the value of the last expression of the snippet,
      *   or [Unit] if the snippet does not end with an expression.
-     * @property warnings the warnings of the dependencies, other than the [resolvedVersions], and of the compiler,
-     *   pointing to the offending lines of the snippet, in their order, or `null` if there are none.
+     * @property warnings the warnings of the dependencies, other than the [resolvedVersions], in the order of their lines,
+     *   followed by the warnings of the compiler, pointing to the offending lines of the snippet, or `null` if there are none.
      *   They might reveal a bug, even if the snippet succeeded.
      *   They also report a repository declaration with credentials refused, superseded by another declaration of it,
      *   which a later dependency, served only to these credentials, would fail without,

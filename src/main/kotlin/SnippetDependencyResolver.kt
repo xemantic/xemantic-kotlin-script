@@ -159,8 +159,9 @@ internal class SnippetDependencyResolver(
             if (result.valueOrNull() == true) {
                 remoteRepository(repositoryCoordinates, options)?.let { repository ->
                     if (declarations.none { it.repository == repository }) {
-                        declarations += Declaration(repositoryCoordinates, options, sourceCodeLocation, repository)
+                        // to the resolver first, so a declaration it rejects is not left among the declarations without it
                         currentMavenResolver?.add(repositoryCoordinates, options, sourceCodeLocation)
+                        declarations += Declaration(repositoryCoordinates, options, sourceCodeLocation, repository)
                     }
                 }
             }
@@ -225,8 +226,7 @@ internal class SnippetDependencyResolver(
         val resolution = last?.takeIf { it.snippet == snippet } ?: resolve(snippet, annotations, context.script.text.lines()).also {
             last = it
         }
-        val errors = resolution.dependencies.errors
-        if (errors.isNotEmpty()) return ResultWithDiagnostics.Failure(errors)
+        if (resolution.dependencies.failed) return ResultWithDiagnostics.Failure(resolution.dependencies.errors)
         return context.compilationConfiguration.with {
             updateClasspath(resolution.files)
         }.asSuccess(resolution.reports)
@@ -286,7 +286,10 @@ internal class SnippetDependencyResolver(
      * A repository declaration superseded by the lookup of its version is reported as a warning added to the [diagnostics] before,
      * naming the line declaring it, as the warning points to this annotation, while the declaration might be in an earlier snippet.
      * It is also logged, as it is not reported again, while the result of the snippet might be lost,
-     * to a fatal error thrown by the snippet, or to the cancellation of the caller.
+     * to a fatal error thrown by the compiler or the snippet, or to the cancellation of the caller.
+     * It is logged on every path, also when the result reports it, as the resolver cannot tell whether the result reaches the caller,
+     * while logging it on the paths losing it would spread over the compilation, the evaluation, and the end of [ScriptSession.execute].
+     * The URL is logged and reported with its user info masked, see [withoutUserInfo].
      */
     private fun ScriptSourceAnnotation<*>.withLatestVersion(
         lines: List<String>,
@@ -300,7 +303,7 @@ internal class SnippetDependencyResolver(
         val latest = try {
             versionOf(coordinates) { superseded ->
                 // the lookup of a version is kept for the session, and the resolution of a snippet for its refinements, so it is reported once
-                val message = "Superseded the declaration of the repository '${superseded.coordinates.string}'" +
+                val message = "Superseded the declaration of the repository '${superseded.coordinates.string.withoutUserInfo()}'" +
                     superseded.location.named(" at ", ",") +
                     " with the credentials refused (401), by its other declaration, so they are no longer sent — " +
                     "declare it again to restore it"
@@ -393,7 +396,7 @@ internal class SnippetDependencyResolver(
         prefix: String = "",
         suffix: String = ""
     ): String = this?.let { location ->
-        "$prefix${location.codeLocationId.substringAfterLast('/')}:${location.locationInText.start.line}$suffix"
+        "$prefix${snippetLine(location.codeLocationId, location.locationInText.start.line)}$suffix"
     } ?: ""
 
     /** The diagnostic of this annotation, spanning its whole line. */
@@ -451,3 +454,11 @@ internal fun String.withRepositoryUrls(): String = replace(repositoryIdWithUrl, 
  * so the parentheses of the message itself, like `Unauthorized (401)`, are kept.
  */
 private val repositoryIdWithUrl = Regex("""(?:${Regex.escape(mavenCentral.id)}|\S+) \(([a-z]+:[^)]*)\)""")
+/**
+ * This message with the user info of each URL, like `alice:token` of `https://alice:token@host/`, masked as `***`,
+ * as a URL might carry the credentials of a repository, which neither the log, nor the LLM should see.
+ */
+internal fun String.withoutUserInfo(): String = replace(urlUserInfo, "$1***@")
+
+/** The user info of a URL, after its scheme and before its host, `alice:token@` of `https://alice:token@host/`. */
+private val urlUserInfo = Regex("""\b([a-zA-Z][a-zA-Z0-9+.-]*://)[^/?#@\s']+@""")

@@ -91,6 +91,32 @@ class SnippetDependencyResolverTest {
     }
 
     /** See #209. */
+    /** See #237. */
+    @Test
+    fun `should mask user info of repository URL`() {
+        // given
+        val message = "Superseded the declaration of the repository 'https://alice:token@repo.example.com/maven/'"
+
+        // when
+        val masked = message.withoutUserInfo()
+
+        // then
+        assert(masked == "Superseded the declaration of the repository 'https://***@repo.example.com/maven/'")
+    }
+
+    /** See #237. */
+    @Test
+    fun `should keep repository URL without user info`() {
+        // given
+        val message = "Repository 'https://repo.example.com/maven/@scope', also 'file:/tmp/a@b'"
+
+        // when
+        val masked = message.withoutUserInfo()
+
+        // then
+        assert(masked == message)
+    }
+
     @Test
     fun `should close version lookup once closed`() {
         // given
