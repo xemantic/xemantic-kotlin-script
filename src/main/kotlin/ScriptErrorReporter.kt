@@ -44,12 +44,6 @@ private const val MAX_REPEATED_FRAMES = 16
 /** The number of the exceptions reported at most, of the causes and the suppressed ones. */
 private const val MAX_REPORTED_EXCEPTIONS = 32
 
-/**
- * The name of a class of a snippet, qualified by the snippet class, like `Snippet3.Color` or `Snippet3$Box`,
- * also as the element class of an array, like `[LSnippet3$Box;`.
- */
-private val snippetQualifiedName = Regex("(?:(?<=\\[L)|(?<![\\p{L}\\p{N}_.$]))Snippet\\d+[.$](?=[\\p{L}_`])")
-
 private val snippetClassName = Regex("Snippet\\d+")
 
 /**
@@ -474,7 +468,7 @@ internal class ScriptErrorReporter(
         val modifier = if (property.kind == SnippetProperty.Kind.CONST) "const modifier" else "@JvmField annotation"
         append("  hint: $failure - declare it again public, without the $modifier, ")
         if (property.kind == SnippetProperty.Kind.JVM_FIELD) {
-            appendDeclareCallersAgainAdvice(emptyList(), ownerClass = null, verb = "accessing", kept = "@JvmField", code = "the code of earlier snippets")
+            appendDeclareCallersAgainAdvice(emptyList(), verb = "accessing", kept = "@JvmField", code = "the code of earlier snippets")
             append(", ")
         }
         append("and declare the type of a declaration of a later snippet reading it, like `fun f(): String = ${name.asReference()}.toString()`,")
@@ -568,7 +562,10 @@ internal class ScriptErrorReporter(
 
     /**
      * The hint at the member of an earlier snippet, declared `internal`, which the [error] thrown at the [stackTrace] failed to call, see [SnippetDeclarations.internalMember],
-     * unless hinted at already, see [stackTraceToHint].
+     * unless hinted at already, see [stackTraceToHint], to declare it `public`, unless declared again public by a later snippet already,
+     * and to declare again the code calling it, see [appendDeclareCallersAgainAdvice],
+     * or, if called directly by the body of the snippet, see [isSnippetBody], only to declare it public, as the body resolves it to its last declaration,
+     * a member of the snippet itself, or of an object, whose values held by earlier snippets are created again then, as they keep the old object.
      */
     private fun StringBuilder.appendInternalMemberHint(
         error: NoSuchMethodError,
@@ -581,8 +578,33 @@ internal class ScriptErrorReporter(
         val calling = error.stackTraceToHint(message, stackTrace, reported) ?: return
         val (owner, method, parameters) = match.destructured
         val member = snippetDeclarations.internalMember(owner, method, parameters.split(", ").filter { it.isNotEmpty() }) ?: return
-        appendInternalMemberHint(member, snippetDeclarations.isFinalClass(owner), calling, indent)
+        val (subject, declared) = if (member.internalSetter) "the setter of '${member.name}'" to "the setter" else "'${member.name}'" to "it"
+        append("$indent  hint: $subject is declared internal in ${member.snippet}, which a later snippet cannot call,")
+        append(" as the K2 REPL compiler calls it by a JVM name it is not compiled to - ")
+        val declaringClass = member.declaringClass
+        val direct = member.calledOn == null && calling.firstOrNull()?.isSnippetBody() == true
+        if (direct && declaringClass == null && member.redeclaration == InternalMember.Redeclaration.NONE) {
+            append("declare $declared public, without the internal modifier.\n")
+            return
+        }
+        when (member.redeclaration) {
+            InternalMember.Redeclaration.NONE -> append("declare $declared public, without the internal modifier, and ")
+            InternalMember.Redeclaration.PUBLIC -> append("it is declared again by a later snippet, so ")
+            InternalMember.Redeclaration.INTERNAL ->
+                append("it is declared again internal by a later snippet, so declare $declared again public, without the internal modifier, and ")
+        }
+        if (direct && declaringClass?.kind == DeclaredClass.Kind.OBJECT) {
+            append("create again the values of earlier snippets holding '${declaringClass.name}', ")
+            if (member.redeclaration != InternalMember.Redeclaration.PUBLIC) append("if any, ")
+            append("as they keep holding the old one.\n")
+            return
+        }
+        appendDeclareCallersAgainAdvice(calling, declaringClass, member.calledOn, verb = "calling", kept = "internal")
+        append(".\n")
     }
+
+    /** Whether this frame is of the body of a snippet, so of the snippet evaluated, as an earlier one is not evaluated again. */
+    private fun StackTraceElement.isSnippetBody(): Boolean = methodName == SNIPPET_BODY_METHOD && snippetClassName.matches(className)
 
     /**
      * The hint at the `@JvmField` property of an earlier snippet, which the [error] thrown at the [stackTrace] accessed as an instance field, while it is static,
@@ -610,7 +632,7 @@ internal class ScriptErrorReporter(
             SnippetProperty.Kind.CONST -> append("it is declared again const by a later snippet, so declare it again public, without the const modifier, and ")
             else -> append("declare it again public, without the @JvmField annotation, and ")
         }
-        appendDeclareCallersAgainAdvice(accessing, ownerClass = null, verb = "accessing", kept = "@JvmField")
+        appendDeclareCallersAgainAdvice(accessing, verb = "accessing", kept = "@JvmField")
         append(".\n")
     }
 
@@ -633,66 +655,50 @@ internal class ScriptErrorReporter(
     }
 
     /**
-     * The hint at the [member] of an earlier snippet, declared `internal`, which the exception thrown at the [stackTrace] failed to call,
-     * to declare it `public`, unless declared again by a later snippet already,
-     * and to declare again the code calling it, see [appendDeclareCallersAgainAdvice],
-     * naming also the class declaring the member, if [ownerFinal].
-     */
-    private fun StringBuilder.appendInternalMemberHint(
-        member: InternalMember,
-        ownerFinal: Boolean,
-        stackTrace: List<StackTraceElement>,
-        indent: String
-    ) {
-        val (subject, declared) = if (member.internalSetter) "the setter of '${member.name}'" to "the setter" else "'${member.name}'" to "it"
-        append("$indent  hint: $subject is declared internal in ${member.snippet}, which a later snippet cannot call,")
-        append(" as the K2 REPL compiler calls it by a JVM name it is not compiled to - ")
-        if (member.declaredAgain) {
-            append("it is declared again by a later snippet, so ")
-        } else {
-            append("declare $declared public, without the internal modifier, and ")
-        }
-        appendDeclareCallersAgainAdvice(stackTrace, member.declaringClass.takeIf { ownerFinal }, verb = "calling", kept = "internal")
-        append(".\n")
-    }
-
-    /**
      * The advice to declare again the [code] [calling][verb] a member of an earlier snippet, directly or not, and to create again the values depending on it,
      * as they keep calling the [kept] one even after it is declared again, not ending the sentence, which the caller continues or ends.
-     * The declarations on the [stackTrace], and their [final][SnippetDeclarations.isFinalClass] classes, also the [ownerClass] declaring the member,
-     * are named only as examples, as the stack trace cannot tell all of them,
+     * The declarations on the [stackTrace], and the classes of its frames whose values a later snippet can create again, see [DeclaredClass.Kind],
+     * also the [ownerClass] declaring the member, are named only as examples, as the stack trace cannot tell all of them,
      * like a lambda calling it created by an earlier call, and kept by a value.
+     * The subclasses of an open class are named to be declared again as well, as they keep extending the old class,
+     * like the [subclass] the member was called on, if it inherits it.
      */
     private fun StringBuilder.appendDeclareCallersAgainAdvice(
         stackTrace: List<StackTraceElement>,
-        ownerClass: String?,
+        ownerClass: DeclaredClass? = null,
+        subclass: String? = null,
         verb: String,
         kept: String,
         code: String = "the code"
     ) {
-        val callerFrames = stackTrace.filter {
-            it.fileName in snippets
-                && it.declarationName() != null
-                // a synthetic method, like a bridge, or a class, like DefaultImpls of an interface
-                && '$' !in it.methodName.removeSuffix(DEFAULT_STUB_SUFFIX)
-                && DEFAULT_IMPLS !in it.ownerClasses()
-        }
-        val callers = callerFrames.declarations()
-        val classes = (listOfNotNull(ownerClass) + callerFrames.filter {
-            snippetDeclarations.isFinalClass(it.className)
-        }.mapNotNull { it.declaringClassName() }).distinct()
+        // not a class like DefaultImpls of an interface
+        val snippetFrames = stackTrace.filter { it.fileName in snippets && DEFAULT_IMPLS !in it.ownerClasses() }
+        val callers = snippetFrames.filter {
+            // a synthetic method, like a bridge, or a lambda, but not a function declared internal
+            it.declarationName() != null && '$' !in it.declaredMethodName()
+        }.declarations()
+        // also of a lambda, or an anonymous object, created by a class, which its values might hold, like a lambda of a property
+        val classes = (listOfNotNull(ownerClass) + snippetFrames.map { it.className }.distinct().mapNotNull {
+            snippetDeclarations.declaredClass(it)
+        }).distinct()
+        val finalClasses = classes.filter { it.kind == DeclaredClass.Kind.FINAL }.map { "'${it.name}'" }
+        val openClasses = classes.filter { it.kind == DeclaredClass.Kind.OPEN }.map { "'${it.name}'" }
+        fun List<String>.ofClasses() = "of the ${if (size > 1) "classes" else "class"} ${enumerated()}"
         append("declare again $code $verb it, directly or not, ")
         callers.takeIf { it.isNotEmpty() }?.let { append("like ${it.enumerated()}, ") }
-        append("and create again the values depending on it, like the ones ")
-        classes.takeIf { it.isNotEmpty() }?.let {
-            append("of the ${if (it.size > 1) "classes" else "class"} ${it.map { name -> "'$name'" }.enumerated()}, or ")
+        if (openClasses.isNotEmpty()) {
+            append("and the subclasses of ${openClasses.enumerated()}, ")
+            subclass?.let { append("like '$it', ") }
         }
+        append("and create again the values depending on it, like the ones ")
+        val values = listOfNotNull(
+            finalClasses.takeIf { it.isNotEmpty() }?.ofClasses(),
+            openClasses.takeIf { it.isNotEmpty() }?.let { "${it.ofClasses()} or of ${if (it.size > 1) "their" else "its"} subclasses" }
+        )
+        values.forEach { append("$it, ") }
+        if (values.isNotEmpty()) append("or ")
         append("holding a lambda $verb it, as they keep $verb the $kept one")
     }
-
-    /** The name of the class of a snippet declaring the declaration of this snippet frame, like `Box` or `Box.Lid`, or `null` for a member of the snippet itself. */
-    private fun StackTraceElement.declaringClassName(): String? =
-        ownerClasses().takeIf { it.isNotEmpty() && snippetClassName.matches(className.substringBefore('$')) }?.joinToString(".")
 
     /** The declarations of the snippet frames of this stack trace, like `'greet' of snippet2.kts`, see [declarationName]. */
     private fun List<StackTraceElement>.declarations(): List<String> = filter {
@@ -839,15 +845,16 @@ internal class ScriptErrorReporter(
 
     /**
      * The name of the function of this snippet frame, in terms of the snippet,
-     * e.g. `Checker.check`, `<snippet body>`, or `<lambda>`.
+     * e.g. `Checker.check`, `<snippet body>`, or `<lambda>`,
+     * of a nested class named by all the classes within the snippet, like `Box.Lid.open`, if [qualified], otherwise by the innermost one, like `Lid.open`.
      */
-    private fun StackTraceElement.functionName(): String {
+    private fun StackTraceElement.functionName(qualified: Boolean = false): String {
         val owner = ownerClasses()
-        val methodParts = methodName.removeSuffix(DEFAULT_STUB_SUFFIX).split('$').filter { it.isNotEmpty() }
+        val methodParts = declaredMethodName().split('$').filter { it.isNotEmpty() }
         val isLambda = methodParts.zipWithNext().any { (name, index) ->
             name == "lambda" && index.all { it.isDigit() }
         } || owner.any { segment -> segment.all { it.isDigit() } }
-        val type = owner.lastOrNull()
+        val type = if (qualified) owner.joinToString(".").ifEmpty { null } else owner.lastOrNull()
         return when {
             isLambda -> "<lambda>"
             methodName == SNIPPET_BODY_METHOD && type == null -> "<snippet body>"
@@ -855,17 +862,24 @@ internal class ScriptErrorReporter(
         }
     }
 
+    /**
+     * The name of the method of this snippet frame as declared, without the suffix of the stub of the default arguments,
+     * nor the module the compiler mangles the name of an `internal` function with, like `helper` of `helper$snippet2_kts$default`.
+     */
+    private fun StackTraceElement.declaredMethodName(): String =
+        methodName.removeSuffix(DEFAULT_STUB_SUFFIX).let { name -> fileName?.let { name.removeSuffix(it.internalSuffix()) } ?: name }
+
     /** The classes of this frame within its snippet, like `[Box, Lid]` of `Snippet2$Box$Lid`, or all the segments of the class of another frame. */
     private fun StackTraceElement.ownerClasses(): List<String> = className.split('$').let { segments ->
         if (snippetClassName.matches(segments.first())) segments.drop(1) else segments
     }.filter { it.isNotEmpty() }
 
     /**
-     * The name of the declaration of this snippet frame, like `greet`, `Checker.check`, or `Config` of its initializer,
+     * The name of the declaration of this snippet frame, like `greet`, `Checker.check`, `Box.Lid.open` of a nested class, or `Config` of its initializer,
      * the property of an accessor, like `t` of `getT`, see [PropertyAccessors],
      * or `null` for the body of a snippet, or a lambda, which is not a declaration to redeclare.
      */
-    private fun StackTraceElement.declarationName(): String? = functionName().takeIf {
+    private fun StackTraceElement.declarationName(): String? = functionName(qualified = true).takeIf {
         it != "<snippet body>" && it != "<lambda>"
     }?.removeSuffix(".<init>")?.removeSuffix(".<clinit>")?.let { name ->
         val property = propertyAccessors.propertyOf(this) ?: return name
@@ -956,7 +970,7 @@ private fun String.indentContinuationLines(indent: String): String = trimEnd().l
 }.joinToString("\n")
 
 /** The names of the classes of the snippets without the snippet class, like `Color.BLUE` instead of `Snippet3.Color.BLUE`. */
-private fun String.withoutSnippetClassName(): String = replace(snippetQualifiedName, "")
+private fun String.withoutSnippetClassName(): String = replace(snippetQualifier, "")
 
 /** Like in [StackTraceElement.toString], e.g. `Native Method`, instead of the negative line number. */
 private val StackTraceElement.source: String get() = when {
