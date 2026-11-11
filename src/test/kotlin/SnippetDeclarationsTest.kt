@@ -496,7 +496,7 @@ class SnippetDeclarationsTest {
         assert(declarations.declaredClass($$"Snippet1$OpenClass") == DeclaredClass("OpenClass", DeclaredClass.Kind.OPEN))
         assert(declarations.declaredClass($$"Snippet1$AbstractClass") == DeclaredClass("AbstractClass", DeclaredClass.Kind.OPEN))
         assert(declarations.declaredClass($$"Snippet1$Object") == DeclaredClass("Object", DeclaredClass.Kind.OBJECT))
-        assert(declarations.declaredClass($$"Snippet1$ClassWithCompanion$Companion") == DeclaredClass("ClassWithCompanion.Companion", DeclaredClass.Kind.OBJECT))
+        assert(declarations.declaredClass($$"Snippet1$ClassWithCompanion$Companion") == DeclaredClass("ClassWithCompanion.Companion", DeclaredClass.Kind.COMPANION))
         assert(declarations.declaredClass($$"Snippet1$ClassOfAnonymousObject$runnable$1") == DeclaredClass("ClassOfAnonymousObject", DeclaredClass.Kind.FINAL))
         assert(declarations.declaredClass($$"Snippet1$Interface") == DeclaredClass("Interface", DeclaredClass.Kind.OTHER))
         assert(declarations.declaredClass($$"Snippet1$Interface$DefaultImpls") == DeclaredClass("Interface.DefaultImpls", DeclaredClass.Kind.OTHER))

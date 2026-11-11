@@ -563,9 +563,8 @@ internal class ScriptErrorReporter(
     /**
      * The hint at the member of an earlier snippet, declared `internal`, which the [error] thrown at the [stackTrace] failed to call, see [SnippetDeclarations.internalMember],
      * unless hinted at already, see [stackTraceToHint], to declare it `public`, unless declared again public by a later snippet already,
-     * and to declare again the code calling it, see [appendDeclareCallersAgainAdvice],
-     * or, if called directly by the body of the snippet, see [isSnippetBody], only to declare it public, as the body resolves it to its last declaration,
-     * a member of the snippet itself, or of an object, whose values held by earlier snippets are created again then, as they keep the old object.
+     * and to declare again the code calling it, see [appendDeclareCallersAgainAdvice], also when the snippet calls it directly,
+     * as the stack trace does not tell whether it calls it also through the code of an earlier snippet.
      */
     private fun StringBuilder.appendInternalMemberHint(
         error: NoSuchMethodError,
@@ -581,30 +580,15 @@ internal class ScriptErrorReporter(
         val (subject, declared) = if (member.internalSetter) "the setter of '${member.name}'" to "the setter" else "'${member.name}'" to "it"
         append("$indent  hint: $subject is declared internal in ${member.snippet}, which a later snippet cannot call,")
         append(" as the K2 REPL compiler calls it by a JVM name it is not compiled to - ")
-        val declaringClass = member.declaringClass
-        val direct = member.calledOn == null && calling.firstOrNull()?.isSnippetBody() == true
-        if (direct && declaringClass == null && member.redeclaration == InternalMember.Redeclaration.NONE) {
-            append("declare $declared public, without the internal modifier.\n")
-            return
-        }
         when (member.redeclaration) {
             InternalMember.Redeclaration.NONE -> append("declare $declared public, without the internal modifier, and ")
             InternalMember.Redeclaration.PUBLIC -> append("it is declared again by a later snippet, so ")
             InternalMember.Redeclaration.INTERNAL ->
                 append("it is declared again internal by a later snippet, so declare $declared again public, without the internal modifier, and ")
         }
-        if (direct && declaringClass?.kind == DeclaredClass.Kind.OBJECT) {
-            append("create again the values of earlier snippets holding '${declaringClass.name}', ")
-            if (member.redeclaration != InternalMember.Redeclaration.PUBLIC) append("if any, ")
-            append("as they keep holding the old one.\n")
-            return
-        }
-        appendDeclareCallersAgainAdvice(calling, declaringClass, member.calledOn, verb = "calling", kept = "internal")
+        appendDeclareCallersAgainAdvice(calling, member.declaringClass, member.calledOn, verb = "calling", kept = "internal")
         append(".\n")
     }
-
-    /** Whether this frame is of the body of a snippet, so of the snippet evaluated, as an earlier one is not evaluated again. */
-    private fun StackTraceElement.isSnippetBody(): Boolean = methodName == SNIPPET_BODY_METHOD && snippetClassName.matches(className)
 
     /**
      * The hint at the `@JvmField` property of an earlier snippet, which the [error] thrown at the [stackTrace] accessed as an instance field, while it is static,
@@ -661,7 +645,8 @@ internal class ScriptErrorReporter(
      * also the [ownerClass] declaring the member, are named only as examples, as the stack trace cannot tell all of them,
      * like a lambda calling it created by an earlier call, and kept by a value.
      * The subclasses of an open class are named to be declared again as well, as they keep extending the old class,
-     * like the [subclass] the member was called on, if it inherits it.
+     * like the [subclass] the member was called on, if it inherits it,
+     * and so is the code referring to an object, or to a companion object by its class, and the values holding it, as they keep the old one.
      */
     private fun StringBuilder.appendDeclareCallersAgainAdvice(
         stackTrace: List<StackTraceElement>,
@@ -683,9 +668,17 @@ internal class ScriptErrorReporter(
         }).distinct()
         val finalClasses = classes.filter { it.kind == DeclaredClass.Kind.FINAL }.map { "'${it.name}'" }
         val openClasses = classes.filter { it.kind == DeclaredClass.Kind.OPEN }.map { "'${it.name}'" }
+        val objects = classes.mapNotNull {
+            when (it.kind) {
+                DeclaredClass.Kind.OBJECT -> "the object '${it.name}'"
+                DeclaredClass.Kind.COMPANION -> "the companion object of '${it.name.substringBeforeLast('.')}'"
+                else -> null
+            }
+        }.enumerated()
         fun List<String>.ofClasses() = "of the ${if (size > 1) "classes" else "class"} ${enumerated()}"
         append("declare again $code $verb it, directly or not, ")
         callers.takeIf { it.isNotEmpty() }?.let { append("like ${it.enumerated()}, ") }
+        if (objects.isNotEmpty()) append("or referring to $objects, ")
         if (openClasses.isNotEmpty()) {
             append("and the subclasses of ${openClasses.enumerated()}, ")
             subclass?.let { append("like '$it', ") }
@@ -696,7 +689,8 @@ internal class ScriptErrorReporter(
             openClasses.takeIf { it.isNotEmpty() }?.let { "${it.ofClasses()} or of ${if (it.size > 1) "their" else "its"} subclasses" }
         )
         values.forEach { append("$it, ") }
-        if (values.isNotEmpty()) append("or ")
+        if (objects.isNotEmpty()) append("holding $objects, ")
+        if (values.isNotEmpty() || objects.isNotEmpty()) append("or ")
         append("holding a lambda $verb it, as they keep $verb the $kept one")
     }
 

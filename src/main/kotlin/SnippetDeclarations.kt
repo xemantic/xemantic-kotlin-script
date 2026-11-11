@@ -78,14 +78,14 @@ internal val snippetQualifier = Regex("(?:(?<=\\[L)|(?<![\\p{L}\\p{N}_.$]))Snipp
  * but for a `private` property or function, which a later snippet does not see at all, so it does not replace the earlier one,
  * see [visibilityToLaterSnippet].
  *
- * The names of the classes of the snippets are kept, with the class loader of the latest one, which loads the earlier ones as well,
+ * The classes of the snippets are kept until read, and then their names only, with the class loader of the latest one, which loads the earlier ones as well,
  * and their members read by kotlin-reflect only when a name is looked up, which is after a compilation error, as reading them takes long.
  * Accessed on the thread of the session only, like the snippets.
  */
 internal class SnippetDeclarations {
 
-    /** The names of the classes of the snippets not read yet, with the names of the snippets. */
-    private val pending = ArrayDeque<Pair<String, String>>()
+    /** The classes of the snippets not read yet, with the names of the snippets. */
+    private val pending = ArrayDeque<Pair<Class<*>, String>>()
 
     /** Whether the last class of a simple name is accessible by a later snippet, not `private`. */
     private val classes = HashMap<String, Boolean>()
@@ -115,11 +115,11 @@ internal class SnippetDeclarations {
     private val readClasses = HashMap<String, DeclaredClass?>()
 
     /** The members of the classes of the snippets by the JVM names of the classes, read so far, `null` if the snippet does not declare the class. */
-    private val memberDeclarations = HashMap<String, List<MemberDeclaration>?>()
+    private val members = HashMap<String, Collection<KCallable<*>>?>()
 
     /** Keeps the [scriptClass] of the snippet of this [name], to be read once a name is looked up. */
     fun keep(scriptClass: Class<*>, name: String) {
-        pending += scriptClass.name to name
+        pending += scriptClass to name
         snippets[scriptClass.name] = name
         scriptClass.classLoader?.let { classLoader = it }
     }
@@ -186,78 +186,69 @@ internal class SnippetDeclarations {
             snippet = snippet,
             internalSetter = setter && (member as KProperty<*>).javaGetter?.name?.endsWith(internalSuffix) == false,
             declaringClass = declaredClass(declaring.name),
-            calledOn = if (ownerClass == declaring) null else ownerClass.name.substringAfter('$').replace('$', '.'),
+            calledOn = if (ownerClass == declaring) null else ownerClass.name.withinSnippet(),
             redeclaration = redeclaration(member, setter, scriptClassName, nested)
         )
     }
 
     /**
-     * How the last snippet kept after the one of the [scriptClassName] declares again the [member], see [InternalMember.Redeclaration],
-     * a member of the same name, kind and parameters, see [parameterSignature], in the snippet class, or in its class of the same [nested] name, like `$Box`,
-     * so a later snippet calls that one, while the code compiled before keeps calling the `internal` one —
-     * not an overload, like `fun secret(x: Int)` of `internal fun secret()`, which a later snippet does not call instead,
-     * nor a `private` one, which a later snippet does not see, see [SnippetDeclarations], and also its setter, if the [setter] is called.
+     * How a later snippet than the one of the [scriptClassName] declares again the [member], see [InternalMember.Redeclaration],
+     * as a member of the same name, kind and parameters, see [parameterSignature], so a later snippet calls that one,
+     * while the code compiled before keeps calling the `internal` one — not an overload, like `fun secret(x: Int)` of `internal fun secret()`,
+     * which a later snippet does not call instead — and also its setter, if the [setter] is called.
+     * A member of the snippet itself, of an empty [nested] name, is told by the last later snippet declaring it, not `private`,
+     * as a `private` one is not seen by a later snippet, see [SnippetDeclarations], while another snippet does not replace it,
+     * and a member of a class of the snippet, of the [nested] name, like `$Box`, by the last later snippet declaring the class,
+     * which replaces the whole class, so a class not declaring the member, or declaring it `private`, does not declare it again.
      */
     private fun redeclaration(member: KCallable<*>, setter: Boolean, scriptClassName: String, nested: String): InternalMember.Redeclaration {
-        val signature = member.parameterSignature()
+        val signature by lazy { member.parameterSignature() }
         val property = member is KProperty<*>
-        var redeclaration = InternalMember.Redeclaration.NONE
-        snippets.keys.dropWhile { it != scriptClassName }.drop(1).forEach { laterClass ->
-            val declaration = memberDeclarations(laterClass + nested)?.lastOrNull {
-                it.name == member.name && it.property == property && it.signature == signature && it.visibility != Visibility.PRIVATE
-            } ?: return@forEach
-            redeclaration = when {
-                declaration.visibility == Visibility.ACCESSIBLE && (!setter || declaration.setterVisibility == Visibility.ACCESSIBLE) ->
-                    InternalMember.Redeclaration.PUBLIC
-                declaration.visibility == Visibility.INTERNAL || setter && declaration.setterVisibility == Visibility.INTERNAL ->
-                    InternalMember.Redeclaration.INTERNAL
-                // like a `val` of a `var` whose setter is called, or a `const val`, which a later snippet fails on otherwise
-                else -> InternalMember.Redeclaration.NONE
+        fun KCallable<*>.declaresAgain() = name == member.name && (this is KProperty<*>) == property && parameterSignature() == signature
+        val laterClasses = snippets.keys.dropWhile { it != scriptClassName }.drop(1).asReversed()
+        val (declaration, snippet) = if (nested.isEmpty()) {
+            laterClasses.firstNotNullOfOrNull { laterClass ->
+                val snippet = snippets.getValue(laterClass)
+                members(laterClass)?.lastOrNull {
+                    it.declaresAgain() && it.visibilityToLaterSnippet(it.declaringSnippet(snippet)) != Visibility.PRIVATE
+                }?.let { it to snippet }
             }
+        } else {
+            laterClasses.firstNotNullOfOrNull { laterClass -> members(laterClass + nested)?.let { it to snippets.getValue(laterClass) } }
+                ?.let { (members, snippet) -> members.lastOrNull { it.declaresAgain() }?.let { it to snippet } }
+        } ?: return InternalMember.Redeclaration.NONE
+        val declaringSnippet = declaration.declaringSnippet(snippet)
+        val visibility = declaration.visibilityToLaterSnippet(declaringSnippet)
+        val setterVisibility = (declaration as? KMutableProperty<*>)?.javaSetter.visibility(declaringSnippet)
+        return when {
+            visibility == Visibility.ACCESSIBLE && (!setter || setterVisibility == Visibility.ACCESSIBLE) -> InternalMember.Redeclaration.PUBLIC
+            visibility == Visibility.INTERNAL || setter && setterVisibility == Visibility.INTERNAL -> InternalMember.Redeclaration.INTERNAL
+            // a `private` one, or a `val` of a `var` whose setter is called, or a `const val`, which a later snippet fails on otherwise
+            else -> InternalMember.Redeclaration.NONE
         }
-        return redeclaration
     }
+
+    /** The snippet declaring the JVM member of this member of a class of the [snippet], which might inherit it from a class of another snippet. */
+    private fun KCallable<*>.declaringSnippet(snippet: String): String =
+        jvmMember()?.declaringClass?.name?.substringBefore('$')?.let { snippets[it] } ?: snippet
 
     /**
      * The members of the class of a snippet of this JVM [name], like `Snippet2$Box`, read once,
      * `null` if the snippet does not declare such a class, or it cannot be read, which is not kept, as no input reproducing it is known.
      */
-    private fun memberDeclarations(name: String): List<MemberDeclaration>? {
-        if (name in memberDeclarations) return memberDeclarations[name]
+    private fun members(name: String): Collection<KCallable<*>>? {
+        if (name in members) return members[name]
         val snippet = snippets[name.substringBefore('$')] ?: return null
         return logger.readOr(null, { "$snippet: cannot read the members of $name" }) {
             val type = try {
                 load(name)
             } catch (_: ClassNotFoundException) {
-                memberDeclarations[name] = null
+                members[name] = null
                 return@readOr null
             }
-            type.kotlin.members.map { member ->
-                // of the snippet declaring the JVM member, as it might be inherited from a class of another snippet
-                val declaringSnippet = member.jvmMember()?.declaringClass?.name?.substringBefore('$')?.let { snippets[it] } ?: snippet
-                MemberDeclaration(
-                    name = member.name,
-                    property = member is KProperty<*>,
-                    signature = member.parameterSignature(),
-                    visibility = member.visibilityToLaterSnippet(declaringSnippet),
-                    setterVisibility = (member as? KMutableProperty<*>)?.javaSetter.visibility(declaringSnippet)
-                )
-            }.also { memberDeclarations[name] = it }
+            type.kotlin.members.also { members[name] = it }
         }
     }
-
-    /**
-     * A member of a class of a snippet, see [parameterSignature], of the [visibility] of its JVM member to a later snippet, see [jvmMember],
-     * `null` for the field of a `const val` or a `@JvmField` property, which a later snippet cannot access, see [visibilityToLaterSnippet],
-     * and the visibility of its setter, `private` if it has none.
-     */
-    private class MemberDeclaration(
-        val name: String,
-        val property: Boolean,
-        val signature: List<String>,
-        val visibility: Visibility?,
-        val setterVisibility: Visibility
-    )
 
     /**
      * The class declared by a snippet of this JVM [name], like `Snippet2$Box`, named within the snippet, like `Box`, see [DeclaredClass],
@@ -287,12 +278,12 @@ internal class SnippetDeclarations {
                 || type.isSynthetic
                 || generateSequence(type.enclosingClass) { it.enclosingClass }.takeWhile { it.name != scriptClassName }.any { it.isInterface } ->
                 DeclaredClass.Kind.OTHER
-            type.declaredFields.any { Modifier.isStatic(it.modifiers) && it.name == "INSTANCE" && it.type == type } || type.kotlin.isCompanion ->
-                DeclaredClass.Kind.OBJECT
+            type.kotlin.isCompanion -> DeclaredClass.Kind.COMPANION
+            type.declaredFields.any { Modifier.isStatic(it.modifiers) && it.name == "INSTANCE" && it.type == type } -> DeclaredClass.Kind.OBJECT
             !Modifier.isFinal(type.modifiers) || Modifier.isAbstract(type.modifiers) -> DeclaredClass.Kind.OPEN
             else -> DeclaredClass.Kind.FINAL
         }
-        return DeclaredClass(type.name.substringAfter('$').replace('$', '.'), kind)
+        return DeclaredClass(type.name.withinSnippet(), kind)
     }
 
     /**
@@ -416,8 +407,8 @@ internal class SnippetDeclarations {
      */
     private fun read(): SnippetDeclarations {
         while (pending.isNotEmpty()) {
-            val (scriptClassName, name) = pending.first()
-            logger.readOr(null, { "$name: cannot load the class of the snippet" }) { load(scriptClassName) }?.let { read(it, name) }
+            val (scriptClass, name) = pending.first()
+            read(scriptClass, name)
             pending.removeFirst()
         }
         return this
@@ -608,6 +599,9 @@ private val defaultPackages = listOf(
     "kotlin.jvm.", "java.lang."
 )
 
+/** This JVM name of a class declared by a snippet, like `Snippet2$Box$Lid`, as named within the snippet, like `Box.Lid`. */
+private fun String.withinSnippet(): String = substringAfter('$').replace('$', '.')
+
 /** The suffix the compiler mangles the JVM name of an `internal` member of this snippet with, like `$snippet1_kts`. */
 internal fun String.internalSuffix(): String = "$" + replace(nonIdentifierCharacter, "_")
 
@@ -677,8 +671,11 @@ internal data class DeclaredClass(val name: String, val kind: Kind) {
         /** An open or an abstract class, whose values might be of its subclasses. */
         OPEN,
 
-        /** An object, or a companion object, of a single value, which a later snippet refers to by its name. */
+        /** An object, of a single value, which a later snippet refers to by its name. */
         OBJECT,
+
+        /** A companion object, of a single value, which a later snippet refers to by the name of its class. */
+        COMPANION,
 
         /** An interface, an enum, a local class, or a class nested in an interface, like `DefaultImpls`. */
         OTHER
