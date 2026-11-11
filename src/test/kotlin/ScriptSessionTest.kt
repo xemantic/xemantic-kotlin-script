@@ -47,6 +47,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
 import org.jetbrains.kotlin.com.intellij.openapi.Disposable
 import org.jetbrains.kotlin.com.intellij.openapi.util.Disposer
@@ -7948,6 +7949,213 @@ class ScriptSessionTest {
             proceed.countDown()
             session.close()
         }
+    }
+
+    /**
+     * A caller whose job has completed already, calling execute on an idle session, executes its snippet,
+     * like a caller cancelled already, as it did when it took the free lock of the session, and fails only after it, see #235.
+     */
+    @Test
+    fun `should execute snippet of caller with a completed job in an idle session`() {
+        // given
+        val ran = AtomicBoolean()
+        val session = ScriptSession {
+            provide<AtomicBoolean>("ran", ran)
+        }
+        val completed = Job().apply { complete() }
+        val callerResult = CompletableFuture<Result<ScriptResult>>()
+        try {
+            // when
+            suspend {
+                session.execute("ran.set(true)")
+            }.startCoroutine(Continuation(completed) {
+                callerResult.complete(it)
+            })
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build
+            assert(callerResult.get(1, TimeUnit.MINUTES).exceptionOrNull() is CancellationException)
+            assert(ran.get())
+        } finally {
+            session.close()
+        }
+    }
+
+    /**
+     * A caller without an interceptor, whose own code throws when it is resumed, like its completion,
+     * throws to the resume executor, as the failure is not one of resuming it, see #235.
+     */
+    @Test
+    fun `should throw failure of caller without an interceptor to the resume executor`() {
+        // given
+        val failure = IllegalStateException("completion failed")
+        val thrown = CompletableFuture<Throwable?>()
+        val session = DefaultScriptSession(
+            emptyList(),
+            Dispatchers.Default,
+            // inline, on the thread of the session, so done before the next snippet
+            resumeExecutor = { command -> thrown.complete(runCatching { command.run() }.exceptionOrNull()) }
+        )
+        try {
+            // when
+            suspend {
+                session.execute("1")
+            }.startCoroutine(Continuation(EmptyCoroutineContext) {
+                throw failure
+            })
+            runBlocking {
+                session.execute("2")
+            }
+
+            // then
+            assert(thrown.getNow(null) === failure)
+        } finally {
+            session.close()
+        }
+    }
+
+    /**
+     * A fatal error, see [isFatal], of a dispatcher which resumed the caller already, running it inline, and threw after it,
+     * cannot be passed to the caller, so it is thrown to the resume executor rather than swallowed, see #235.
+     */
+    @Test
+    fun `should throw fatal error of dispatcher which resumed its caller to the resume executor`() {
+        // given
+        val failure = InternalError("dispatch failed after running the resumption")
+        val failing = AtomicBoolean()
+        val thrown = CompletableFuture<Throwable?>()
+        val session = DefaultScriptSession(
+            listOf(ScriptProperty("failing", typeOf<AtomicBoolean>(), failing)),
+            Dispatchers.Default,
+            // inline, on the thread of the session, so done before the next snippet, catching the fatal error, see CLAUDE.md
+            resumeExecutor = { command -> thrown.complete(runCatching { command.run() }.exceptionOrNull()) }
+        )
+        val dispatcher = object : CoroutineDispatcher() {
+            // in place until failing, so the caller is queued before the next snippet once started
+            override fun isDispatchNeeded(context: CoroutineContext) = failing.get()
+            override fun dispatch(context: CoroutineContext, block: Runnable) {
+                block.run()
+                throw failure
+            }
+        }
+        val callerResult = CompletableFuture<Result<ScriptResult>>()
+        try {
+            // when
+            suspend {
+                session.execute("failing.set(true); 42")
+            }.startCoroutine(Continuation(dispatcher) {
+                callerResult.complete(it)
+            })
+            runBlocking {
+                session.execute("43")
+            }
+
+            // then
+            assert(callerResult.getNow(null)?.getOrNull() is ScriptResult.Value)
+            assert(thrown.getNow(null) === failure)
+        } finally {
+            session.close()
+        }
+    }
+
+    /**
+     * A caller cancelled while it waits for the snippets of other callers would leave its turn queued on the thread of the session
+     * until the snippets ahead end, keeping its coroutine context, with whatever its elements hold, see #235.
+     */
+    @Test
+    fun `should release context of caller cancelled while it waits`() {
+        withSessionBlockedBySnippet { session ->
+            // when
+            val element = contextElementOfCallerCancelledWhileWaiting(session)
+
+            // then
+            collectGarbageUntilCleared(element)
+            assert(element.refersTo(null))
+        }
+    }
+
+    /**
+     * A caller timing out while it waits for the snippets of other callers would leave its turn queued on the thread of the session
+     * until the snippets ahead end, keeping its cancellation, which refers to the frames of the caller, with their locals, see #235.
+     */
+    @Test
+    fun `should release frame of caller timing out while it waits`() {
+        withSessionBlockedBySnippet { session ->
+            // when
+            val local = localOfCallerTimingOutWhileWaiting(session)
+
+            // then
+            collectGarbageUntilCleared(local)
+            assert(local.refersTo(null))
+        }
+    }
+
+    /** Runs the [block] with a session whose thread is blocked by the snippet of another caller until the [block] returns. */
+    private fun withSessionBlockedBySnippet(block: (ScriptSession) -> Unit) {
+        val started = CountDownLatch(1)
+        val proceed = CountDownLatch(1)
+        val session = ScriptSession {
+            provide<CountDownLatch>("started", started)
+            provide<CountDownLatch>("proceed", proceed)
+        }
+        try {
+            val holder = CompletableFuture.supplyAsync {
+                runBlocking {
+                    session.execute("started.countDown(); proceed.await(); 1")
+                }
+            }
+            started.await()
+            block(session)
+            assert(!holder.isDone)
+        } finally {
+            proceed.countDown()
+            session.close()
+        }
+    }
+
+    /**
+     * Executes a snippet in the [session], with a context element, cancelled while it waits for the snippet ahead of it,
+     * outside of the test, so no frame of the test keeps it, see [collectGarbageUntilCleared].
+     *
+     * @return the reference to the context element.
+     */
+    private fun contextElementOfCallerCancelledWhileWaiting(session: ScriptSession): WeakReference<Ballast> {
+        val element = Ballast()
+        // started in place, so waiting for the snippet ahead once launch returns
+        val waiting = CoroutineScope(Dispatchers.Unconfined + element).launch {
+            session.execute("1")
+        }
+        assert(!waiting.isCompleted)
+        // resumed in place, on this thread, so completed once cancel returns
+        waiting.cancel()
+        assert(waiting.isCompleted)
+        return WeakReference(element)
+    }
+
+    /**
+     * Executes a snippet in the [session], timing out while it waits for the snippet ahead of it, with a local of the caller kept across it,
+     * outside of the test, so no frame of the test keeps it, see [collectGarbageUntilCleared].
+     *
+     * @return the reference to the local.
+     */
+    private fun localOfCallerTimingOutWhileWaiting(session: ScriptSession): WeakReference<ByteArray> {
+        val local = ByteArray(1_000_000)
+        val result = runBlocking {
+            val timedOut = withTimeoutOrNull(1) {
+                session.execute("1")
+            }
+            // read after the execution, so kept by the frame of the caller while it waits
+            timedOut to local.size
+        }
+        assert(result.first == null)
+        return WeakReference(local)
+    }
+
+    /** A coroutine context element holding a megabyte. */
+    private class Ballast : AbstractCoroutineContextElement(Ballast) {
+        companion object Key : CoroutineContext.Key<Ballast>
+        @Suppress("unused")
+        val bytes = ByteArray(1_000_000)
     }
 
     /**

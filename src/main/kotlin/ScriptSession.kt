@@ -496,36 +496,42 @@ internal class DefaultScriptSession(
         val context = currentCoroutineContext().minusKey(Job).minusKey(ContinuationInterceptor) + CoroutineName(name)
         // always suspended, unless thrown, as a caller resumed before suspendCoroutine returns would continue on the current thread
         return suspendCoroutineUninterceptedOrReturn { uninterceptedContinuation ->
-            Turn(uninterceptedContinuation, callerJob) { runBlocking(context, block) }.submit()
+            Turn(uninterceptedContinuation) { runBlocking(context, block) }.submit(callerJob)
         }
     }
 
     /**
-     * The turn of a caller of [execute], whose [task], the block of [onSessionThread], is queued on the [thread] as this runnable,
+     * The runnable queued on the [thread] for a [turn], keeping it only until the [thread] takes it, or the turn is dropped,
+     * so a turn cancelled while it waits leaves only this runnable on the queue, holding nothing, see [Turn.onCancelled].
+     */
+    private class QueuedTurn(
+        @Volatile var turn: Turn<*>?
+    ) : Runnable {
+
+        override fun run() {
+            val turn = turn ?: return
+            this.turn = null
+            turn.start()
+        }
+
+    }
+
+    /**
+     * The turn of a caller of [execute], whose [task], the block of [onSessionThread], is queued on the [thread] by a [QueuedTurn],
      * resuming the [caller] exactly once, after the task, or when the caller is cancelled before it, or when it is not queued.
      *
      * A failing dispatcher, or resume executor, cannot resume the caller twice, as the ones taking the resumption, and then throwing,
      * like [Dispatchers.Default] queueing the task before it fails to start a worker for it:
      * the first resumption reaching the caller wins, and the other ones are dropped.
-     * A turn cancelled while it waits drops the task, and the caller once resumed,
-     * so a turn left on the queue of the [thread] keeps neither the snippet, nor the continuation of its caller.
+     * A turn cancelled while it waits is dropped by its [QueuedTurn], so nothing of its caller stays on the queue of the [thread].
      *
      * @param caller the continuation of the caller, intercepted by its interceptor at once, on its thread,
      * so an interceptor failing to intercept it fails the caller in place, before its task is queued.
-     * @param callerJob the job of the caller, if any, which cancels the turn while the task waits for the earlier ones.
      */
     private inner class Turn<T>(
         private var caller: Continuation<T>?,
-        private val callerJob: Job?,
         private var task: (() -> T)?
-    ) : Continuation<T>, Runnable {
-
-        override val context: CoroutineContext = caller!!.context
-
-        private val interceptor = context[ContinuationInterceptor]
-
-        /** The continuation of the first resumption of the caller, see [resumeCaller]. */
-        private var intercepted: Continuation<T>? = intercept()
+    ) : Continuation<T> {
 
         private val state = AtomicReference(TurnState.NEW)
 
@@ -534,11 +540,20 @@ internal class DefaultScriptSession(
         /** Whether the task is counted by the [turns] no more. */
         private val finished = AtomicBoolean()
 
-        /** The cancellation of the [callerJob], if it cancelled this turn, see [onCancelled]. */
+        private val queued = QueuedTurn(this)
+
+        override val context: CoroutineContext = caller!!.context
+
+        private val interceptor = context[ContinuationInterceptor]
+
+        /** The continuation of the first resumption of the caller, see [resumeCaller]. */
+        private var intercepted: Continuation<T>? = intercept()
+
+        /** The cancellation of the job of the caller, if it cancelled this turn, see [onCancelled]. */
         private var cancellation: CancellationException? = null
 
         /**
-         * The child of the [callerJob] cancelled with it, completed once the task starts, or is not queued,
+         * The child of the job of the caller cancelled with it, completed once the task starts, or is not queued,
          * written before the task is queued, so the [thread] reads it after.
          */
         private var waiting: CompletableJob? = null
@@ -564,47 +579,53 @@ internal class DefaultScriptSession(
          * Queues the task on the [thread], counted by the [turns] until it ends there,
          * watching the cancellation of the [callerJob] while it waits for the earlier ones, so the caller resumes at once,
          * without its task, like a cancelled waiter of a lock, see [onCancelled].
-         * A caller cancelled already when it calls [execute] is rejected the same way, at once, unless its turn is free,
-         * like the tryLock of a lock taking it, as no other task is counted:
+         * A caller cancelled already, or with its job completed, when it calls [execute] is rejected the same way, at once,
+         * unless its turn is free, like the tryLock of a lock taking it, as no other task is counted:
          * then it runs its snippet, cancelled, as a cancellation while its snippet is compiled would leave it to be evaluated anyway.
          *
          * @return [COROUTINE_SUSPENDED] if the task is queued, or taken by the [thread] although it threw, which is logged then.
          * @throws Throwable the failure of the [thread] to take it, as an [IllegalStateException] if it rejected the task,
          * the session closed, or the cancellation of the caller, cancelled before the task is queued, unless it is taken.
          */
-        fun submit(): Any? {
+        fun submit(callerJob: Job?): Any? {
             val free = turns.getAndIncrement() == 0
-            if (callerJob != null && !(free && callerJob.isCancelled)) {
-                waiting = Job(callerJob).also { waiting ->
-                    waiting.invokeOnCompletion { cause ->
-                        // the cancellation of the parent, or one wrapping its failure, see `Job.cancel`
-                        if (cause != null) {
-                            onCancelled(cause as? CancellationException ?: CancellationException("The caller is cancelled", cause))
+            try {
+                if (callerJob != null && !(free && !callerJob.isActive)) {
+                    waiting = Job(callerJob).also { waiting ->
+                        waiting.invokeOnCompletion { cause ->
+                            // the cancellation of the parent, or one wrapping its failure, see `Job.cancel`
+                            if (cause != null) {
+                                onCancelled(cause as? CancellationException ?: CancellationException("The caller is cancelled", cause))
+                            }
                         }
                     }
                 }
+            } catch (e: Throwable) {
+                finish()
+                throw e
             }
             // not queued if cancelled already, as it would be skipped
-            val submitting = state.get() != TurnState.CANCELLED
-            val failure = if (!submitting) null else try {
-                thread.execute(this)
+            val failure = if (state.get() == TurnState.CANCELLED) null else try {
+                thread.execute(queued)
                 null
             } catch (e: Throwable) {
                 e
             }
-            if (state.compareAndSet(TurnState.NEW, if (failure == null) TurnState.QUEUED else TurnState.REJECTED)) {
+            // a task not taken by the thread is dropped like a cancelled one, as it might be queued nevertheless
+            if (state.compareAndSet(TurnState.NEW, if (failure == null) TurnState.QUEUED else TurnState.CANCELLED)) {
                 if (failure == null) return COROUTINE_SUSPENDED
                 finish()
                 waiting?.complete()
+                drop()
                 throw if (failure is RejectedExecutionException) IllegalStateException(SESSION_CLOSED_MESSAGE) else failure
             }
             if (state.get() == TurnState.STARTED) {
                 failure?.let { e -> logger.warn(e) { "$name: submitting the snippet failed after the thread took it" } }
                 return COROUTINE_SUSPENDED
             }
-            // cancelled before the task is queued, or while it is submitted, which skips it if queued nevertheless,
+            // cancelled before the task is queued, or while it is submitted, which dropped it from the queued runnable,
             // also when the thread rejects it, as the cancellation of the caller came first
-            if (!submitting || failure != null) finish()
+            finish()
             throw cancellation!!
         }
 
@@ -613,8 +634,16 @@ internal class DefaultScriptSession(
             if (finished.compareAndSet(false, true)) turns.decrementAndGet()
         }
 
+        /** Drops the task, and what refers to the caller, but the [caller] itself, dropped once resumed, see [tryResume]. */
+        private fun drop() {
+            queued.turn = null
+            task = null
+            intercepted = null
+            waiting = null
+        }
+
         /** Runs the task on the [thread], unless the caller was cancelled before, and resumes the caller with its result. */
-        override fun run() {
+        fun start() {
             if (!state.compareAndSet(TurnState.NEW, TurnState.STARTED)
                 && !state.compareAndSet(TurnState.QUEUED, TurnState.STARTED)
             ) {
@@ -630,23 +659,22 @@ internal class DefaultScriptSession(
         }
 
         /**
-         * Resumes the caller cancelled while its task waits, with the [cancellation] of its [callerJob],
+         * Resumes the caller cancelled while its task waits, with the [cancellation] of its job,
          * on the cancelling thread, unless it is the [thread], where it is resumed like after its task, see [resumeCaller],
          * dropping the task, so the turn left on the queue of the [thread] keeps nothing of the caller once it is resumed.
          */
         private fun onCancelled(cancellation: CancellationException) {
             // written before the state, which publishes it
             this.cancellation = cancellation
-            val queued = when {
+            val waited = when {
                 state.compareAndSet(TurnState.NEW, TurnState.CANCELLED) -> false
                 state.compareAndSet(TurnState.QUEUED, TurnState.CANCELLED) -> true
                 else -> return
             }
-            task = null
-            intercepted = null
-            waiting = null
+            drop()
             // still submitting otherwise, which throws the cancellation then, see submit
-            if (!queued) return
+            if (!waited) return
+            finish()
             val result = Result.failure<T>(cancellation)
             if (Thread.currentThread() === sessionThread) resumeCaller(result) else resumeOrFail(result)
         }
@@ -679,7 +707,8 @@ internal class DefaultScriptSession(
             intercepted = null
             val fatal = failure?.fatalError
             val resume: () -> Unit = if (fatal != null) {
-                { tryResume(Result.failure(fatal)) }
+                // thrown if the dispatcher resumed the caller already, and then threw, so it is never swallowed
+                { if (!tryResume(Result.failure(fatal))) throw fatal }
             } else {
                 { resumeOrFail(result) }
             }
@@ -691,9 +720,9 @@ internal class DefaultScriptSession(
          * or, if that throws, like a dispatcher of an executor shut down, or one always failing to tell whether it dispatches,
          * without the interceptor, in place, with that failure, as resuming by it again would fail again,
          * while left unresumed, the caller would never return.
-         * A fatal error, see [isFatal], is passed unwrapped from the `DispatchException` of kotlinx.coroutines,
-         * and if thrown when the caller is resumed already, by its own code, or by an interceptor which resumed it and then threw,
-         * it is thrown, while another failure is logged then.
+         * A fatal error, see [isFatal], is passed unwrapped from the `DispatchException` of kotlinx.coroutines.
+         * A failure thrown when the caller is resumed already is thrown, if it is fatal, or thrown by the caller itself, without an interceptor,
+         * while a failure of an interceptor which resumed the caller and then threw is logged.
          */
         private fun resumeOrFail(result: Result<T>) {
             try {
@@ -701,7 +730,7 @@ internal class DefaultScriptSession(
             } catch (e: Throwable) {
                 val fatal = e.fatalError
                 if (!tryResume(Result.failure(fatal ?: e))) {
-                    if (fatal != null) throw fatal
+                    if (fatal != null || interceptor == null) throw fatal ?: e
                     logger.warn(e) { "$name: resuming the caller failed after it was resumed" }
                 }
             }
@@ -843,10 +872,8 @@ private enum class TurnState {
     QUEUED,
     /** Its task is run, and its caller is resumed after it. */
     STARTED,
-    /** Its caller was cancelled before its task started, which is skipped then. */
-    CANCELLED,
-    /** Its task was not submitted, failing its caller in place. */
-    REJECTED
+    /** Its caller was cancelled before its task started, or its task was not taken by the thread, so it is skipped. */
+    CANCELLED
 }
 
 /**
