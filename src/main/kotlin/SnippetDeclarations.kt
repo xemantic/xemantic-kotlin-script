@@ -42,7 +42,7 @@ import kotlin.reflect.jvm.javaSetter
 private val logger = KotlinLogging.logger {}
 
 /** The suffix of the stub of a function taking the default arguments. */
-private const val DEFAULT_STUB_SUFFIX = "\$default"
+internal const val DEFAULT_STUB_SUFFIX = "\$default"
 
 /** A character the compiler replaces with `_` in the name of a module, like `.` of `snippet1.kts`. */
 private val nonIdentifierCharacter = Regex("[^\\p{L}\\p{N}_]")

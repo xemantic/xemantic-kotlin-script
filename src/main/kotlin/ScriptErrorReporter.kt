@@ -50,23 +50,11 @@ private val mangledMethod = Regex("[\\p{L}_][\\p{L}\\p{N}_]*-[\\p{L}\\p{N}_]{7}\
  */
 private val missingMethod = Regex("'[^\\s'(]+ ([^\\s(]+)\\.([^.\\s(]+)\\(([^()]*)\\)'")
 
-/** The suffix of the stub of a function taking the default arguments. */
-private const val DEFAULT_STUB_SUFFIX = "\$default"
+/** The class of the default methods of an interface, like `Greeter$DefaultImpls`. */
+private const val DEFAULT_IMPLS = "DefaultImpls"
 
 /** The method evaluating the body of a snippet. */
 private const val SNIPPET_BODY_METHOD = "\$\$eval"
-
-/** The part of the name of the method of a lambda following the name of the code creating it, like `$lambda$0` of `g$lambda$0`. */
-private const val LAMBDA_INFIX = "\$lambda\$"
-
-/** The code creating a lambda of the body of a snippet, as named by the method of the lambda, like `__eval$lambda$0`. */
-private const val SNIPPET_BODY_LAMBDA_CREATOR = "__eval"
-
-/** The suffix of the code creating a lambda of the delegate of a property, like `p_delegate` of `p_delegate$lambda$0`. */
-private const val DELEGATE_SUFFIX = "_delegate"
-
-/** The accessor of a property creating a lambda, like `_get_p_` of `_get_p_$lambda$0`. */
-private val accessorLambdaCreator = Regex("_[gs]et_(.+)_")
 
 /** The most properties named in the hint at the ones left uninitialized by a snippet, the first ones declared. */
 private const val MAX_NAMED_UNINITIALIZED = 5
@@ -303,13 +291,11 @@ internal class ScriptErrorReporter(
     /**
      * The hint at the [member] of an earlier snippet, declared `internal`, which the exception thrown at the [stackTrace] failed to call,
      * to declare it `public`, unless declared again by a later snippet already,
-     * and then, if the declarations calling it are known for sure, see [internalMemberCallers],
-     * and the class declaring it, unless the snippet itself, is [final][SnippetDeclarations.isFinalClass],
-     * to create again the values of the class declaring it, which keep being of that class, even after declaring it again,
-     * to declare again the declarations calling it, which keep calling the `internal` one, even after declaring it again,
-     * and to create again the values of the classes declaring them, which keep being of these classes —
-     * or else to declare again the code calling it, directly or not, and to create again the values depending on it,
-     * which is enough when followed, while naming them might leave out some of them, so that the advice would fail again.
+     * and to declare again the code calling it, directly or not, and to create again the values depending on it,
+     * as they keep calling the `internal` one even after it is declared again.
+     * The declarations on the [stackTrace], and their [final][SnippetDeclarations.isFinalClass] classes, also the one declaring the member,
+     * if [ownerFinal], are named only as examples, as the stack trace cannot tell all of them,
+     * like a lambda calling it created by an earlier call, and kept by a value.
      */
     private fun StringBuilder.appendInternalMemberHint(
         member: InternalMember,
@@ -317,86 +303,32 @@ internal class ScriptErrorReporter(
         stackTrace: List<StackTraceElement>,
         indent: String
     ) {
-        val callerFrames = internalMemberCallers(stackTrace).takeIf { ownerFinal }
-        val (subject, declared) = if (member.internalSetter) "the setter of '${member.name}'" to "the setter" else "'${member.name}'" to "it"
-        val advice = buildList {
-            if (!member.declaredAgain) add("declare $declared public, without the internal modifier")
-            if (callerFrames == null) {
-                add("declare again the code calling it, directly or not, and create again the values depending on it, as they keep calling the internal one")
-                return@buildList
-            }
-            member.declaringClass?.let {
-                add("create again the values of '$it', as the ones created before keep being of the class declaring it internal")
-            }
-            val callers = callerFrames.declarations()
-            callers.firstOrNull()?.let { caller ->
-                val callersOfCaller = callers.drop(1).takeIf { it.isNotEmpty() }?.let { ", and the ones calling them, like ${it.enumerated()}" } ?: ""
-                add("declare again the declarations calling it, like $caller$callersOfCaller, as they keep calling the internal one")
-            }
-            val callerClasses = callerFrames.mapNotNull { it.declaringClassName() }.distinct().filter { it != member.declaringClass }
-            if (callerClasses.isNotEmpty()) {
-                val classes = if (callerClasses.size > 1) "classes" else "class"
-                add("create again the values of ${callerClasses.map { "'$it'" }.enumerated()}, as the ones created before keep being of the $classes calling the internal one")
-            }
-            if (isEmpty()) add("declare again the code calling it, as it keeps calling the internal one")
+        val callerFrames = stackTrace.filter {
+            it.fileName in snippets
+                && it.declarationName() != null
+                // a synthetic method, like a bridge, or a class, like DefaultImpls of an interface
+                && '$' !in it.methodName.removeSuffix(DEFAULT_STUB_SUFFIX)
+                && DEFAULT_IMPLS !in it.ownerClasses()
         }
+        val callers = callerFrames.declarations()
+        val classes = (listOfNotNull(member.declaringClass.takeIf { ownerFinal }) + callerFrames.filter {
+            snippetDeclarations.isFinalClass(it.className)
+        }.mapNotNull { it.declaringClassName() }).distinct()
+        val (subject, declared) = if (member.internalSetter) "the setter of '${member.name}'" to "the setter" else "'${member.name}'" to "it"
         append("$indent  hint: $subject is declared internal in ${member.snippet}, which a later snippet cannot call,")
         append(" as the K2 REPL compiler calls it by a JVM name it is not compiled to - ")
-        if (member.declaredAgain) append("it is declared again by a later snippet, so ")
-        append(advice.joinToString(", and "))
-        append(".\n")
-    }
-
-    /**
-     * The snippet frames of the [stackTrace] of the declarations calling an `internal` member of an earlier snippet,
-     * which keep calling it even after it is declared again: the declaration of the top snippet frame, and the ones calling it,
-     * also through a lambda run by the code creating it, see [isLambdaRunByItsCreator], up to the body of a snippet,
-     * or a lambda of the snippet which failed, as declaring it again creates the lambda again —
-     * or `null` if they cannot be told for sure: when a lambda is run by another function than the one creating it,
-     * so it might be held by a value, or the declaration creating it is not on the stack, like `fun g() = call { secret() }`,
-     * like a lambda of a coroutine, when a declaration is of a class which is not [final][SnippetDeclarations.isFinalClass],
-     * so its values might be of a subclass, or of an interface, when a frame is of a synthetic method, like a bridge,
-     * or when the stack trace ends in another frame.
-     */
-    private fun internalMemberCallers(stackTrace: List<StackTraceElement>): List<StackTraceElement>? {
-        val frames = stackTrace.filter { it.fileName in snippets }
-        val failedSnippet = frames.lastOrNull { it.methodName == SNIPPET_BODY_METHOD }?.fileName
-        val callers = mutableListOf<StackTraceElement>()
-        frames.forEachIndexed { index, frame ->
-            when {
-                frame.functionName() == "<snippet body>" -> return callers
-                frame.functionName() == "<lambda>" -> when {
-                    frames.getOrNull(index + 1)?.let { frame.isLambdaRunByItsCreator(it) } == true -> {}
-                    frame.fileName == failedSnippet -> return callers
-                    else -> return null
-                }
-                frame.declarationName() != null
-                    && '$' !in frame.methodName.removeSuffix(DEFAULT_STUB_SUFFIX)
-                    && snippetDeclarations.isFinalClass(frame.className) -> callers += frame
-                else -> return null
-            }
+        if (member.declaredAgain) {
+            append("it is declared again by a later snippet, so ")
+        } else {
+            append("declare $declared public, without the internal modifier, and ")
         }
-        return null
-    }
-
-    /**
-     * Whether this frame of a lambda, like `g$lambda$0`, is run by the [next] frame, of the code creating it,
-     * the function `g`, also through another lambda of it, like `g$lambda$0` for `g$lambda$0$0`, the constructor, of a property initializer or an `init` block,
-     * or the accessor of a property, of a lambda of the accessor, like `_get_p_$lambda$0`, or of its delegate, like `p_delegate$lambda$0`,
-     * but not a lambda of the body of a snippet, like `__eval$lambda$0`, which a value of the snippet might hold.
-     */
-    private fun StackTraceElement.isLambdaRunByItsCreator(next: StackTraceElement): Boolean {
-        if (next.className != className || next.fileName != fileName || !methodName.contains(LAMBDA_INFIX)) return false
-        val creator = methodName.substringBefore(LAMBDA_INFIX)
-        if (creator == SNIPPET_BODY_LAMBDA_CREATOR) return false
-        val property = creator.removeSuffix(DELEGATE_SUFFIX).takeIf { it != creator }
-            ?: accessorLambdaCreator.matchEntire(creator)?.groupValues?.get(1)
-        return when {
-            next.methodName == creator || next.methodName == "<init>" -> true
-            next.methodName.contains(LAMBDA_INFIX) -> next.methodName.substringBefore(LAMBDA_INFIX) == creator
-            property != null -> next.declarationName()?.substringAfterLast('.') == property
-            else -> false
+        append("declare again the code calling it, directly or not, ")
+        callers.takeIf { it.isNotEmpty() }?.let { append("like ${it.enumerated()}, ") }
+        append("and create again the values depending on it, like the ones ")
+        classes.takeIf { it.isNotEmpty() }?.let {
+            append("of the ${if (it.size > 1) "classes" else "class"} ${it.map { name -> "'$name'" }.enumerated()}, or ")
         }
+        append("holding a lambda calling it, as they keep calling the internal one.\n")
     }
 
     /** The name of the class of a snippet declaring the declaration of this snippet frame, like `Box` or `Box.Lid`, or `null` for a member of the snippet itself. */
