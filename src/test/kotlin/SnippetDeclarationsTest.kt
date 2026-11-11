@@ -92,6 +92,7 @@ class SnippetDeclarationsTest {
                         fun internalFunctionLater() = 1
                         fun overloadedLater() = 1
                         fun privateFunctionLater() = 1
+                        fun <T> genericLater(x: T) = x
                         val String.internalExtensionLater get() = 1
                         val String.overloadedExtensionLater get() = 1
                         fun String.internalExtensionFunctionLater() = 1
@@ -108,6 +109,7 @@ class SnippetDeclarationsTest {
                         internal fun internalFunctionLater() = 2
                         internal fun overloadedLater(x: Int) = x
                         private fun privateFunctionLater() = 2
+                        internal fun <R> genericLater(x: R) = x
                         internal val String.internalExtensionLater get() = 2
                         internal val Int.overloadedExtensionLater get() = 2
                         internal fun String.internalExtensionFunctionLater() = 2
@@ -192,8 +194,8 @@ class SnippetDeclarationsTest {
         assert(declarations.property("publicProperty") == SnippetProperty(SnippetProperty.Kind.ACCESSIBLE, "snippet1.kts"))
         assert(declarations.property("internalProperty") == SnippetProperty(SnippetProperty.Kind.INTERNAL, "snippet1.kts"))
         assert(declarations.property("privateProperty") == null)
-        assert(declarations.jvmFieldProperty("jvmFieldProperty") == "snippet1.kts")
-        assert(declarations.jvmFieldProperty("publicProperty") == null)
+        assert(declarations.isJvmFieldProperty("jvmFieldProperty", "snippet1.kts"))
+        assert(!declarations.isJvmFieldProperty("publicProperty", "snippet1.kts"))
     }
 
     @Test
@@ -211,19 +213,21 @@ class SnippetDeclarationsTest {
         assert(declarations.property("constLater") == SnippetProperty(SnippetProperty.Kind.CONST, "snippet2.kts"))
         assert(!declarations.isProperty("jvmFieldLater"))
         assert(declarations.property("jvmFieldLater") == SnippetProperty(SnippetProperty.Kind.JVM_FIELD, "snippet2.kts"))
-        assert(declarations.jvmFieldProperty("jvmFieldLater") == "snippet2.kts")
+        assert(declarations.isJvmFieldProperty("jvmFieldLater", "snippet2.kts"))
         assert(!declarations.isProperty("internalLater"))
         assert(declarations.isProperty("publicLater"))
         assert(declarations.isProperty("publicLaterJvmField"))
-        assert(declarations.jvmFieldProperty("publicLaterJvmField") == "snippet1.kts")
+        assert(declarations.isJvmFieldProperty("publicLaterJvmField", "snippet1.kts"))
+        assert(!declarations.isJvmFieldProperty("publicLaterJvmField", "snippet2.kts"))
         assert(!declarations.isFunction("internalFunctionLater"))
+        assert(!declarations.isFunction("genericLater"))
         assert(declarations.extensionPropertyReceivers("internalExtensionLater").isEmpty())
         assert(declarations.extensionFunctionReceivers("internalExtensionFunctionLater").isEmpty())
         assert(!declarations.isClass("PrivateClassLater"))
     }
 
     @Test
-    fun `should keep the declaration of a name not replaced by private declaration or overload of later snippet`() {
+    fun `should keep the declaration of a name not replaced by private declaration or extension of another receiver of later snippet`() {
         // given
         val declarations = SnippetDeclarations()
 
@@ -235,8 +239,21 @@ class SnippetDeclarationsTest {
         // then
         assert(declarations.isProperty("privateLater"))
         assert(declarations.isFunction("privateFunctionLater"))
-        assert(declarations.isFunction("overloadedLater"))
         assert(declarations.extensionPropertyReceivers("overloadedExtensionLater") == setOf(ExtensionReceiver("String", nullable = false)))
+    }
+
+    @Test
+    fun `should not tell function accessible when an overload of it is internal`() {
+        // given
+        val declarations = SnippetDeclarations()
+
+        // when
+        redeclaringSnippetClasses.forEachIndexed { index, snippetClass ->
+            declarations.keep(snippetClass, "snippet${index + 1}.kts")
+        }
+
+        // then
+        assert(!declarations.isFunction("overloadedLater"))
     }
 
     @Test

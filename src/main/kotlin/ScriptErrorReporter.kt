@@ -146,7 +146,6 @@ internal class ScriptErrorReporter(
         if (exception != null && diagnostic.severity >= ScriptDiagnostic.Severity.ERROR) {
             append("The compiler failed internally: ")
             appendThrowable(exception, "", "  ", Collections.newSetFromMap(IdentityHashMap()))
-            appendConstPropertyHint(exception)
         } else {
             append(diagnostic.message.indentContinuationLines("  "))
             append('\n')
@@ -170,6 +169,9 @@ internal class ScriptErrorReporter(
                 }
                 append("  | $sourceLine\n")
             }
+        }
+        if (exception != null && diagnostic.severity >= ScriptDiagnostic.Severity.ERROR) {
+            appendConstPropertyHint(exception)
         }
         unresolvedReference.matchEntire(diagnostic.message)?.let { match ->
             appendUnresolvedEarlierDeclarationHint(match.groupValues[1], receiverType = match.groups[2]?.value)
@@ -199,6 +201,19 @@ internal class ScriptErrorReporter(
             append(" like `fun f(x: Any) = x is $name` - declare the type, like `fun f(x: Any): Boolean = x is $name`.\n")
             return
         }
+        // before a function of the name, as a later snippet fails on the property also once its type is declared
+        snippetDeclarations.property(name)?.let { property ->
+            val failure = propertyFailure(name, property) ?: return@let
+            append("  hint: $failure - declare it again public, without the ${property.kind.modifier()}, ")
+            if (property.kind == SnippetProperty.Kind.JVM_FIELD) {
+                // the code of earlier snippets reading it compiles, but keeps accessing the @JvmField one
+                append("declare again the code of earlier snippets accessing it, directly or not, ")
+                append("and create again the values depending on it, like the ones holding a lambda accessing it, as they keep accessing the @JvmField one, ")
+            }
+            append("and declare the type of a declaration of a later snippet reading it, like `fun f(): String = $name.toString()`,")
+            append(" as the K2 REPL compiler does not resolve a property of an earlier snippet within a declaration of an inferred type used in the same snippet.\n")
+            return
+        }
         when {
             snippetDeclarations.isProperty(name) -> {
                 appendDeclareTypeHint(name, "fun f() = $name.toString()", "fun f(): String = $name.toString()")
@@ -208,13 +223,6 @@ internal class ScriptErrorReporter(
                 appendDeclareTypeHint(name, "fun f() = $name(...).toString()", "fun f(): String = $name(...).toString()")
                 return
             }
-        }
-        snippetDeclarations.property(name)?.let { property ->
-            val inaccessible = inaccessibleProperty(name, property) ?: return@let
-            append("  hint: $inaccessible - declare it again without the ${property.kind.modifier()},")
-            append(" and declare the type of a declaration of a later snippet reading it, like `fun f(): String = $name.toString()`,")
-            append(" as the K2 REPL compiler does not resolve a property of an earlier snippet within a declaration of an inferred type used in the same snippet.\n")
-            return
         }
         val propertyReceivers = snippetDeclarations.extensionPropertyReceivers(name)
         val (receivers, reference) = if (propertyReceivers.isNotEmpty()) {
@@ -237,15 +245,16 @@ internal class ScriptErrorReporter(
     /**
      * Why a later snippet fails on this [property] of this [name], a `const val` or a `@JvmField` one, wherever it reads it,
      * `null` for another kind of property.
+     * The hints advise to declare it again public, as an `internal` one cannot be told, see [SnippetDeclarations].
      */
-    private fun inaccessibleProperty(name: String, property: SnippetProperty): String? = when (property.kind) {
+    private fun propertyFailure(name: String, property: SnippetProperty): String? = when (property.kind) {
         SnippetProperty.Kind.CONST ->
             "'$name' is declared const in ${property.snippet}, which a later snippet cannot read, as the K2 REPL compiler fails on it"
-        SnippetProperty.Kind.JVM_FIELD -> jvmFieldProperty(name, property.snippet)
+        SnippetProperty.Kind.JVM_FIELD -> jvmFieldFailure(name, property.snippet)
         else -> null
     }
 
-    private fun jvmFieldProperty(name: String, snippet: String): String =
+    private fun jvmFieldFailure(name: String, snippet: String): String =
         "'$name' is declared @JvmField in $snippet, which a later snippet cannot access, as the K2 REPL compiler accesses it as an instance field, while it is static"
 
     private fun SnippetProperty.Kind.modifier(): String = if (this == SnippetProperty.Kind.CONST) "const modifier" else "@JvmField annotation"
@@ -265,7 +274,7 @@ internal class ScriptErrorReporter(
         val property = snippetDeclarations.property(name)?.takeIf {
             it.kind == SnippetProperty.Kind.CONST && snippetDeclarations.snippetOf(owner) == it.snippet
         } ?: return
-        append("  hint: ${inaccessibleProperty(name, property)} - declare it again without the const modifier.\n")
+        append("  hint: ${propertyFailure(name, property)} - declare it again public, without the const modifier.\n")
     }
 
     /**
@@ -341,7 +350,7 @@ internal class ScriptErrorReporter(
 
     /**
      * The hint at the `@JvmField` property of an earlier snippet, which the [error] thrown at the [stackTrace] accessed as an instance field, while it is static,
-     * to declare it again without the annotation, unless declared again by a later snippet already, see [SnippetDeclarations.jvmFieldProperty],
+     * to declare it again public, without the annotation, unless declared again public by a later snippet already, see [SnippetDeclarations.isJvmFieldProperty],
      * and to declare again the code accessing it, see [appendDeclareCallersAgainAdvice], unless hinted at already, see [stackTraceToHint].
      */
     private fun StringBuilder.appendJvmFieldPropertyHint(
@@ -354,15 +363,15 @@ internal class ScriptErrorReporter(
         val field = nonStaticField.matchEntire(message)?.groupValues?.get(1) ?: return
         val owner = field.substringBeforeLast('.', missingDelimiterValue = "")
         val name = field.substringAfterLast('.')
-        if (snippetDeclarations.jvmFieldProperty(name) == null) return
-        // the field of an earlier @JvmField property of the name, if declared @JvmField again
+        // the snippet first, as telling the property reads the classes of the snippets not read yet
         val snippet = snippetDeclarations.snippetOf(owner) ?: return
+        if (!snippetDeclarations.isJvmFieldProperty(name, snippet)) return
         val accessing = error.stackTraceToHint(message, stackTrace, reported) ?: return
-        append("$indent  hint: ${jvmFieldProperty(name, snippet)} - ")
-        if (snippetDeclarations.property(name)?.kind == SnippetProperty.Kind.ACCESSIBLE) {
-            append("it is declared again by a later snippet, so ")
-        } else {
-            append("declare it again without the @JvmField annotation, and ")
+        append("$indent  hint: ${jvmFieldFailure(name, snippet)} - ")
+        when (snippetDeclarations.property(name)?.kind) {
+            SnippetProperty.Kind.ACCESSIBLE -> append("it is declared again by a later snippet, so ")
+            SnippetProperty.Kind.INTERNAL -> append("it is declared again internal by a later snippet, so declare it again public, without the internal modifier, and ")
+            else -> append("declare it again public, without the @JvmField annotation, and ")
         }
         appendDeclareCallersAgainAdvice(accessing, ownerClass = null, verb = "accessing", kept = "@JvmField")
     }

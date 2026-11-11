@@ -86,8 +86,6 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   it continues without the refined configuration, also without the default imports, and the failure is reported without its code and end, like any warning of a refinement —
   see `SnippetDependencyResolver.takeDependencies`.
   The classpath added by a refinement stays with the compiler even if the snippet fails to compile.
-- A later snippet resolves a name to its last declaration, also an `internal`, `const` or `@JvmField` one, or a `private` class, which it then fails on,
-  but not to a `private` property or function, which it does not see, nor to an overload of other parameters — so a hint must check the last declaration, see `SnippetDeclarations`.
 - Known compiler bugs, each with a test pinning the hint: a class of an earlier snippet is unresolved in a declaration of an inferred type calling it,
   and so is a property (also a provided one), a function, or an extension (reported `on receiver of type` on an explicit receiver) of an earlier snippet, but only when that declaration is used in the same snippet, while a property with an initializer, like `val x = name.length`, resolves it,
   while a declaration of a snippet which failed to compile stays unresolved even with the type declared, so it gets no hint,
