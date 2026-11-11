@@ -113,21 +113,20 @@ internal class SnippetDeclarations {
                 ownerClass.kotlin.members.firstNotNullOfOrNull { member ->
                     when {
                         member is KProperty<*> && member.javaGetter == jvmMethod -> member to false
-                        member is KMutableProperty<*> && member.javaSetter == jvmMethod ->
-                            member to (member.javaGetter?.name?.endsWith(internalSuffix) == false)
+                        member is KMutableProperty<*> && member.javaSetter == jvmMethod -> member to true
                         member is KFunction<*> && member.javaMethod == jvmMethod -> member to false
                         else -> null
                     }
                 }
-            }?.let { (member, internalSetter) ->
+            }?.let { (member, setter) ->
                 val nested = owner.removePrefix(scriptClass.name)
                 val classes = nested.split('$').filter { it.isNotEmpty() }
                 InternalMember(
                     name = (classes + member.name).joinToString("."),
                     snippet = snippet,
-                    internalSetter = internalSetter,
+                    internalSetter = setter && (member as KProperty<*>).javaGetter?.name?.endsWith(internalSuffix) == false,
                     declaringClass = classes.joinToString(".").ifEmpty { null },
-                    declaredAgain = isDeclaredAgain(member, scriptClass, nested)
+                    declaredAgain = isDeclaredAgain(member, setter, scriptClass, nested)
                 )
             }
         }
@@ -135,34 +134,67 @@ internal class SnippetDeclarations {
 
     /**
      * Whether a snippet kept after the one of the [scriptClass] declares a [member] of the same name, kind and parameters, see [parameterSignature],
-     * accessible by a later snippet, in the snippet class, or in its class of the same [nested] name, like `$Box`,
+     * accessible by a later snippet, also its setter, if the [setter] is called, in the snippet class, or in its class of the same [nested] name, like `$Box`,
      * so a later snippet calls that one, while the code compiled before keeps calling the `internal` one —
      * not an overload, like `fun secret(x: Int)` of `internal fun secret()`, which a later snippet does not call instead.
      */
-    private fun isDeclaredAgain(member: KCallable<*>, scriptClass: Class<*>, nested: String): Boolean {
+    private fun isDeclaredAgain(member: KCallable<*>, setter: Boolean, scriptClass: Class<*>, nested: String): Boolean {
         val signature = member.parameterSignature()
         return snippetClasses.values.dropWhile { it.first != scriptClass }.drop(1).any { (laterClass, laterSnippet) ->
             logger.readOr(false, { "$laterSnippet: cannot read the members of $laterClass$nested" }) {
-                val ownerClass = if (nested.isEmpty()) laterClass else Class.forName(laterClass.name + nested, false, laterClass.classLoader)
+                val ownerClass = if (nested.isEmpty()) laterClass else try {
+                    Class.forName(laterClass.name + nested, false, laterClass.classLoader)
+                } catch (_: ClassNotFoundException) {
+                    // the later snippet does not declare the class again
+                    return@readOr false
+                }
                 ownerClass.kotlin.members.any {
                     it.name == member.name
                         && (it is KProperty<*>) == (member is KProperty<*>)
                         && it.parameterSignature() == signature
                         && it.isAccessibleByLaterSnippet(laterSnippet)
+                        && (!setter || it is KMutableProperty<*> && it.javaSetter.isAccessibleByLaterSnippet(laterSnippet))
                 }
             }
         }
     }
 
     /**
+     * Whether the class of this [name], like `Snippet2$Box`, declared by a snippet, or the class of a snippet itself, has values of this class only,
+     * which a later snippet can create again: a final class, not an interface, nor nested in one, like `DefaultImpls`,
+     * not abstract, nor an enum, an object, or a companion object, nor a local or anonymous class.
+     * `false` if it is not a class of a snippet, or cannot be read.
+     *
+     * @throws VirtualMachineError thrown by the reflection, other than [StackOverflowError].
+     */
+    fun isFinalClass(name: String): Boolean {
+        val (scriptClass, snippet) = snippetClasses[name.substringBefore('$')] ?: return false
+        if (name == scriptClass.name) return true
+        return logger.readOr(false, { "$snippet: cannot read the class $name" }) {
+            // not initialized, as a static initializer of the class might not have run yet, or have failed
+            val type = Class.forName(name, false, scriptClass.classLoader)
+            Modifier.isFinal(type.modifiers)
+                && !Modifier.isAbstract(type.modifiers)
+                && !type.isEnum
+                && !type.isAnonymousClass
+                && !type.isLocalClass
+                && !type.isSynthetic
+                && generateSequence(type) { it.enclosingClass }.takeWhile { it != scriptClass }.none { it.isInterface }
+                && type.declaredFields.none { Modifier.isStatic(it.modifiers) && it.name == "INSTANCE" && it.type == type }
+                && !type.kotlin.isCompanion
+        }
+    }
+
+    /**
      * The kinds and the types of the parameters of this callable, but the instance, like `[VALUE Int]` of `fun secret(x: Int)`,
+     * and whether they are optional, like `[VALUE Int = default]` of `fun secret(x: Int = 1)`, as a call without the argument fails otherwise,
      * with the types declared by a snippet named without the class of the snippet, like `Box` of `Snippet1.Box`,
      * so that a declaration taking a class declared again matches.
      */
     private fun KCallable<*>.parameterSignature(): List<String> = parameters.filter {
         it.kind != KParameter.Kind.INSTANCE
     }.map {
-        "${it.kind} ${it.type.toString().replace(snippetQualifier, "")}"
+        "${it.kind} ${it.type.toString().replace(snippetQualifier, "")}${if (it.isOptional) " = default" else ""}"
     }
 
     /** Whether a class of this simple [name] is declared by a snippet, and is not `private`. */
@@ -249,14 +281,14 @@ internal class SnippetDeclarations {
      * A property is told by its getter only: one of a field only, also a public `const val` or `@JvmField` one, is not accessible,
      * as a later snippet fails on it in any declaration, the compiler crashing on the former, and reading the latter as an instance field, which is static.
      */
-    private fun KCallable<*>.isAccessibleByLaterSnippet(snippet: String): Boolean {
-        val jvmMember: Member? = when (this) {
-            is KProperty<*> -> javaGetter
-            is KFunction<*> -> javaMethod
-            else -> null
-        }
-        return jvmMember != null && !Modifier.isPrivate(jvmMember.modifiers) && !jvmMember.name.endsWith(snippet.internalSuffix())
-    }
+    private fun KCallable<*>.isAccessibleByLaterSnippet(snippet: String): Boolean = when (this) {
+        is KProperty<*> -> javaGetter
+        is KFunction<*> -> javaMethod
+        else -> null
+    }.isAccessibleByLaterSnippet(snippet)
+
+    private fun Member?.isAccessibleByLaterSnippet(snippet: String): Boolean =
+        this != null && !Modifier.isPrivate(modifiers) && !name.endsWith(snippet.internalSuffix())
 
     private fun Method.parameterTypeNames(): List<String> = parameterTypes.map { it.typeName }
 
