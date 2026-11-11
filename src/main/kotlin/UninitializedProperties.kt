@@ -101,17 +101,17 @@ internal class UninitializedProperties {
     fun keep(
         scriptClass: Class<*>,
         snippet: String
-    ): List<UninitializedProperty> = logger.readOr(emptyList(), { "$snippet: cannot read the properties of the snippet which failed" }) {
+    ): List<UninitializedProperty> = logger.runOr(emptyList(), { "$snippet: cannot read the properties of the snippet which failed" }) {
         // a property of a custom getter has no field; read per property, so a property kotlin-reflect fails on loses only itself,
         // no input reproducing such a failure is known
         val properties = scriptClass.kotlin.declaredMemberProperties.mapNotNull { property ->
-            logger.readOr(null, { "$snippet: cannot read the field of the property ${property.name} of the snippet which failed" }) {
+            logger.runOr(null, { "$snippet: cannot read the field of the property ${property.name} of the snippet which failed" }) {
                 property.javaField?.let { it.name to property }
             }
         }.toMap()
         scriptClass.declaredFields.mapNotNull { field ->
             properties[field.name]?.let { property ->
-                logger.readOr(null, { "$snippet: cannot read the property ${property.name} of the snippet which failed" }) {
+                logger.runOr(null, { "$snippet: cannot read the property ${property.name} of the snippet which failed" }) {
                     uninitialized(property, field, scriptClass, snippet)
                 }
             }
@@ -134,7 +134,7 @@ internal class UninitializedProperties {
         ) return null
         val delegated = field.name.endsWith(DELEGATE_SUFFIX)
         // whether the type takes null, unknown if kotlin-reflect fails on the type; no input reproducing such a failure is known
-        val nullable = if (delegated) false else logger.readOr(null, { "$snippet: cannot read the type of the property ${property.name}" }) {
+        val nullable = if (delegated) false else logger.runOr(null, { "$snippet: cannot read the type of the property ${property.name}" }) {
             nullType.isSubtypeOf(property.returnType)
         }
         if (nullable == true) return null

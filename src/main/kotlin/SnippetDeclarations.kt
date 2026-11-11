@@ -144,7 +144,7 @@ internal class SnippetDeclarations {
      */
     fun internalMember(owner: String, method: String, parameterTypes: List<String>): InternalMember? {
         val snippet = snippets[owner.substringBefore('$')] ?: return null
-        return logger.readOr(null, { "$snippet: cannot read the internal member $method of $owner" }) {
+        return logger.runOr(null, { "$snippet: cannot read the internal member $method of $owner" }) {
             val ownerClass = load(owner)
             generateSequence(ownerClass) { it.superclass }
                 .takeWhile { it.name.substringBefore('$') in snippets }
@@ -239,12 +239,12 @@ internal class SnippetDeclarations {
     private fun members(name: String): Collection<KCallable<*>>? {
         if (name in members) return members[name]
         val snippet = snippets[name.substringBefore('$')] ?: return null
-        return logger.readOr(null, { "$snippet: cannot read the members of $name" }) {
+        return logger.runOr(null, { "$snippet: cannot read the members of $name" }) {
             val type = try {
                 load(name)
             } catch (_: ClassNotFoundException) {
                 members[name] = null
-                return@readOr null
+                return@runOr null
             }
             type.kotlin.members.also { members[name] = it }
         }
@@ -262,7 +262,7 @@ internal class SnippetDeclarations {
         val scriptClassName = name.substringBefore('$')
         val snippet = snippets[scriptClassName] ?: return null
         if (name in readClasses) return readClasses[name]
-        return logger.readOr(null, { "$snippet: cannot read the class $name" }) {
+        return logger.runOr(null, { "$snippet: cannot read the class $name" }) {
             declaredClass(load(name), scriptClassName).also { readClasses[name] = it }
         }
     }
@@ -416,7 +416,7 @@ internal class SnippetDeclarations {
 
     private fun read(scriptClass: Class<*>, snippet: String) {
         val snippetIndex = readSnippets++
-        logger.readOr(Unit, { "$snippet: cannot read the classes of the snippet" }) {
+        logger.runOr(Unit, { "$snippet: cannot read the classes of the snippet" }) {
             scriptClass.declaredClasses.forEach { declared ->
                 // the InnerClasses attribute keeps the Kotlin visibility of a nested class, but internal, which is public
                 classes[declared.simpleName] = !Modifier.isPrivate(declared.modifiers)
@@ -424,7 +424,7 @@ internal class SnippetDeclarations {
         }
         val kClass = scriptClass.kotlin
         readVisible(snippet, "properties", { kClass.declaredMemberProperties }) { property, accessible, jvmMember ->
-            val kind = logger.readOr(SnippetProperty.Kind.ACCESSIBLE, { "$snippet: cannot read the kind of ${property.name} of the snippet" }) {
+            val kind = logger.runOr(SnippetProperty.Kind.ACCESSIBLE, { "$snippet: cannot read the kind of ${property.name} of the snippet" }) {
                 property.kind(accessible, jvmMember)
             }
             properties[property.name] = SnippetProperty(kind, snippet)
@@ -452,9 +452,9 @@ internal class SnippetDeclarations {
         members: () -> Collection<KCallable<*>>,
         add: (KCallable<*>, accessible: Boolean, jvmMember: Member?) -> Unit
     ) {
-        logger.readOr(emptyList(), { "$snippet: cannot read the $kind of the snippet" }) { members() }.forEach { member ->
+        logger.runOr(emptyList(), { "$snippet: cannot read the $kind of the snippet" }) { members() }.forEach { member ->
             // kept if unknown, as the hint was given before the accessibility was checked
-            val (visibility, jvmMember) = logger.readOr(Visibility.ACCESSIBLE to null, { "$snippet: cannot read the JVM member of ${member.name} of the snippet" }) {
+            val (visibility, jvmMember) = logger.runOr(Visibility.ACCESSIBLE to null, { "$snippet: cannot read the JVM member of ${member.name} of the snippet" }) {
                 member.jvmMember().let { it.visibility(snippet) to it }
             }
             if (visibility != Visibility.PRIVATE) add(member, visibility == Visibility.ACCESSIBLE, jvmMember)
@@ -474,7 +474,7 @@ internal class SnippetDeclarations {
         snippet: String,
         snippetIndex: Int
     ) {
-        val signature = logger.readOr(null, { "$snippet: cannot read the parameters of ${callable.name} of the snippet" }) {
+        val signature = logger.runOr(null, { "$snippet: cannot read the parameters of ${callable.name} of the snippet" }) {
             callable.parameterSignature(optional = false)
         } ?: listOf("$snippet ${System.identityHashCode(callable)}")
         getOrPut(callable.name) { LinkedHashMap() }[signature] = Overload(receiver, receiverClass, accessible, snippetIndex)
@@ -482,7 +482,7 @@ internal class SnippetDeclarations {
 
     /** The receiver of this extension, `null` if it cannot be read, as no receiver could be matched then. */
     private fun KCallable<*>.receiver(snippet: String): ExtensionReceiver? =
-        logger.readOr(null, { "$snippet: cannot read the receiver of $name of the snippet" }) {
+        logger.runOr(null, { "$snippet: cannot read the receiver of $name of the snippet" }) {
             extensionReceiverParameter?.type?.let { ExtensionReceiver.of(it) }
         }
 
@@ -491,7 +491,7 @@ internal class SnippetDeclarations {
      * `null` if it cannot be read, or the bound is not a single class.
      */
     private fun KCallable<*>.receiverClass(snippet: String): KClass<*>? =
-        logger.readOr(null, { "$snippet: cannot read the receiver class of $name of the snippet" }) {
+        logger.runOr(null, { "$snippet: cannot read the receiver class of $name of the snippet" }) {
             when (val classifier = extensionReceiverParameter?.type?.classifier) {
                 is KClass<*> -> classifier
                 is KTypeParameter -> classifier.upperBounds.singleOrNull()?.classifier as? KClass<*>

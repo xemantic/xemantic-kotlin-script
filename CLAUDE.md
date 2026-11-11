@@ -76,6 +76,7 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 
 - `K2ReplCompiler.createCompilationState` must get a host configuration with `repl { firReplHistoryProvider(...); isReplSnippetSource { _, _ -> true } }` —
   passing the plain `defaultJvmScriptingHostConfiguration` crashes the first snippet with an NPE in `Fir2IrReplSnippetConfiguratorExtensionImpl`.
+- `Disposer.dispose` never throws the failure of a disposable itself, but an `AssertionError` of the compiler's logger caused by it, so `isFatal` misses a fatal one — dispose through `disposeTree`.
 - Its own history provider keeps the snippets which failed to compile, so the next snippet resolves their declarations, and fails at runtime — see `ReplHistory`.
 - `compile` drops the warnings of a successful snippet (`asSuccess()` without reports), they are read from the message collector instead.
 - `compile` may throw instead of returning a failure, e.g. on a backend crash, also an `Error`, like a `StackOverflowError` of the parser on deeply nested parentheses.

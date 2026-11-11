@@ -9215,12 +9215,12 @@ class ScriptSessionTest {
         // given
         lateinit var closedSession: ScriptSession
         // closes the session after the check of a closed session in execute, before the snippet is dispatched
-        closedSession = DefaultScriptSession(emptyList(), Dispatchers.Default) { threadFactory ->
+        closedSession = DefaultScriptSession(emptyList(), Dispatchers.Default, executor = { threadFactory ->
             InterceptedExecutor(Executors.newSingleThreadExecutor(threadFactory)) { index, execute ->
                 if (index == 0) closedSession.close()
                 execute()
             }
-        }
+        })
 
         // when
         val exception = assertFailsWith<IllegalStateException> {
@@ -9238,7 +9238,7 @@ class ScriptSessionTest {
         val disposalQueued = CompletableFuture<Unit>()
         val snippetQueued = CompletableFuture<Unit>()
         lateinit var closedSession: ScriptSession
-        closedSession = DefaultScriptSession(emptyList(), Dispatchers.Default) { threadFactory ->
+        closedSession = DefaultScriptSession(emptyList(), Dispatchers.Default, executor = { threadFactory ->
             InterceptedExecutor(Executors.newSingleThreadExecutor(threadFactory)) { index, execute ->
                 when (index) {
                     // the snippet, past the check of a closed session, closed on another thread
@@ -9257,7 +9257,7 @@ class ScriptSessionTest {
                     else -> execute()
                 }
             }
-        }
+        })
 
         // when
         val exception = assertFailsWith<IllegalStateException> {
@@ -9278,13 +9278,13 @@ class ScriptSessionTest {
         lateinit var session: ScriptSession
         var closingAgain: Result<Unit>? = null
         val submissions = AtomicInteger()
-        session = DefaultScriptSession(emptyList(), Dispatchers.Default) { threadFactory ->
+        session = DefaultScriptSession(emptyList(), Dispatchers.Default, executor = { threadFactory ->
             InterceptedExecutor(Executors.newSingleThreadExecutor(threadFactory)) { index, execute ->
                 submissions.incrementAndGet()
                 if (index == 0) closingAgain = runCatching { session.close() }
                 execute()
             }
-        }
+        })
 
         // when
         session.close()
@@ -9304,14 +9304,14 @@ class ScriptSessionTest {
         // given a session, with a property, a dependency, and a disposable of its compiler failing to dispose
         val threads = CopyOnWriteArrayList<Thread>()
         val uncaught = CopyOnWriteArrayList<Throwable>()
-        val failingSession = DefaultScriptSession(listOf(property("name", "value")), Dispatchers.Default) { threadFactory ->
+        val failingSession = DefaultScriptSession(listOf(property("name", "value")), Dispatchers.Default, executor = { threadFactory ->
             Executors.newSingleThreadExecutor { runnable ->
                 threadFactory.newThread(runnable).apply {
                     setUncaughtExceptionHandler { _, e -> uncaught += e }
                     threads += this
                 }
             }
-        }
+        })
         val dependencies = createTempDirectory("dependencies")
         try {
             dependencies.resolve("marker.txt").writeText("marker")
@@ -9323,7 +9323,8 @@ class ScriptSessionTest {
             val warnings = LogCollector("com.xemantic.kotlin.script").use { logs ->
                 failingSession.close()
                 threads.forEach { it.join(TimeUnit.MINUTES.toMillis(1)) }
-                logs.events.filter { it.level == Level.WARN }
+                // of this session only, as another one in the same JVM, like one closed by an earlier test, may warn meanwhile
+                logs.events.filter { it.level == Level.WARN && it.formattedMessage.startsWith("script-session-${failingSession.id}:") }
             }
 
             // then
@@ -9342,7 +9343,46 @@ class ScriptSessionTest {
             assert(value is IllegalStateException && value.message == "The session is closed")
             assert(uncaught.isEmpty())
         } finally {
+            // closed again, harmlessly, as an early failure of the test would leak its thread and its compiler otherwise
+            failingSession.close()
             dependencies.toFile().deleteRecursively()
+        }
+    }
+
+    /**
+     * The disposer of the compiler wraps a failure of a disposable in an [AssertionError], logging it by the logger of the compiler,
+     * so a fatal error of the disposal is unwrapped to be thrown, to the uncaught exception handler of the thread, see #239.
+     */
+    @Test
+    fun `should throw fatal error of disposal of compiler of closed session to uncaught exception handler`() = runTest {
+        // given a session, with a property, and a disposable of its compiler failing to dispose with a fatal error
+        val threads = CopyOnWriteArrayList<Thread>()
+        val uncaught = CopyOnWriteArrayList<Throwable>()
+        val failingSession = DefaultScriptSession(listOf(property("name", "value")), Dispatchers.Default, executor = { threadFactory ->
+            Executors.newSingleThreadExecutor { runnable ->
+                threadFactory.newThread(runnable).apply {
+                    setUncaughtExceptionHandler { _, e -> uncaught += e }
+                    threads += this
+                }
+            }
+        })
+        try {
+            failingSession.execute("1")
+            Disposer.register(failingSession.repl!!.disposable, Disposable { throw OutOfMemoryError("Disposal failed") })
+
+            // when
+            failingSession.close()
+            threads.forEach { it.join(TimeUnit.MINUTES.toMillis(1)) }
+
+            // then
+            val value = runCatching { ScriptPropertyValues.get(failingSession.id, "name") }.exceptionOrNull()
+            assert(threads.none { it.isAlive })
+            assert(uncaught.map { "${it.javaClass.simpleName}: ${it.message}" } == listOf("OutOfMemoryError: Disposal failed"))
+            // released even if the disposal fails
+            assert(value is IllegalStateException && value.message == "The session is closed")
+        } finally {
+            // closed again, harmlessly, as an early failure of the test would leak its thread and its compiler otherwise
+            failingSession.close()
         }
     }
 

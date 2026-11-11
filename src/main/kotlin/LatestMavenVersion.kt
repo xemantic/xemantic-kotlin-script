@@ -140,7 +140,12 @@ internal class MavenVersionLookup(
     /** The repository system, created by the first lookup, so a lookup never used creates none to shut down. */
     private val repositorySystem = lazy(LazyThreadSafetyMode.NONE, repositorySystemFactory)
 
-    /** Volatile, so a lookup sees the lookup closed also if it is closed on another thread than the one of the session. */
+    /**
+     * Volatile, so a lookup started after the lookup is closed on another thread, like by a test, sees it closed,
+     * which does not make the lookup safe across threads:
+     * a lookup closed while another one runs, past its check, still uses the repository system shut down meanwhile,
+     * or even creates it after the close, as neither the check nor the lazy [repositorySystem] is synchronized with it.
+     */
     @Volatile
     private var closed = false
 

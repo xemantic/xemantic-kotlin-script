@@ -66,7 +66,7 @@ internal class PropertyAccessors {
      * @throws VirtualMachineError thrown by the reflection, other than [StackOverflowError].
      */
     private fun accessors(className: String): Map<String, String>? = classes[className]
-        ?: logger.readOr(null, { "cannot read the accessors of the class $className of a frame" }) {
+        ?: logger.runOr(null, { "cannot read the accessors of the class $className of a frame" }) {
             // not initialized, as a static initializer of the class might not have run yet, or have failed
             classLoader?.let { Class.forName(className, false, it) }?.kotlin?.accessors()?.also { classes[className] = it }
         }
