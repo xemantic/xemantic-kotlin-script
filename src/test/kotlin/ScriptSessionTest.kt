@@ -31,6 +31,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CompletableJob
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
@@ -7857,6 +7858,226 @@ class ScriptSessionTest {
             holderExecutor.shutdownNow()
             executor.shutdown()
             saturated.shutdown()
+        }
+    }
+
+    /**
+     * A caller cancelled already when it calls execute, while the snippets of other callers are ahead of its own,
+     * would wait for them, and then run its snippet nevertheless, so a `withTimeout` around execute would not bound the wait,
+     * as it did when the caller waited for the lock of the session, see #235.
+     */
+    @Test
+    fun `should reject caller cancelled already while snippets of other callers are ahead of it`() {
+        // given
+        val started = CountDownLatch(1)
+        val proceed = CountDownLatch(1)
+        val ran = AtomicBoolean()
+        val session = ScriptSession {
+            provide<CountDownLatch>("started", started)
+            provide<CountDownLatch>("proceed", proceed)
+            provide<AtomicBoolean>("ran", ran)
+        }
+        try {
+            val holder = CompletableFuture.supplyAsync {
+                runBlocking {
+                    session.execute("started.countDown(); proceed.await(); 1")
+                }
+            }
+            started.await()
+            val failure = CompletableFuture<Throwable?>()
+
+            // when
+            // started in place, so completed once execute returns, if it does not wait
+            val cancelled = CoroutineScope(Dispatchers.Unconfined).launch {
+                cancel()
+                session.execute("ran.set(true); 2")
+            }
+            cancelled.invokeOnCompletion { failure.complete(it) }
+
+            // then
+            assert(cancelled.isCompleted)
+            assert(failure.get() is CancellationException)
+            assert(!holder.isDone)
+            proceed.countDown()
+            holder.get(1, TimeUnit.MINUTES) should {
+                be<ScriptResult.Value>()
+                have(value == 1)
+            }
+            runBlocking {
+                session.execute("ran.get()")
+            } should {
+                be<ScriptResult.Value>()
+                have(value == false)
+            }
+        } finally {
+            proceed.countDown()
+            session.close()
+        }
+    }
+
+    /**
+     * A caller cancelled while it waits for the snippets of other callers would leave its snippet,
+     * with its context and continuation, queued on the thread of the session until the snippets ahead end,
+     * so many callers timing out behind a blocked snippet would retain all of them, see #235.
+     */
+    @Test
+    fun `should release snippet of caller cancelled while it waits`() {
+        // given
+        val started = CountDownLatch(1)
+        val proceed = CountDownLatch(1)
+        val session = ScriptSession {
+            provide<CountDownLatch>("started", started)
+            provide<CountDownLatch>("proceed", proceed)
+        }
+        try {
+            val holder = CompletableFuture.supplyAsync {
+                runBlocking {
+                    session.execute("started.countDown(); proceed.await(); 1")
+                }
+            }
+            started.await()
+
+            // when
+            val snippet = snippetOfCallerCancelledWhileWaiting(session)
+
+            // then
+            collectGarbageUntilCleared(snippet)
+            assert(snippet.refersTo(null))
+            assert(!holder.isDone)
+        } finally {
+            proceed.countDown()
+            session.close()
+        }
+    }
+
+    /**
+     * Executes a snippet in the [session], cancelled while it waits for the snippet ahead of it,
+     * outside of the test, so no frame of the test keeps it, see [collectGarbageUntilCleared].
+     *
+     * @return the reference to the snippet.
+     */
+    private fun snippetOfCallerCancelledWhileWaiting(session: ScriptSession): WeakReference<String> {
+        val snippet = "\"${"x".repeat(100_000)}\""
+        // started in place, so waiting for the snippet ahead once launch returns
+        val waiting = CoroutineScope(Dispatchers.Unconfined).launch {
+            session.execute(snippet)
+        }
+        assert(!waiting.isCompleted)
+        // resumed in place, on this thread, so completed once cancel returns
+        waiting.cancel()
+        assert(waiting.isCompleted)
+        return WeakReference(snippet)
+    }
+
+    /**
+     * A caller cancelled while its snippet is submitted to the thread of the session, rejecting it as the session is closed meanwhile,
+     * fails with its cancellation, like any caller cancelled before its snippet starts, rather than with the rejection, see #235.
+     */
+    @Test
+    fun `should fail caller cancelled while its snippet is rejected with its cancellation`() {
+        // given
+        lateinit var caller: Job
+        val session = DefaultScriptSession(emptyList(), Dispatchers.Default) { threadFactory ->
+            InterceptedExecutor(Executors.newSingleThreadExecutor(threadFactory)) { index, execute ->
+                if (index == 0) {
+                    caller.cancel()
+                    throw RejectedExecutionException()
+                }
+                execute()
+            }
+        }
+        val failure = CompletableFuture<Throwable?>()
+        try {
+            // when
+            // lazy, so the caller is known to the executor before the snippet is submitted
+            caller = CoroutineScope(Dispatchers.Unconfined).launch(start = CoroutineStart.LAZY) {
+                session.execute("1")
+            }
+            caller.invokeOnCompletion { failure.complete(it) }
+            caller.start()
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build
+            assert(failure.get(1, TimeUnit.MINUTES) is CancellationException)
+        } finally {
+            session.close()
+        }
+    }
+
+    /**
+     * A fatal error, see [isFatal], thrown by the `dispatch` of a dispatcher, is wrapped by kotlinx.coroutines,
+     * and passed to the caller unwrapped, like a fatal error of the snippet, see #235.
+     */
+    @Test
+    fun `should fail caller with unwrapped fatal error thrown by dispatch of its dispatcher`() {
+        // given
+        val failure = InternalError("dispatch failed")
+        val failures = AtomicInteger()
+        val session = ScriptSession {
+            provide<AtomicInteger>("failures", failures)
+        }
+        val executor = Executors.newSingleThreadExecutor()
+        val dispatcher = object : CoroutineDispatcher() {
+            // fails only once, so a retry would resume the caller with the value of its snippet
+            override fun dispatch(context: CoroutineContext, block: Runnable) {
+                if (failures.getAndDecrement() > 0) throw failure
+                executor.execute(block)
+            }
+        }
+        try {
+            val callerResult = CompletableFuture<Result<ScriptResult>>()
+
+            // when
+            suspend {
+                session.execute("failures.set(1); 42")
+            }.startCoroutine(Continuation(dispatcher) {
+                callerResult.complete(it)
+            })
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build
+            assert(callerResult.get(1, TimeUnit.MINUTES).exceptionOrNull() === failure)
+        } finally {
+            session.close()
+            executor.shutdown()
+        }
+    }
+
+    /**
+     * A caller resuming in place, on the thread of the session, is resumed there after all, if the resume executor fails to take it,
+     * like [Dispatchers.Default] failing to start a worker, as left unresumed, it would never return, see #224 and #235.
+     */
+    @Test
+    fun `should resume caller in place when the resume executor fails`() {
+        // given
+        val session = DefaultScriptSession(
+            emptyList(),
+            Dispatchers.Default,
+            resumeExecutor = { throw IllegalStateException("resumeExecutor failed") }
+        )
+        val callerResult = CompletableFuture<Result<Pair<Any?, Thread>>>()
+        try {
+            // when
+            suspend {
+                val result = session.execute("Thread.currentThread()")
+                assert(result is ScriptResult.Value)
+                result.value to Thread.currentThread()
+            }.startCoroutine(Continuation(EmptyCoroutineContext) {
+                callerResult.complete(it)
+            })
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build
+            val (sessionThread, callerThread) = callerResult.get(1, TimeUnit.MINUTES).getOrThrow()
+            assert(callerThread === sessionThread)
+            runBlocking {
+                session.execute("2")
+            } should {
+                be<ScriptResult.Value>()
+                have(value == 2)
+            }
+        } finally {
+            session.close()
         }
     }
 

@@ -129,7 +129,8 @@ ScriptSession {
   A caller cancelled while it waits resumes at once, with its `CancellationException`, without executing its snippet,
   on the cancelling thread, if it would resume in place, unless that is the thread of the session, like a snippet cancelling it,
   which resumes it as above.
-  A caller cancelled already when it calls `execute` executes its snippet, cancelled, as the cancellation of a caller whose snippet is compiled would.
+  So does a caller cancelled already when it calls `execute`, so `withTimeout` bounds the wait,
+  unless no other snippet is executed, or waiting, then: such a caller executes its snippet, cancelled.
 * The snippets are received by the `ScriptScope`, a `CoroutineScope` living as long as the session,
   with `kotlinx.coroutines.*` imported by default:
   * `await { ... }` runs suspending code, like the requests of a ktor client,
