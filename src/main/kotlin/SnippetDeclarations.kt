@@ -471,7 +471,7 @@ private const val ALIAS_EXPANSION_START = " /* = "
 private const val ALIAS_EXPANSION_END = " */"
 
 /** The name of a class, also of a nested one, like `Map.Entry`, unlike a function type, like `(Int) -> Int`. */
-private val className = Regex("[\\w.]+")
+private val className = Regex("[\\p{L}\\p{N}_.]+")
 
 /**
  * The supertypes of the well-known types of `kotlin.*`, and of the JVM types of the collection functions, like `ArrayList` of `arrayListOf`,
@@ -492,11 +492,11 @@ private val wellKnownSupertypes: Map<String, Set<String>> = buildMap {
     put("MutableSet", setOf("Set", "MutableCollection", "Collection", "MutableIterable", "Iterable"))
     put("MutableMap", setOf("Map"))
     put("MutableMap.MutableEntry", setOf("Map.Entry"))
-    put("ArrayList", getValue("MutableList"))
-    put("HashSet", getValue("MutableSet"))
-    put("LinkedHashSet", getValue("MutableSet") + "HashSet")
-    put("HashMap", getValue("MutableMap"))
-    put("LinkedHashMap", getValue("MutableMap") + "HashMap")
+    put("ArrayList", getValue("MutableList") + "MutableList")
+    put("HashSet", getValue("MutableSet") + "MutableSet")
+    put("LinkedHashSet", getValue("HashSet") + "HashSet")
+    put("HashMap", getValue("MutableMap") + "MutableMap")
+    put("LinkedHashMap", getValue("HashMap") + "HashMap")
     put("StringBuilder", setOf("CharSequence", "Appendable"))
 }
 
@@ -533,18 +533,23 @@ internal enum class Acceptance {
 
 /**
  * The receiver of an extension declared by a snippet, of the [name] of its class without the package, like `String` or `Map.Entry`,
- * with its [typeArguments], `*` for a star projection, or `null` for a type parameter, both matching any,
+ * with its [typeArguments], `*` for a star projection, matching any, or `null` for one of a type parameter,
+ * matching any unless [constrained][constrainedArguments],
  * or of a function type, like `(Int) -> Int` or `List<Int>.() -> Int`, or of the upper bound of a type parameter, `Any` if unbounded,
  * taking `null` if [nullable].
  *
  * @param variances the variance of each of the [typeArguments], of its projection, like `out Number`, or of the type parameter of its class,
  * like `out E` of `List`, `null` if not known, [KVariance.INVARIANT] if not given.
+ * @param constrainedArguments the indices of the [typeArguments] of a type parameter which do not match any type argument,
+ * as it has a bound, like `T` of `fun <T : Number> List<T>.f()`, or is used again, like `K` of `fun <K> Map<K, K>.f()`,
+ * or is nullable, or nested, like `List<T>` of `fun <T> List<List<T>>.f()`, which are not checked, so [possibly][Acceptance.POSSIBLE] matching.
  */
 internal data class ExtensionReceiver(
     val name: String,
     val typeArguments: List<String?> = emptyList(),
     val nullable: Boolean = false,
-    val variances: List<KVariance?> = emptyList()
+    val variances: List<KVariance?> = emptyList(),
+    val constrainedArguments: Set<Int> = emptySet()
 ) {
 
     /**
@@ -556,9 +561,6 @@ internal data class ExtensionReceiver(
         name.matches(className) -> toString()
         else -> if (nullable) "($name)?" else "($name)"
     }
-
-    /** Whether an extension of this receiver can be called on the receiver of a type, as rendered by a compiler [message], see [acceptance]. */
-    fun accepts(message: String): Boolean = acceptance(message) == Acceptance.ACCEPTED
 
     /**
      * Whether an extension of this receiver can be called on the receiver of a type, as rendered by a compiler [message],
@@ -574,12 +576,9 @@ internal data class ExtensionReceiver(
         val type = message.replace(snippetQualifier, "")
         val intersection = type.splitAtTopLevel(" & ")
         if (intersection.size > 1) return intersection.maxOf { acceptance(it, nested) }
-        val unwrapped = type.removeSuffix("?").let { if (it.isParenthesized()) it.substring(1, it.length - 1) else null }
-        // a function type is nullable if parenthesized, like `((Int) -> String?)?`, not by the nullable result of `(Int) -> String?`
-        val typeNullable = type.endsWith("?") && (unwrapped != null || !type.isFunctionType())
+        val (base, typeNullable) = type.withoutNullability()
         if (typeNullable && !nullable) return Acceptance.REJECTED
         if (name == "Any") return Acceptance.ACCEPTED
-        val base = unwrapped ?: if (typeNullable) type.removeSuffix("?") else type.removeSuffix("!")
         val typeName = base.substringBefore('<')
         val otherClass = if (nested && !(typeName in closedWellKnownTypes && name in wellKnownTypes)) Acceptance.POSSIBLE else Acceptance.REJECTED
         if (base.isFunctionType() || !typeName.matches(className)) return if (base == name) Acceptance.ACCEPTED else otherClass
@@ -588,7 +587,8 @@ internal data class ExtensionReceiver(
             typeName -> argumentsAcceptance(arguments)
             in wellKnownSupertypes[typeName].orEmpty() -> when {
                 arguments.size == typeArguments.size -> argumentsAcceptance(arguments)
-                typeArguments.all { it == null || it == "*" } -> Acceptance.ACCEPTED
+                typeArguments.indices.all { typeArguments[it] == "*" || typeArguments[it] == null && it !in constrainedArguments } ->
+                    Acceptance.ACCEPTED
                 else -> Acceptance.POSSIBLE
             }
             else -> otherClass
@@ -597,7 +597,9 @@ internal data class ExtensionReceiver(
 
     private fun argumentsAcceptance(arguments: List<String>): Acceptance =
         if (arguments.size != typeArguments.size) Acceptance.REJECTED else typeArguments.indices.minOfOrNull { index ->
-            argumentAcceptance(typeArguments[index], arguments[index], variances.getOrElse(index) { KVariance.INVARIANT })
+            val expected = typeArguments[index]
+            if (expected == null && index in constrainedArguments) Acceptance.POSSIBLE
+            else argumentAcceptance(expected, arguments[index], variances.getOrElse(index) { KVariance.INVARIANT })
         } ?: Acceptance.ACCEPTED
 
     /**
@@ -666,7 +668,8 @@ internal data class ExtensionReceiver(
                                     KVariance.INVARIANT -> if (name in invariantMutableTypes) KVariance.INVARIANT else classifier.typeParameters.getOrNull(index)?.variance
                                     else -> argument.variance
                                 }
-                            }
+                            },
+                            constrainedArguments = type.constrainedArguments()
                         )
                     }
                 }
@@ -682,9 +685,7 @@ internal data class ExtensionReceiver(
          * of type arguments of variances not known.
          */
         private fun receiverOf(type: String): ExtensionReceiver {
-            val unwrapped = type.removeSuffix("?").let { if (it.isParenthesized()) it.substring(1, it.length - 1) else null }
-            val nullable = type.endsWith("?") && (unwrapped != null || !type.isFunctionType())
-            val base = unwrapped ?: if (nullable) type.removeSuffix("?") else type
+            val (base, nullable) = type.withoutNullability()
             val name = base.substringBefore('<')
             if (base.isFunctionType() || !name.matches(className)) return ExtensionReceiver(base, nullable = nullable)
             val arguments = typeArgumentsOf(base)
@@ -696,6 +697,37 @@ internal data class ExtensionReceiver(
 
         private fun KType.hasTypeParameter(): Boolean =
             classifier is KTypeParameter || arguments.any { it.type?.hasTypeParameter() == true }
+
+        /** The indices of the type arguments of this type of a type parameter not matching any type argument, see [ExtensionReceiver.constrainedArguments]. */
+        private fun KType.constrainedArguments(): Set<Int> {
+            val uses = HashMap<KTypeParameter, Int>()
+            fun KType.count() {
+                (classifier as? KTypeParameter)?.let { uses.merge(it, 1, Int::plus) }
+                arguments.forEach { it.type?.count() }
+            }
+            count()
+            return arguments.indices.filterTo(HashSet()) { index ->
+                val argument = arguments[index].type
+                val parameter = argument?.classifier as? KTypeParameter
+                argument != null && argument.hasTypeParameter() && (
+                    parameter == null
+                        || argument.isMarkedNullable
+                        || uses[parameter] != 1
+                        || parameter.upperBounds.singleOrNull().let { it == null || it.classifier != Any::class || !it.isMarkedNullable }
+                    )
+            }
+        }
+
+        /**
+         * This rendered type without its nullability, and whether it is nullable,
+         * like `String` of `String?`, or `(Int) -> Int` of `((Int) -> Int)?`, but not of `(Int) -> Int?`, a function type of a nullable result,
+         * or of a platform type, like `String!`, not nullable.
+         */
+        private fun String.withoutNullability(): Pair<String, Boolean> {
+            val unwrapped = removeSuffix("?").let { if (it.isParenthesized()) it.substring(1, it.length - 1) else null }
+            val nullable = endsWith("?") && (unwrapped != null || !isFunctionType())
+            return (unwrapped ?: if (nullable) removeSuffix("?") else removeSuffix("!")) to nullable
+        }
 
         private fun String.unqualified(): String = expandAliases().replace(qualifier, "")
 

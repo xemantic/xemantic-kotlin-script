@@ -71,6 +71,9 @@ class SnippetDeclarationsTest {
                     val StringBuilder.builderExtensionProperty get() = 1
                     fun MutableList<out Number>.outMutableListExtensionFunction() = 1
                     fun (List<Int>.() -> Pair<String, Int>).receiverFunctionTypeExtensionFunction() = 1
+                    fun <T : Number> MutableList<T>.boundedListExtensionFunction() = 1
+                    fun <K> Map<K, K>.repeatedMapExtensionFunction() = 1
+                    fun <T> List<List<T>>.nestedListExtensionFunction() = 1
                     class PublicClass
                     private class PrivateClass
                     internal class InternalClass
@@ -455,7 +458,7 @@ class SnippetDeclarationsTest {
         val receiver = ExtensionReceiver("Map.Entry", listOf("Int", "String"))
 
         // when
-        val accepted = receiver.accepts("Map.Entry<Int, String>")
+        val accepted = receiver.acceptance("Map.Entry<Int, String>") == Acceptance.ACCEPTED
 
         // then
         assert(accepted)
@@ -467,7 +470,7 @@ class SnippetDeclarationsTest {
         val receiver = ExtensionReceiver("String")
 
         // when
-        val accepted = receiver.accepts("List<Int>")
+        val accepted = receiver.acceptance("List<Int>") == Acceptance.ACCEPTED
 
         // then
         assert(!accepted)
@@ -479,7 +482,7 @@ class SnippetDeclarationsTest {
         val receiver = ExtensionReceiver("Map.Entry", listOf("Int", "Int"))
 
         // when
-        val accepted = receiver.accepts("Other.Entry<Int, Int>")
+        val accepted = receiver.acceptance("Other.Entry<Int, Int>") == Acceptance.ACCEPTED
 
         // then
         assert(!accepted)
@@ -491,7 +494,7 @@ class SnippetDeclarationsTest {
         val receiver = ExtensionReceiver("List", listOf("String"))
 
         // when
-        val accepted = receiver.accepts("List<Int>")
+        val accepted = receiver.acceptance("List<Int>") == Acceptance.ACCEPTED
 
         // then
         assert(!accepted)
@@ -503,7 +506,7 @@ class SnippetDeclarationsTest {
         val receiver = ExtensionReceiver("Map.Entry", listOf(null, "String"))
 
         // when
-        val accepted = receiver.accepts("Map.Entry<List<Int>, String>")
+        val accepted = receiver.acceptance("Map.Entry<List<Int>, String>") == Acceptance.ACCEPTED
 
         // then
         assert(accepted)
@@ -515,7 +518,7 @@ class SnippetDeclarationsTest {
         val receiver = ExtensionReceiver("(Int) -> Int")
 
         // when
-        val accepted = receiver.accepts("(Int) -> Int")
+        val accepted = receiver.acceptance("(Int) -> Int") == Acceptance.ACCEPTED
 
         // then
         assert(accepted)
@@ -527,7 +530,7 @@ class SnippetDeclarationsTest {
         val receiver = ExtensionReceiver("String")
 
         // when
-        val accepted = receiver.accepts("String?")
+        val accepted = receiver.acceptance("String?") == Acceptance.ACCEPTED
 
         // then
         assert(!accepted)
@@ -539,7 +542,7 @@ class SnippetDeclarationsTest {
         val receiver = ExtensionReceiver("String", nullable = true)
 
         // when
-        val accepted = receiver.accepts("String")
+        val accepted = receiver.acceptance("String") == Acceptance.ACCEPTED
 
         // then
         assert(accepted)
@@ -551,7 +554,7 @@ class SnippetDeclarationsTest {
         val receiver = ExtensionReceiver("Any", nullable = true)
 
         // when
-        val accepted = receiver.accepts("List<Int>?")
+        val accepted = receiver.acceptance("List<Int>?") == Acceptance.ACCEPTED
 
         // then
         assert(accepted)
@@ -566,9 +569,9 @@ class SnippetDeclarationsTest {
 
         // when
         val accepted = listOf(
-            collection.accepts("MutableList<Int>"),
-            charSequence.accepts("String"),
-            entry.accepts("MutableMap.MutableEntry<Int, String>")
+            collection.acceptance("MutableList<Int>") == Acceptance.ACCEPTED,
+            charSequence.acceptance("String") == Acceptance.ACCEPTED,
+            entry.acceptance("MutableMap.MutableEntry<Int, String>") == Acceptance.ACCEPTED
         )
 
         // then
@@ -582,7 +585,7 @@ class SnippetDeclarationsTest {
         val concrete = ExtensionReceiver("Comparable", listOf("String"))
 
         // when
-        val accepted = listOf(generic.accepts("String"), concrete.accepts("String"))
+        val accepted = listOf(generic.acceptance("String") == Acceptance.ACCEPTED, concrete.acceptance("String") == Acceptance.ACCEPTED)
 
         // then
         assert(accepted == listOf(true, false))
@@ -594,7 +597,7 @@ class SnippetDeclarationsTest {
         val receiver = ExtensionReceiver("MutableList", listOf("Int"))
 
         // when
-        val accepted = receiver.accepts("List<Int>")
+        val accepted = receiver.acceptance("List<Int>") == Acceptance.ACCEPTED
 
         // then
         assert(!accepted)
@@ -606,7 +609,7 @@ class SnippetDeclarationsTest {
         val receiver = ExtensionReceiver("Shape")
 
         // when
-        val accepted = receiver.accepts("Circle")
+        val accepted = receiver.acceptance("Circle") == Acceptance.ACCEPTED
 
         // then
         assert(!accepted)
@@ -628,7 +631,7 @@ class SnippetDeclarationsTest {
         val receiver = ExtensionReceiver("List", listOf("*"))
 
         // when
-        val accepted = receiver.accepts("List<Int>")
+        val accepted = receiver.acceptance("List<Int>") == Acceptance.ACCEPTED
 
         // then
         assert(accepted)
@@ -640,7 +643,7 @@ class SnippetDeclarationsTest {
         val receiver = ExtensionReceiver("(Int) -> String?")
 
         // when
-        val accepted = listOf(receiver.accepts("(Int) -> String?"), receiver.accepts("((Int) -> String?)?"))
+        val accepted = listOf(receiver.acceptance("(Int) -> String?") == Acceptance.ACCEPTED, receiver.acceptance("((Int) -> String?)?") == Acceptance.ACCEPTED)
 
         // then
         assert(accepted == listOf(true, false))
@@ -666,9 +669,9 @@ class SnippetDeclarationsTest {
 
         // when
         val accepted = listOf(
-            point.accepts("Snippet1.Point"),
-            inner.accepts("Snippet1.Box.Inner"),
-            list.accepts("List<Snippet1.Point>")
+            point.acceptance("Snippet1.Point") == Acceptance.ACCEPTED,
+            inner.acceptance("Snippet1.Box.Inner") == Acceptance.ACCEPTED,
+            list.acceptance("List<Snippet1.Point>") == Acceptance.ACCEPTED
         )
 
         // then
@@ -704,8 +707,8 @@ class SnippetDeclarationsTest {
 
         // when
         val accepted = listOf(
-            receiver.accepts("List<Int>.() -> Pair<String, Int>"),
-            receiver.accepts("List<String>.() -> Pair<String, Int>")
+            receiver.acceptance("List<Int>.() -> Pair<String, Int>") == Acceptance.ACCEPTED,
+            receiver.acceptance("List<String>.() -> Pair<String, Int>") == Acceptance.ACCEPTED
         )
 
         // then
@@ -724,12 +727,12 @@ class SnippetDeclarationsTest {
 
         // when
         val accepted = listOf(
-            map.accepts("Map<String, Int>"),
-            numbers.accepts("List<Int>"),
-            projected.accepts("MutableList<Int>"),
-            anything.accepts("List<Comparable<*> & Serializable>"),
-            pair.accepts("Pair<Int, String>"),
-            texts.accepts("List<StringBuilder>")
+            map.acceptance("Map<String, Int>") == Acceptance.ACCEPTED,
+            numbers.acceptance("List<Int>") == Acceptance.ACCEPTED,
+            projected.acceptance("MutableList<Int>") == Acceptance.ACCEPTED,
+            anything.acceptance("List<Comparable<*> & Serializable>") == Acceptance.ACCEPTED,
+            pair.acceptance("Pair<Int, String>") == Acceptance.ACCEPTED,
+            texts.acceptance("List<StringBuilder>") == Acceptance.ACCEPTED
         )
 
         // then
@@ -799,16 +802,21 @@ class SnippetDeclarationsTest {
 
         // when
         val accepted = listOf(
-            collection.accepts("ArrayList<Int>"),
-            collection.accepts("HashSet<Int>"),
-            collection.accepts("LinkedHashSet<Int>"),
-            map.accepts("HashMap<String, Int>"),
-            map.accepts("LinkedHashMap<String, Int>"),
-            charSequence.accepts("StringBuilder")
+            collection.acceptance("ArrayList<Int>") == Acceptance.ACCEPTED,
+            collection.acceptance("HashSet<Int>") == Acceptance.ACCEPTED,
+            collection.acceptance("LinkedHashSet<Int>") == Acceptance.ACCEPTED,
+            map.acceptance("HashMap<String, Int>") == Acceptance.ACCEPTED,
+            map.acceptance("LinkedHashMap<String, Int>") == Acceptance.ACCEPTED,
+            charSequence.acceptance("StringBuilder") == Acceptance.ACCEPTED,
+            ExtensionReceiver("MutableSet", listOf("Int")).acceptance("HashSet<Int>") == Acceptance.ACCEPTED,
+            ExtensionReceiver("MutableSet", listOf("Int")).acceptance("LinkedHashSet<Int>") == Acceptance.ACCEPTED,
+            ExtensionReceiver("MutableList", listOf("Int")).acceptance("ArrayList<Int>") == Acceptance.ACCEPTED,
+            ExtensionReceiver("MutableMap", listOf("String", "Int")).acceptance("HashMap<String, Int>") == Acceptance.ACCEPTED,
+            ExtensionReceiver("MutableMap", listOf("String", "Int")).acceptance("LinkedHashMap<String, Int>") == Acceptance.ACCEPTED
         )
 
         // then
-        assert(accepted == listOf(true, true, true, true, true, true))
+        assert(accepted == List(11) { true })
     }
 
     @Test
@@ -825,6 +833,36 @@ class SnippetDeclarationsTest {
 
         // then
         assert(acceptances == listOf(Acceptance.ACCEPTED, Acceptance.REJECTED))
+    }
+
+    @Test
+    fun `should keep type arguments of bounded or repeated type parameters of receivers as constrained`() {
+        // when
+        val declarations = declarations
+
+        // then
+        assert(declarations.extensionFunctionReceivers("boundedListExtensionFunction").single().constrainedArguments == setOf(0))
+        assert(declarations.extensionFunctionReceivers("repeatedMapExtensionFunction").single().constrainedArguments == setOf(0, 1))
+        assert(declarations.extensionFunctionReceivers("nestedListExtensionFunction").single().constrainedArguments == setOf(0))
+        assert(declarations.extensionPropertyReceivers("genericListExtensionProperty").single().constrainedArguments.isEmpty())
+    }
+
+    @Test
+    fun `should possibly accept receiver of constrained type argument`() {
+        // given
+        val bounded = ExtensionReceiver("MutableList", listOf(null), constrainedArguments = setOf(0))
+        val repeated = ExtensionReceiver("Map", listOf(null, null), constrainedArguments = setOf(0, 1))
+        val comparable = ExtensionReceiver("Comparable", listOf(null), constrainedArguments = setOf(0))
+
+        // when
+        val acceptances = listOf(
+            bounded.acceptance("MutableList<String>"),
+            repeated.acceptance("MutableMap<Int, String>"),
+            comparable.acceptance("String")
+        )
+
+        // then
+        assert(acceptances == listOf(Acceptance.POSSIBLE, Acceptance.POSSIBLE, Acceptance.POSSIBLE))
     }
 
 }

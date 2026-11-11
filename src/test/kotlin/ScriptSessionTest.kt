@@ -1524,6 +1524,249 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should hint conditionally when extensions of earlier snippet of bounded or repeated type parameters are unresolved in declaration of inferred type`() = runTest {
+        // given
+        session.execute("""
+            fun <T : Number> MutableList<T>.sumUp() = sumOf { it.toInt() }
+            fun <T : Number> Collection<T>.sumAll() = sumOf { it.toInt() }
+            fun <T> MutableMap<T, T>.same() = size
+            fun <K> Map<K, K>.sameKV() = size
+            fun <T : Number> List<T>.bounded() = size
+        """.trimIndent())
+
+        // when
+        val results = listOf(
+            "fun a() = mutableListOf(\"a\").sumUp()\na()",
+            "fun b() = listOf(\"a\").sumAll()\nb()",
+            "fun c() = mutableMapOf(1 to \"a\").same()\nc()",
+            "fun d() = mutableMapOf(1 to \"a\").sameKV()\nd()",
+            "fun e() = listOf(\"a\").bounded()\ne()"
+        ).map { session.execute(it) }
+
+        // then
+        results.joinToString("\n\n") { (it as ScriptResult.Error).message } sameAs """
+                snippet2.kts:1:30: error: Unresolved reference 'sumUp' on receiver of type 'MutableList<String>'.
+                  | fun a() = mutableListOf("a").<error>sumUp</error>()
+                  hint: 'sumUp' is an extension of MutableList<*> declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.sumUp(...).toString()` - declare the type, like `fun f(): String = receiver.sumUp(...).toString()`, and the compiler tells if the receiver is not of this type.
+
+                snippet3.kts:1:23: error: Unresolved reference 'sumAll' on receiver of type 'List<String>'.
+                  | fun b() = listOf("a").<error>sumAll</error>()
+                  hint: 'sumAll' is an extension of Collection<*> declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.sumAll(...).toString()` - declare the type, like `fun f(): String = receiver.sumAll(...).toString()`, and the compiler tells if the receiver is not of this type.
+
+                snippet4.kts:1:34: error: Unresolved reference 'same' on receiver of type 'MutableMap<Int, String>'.
+                  | fun c() = mutableMapOf(1 to "a").<error>same</error>()
+                  hint: 'same' is an extension of MutableMap<*, *> declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.same(...).toString()` - declare the type, like `fun f(): String = receiver.same(...).toString()`, and the compiler tells if the receiver is not of this type.
+
+                snippet5.kts:1:34: error: Unresolved reference 'sameKV' on receiver of type 'MutableMap<Int, String>'.
+                  | fun d() = mutableMapOf(1 to "a").<error>sameKV</error>()
+                  hint: 'sameKV' is an extension of Map<*, *> declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.sameKV(...).toString()` - declare the type, like `fun f(): String = receiver.sameKV(...).toString()`, and the compiler tells if the receiver is not of this type.
+
+                snippet6.kts:1:23: error: Unresolved reference 'bounded' on receiver of type 'List<String>'.
+                  | fun e() = listOf("a").<error>bounded</error>()
+                  hint: 'bounded' is an extension of List<*> declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.bounded(...).toString()` - declare the type, like `fun f(): String = receiver.bounded(...).toString()`, and the compiler tells if the receiver is not of this type.
+            """.trimIndent()
+    }
+
+    @Test
+    fun `should report receiver type mismatch when extensions of earlier snippet of bounded or repeated type parameters are called on receiver of other type in declaration of declared type`() = runTest {
+        // given
+        session.execute("""
+            fun <T : Number> MutableList<T>.sumUp() = sumOf { it.toInt() }
+            fun <T : Number> Collection<T>.sumAll() = sumOf { it.toInt() }
+            fun <T> MutableMap<T, T>.same() = size
+            fun <K> Map<K, K>.sameKV() = size
+            fun <T : Number> List<T>.bounded() = size
+        """.trimIndent())
+
+        // when
+        val results = listOf(
+            "fun a(): String = mutableListOf(\"a\").sumUp().toString()\na()",
+            "fun b(): String = listOf(\"a\").sumAll().toString()\nb()",
+            "fun c(): String = mutableMapOf(1 to \"a\").same().toString()\nc()",
+            "fun d(): String = mutableMapOf(1 to \"a\").sameKV().toString()\nd()",
+            "fun e(): String = listOf(\"a\").bounded().toString()\ne()"
+        ).map { session.execute(it) }
+
+        // then
+        assert(results.all { it is ScriptResult.Error && "receiver type mismatch" in it.message })
+    }
+
+    @Test
+    fun `should call extensions of earlier snippet of bounded or repeated type parameters in declaration of declared type`() = runTest {
+        // given
+        session.execute("""
+            fun <T : Number> MutableList<T>.sumUp() = sumOf { it.toInt() }
+            fun <T : Number> Collection<T>.sumAll() = sumOf { it.toInt() }
+            fun <T> MutableMap<T, T>.same() = size
+            fun <K> Map<K, K>.sameKV() = size
+            fun <T : Number> List<T>.bounded() = size
+        """.trimIndent())
+
+        // when
+        val result = session.execute("""
+            fun f(): String = listOf(mutableListOf(1).sumUp(), listOf(2).sumAll(), mutableMapOf(1 to 1).same(), mapOf(1 to 1).sameKV(), listOf(1).bounded()).toString()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "[1, 2, 1, 1, 1]")
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extensions of earlier snippet of mutable receiver are unresolved on receiver of concrete mutable type`() = runTest {
+        // given
+        session.execute("""
+            fun MutableSet<Int>.growSet() = add(2)
+            fun MutableMap<String, Int>.growMap() = put("b", 2)
+        """.trimIndent())
+
+        // when
+        val results = listOf(
+            "fun a() = hashSetOf(1).growSet()\na()",
+            "fun b() = hashMapOf(\"a\" to 1).growMap()\nb()"
+        ).map { session.execute(it) }
+
+        // then
+        results.joinToString("\n\n") { (it as ScriptResult.Error).message } sameAs """
+                snippet2.kts:1:24: error: Unresolved reference 'growSet' on receiver of type 'HashSet<Int>'.
+                  | fun a() = hashSetOf(1).<error>growSet</error>()
+                  hint: 'growSet' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.growSet(...).toString()` - declare the type, like `fun f(): String = receiver.growSet(...).toString()`.
+
+                snippet3.kts:1:31: error: Unresolved reference 'growMap' on receiver of type 'HashMap<String, Int>'.
+                  | fun b() = hashMapOf("a" to 1).<error>growMap</error>()
+                  hint: 'growMap' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.growMap(...).toString()` - declare the type, like `fun f(): String = receiver.growMap(...).toString()`.
+            """.trimIndent()
+    }
+
+    @Test
+    fun `should call extensions of earlier snippet of mutable receiver on receiver of concrete mutable type in declaration of declared type`() = runTest {
+        // given
+        session.execute("""
+            fun MutableSet<Int>.growSet() = add(2)
+            fun MutableMap<String, Int>.growMap() = put("b", 2)
+        """.trimIndent())
+
+        // when
+        val result = session.execute("""
+            fun f(): String = listOf(hashSetOf(1).growSet(), hashMapOf("a" to 1).growMap()).toString()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "[true, null]")
+        }
+    }
+
+    @Test
+    fun `should not hint declaring the type when extension function of earlier snippet of Long receiver is unresolved on integer literal of Int range`() = runTest {
+        // given
+        session.execute("fun Long.lng() = this * 2")
+
+        // when
+        val result = session.execute("""
+            fun f() = 1.lng()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:13: error: Unresolved reference 'lng'.
+                  | fun f() = 1.<error>lng</error>()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extension function of earlier snippet of Long receiver is unresolved on integer literal beyond Int range`() = runTest {
+        // given
+        session.execute("fun Long.lng() = this * 2")
+
+        // when
+        val result = session.execute("""
+            fun f() = 3000000000.lng()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:22: error: Unresolved reference 'lng' on receiver of type 'Long'.
+                  | fun f() = 3000000000.<error>lng</error>()
+                  hint: 'lng' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.lng(...).toString()` - declare the type, like `fun f(): String = receiver.lng(...).toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call extension function of earlier snippet of Long receiver on integer literal beyond Int range in declaration of declared type`() = runTest {
+        // given
+        session.execute("fun Long.lng() = this * 2")
+
+        // when
+        val result = session.execute("""
+            fun f(): String = 3000000000.lng().toString()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "6000000000")
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type with backticks when extension function of earlier snippet of backticked name is unresolved in declaration of inferred type`() = runTest {
+        // given
+        session.execute("fun String.`back tick`() = length")
+
+        // when
+        val result = session.execute("""
+            fun f() = "ab".`back tick`()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:16: error: Unresolved reference 'back tick' on receiver of type 'String'.
+                  | fun f() = "ab".<error>`back tick`</error>()
+                  hint: 'back tick' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.`back tick`(...).toString()` - declare the type, like `fun f(): String = receiver.`back tick`(...).toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call extension function of earlier snippet of backticked name in declaration of declared type`() = runTest {
+        // given
+        session.execute("fun String.`back tick`() = length")
+
+        // when
+        val result = session.execute("""
+            fun f(): String = "ab".`back tick`().toString()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "2")
+        }
+    }
+
+    @Test
     fun `should not hint declaring the type when property of earlier snippet is unresolved on integer literal`() = runTest {
         // given
         session.execute("val greeting = \"hi\"")

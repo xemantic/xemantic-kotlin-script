@@ -75,8 +75,20 @@ private class UnresolvedReference(val onExplicitReceiver: Boolean, val callable:
 /** An integer literal without a suffix, followed by a `.`, ending the code before a reference, like `1.` or `0xFF.`, but not `1.0.`. */
 private val integerLiteralReceiver = Regex("(?<![\\p{L}\\p{N}_.])(?:0[xXbB][0-9a-fA-F_]+|\\p{N}[\\p{N}_]*)\\.$")
 
-/** The types of an integer literal receiver, `Long` if it is too big for an `Int`. */
-private val integerLiteralTypes = listOf("Int", "Long")
+/** The type of an integer literal receiver, as one too big for an `Int`, a `Long`, is rendered by a compiler message. */
+private val integerLiteralTypes = listOf("Int")
+
+/** A name the source can refer to without backticks. */
+private val plainIdentifier = Regex("[\\p{L}_][\\p{L}\\p{N}_]*")
+
+/** The hard keywords of Kotlin, which a name of a declaration is backticked as. */
+private val hardKeywords = setOf(
+    "as", "break", "class", "continue", "do", "else", "false", "for", "fun", "if", "in", "interface", "is", "null", "object",
+    "package", "return", "super", "this", "throw", "true", "try", "typealias", "typeof", "val", "var", "when", "while"
+)
+
+/** This name as the source refers to it, backticked if it is not a plain identifier, like `` `back tick` ``. */
+private fun String.asReference(): String = if (plainIdentifier.matches(this) && this !in hardKeywords) this else "`$this`"
 
 /**
  * The code before the [column] of the [line] of these lines, or of the nearest line before it of any code, if the [line] starts there,
@@ -266,7 +278,7 @@ internal class ScriptErrorReporter(
             val name = match.groupValues[1]
             val line = location?.let { lines?.getOrNull(it.start.line - 1) }
             val column = location?.start?.col?.minus(1)
-            val reference = if (line != null && column != null && column in 0..line.length) {
+            val usage = if (line != null && column != null && column in 0..line.length) {
                 val before = lines.orEmpty().codeBefore(location.start.line - 1, column)
                 val after = line.substring(column).removePrefix("`$name`").removePrefix(name).trimStart()
                 UnresolvedReference(
@@ -276,7 +288,7 @@ internal class ScriptErrorReporter(
                     onIntegerLiteral = before != null && integerLiteralReceiver.containsMatchIn(before)
                 )
             } else null
-            appendUnresolvedEarlierDeclarationHint(name, receiverType = match.groups[2]?.value, reference)
+            appendUnresolvedEarlierDeclarationHint(name, receiverType = match.groups[2]?.value, usage)
         }
     }
 
@@ -287,41 +299,42 @@ internal class ScriptErrorReporter(
      * The compiler does not render the type of an integer literal receiver, like `1.tagged()`, nor any implicit receiver,
      * also when no receiver of the type of the extension is in scope at all, so the hint is conditional then,
      * on the compiler reporting the mismatch of the receiver once the type is declared, which the hint makes no worse.
-     * The form of an extension, a property or a function, is told by the [reference] in the source, if any.
+     * The form of an extension, a property or a function, is told by its [usage] in the source, if any.
      * A declaration of a snippet which failed to compile is not kept, so not hinted at, as it stays unresolved also then,
      * nor an inaccessible one, see [SnippetDeclarations].
      * A reference called, see [UnresolvedReference.called], also with type arguments, see [startsCall], is hinted at as a function first, and only then as a property, like one of a function type,
      * unless an inaccessible function of the name is declared, which the compiler calls instead,
-     * and one not called as a property only, also a `const val` or a `@JvmField` one, see [appendPropertyHint],
-     * both, the property first, if it is not known whether it is called.
+     * and one not known to be called as a property first, also a `const val` or a `@JvmField` one, see [appendPropertyHint],
+     * and only then as a function, unless a property of the name is declared, which the compiler takes then instead.
      */
-    private fun StringBuilder.appendUnresolvedEarlierDeclarationHint(name: String, receiverType: String?, reference: UnresolvedReference?) {
+    private fun StringBuilder.appendUnresolvedEarlierDeclarationHint(name: String, receiverType: String?, usage: UnresolvedReference?) {
+        val reference = name.asReference()
         // a callable reference to an extension of a snippet is not resolved also with the type declared, as a member and an extension at the same time
-        val callable = reference?.callable == true
-        val called = reference?.called
+        val callable = usage?.callable == true
+        val called = usage?.called
         if (receiverType != null) {
             if (callable) return
             appendExplicitReceiverHint(name, listOf(receiverType), called, certain = true)
             return
         }
-        val onExplicitReceiver = reference?.onExplicitReceiver == true
+        val onExplicitReceiver = usage?.onExplicitReceiver == true
         if (!onExplicitReceiver) {
             if (snippetDeclarations.isClass(name)) {
                 append("  hint: '$name' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type,")
-                append(" like `fun f(x: Any) = x is $name` - declare the type, like `fun f(x: Any): Boolean = x is $name`.\n")
+                append(" like `fun f(x: Any) = x is $reference` - declare the type, like `fun f(x: Any): Boolean = x is $reference`.\n")
                 return
             }
             if (called != true && appendPropertyHint(name)) return
             // not known to be called, it is still called if no property of the name is declared
             if ((called == true || snippetDeclarations.property(name) == null) && snippetDeclarations.isFunction(name)) {
-                appendDeclareTypeHint(name, "fun f() = $name(...).toString()", "fun f(): String = $name(...).toString()")
+                appendDeclareTypeHint(name, "fun f() = $reference(...).toString()", "fun f(): String = $reference(...).toString()")
                 return
             }
             // a call of an inaccessible function of the name, which the compiler calls rather than a property of a function type, fails also then
             if (called == true && !snippetDeclarations.isAnyFunction(name) && appendPropertyHint(name)) return
         }
         if (callable) return
-        if (reference?.onIntegerLiteral == true) {
+        if (usage?.onIntegerLiteral == true) {
             appendExplicitReceiverHint(name, integerLiteralTypes, called, certain = false)
             return
         }
@@ -331,7 +344,7 @@ internal class ScriptErrorReporter(
         // the receivers of the form of the reference first, the other ones being possible as well, like a property of a function type called
         val receivers = if (isCall) functionReceivers + propertyReceivers else propertyReceivers + functionReceivers
         if (receivers.isEmpty()) return
-        val calledOn = if (isCall) "$name(...)" else name
+        val calledOn = if (isCall) "$reference(...)" else reference
         val ofType = if (receivers.size == 1) "of this type" else "of one of these types"
         append("  hint: '$name' is an extension of ${receivers.joinToString(" or ")} declared in an earlier snippet,")
         append(" which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet,")
@@ -361,7 +374,8 @@ internal class ScriptErrorReporter(
         val functions = snippetDeclarations.extensionFunctionReceivers(name).accepting()
         if (properties.isEmpty() && functions.isEmpty()) return
         val isCall = called == true || properties.isEmpty()
-        val calledOn = if (isCall) "receiver.$name(...)" else "receiver.$name"
+        val reference = name.asReference()
+        val calledOn = if (isCall) "receiver.$reference(...)" else "receiver.$reference"
         if (certain && (properties.containsValue(Acceptance.ACCEPTED) || functions.containsValue(Acceptance.ACCEPTED))) {
             appendDeclareTypeHint(name, "fun f() = $calledOn.toString()", "fun f(): String = $calledOn.toString()")
             return
@@ -385,7 +399,7 @@ internal class ScriptErrorReporter(
         val property = snippetDeclarations.property(name) ?: return false
         val failure = when (property.kind) {
             SnippetProperty.Kind.ACCESSIBLE -> {
-                appendDeclareTypeHint(name, "fun f() = $name.toString()", "fun f(): String = $name.toString()")
+                appendDeclareTypeHint(name, "fun f() = ${name.asReference()}.toString()", "fun f(): String = ${name.asReference()}.toString()")
                 return true
             }
             SnippetProperty.Kind.CONST -> constFailure(name, property.snippet)
@@ -398,7 +412,7 @@ internal class ScriptErrorReporter(
             appendDeclareCallersAgainAdvice(emptyList(), ownerClass = null, verb = "accessing", kept = "@JvmField", code = "the code of earlier snippets")
             append(", ")
         }
-        append("and declare the type of a declaration of a later snippet reading it, like `fun f(): String = $name.toString()`,")
+        append("and declare the type of a declaration of a later snippet reading it, like `fun f(): String = ${name.asReference()}.toString()`,")
         append(" as $K2_REPL_DOES_NOT_RESOLVE a property of an earlier snippet within a declaration of an inferred type used in the same snippet.\n")
         return true
     }
