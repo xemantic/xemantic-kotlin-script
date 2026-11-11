@@ -77,6 +77,9 @@ import kotlin.test.assertFailsWith
 import kotlin.time.Clock
 import kotlin.time.Instant
 
+/** The hint at the compiler failing on `const val LIMIT` of `snippet1.kts`. */
+private const val CONST_LIMIT_HINT = "  hint: 'LIMIT' is declared const in snippet1.kts, which a later snippet cannot read, as the K2 REPL compiler fails on it - declare it again without the const modifier."
+
 class ScriptSessionTest {
 
     private val session = ScriptSession()
@@ -1633,7 +1636,7 @@ class ScriptSessionTest {
     }
 
     @Test
-    fun `should not hint declaring the type when const property of earlier snippet is unresolved in declaration of inferred type`() = runTest {
+    fun `should hint redeclaring without const when const property of earlier snippet is unresolved in declaration of inferred type`() = runTest {
         // given
         session.execute("const val LIMIT = 1")
 
@@ -1650,12 +1653,13 @@ class ScriptSessionTest {
             message sameAs """
                 snippet2.kts:1:14: error: Unresolved reference 'LIMIT'.
                   | fun next() = <error>LIMIT</error> + 1
+                  hint: 'LIMIT' is declared const in snippet1.kts, which a later snippet cannot read, as the K2 REPL compiler fails on it - declare it again without the const modifier, and declare the type of a declaration of a later snippet reading it, like `fun f(): String = LIMIT.toString()`, as the K2 REPL compiler does not resolve a property of an earlier snippet within a declaration of an inferred type used in the same snippet.
             """.trimIndent()
         }
     }
 
     @Test
-    fun `should fail compiling const property of earlier snippet also in declaration of declared type`() = runTest {
+    fun `should hint redeclaring without const when compiler fails on const property of earlier snippet read in declaration of declared type`() = runTest {
         // given
         session.execute("const val LIMIT = 1")
 
@@ -1671,11 +1675,261 @@ class ScriptSessionTest {
             have(phase == ExecutionPhase.COMPILATION)
             have(message.startsWith("error: The compiler failed internally"))
             have("InterpreterMethodNotFoundError: Unknown function: LIMIT(Snippet1)" in message)
+            have(message.lines().last() == CONST_LIMIT_HINT)
         }
     }
 
     @Test
-    fun `should not hint declaring the type when JvmField property of earlier snippet is unresolved in declaration of inferred type`() = runTest {
+    fun `should hint redeclaring without const when compiler fails on const property of earlier snippet read in top-level expression`() = runTest {
+        // given
+        session.execute("const val LIMIT = 1")
+
+        // when
+        val result = session.execute("LIMIT + 1")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            have(message.startsWith("error: The compiler failed internally"))
+            have("InterpreterMethodNotFoundError: Unknown function: LIMIT(Snippet1)" in message)
+            have(message.lines().last() == CONST_LIMIT_HINT)
+        }
+    }
+
+    @Test
+    fun `should hint redeclaring without const when compiler fails on const property of earlier snippet read in property initializer`() = runTest {
+        // given
+        session.execute("const val LIMIT = 1")
+
+        // when
+        val result = session.execute("val next = LIMIT + 1")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            have(message.startsWith("error: The compiler failed internally"))
+            have("InterpreterMethodNotFoundError: Unknown function: LIMIT(Snippet1)" in message)
+            have(message.lines().last() == CONST_LIMIT_HINT)
+        }
+    }
+
+    @Test
+    fun `should read const property of earlier snippet once declared again without const as hinted`() = runTest {
+        // given
+        session.execute("const val LIMIT = 1")
+        val failure = session.execute("LIMIT + 1")
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines().last() == CONST_LIMIT_HINT)
+        }
+        session.execute("val LIMIT = 1")
+
+        // when
+        val result = session.execute("""
+            fun next(): Int = LIMIT + 1
+            next() + LIMIT
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 3)
+        }
+    }
+
+    @Test
+    fun `should not hint at const property of earlier snippet when compiler fails on const property of object`() = runTest {
+        // given
+        session.execute("const val X = 1")
+        session.execute("object O { const val X = 1 }")
+
+        // when
+        val result = session.execute("O.X + 1")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            have("InterpreterMethodNotFoundError: Unknown function: X(O)" in message)
+            have("hint:" !in message)
+        }
+    }
+
+    @Test
+    fun `should hint redeclaring without const when property declared again as const is unresolved in declaration of inferred type`() = runTest {
+        // given
+        session.execute("val LIMIT = 1")
+        session.execute("const val LIMIT = 2")
+
+        // when
+        val result = session.execute("""
+            fun next() = LIMIT + 1
+            next()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet3.kts:1:14: error: Unresolved reference 'LIMIT'.
+                  | fun next() = <error>LIMIT</error> + 1
+                  hint: 'LIMIT' is declared const in snippet2.kts, which a later snippet cannot read, as the K2 REPL compiler fails on it - declare it again without the const modifier, and declare the type of a declaration of a later snippet reading it, like `fun f(): String = LIMIT.toString()`, as the K2 REPL compiler does not resolve a property of an earlier snippet within a declaration of an inferred type used in the same snippet.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when const property declared again without const is unresolved in declaration of inferred type`() = runTest {
+        // given
+        session.execute("const val LIMIT = 1")
+        session.execute("val LIMIT = 2")
+
+        // when
+        val result = session.execute("""
+            fun next() = LIMIT + 1
+            next()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet3.kts:1:14: error: Unresolved reference 'LIMIT'.
+                  | fun next() = <error>LIMIT</error> + 1
+                  hint: 'LIMIT' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = LIMIT.toString()` - declare the type, like `fun f(): String = LIMIT.toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not hint declaring the type when property declared again internal is unresolved in declaration of inferred type`() = runTest {
+        // given
+        session.execute("val limit = 1")
+        session.execute("internal val limit = 2")
+
+        // when
+        val result = session.execute("""
+            fun next() = limit + 1
+            next()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet3.kts:1:14: error: Unresolved reference 'limit'.
+                  | fun next() = <error>limit</error> + 1
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not hint declaring the type when function declared again internal is unresolved in declaration of inferred type`() = runTest {
+        // given
+        session.execute("fun limit() = 1")
+        session.execute("internal fun limit() = 2")
+
+        // when
+        val result = session.execute("""
+            fun next() = limit() + 1
+            next()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet3.kts:1:14: error: Unresolved reference 'limit'.
+                  | fun next() = <error>limit</error>() + 1
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call function of earlier snippet overloaded by later internal function once its type is declared as hinted`() = runTest {
+        // given
+        session.execute("fun limit() = 1")
+        session.execute("internal fun limit(x: Int) = x")
+        val failure = session.execute("""
+            fun next() = limit() + 1
+            next()
+        """.trimIndent())
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines().last() == "  hint: 'limit' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = limit(...).toString()` - declare the type, like `fun f(): String = limit(...).toString()`.")
+        }
+
+        // when
+        val result = session.execute("""
+            fun next(): Int = limit() + 1
+            next()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should read property of earlier snippet declared again private by later snippet once its type is declared as hinted`() = runTest {
+        // given
+        session.execute("val limit = 1")
+        session.execute("private val limit = 2")
+        val failure = session.execute("""
+            fun next() = limit + 1
+            next()
+        """.trimIndent())
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines().last() == "  hint: 'limit' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = limit.toString()` - declare the type, like `fun f(): String = limit.toString()`.")
+        }
+
+        // when
+        val result = session.execute("""
+            fun next(): Int = limit + 1
+            next()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should not hint declaring the type when class declared again private is unresolved in declaration of inferred type`() = runTest {
+        // given
+        session.execute("class Box")
+        session.execute("private class Box")
+
+        // when
+        val result = session.execute("""
+            fun isBox(x: Any) = x is Box
+            isBox(1)
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet3.kts:1:26: error: Unresolved reference 'Box'.
+                  | fun isBox(x: Any) = x is <error>Box</error>
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint redeclaring without JvmField when JvmField property of earlier snippet is unresolved in declaration of inferred type`() = runTest {
         // given
         session.execute("@JvmField val limit = 1")
 
@@ -1692,12 +1946,13 @@ class ScriptSessionTest {
             message sameAs """
                 snippet2.kts:1:14: error: Unresolved reference 'limit'.
                   | fun next() = <error>limit</error> + 1
+                  hint: 'limit' is declared @JvmField in snippet1.kts, which a later snippet cannot access, as the K2 REPL compiler accesses it as an instance field, while it is static - declare it again without the @JvmField annotation, and declare the type of a declaration of a later snippet reading it, like `fun f(): String = limit.toString()`, as the K2 REPL compiler does not resolve a property of an earlier snippet within a declaration of an inferred type used in the same snippet.
             """.trimIndent()
         }
     }
 
     @Test
-    fun `should fail reading JvmField property of earlier snippet also in declaration of declared type`() = runTest {
+    fun `should hint redeclaring without JvmField when JvmField property of earlier snippet is read in declaration of declared type`() = runTest {
         // given
         session.execute("@JvmField val limit = 1")
 
@@ -1713,10 +1968,170 @@ class ScriptSessionTest {
             have(phase == ExecutionPhase.EVALUATION)
             message sameAs """
                 java.lang.IncompatibleClassChangeError: Expected non-static field limit
+                  hint: 'limit' is declared @JvmField in snippet1.kts, which a later snippet cannot access, as the K2 REPL compiler accesses it as an instance field, while it is static - declare it again without the @JvmField annotation, and declare again the code accessing it, directly or not, like 'next' of snippet2.kts, and create again the values depending on it, like the ones holding a lambda accessing it, as they keep accessing the @JvmField one.
                   at next(snippet2.kts:1)
                   | fun next(): Int = limit + 1
                   at <snippet body>(snippet2.kts:2)
                   | next()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint redeclaring without JvmField when JvmField property of earlier snippet is read in top-level expression`() = runTest {
+        // given
+        session.execute("@JvmField val limit = 1")
+
+        // when
+        val result = session.execute("limit + 1")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IncompatibleClassChangeError: Expected non-static field limit
+                  hint: 'limit' is declared @JvmField in snippet1.kts, which a later snippet cannot access, as the K2 REPL compiler accesses it as an instance field, while it is static - declare it again without the @JvmField annotation, and declare again the code accessing it, directly or not, and create again the values depending on it, like the ones holding a lambda accessing it, as they keep accessing the @JvmField one.
+                  at <snippet body>(snippet2.kts:1)
+                  | limit + 1
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint redeclaring without JvmField when JvmField property of earlier snippet is read in property initializer`() = runTest {
+        // given
+        session.execute("@JvmField val limit = 1")
+
+        // when
+        val result = session.execute("val next = limit + 1")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IncompatibleClassChangeError: Expected non-static field limit
+                  hint: 'limit' is declared @JvmField in snippet1.kts, which a later snippet cannot access, as the K2 REPL compiler accesses it as an instance field, while it is static - declare it again without the @JvmField annotation, and declare again the code accessing it, directly or not, and create again the values depending on it, like the ones holding a lambda accessing it, as they keep accessing the @JvmField one.
+                  at <snippet body>(snippet2.kts:1)
+                  | val next = limit + 1
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint redeclaring without JvmField when JvmField variable of earlier snippet is assigned`() = runTest {
+        // given
+        session.execute("@JvmField var limit = 1")
+
+        // when
+        val result = session.execute("limit = 2")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IncompatibleClassChangeError: Expected non-static field limit
+                  hint: 'limit' is declared @JvmField in snippet1.kts, which a later snippet cannot access, as the K2 REPL compiler accesses it as an instance field, while it is static - declare it again without the @JvmField annotation, and declare again the code accessing it, directly or not, and create again the values depending on it, like the ones holding a lambda accessing it, as they keep accessing the @JvmField one.
+                  at <snippet body>(snippet2.kts:1)
+                  | limit = 2
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint redeclaring the code accessing JvmField property of earlier snippet declared again without JvmField`() = runTest {
+        // given
+        session.execute("@JvmField val limit = 1")
+        session.execute("fun next(): Int = limit + 1")
+        session.execute("fun twice(): Int = next() * 2")
+        session.execute("val limit = 1")
+
+        // when
+        val result = session.execute("twice()")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IncompatibleClassChangeError: Expected non-static field limit
+                  hint: 'limit' is declared @JvmField in snippet1.kts, which a later snippet cannot access, as the K2 REPL compiler accesses it as an instance field, while it is static - it is declared again by a later snippet, so declare again the code accessing it, directly or not, like 'next' of snippet2.kts and 'twice' of snippet3.kts, and create again the values depending on it, like the ones holding a lambda accessing it, as they keep accessing the @JvmField one.
+                  at next(snippet2.kts:1)
+                  | fun next(): Int = limit + 1
+                  at twice(snippet3.kts:1)
+                  | fun twice(): Int = next() * 2
+                  at <snippet body>(snippet5.kts:1)
+                  | twice()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should access JvmField property of earlier snippet once declared again without JvmField together with the code accessing it as hinted`() = runTest {
+        // given
+        session.execute("@JvmField val limit = 1")
+        session.execute("fun next(): Int = limit + 1")
+        session.execute("fun twice(): Int = next() * 2")
+        val failure = session.execute("twice()")
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines()[1] == "  hint: 'limit' is declared @JvmField in snippet1.kts, which a later snippet cannot access, as the K2 REPL compiler accesses it as an instance field, while it is static - declare it again without the @JvmField annotation, and declare again the code accessing it, directly or not, like 'next' of snippet2.kts and 'twice' of snippet3.kts, and create again the values depending on it, like the ones holding a lambda accessing it, as they keep accessing the @JvmField one.")
+        }
+        session.execute("""
+            val limit = 1
+            fun next(): Int = limit + 1
+            fun twice(): Int = next() * 2
+        """.trimIndent())
+
+        // when
+        val result = session.execute("twice() + limit")
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 5)
+        }
+    }
+
+    @Test
+    fun `should not hint at JvmField property when property of earlier snippet not declared JvmField is accessed as non-static`() = runTest {
+        // given
+        session.execute("@JvmField val limit = 1")
+        session.execute("val other = 1")
+
+        // when
+        val result = session.execute("throw IncompatibleClassChangeError(\"Expected non-static field Snippet2.other\")")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IncompatibleClassChangeError: Expected non-static field other
+                  at <snippet body>(snippet3.kts:1)
+                  | throw IncompatibleClassChangeError("Expected non-static field Snippet2.other")
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not hint at JvmField property of earlier snippet when field of the same name of another class is accessed as non-static`() = runTest {
+        // given
+        session.execute("@JvmField val limit = 1")
+
+        // when
+        val result = session.execute("throw IncompatibleClassChangeError(\"Expected non-static field com.example.Other.limit\")")
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                java.lang.IncompatibleClassChangeError: Expected non-static field com.example.Other.limit
+                  at <snippet body>(snippet2.kts:1)
+                  | throw IncompatibleClassChangeError("Expected non-static field com.example.Other.limit")
             """.trimIndent()
         }
     }

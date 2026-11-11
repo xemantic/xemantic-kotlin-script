@@ -35,6 +35,7 @@ import kotlin.reflect.full.declaredMemberExtensionProperties
 import kotlin.reflect.full.declaredMemberFunctions
 import kotlin.reflect.full.declaredMemberProperties
 import kotlin.reflect.full.extensionReceiverParameter
+import kotlin.reflect.jvm.javaField
 import kotlin.reflect.jvm.javaGetter
 import kotlin.reflect.jvm.javaMethod
 import kotlin.reflect.jvm.javaSetter
@@ -52,12 +53,15 @@ private val snippetQualifier = Regex("(?<![\\p{L}\\p{N}_.])Snippet\\d+\\.")
 
 /**
  * The names of the declarations of the evaluated snippets which a later snippet can access,
- * for the hint at the K2 REPL compiler not resolving them within a declaration of an inferred type.
+ * for the hint at the K2 REPL compiler not resolving them within a declaration of an inferred type,
+ * and of the properties a later snippet fails on wherever it reads them, a `const val` or a `@JvmField` one, see [property].
  *
- * A `private` declaration is left out, as it cannot be accessed by a later snippet at all,
- * and so is an `internal` property or function, as a later snippet calls it by a name it is not compiled to,
- * failing at runtime, hinted at by [internalMember] instead, and so is a `const val` or a `@JvmField` property,
- * failing in any declaration, see [isAccessibleByLaterSnippet].
+ * A later snippet resolves a name to its last declaration, so a later declaration replaces an earlier one of the same name,
+ * a property of a property, a function or an extension of the same parameters, see [parameterSignature], and a class of a class,
+ * also when the later one cannot be accessed, like an `internal` property or function, which a later snippet calls by a name it is not compiled to,
+ * failing at runtime, hinted at by [internalMember] instead, and like a `private` class,
+ * but for a `private` property or function, which a later snippet does not see at all, so it does not replace the earlier one,
+ * see [isAccessibleByLaterSnippet].
  *
  * The classes of the snippets are kept, and their members read by kotlin-reflect only when a name is looked up,
  * which is after a compilation error, as reading them takes long.
@@ -68,15 +72,20 @@ internal class SnippetDeclarations {
     /** The classes of the snippets not read yet, with the names of the snippets. */
     private val pending = ArrayDeque<Pair<Class<*>, String>>()
 
-    private val classes = HashSet<String>()
+    /** Whether the last class of a simple name is accessible by a later snippet, not `private`. */
+    private val classes = HashMap<String, Boolean>()
 
-    private val properties = HashSet<String>()
+    /** The last property of a name, not an extension. */
+    private val properties = HashMap<String, SnippetProperty>()
 
-    private val functions = HashSet<String>()
+    /** The snippet of the last `@JvmField` property of a name, also when declared again otherwise by a later snippet. */
+    private val jvmFieldProperties = HashMap<String, String>()
 
-    private val extensionProperties = HashMap<String, MutableSet<ExtensionReceiver>>()
+    private val functions = HashMap<String, MutableMap<List<String>, Overload>>()
 
-    private val extensionFunctions = HashMap<String, MutableSet<ExtensionReceiver>>()
+    private val extensionProperties = HashMap<String, MutableMap<List<String>, Overload>>()
+
+    private val extensionFunctions = HashMap<String, MutableMap<List<String>, Overload>>()
 
     /** The classes of the snippets, with the names of the snippets, by the names of the classes, like `Snippet1`, in the order of the snippets. */
     private val snippetClasses = LinkedHashMap<String, Pair<Class<*>, String>>()
@@ -86,6 +95,9 @@ internal class SnippetDeclarations {
         pending += scriptClass to name
         snippetClasses[scriptClass.name] = scriptClass to name
     }
+
+    /** The name of the snippet of the class of this [name], like `snippet1.kts` of `Snippet1`, `null` if it is not the class of a snippet. */
+    fun snippetOf(name: String): String? = snippetClasses[name]?.second
 
     /**
      * The `internal` member of a snippet, or of a class declared by it, which a later snippet failed to call
@@ -197,20 +209,32 @@ internal class SnippetDeclarations {
         "${it.kind} ${it.type.toString().replace(snippetQualifier, "")}${if (it.isOptional) " = default" else ""}"
     }
 
-    /** Whether a class of this simple [name] is declared by a snippet, and is not `private`. */
-    fun isClass(name: String): Boolean = name in read().classes
+    /** Whether the last class of this simple [name] declared by a snippet is not `private`. */
+    fun isClass(name: String): Boolean = read().classes[name] == true
 
-    /** Whether a property of this [name] is declared by a snippet, not an extension, also a provided one. */
-    fun isProperty(name: String): Boolean = name in read().properties
+    /** Whether the last property of this [name] declared by a snippet, not an extension, also a provided one, is accessible by a later snippet. */
+    fun isProperty(name: String): Boolean = property(name)?.kind == SnippetProperty.Kind.ACCESSIBLE
 
-    /** Whether a function of this [name] is declared by a snippet, not an extension. */
-    fun isFunction(name: String): Boolean = name in read().functions
+    /** The last property of this [name] declared by a snippet, not an extension, also a provided one, `null` if none, or only a `private` one. */
+    fun property(name: String): SnippetProperty? = read().properties[name]
 
-    /** The receivers of the extension properties of this [name] declared by the snippets, in the order of the declarations. */
-    fun extensionPropertyReceivers(name: String): Set<ExtensionReceiver> = read().extensionProperties[name] ?: emptySet()
+    /**
+     * The snippet of the last `@JvmField` property of this [name], also when a later snippet declares it again otherwise,
+     * as the code compiled before keeps accessing the `@JvmField` one, `null` if none.
+     */
+    fun jvmFieldProperty(name: String): String? = read().jvmFieldProperties[name]
 
-    /** The receivers of the extension functions of this [name] declared by the snippets, in the order of the declarations. */
-    fun extensionFunctionReceivers(name: String): Set<ExtensionReceiver> = read().extensionFunctions[name] ?: emptySet()
+    /** Whether a function of this [name] declared by a snippet, not an extension, is accessible by a later snippet, any overload of it. */
+    fun isFunction(name: String): Boolean = read().functions[name]?.values?.any { it.accessible } == true
+
+    /** The receivers of the extension properties of this [name] declared by the snippets accessible by a later snippet, in the order of the declarations. */
+    fun extensionPropertyReceivers(name: String): Set<ExtensionReceiver> = read().extensionProperties.receivers(name)
+
+    /** The receivers of the extension functions of this [name] declared by the snippets accessible by a later snippet, in the order of the declarations. */
+    fun extensionFunctionReceivers(name: String): Set<ExtensionReceiver> = read().extensionFunctions.receivers(name)
+
+    private fun Map<String, Map<List<String>, Overload>>.receivers(name: String): Set<ExtensionReceiver> =
+        this[name]?.values?.filter { it.accessible }?.mapNotNullTo(LinkedHashSet()) { it.receiver } ?: emptySet()
 
     /**
      * Reads the [pending] classes, each kind of the members of a class, and each member, on its own,
@@ -233,43 +257,84 @@ internal class SnippetDeclarations {
         logger.readOr(Unit, { "$snippet: cannot read the classes of the snippet" }) {
             scriptClass.declaredClasses.forEach { declared ->
                 // the InnerClasses attribute keeps the Kotlin visibility of a nested class, but internal, which is public
-                if (!Modifier.isPrivate(declared.modifiers)) classes += declared.simpleName
+                classes[declared.simpleName] = !Modifier.isPrivate(declared.modifiers)
             }
         }
         val kClass = scriptClass.kotlin
-        readAccessible(snippet, "properties", { kClass.declaredMemberProperties }) { properties += it.name }
-        readAccessible(snippet, "functions", { kClass.declaredMemberFunctions }) { functions += it.name }
-        readAccessible(snippet, "extension properties", { kClass.declaredMemberExtensionProperties }) {
-            extensionProperties.addReceiver(it, snippet)
+        readVisible(snippet, "properties", { kClass.declaredMemberProperties }) { property, accessible ->
+            val kind = logger.readOr(SnippetProperty.Kind.ACCESSIBLE, { "$snippet: cannot read the kind of ${property.name} of the snippet" }) {
+                property.kind(accessible)
+            }
+            properties[property.name] = SnippetProperty(kind, snippet)
+            if (kind == SnippetProperty.Kind.JVM_FIELD) jvmFieldProperties[property.name] = snippet
         }
-        readAccessible(snippet, "extension functions", { kClass.declaredMemberExtensionFunctions }) {
-            extensionFunctions.addReceiver(it, snippet)
+        readVisible(snippet, "functions", { kClass.declaredMemberFunctions }) { function, accessible ->
+            functions.addOverload(function, accessible, receiver = null, snippet)
+        }
+        readVisible(snippet, "extension properties", { kClass.declaredMemberExtensionProperties }) { extension, accessible ->
+            extensionProperties.addOverload(extension, accessible, extension.receiver(snippet), snippet)
+        }
+        readVisible(snippet, "extension functions", { kClass.declaredMemberExtensionFunctions }) { extension, accessible ->
+            extensionFunctions.addOverload(extension, accessible, extension.receiver(snippet), snippet)
         }
     }
 
-    /** Reads the [members] of a kind of the [snippet], passing the ones accessible by a later snippet to [add]. */
-    private inline fun readAccessible(
+    /**
+     * Reads the [members] of a kind of the [snippet], passing the ones a later snippet sees to [add], with whether it can access them,
+     * so not a `private` one, which does not replace an earlier declaration, see [SnippetDeclarations].
+     */
+    private inline fun readVisible(
         snippet: String,
         kind: String,
         members: () -> Collection<KCallable<*>>,
-        add: (KCallable<*>) -> Unit
+        add: (KCallable<*>, accessible: Boolean) -> Unit
     ) {
         logger.readOr(emptyList(), { "$snippet: cannot read the $kind of the snippet" }) { members() }.forEach { member ->
             // kept if unknown, as the hint was given before the accessibility was checked
-            val accessible = logger.readOr(true, { "$snippet: cannot read the JVM member of ${member.name} of the snippet" }) {
-                member.isAccessibleByLaterSnippet(snippet)
+            val visibility = logger.readOr(Visibility.ACCESSIBLE, { "$snippet: cannot read the JVM member of ${member.name} of the snippet" }) {
+                member.visibility(snippet)
             }
-            if (accessible) add(member)
+            if (visibility != Visibility.PRIVATE) add(member, visibility == Visibility.ACCESSIBLE)
         }
     }
 
-    /** Adds the receiver of this [extension] by its name, not added if it cannot be read, as no receiver could be matched then. */
-    private fun MutableMap<String, MutableSet<ExtensionReceiver>>.addReceiver(extension: KCallable<*>, snippet: String) {
-        logger.readOr(null, { "$snippet: cannot read the receiver of ${extension.name} of the snippet" }) {
-            extension.extensionReceiverParameter?.type?.let { ExtensionReceiver.of(it) }
-        }?.let { receiver ->
-            getOrPut(extension.name) { LinkedHashSet() } += receiver
+    /**
+     * Replaces the overload of the same parameters as this [callable], see [parameterSignature], with it, by its name,
+     * kept in the place of the replaced one, or added after the others — as one of a signature of its own if the parameters cannot be read,
+     * since it cannot be told then which one it replaces.
+     */
+    private fun MutableMap<String, MutableMap<List<String>, Overload>>.addOverload(
+        callable: KCallable<*>,
+        accessible: Boolean,
+        receiver: ExtensionReceiver?,
+        snippet: String
+    ) {
+        val signature = logger.readOr(null, { "$snippet: cannot read the parameters of ${callable.name} of the snippet" }) {
+            callable.parameterSignature()
+        } ?: listOf("$snippet ${System.identityHashCode(callable)}")
+        getOrPut(callable.name) { LinkedHashMap() }[signature] = Overload(receiver, accessible)
+    }
+
+    /** The receiver of this extension, `null` if it cannot be read, as no receiver could be matched then. */
+    private fun KCallable<*>.receiver(snippet: String): ExtensionReceiver? =
+        logger.readOr(null, { "$snippet: cannot read the receiver of $name of the snippet" }) {
+            extensionReceiverParameter?.type?.let { ExtensionReceiver.of(it) }
         }
+
+    /** A function or an extension of a name, of the [receiver] of an extension, if it can be read, and whether it is [accessible] by a later snippet. */
+    private class Overload(val receiver: ExtensionReceiver?, val accessible: Boolean)
+
+    private enum class Visibility { ACCESSIBLE, INTERNAL, PRIVATE }
+
+    /**
+     * The kind of this property of a snippet, not `private`, a `const val` or a `@JvmField` one told by its public field without a getter,
+     * which a later snippet fails on wherever it reads it, the compiler crashing on the former, and reading the latter as an instance field, which is static.
+     */
+    private fun KCallable<*>.kind(accessible: Boolean): SnippetProperty.Kind = when {
+        !accessible -> SnippetProperty.Kind.INTERNAL
+        this !is KProperty<*> || javaGetter != null -> SnippetProperty.Kind.ACCESSIBLE
+        isConst -> SnippetProperty.Kind.CONST
+        else -> SnippetProperty.Kind.JVM_FIELD
     }
 
     /**
@@ -279,13 +344,26 @@ internal class SnippetDeclarations {
      * while an `internal` one is public, but its name is mangled with the module, the [snippet], like `getCount$snippet1_kts`,
      * which a later snippet does not call, like `getCount$main`.
      * A property is told by its getter only: one of a field only, also a public `const val` or `@JvmField` one, is not accessible,
-     * as a later snippet fails on it in any declaration, the compiler crashing on the former, and reading the latter as an instance field, which is static.
+     * as a later snippet fails on it wherever it reads it, see [kind].
      */
-    private fun KCallable<*>.isAccessibleByLaterSnippet(snippet: String): Boolean = when (this) {
-        is KProperty<*> -> javaGetter
+    private fun KCallable<*>.isAccessibleByLaterSnippet(snippet: String): Boolean =
+        visibility(snippet) == Visibility.ACCESSIBLE && (this !is KProperty<*> || javaGetter != null)
+
+    /**
+     * The visibility of this member of the [snippet] to a later snippet, told by its JVM member, see [isAccessibleByLaterSnippet],
+     * of a property by its getter, or, if it has none, by its field, public for a `const val` or a `@JvmField` one.
+     */
+    private fun KCallable<*>.visibility(snippet: String): Visibility = when (this) {
+        is KProperty<*> -> javaGetter ?: javaField?.takeIf { Modifier.isPublic(it.modifiers) }
         is KFunction<*> -> javaMethod
         else -> null
-    }.isAccessibleByLaterSnippet(snippet)
+    }.let { member ->
+        when {
+            member == null || Modifier.isPrivate(member.modifiers) -> Visibility.PRIVATE
+            member.name.endsWith(snippet.internalSuffix()) -> Visibility.INTERNAL
+            else -> Visibility.ACCESSIBLE
+        }
+    }
 
     private fun Member?.isAccessibleByLaterSnippet(snippet: String): Boolean =
         this != null && !Modifier.isPrivate(modifiers) && !name.endsWith(snippet.internalSuffix())
@@ -305,6 +383,27 @@ internal class SnippetDeclarations {
 
     /** The suffix the compiler mangles the JVM name of an `internal` member of this snippet with, like `$snippet1_kts`. */
     private fun String.internalSuffix(): String = "$" + replace(nonIdentifierCharacter, "_")
+
+}
+
+/** A property of the [snippet], not an extension, of the [kind] telling whether a later snippet can access it. */
+internal data class SnippetProperty(val kind: Kind, val snippet: String) {
+
+    enum class Kind {
+
+        /** Accessible by a later snippet, when it resolves it, see [SnippetDeclarations]. */
+        ACCESSIBLE,
+
+        /** An `internal` property, which a later snippet calls by a name it is not compiled to, see [SnippetDeclarations.internalMember]. */
+        INTERNAL,
+
+        /** A `const val`, which the compiler crashes on wherever a later snippet reads it. */
+        CONST,
+
+        /** A `@JvmField` property, which a later snippet accesses as an instance field, while it is static. */
+        JVM_FIELD
+
+    }
 
 }
 

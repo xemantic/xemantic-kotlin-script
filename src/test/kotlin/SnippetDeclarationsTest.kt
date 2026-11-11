@@ -75,6 +75,52 @@ class SnippetDeclarationsTest {
             }
         }
 
+        /**
+         * The classes of two snippets, the second declaring again each name of the first in another kind or visibility,
+         * which a later snippet resolves to the second one, but a `private` property or function, and an overload.
+         */
+        private val redeclaringSnippetClasses: List<Class<*>> by lazy {
+            ScriptSession().use { session ->
+                listOf(
+                    """
+                        val constLater = 1
+                        val jvmFieldLater = 1
+                        val internalLater = 1
+                        const val publicLater = 1
+                        @JvmField val publicLaterJvmField = 1
+                        val privateLater = 1
+                        fun internalFunctionLater() = 1
+                        fun overloadedLater() = 1
+                        fun privateFunctionLater() = 1
+                        val String.internalExtensionLater get() = 1
+                        val String.overloadedExtensionLater get() = 1
+                        fun String.internalExtensionFunctionLater() = 1
+                        class PrivateClassLater
+                        Snippet1::class.java
+                    """,
+                    """
+                        const val constLater = 2
+                        @JvmField val jvmFieldLater = 2
+                        internal val internalLater = 2
+                        val publicLater = 2
+                        val publicLaterJvmField = 2
+                        private val privateLater = 2
+                        internal fun internalFunctionLater() = 2
+                        internal fun overloadedLater(x: Int) = x
+                        private fun privateFunctionLater() = 2
+                        internal val String.internalExtensionLater get() = 2
+                        internal val Int.overloadedExtensionLater get() = 2
+                        internal fun String.internalExtensionFunctionLater() = 2
+                        private class PrivateClassLater
+                        Snippet2::class.java
+                    """
+                ).map { snippet ->
+                    val result = runBlocking { session.execute(snippet.trimIndent()) }
+                    (result as ScriptResult.Value).value as Class<*>
+                }
+            }
+        }
+
     }
 
     private val declarations = SnippetDeclarations().apply {
@@ -132,6 +178,65 @@ class SnippetDeclarationsTest {
         assert(!declarations.isProperty("constProperty"))
         assert(!declarations.isProperty("jvmFieldProperty"))
         assert(!declarations.isProperty("jvmFieldVariable"))
+    }
+
+    @Test
+    fun `should tell const and JvmField properties of snippet`() {
+        // when
+        val declarations = declarations
+
+        // then
+        assert(declarations.property("constProperty") == SnippetProperty(SnippetProperty.Kind.CONST, "snippet1.kts"))
+        assert(declarations.property("jvmFieldProperty") == SnippetProperty(SnippetProperty.Kind.JVM_FIELD, "snippet1.kts"))
+        assert(declarations.property("jvmFieldVariable") == SnippetProperty(SnippetProperty.Kind.JVM_FIELD, "snippet1.kts"))
+        assert(declarations.property("publicProperty") == SnippetProperty(SnippetProperty.Kind.ACCESSIBLE, "snippet1.kts"))
+        assert(declarations.property("internalProperty") == SnippetProperty(SnippetProperty.Kind.INTERNAL, "snippet1.kts"))
+        assert(declarations.property("privateProperty") == null)
+        assert(declarations.jvmFieldProperty("jvmFieldProperty") == "snippet1.kts")
+        assert(declarations.jvmFieldProperty("publicProperty") == null)
+    }
+
+    @Test
+    fun `should keep the declaration of a name declared again by later snippet instead of the earlier one`() {
+        // given
+        val declarations = SnippetDeclarations()
+
+        // when
+        redeclaringSnippetClasses.forEachIndexed { index, snippetClass ->
+            declarations.keep(snippetClass, "snippet${index + 1}.kts")
+        }
+
+        // then
+        assert(!declarations.isProperty("constLater"))
+        assert(declarations.property("constLater") == SnippetProperty(SnippetProperty.Kind.CONST, "snippet2.kts"))
+        assert(!declarations.isProperty("jvmFieldLater"))
+        assert(declarations.property("jvmFieldLater") == SnippetProperty(SnippetProperty.Kind.JVM_FIELD, "snippet2.kts"))
+        assert(declarations.jvmFieldProperty("jvmFieldLater") == "snippet2.kts")
+        assert(!declarations.isProperty("internalLater"))
+        assert(declarations.isProperty("publicLater"))
+        assert(declarations.isProperty("publicLaterJvmField"))
+        assert(declarations.jvmFieldProperty("publicLaterJvmField") == "snippet1.kts")
+        assert(!declarations.isFunction("internalFunctionLater"))
+        assert(declarations.extensionPropertyReceivers("internalExtensionLater").isEmpty())
+        assert(declarations.extensionFunctionReceivers("internalExtensionFunctionLater").isEmpty())
+        assert(!declarations.isClass("PrivateClassLater"))
+    }
+
+    @Test
+    fun `should keep the declaration of a name not replaced by private declaration or overload of later snippet`() {
+        // given
+        val declarations = SnippetDeclarations()
+
+        // when
+        redeclaringSnippetClasses.forEachIndexed { index, snippetClass ->
+            declarations.keep(snippetClass, "snippet${index + 1}.kts")
+        }
+
+        // then
+        assert(declarations.isProperty("privateLater"))
+        assert(declarations.isFunction("privateFunctionLater"))
+        assert(declarations.isFunction("overloadedLater"))
+        assert(declarations.extensionPropertyReceivers("overloadedExtensionLater") == setOf(ExtensionReceiver("String", nullable = false)))
     }
 
     @Test

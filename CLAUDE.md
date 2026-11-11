@@ -86,12 +86,15 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   it continues without the refined configuration, also without the default imports, and the failure is reported without its code and end, like any warning of a refinement —
   see `SnippetDependencyResolver.takeDependencies`.
   The classpath added by a refinement stays with the compiler even if the snippet fails to compile.
+- A later snippet resolves a name to its last declaration, also an `internal`, `const` or `@JvmField` one, or a `private` class, which it then fails on,
+  but not to a `private` property or function, which it does not see, nor to an overload of other parameters — so a hint must check the last declaration, see `SnippetDeclarations`.
 - Known compiler bugs, each with a test pinning the hint: a class of an earlier snippet is unresolved in a declaration of an inferred type calling it,
   and so is a property (also a provided one), a function, or an extension (reported `on receiver of type` on an explicit receiver) of an earlier snippet, but only when that declaration is used in the same snippet, while a property with an initializer, like `val x = name.length`, resolves it,
   while a declaration of a snippet which failed to compile stays unresolved even with the type declared, so it gets no hint,
   an `internal` property or function of an earlier snippet is called by a name it is not compiled to, failing with a `NoSuchMethodError` even with the type declared, so it gets a hint at declaring it public instead,
-  a `const val` of an earlier snippet crashes the backend wherever a later snippet reads it (`InterpreterMethodNotFoundError`),
-  and a `@JvmField` property is read as an instance field, while it is static, failing with an `IncompatibleClassChangeError` — so neither gets a hint,
+  a `const val` of an earlier snippet, unresolved in a declaration of an inferred type, crashes the backend wherever else a later snippet reads it (`InterpreterMethodNotFoundError`), also at the top level,
+  and a `@JvmField` property is accessed as an instance field, while it is static, failing with an `IncompatibleClassChangeError` (its HotSpot message names the class, `Snippet1.limit`, which the report strips) —
+  so both get a hint at declaring it again without `const` / `@JvmField`, while a `const val` of an `object` of an earlier snippet crashes as well (`Unknown function: X(O)`), without a hint,
   a value class property or function of an earlier snippet is called by a mangled name, which is not declared (the provided properties work around it with `@get:JvmName`),
   an `inline` declaration cannot be called across snippets,
   the backend crashes on `val context: Int inline get() = coroutineContext.hashCode()`, which stands in for an internal failure of the compiler in `should report internal failure of the compiler and continue the session`.
