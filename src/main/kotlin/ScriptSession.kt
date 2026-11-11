@@ -21,6 +21,7 @@ package com.xemantic.kotlin.script
 
 import io.github.oshai.kotlinlogging.KLogger
 import io.github.oshai.kotlinlogging.KotlinLogging
+import io.github.oshai.kotlinlogging.Level
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
@@ -209,11 +210,15 @@ private val reservedNames = setOf("coroutineContext", "await")
 /**
  * The [ScriptSession], with the thread of its snippets run by the single thread [executor] created with the given thread factory,
  * and a caller which would resume in place, on that thread, resumed from the [resumeExecutor] instead, see [ScriptSession.execute].
+ *
+ * @param newReplDisposable creates the disposable of a compiler of this name, see [createRepl],
+ * replaced only by the tests, to make its disposal fail.
  */
 internal class DefaultScriptSession(
     private val properties: List<ScriptProperty<*>>,
     dispatcher: CoroutineDispatcher,
     private val resumeExecutor: Executor = Dispatchers.Default.asExecutor(),
+    private val newReplDisposable: (name: String) -> Disposable = Disposer::newDisposable,
     executor: (ThreadFactory) -> ExecutorService = Executors::newSingleThreadExecutor
 ) : ScriptSession {
 
@@ -226,7 +231,8 @@ internal class DefaultScriptSession(
         }
     }
 
-    private val id = sessionIds.incrementAndGet()
+    /** The id of the session, which its property values are registered by, see [ScriptPropertyValues], exposed only for the tests. */
+    internal val id = sessionIds.incrementAndGet()
 
     private val name = "script-session-$id"
 
@@ -250,6 +256,7 @@ internal class DefaultScriptSession(
 
     private val disposable = Disposer.newDisposable(name)
 
+    /** The resolver of the dependencies declared by the snippets, exposed only for the tests. */
     internal val dependencyResolver = SnippetDependencyResolver(classLoader)
 
     /** The lines of the snippets by their names, like `snippet3.kts`, accessed on the [thread] only. */
@@ -559,7 +566,7 @@ internal class DefaultScriptSession(
      * not seeing the declaration which threw.
      */
     private suspend fun createRepl(): Repl? {
-        val disposable = Disposer.newDisposable("$name-repl").also {
+        val disposable = newReplDisposable("$name-repl").also {
             Disposer.register(this.disposable, it)
         }
         val created = try {
@@ -571,7 +578,7 @@ internal class DefaultScriptSession(
         if (propertiesFailure != null) {
             // the disposer disposes the whole subtree, and then rethrows an exception thrown by any of its disposables,
             // which would make this first result differ from the kept failure returned by every later execution,
-            // so it is only logged; not tested, as no input makes a disposable of the compiler throw deterministically
+            // so it is only logged
             runCatching { Disposer.dispose(disposable) }.onFailure { e ->
                 logger.warn(e) { "$name: disposing the compiler of the failed declaration of the properties failed" }
             }
@@ -631,20 +638,16 @@ internal class DefaultScriptSession(
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         job.cancel()
-        // released after the last evaluation on the thread, which might be the declaration of the properties reading them,
-        // and before the disposal, so its failure cannot keep them
+        // released after the last evaluation on the thread, which might be the declaration of the properties reading them
         thread.execute {
             // each one released even if an earlier one fails, which is logged, as no caller awaits the release,
             // while a fatal error is thrown, to the uncaught exception handler of the thread
-            try {
+            logger.runOr(Unit, Level.WARN, { "$name: releasing the session failed" }) {
                 releaseAll(
                     { ScriptPropertyValues.unregister(id) },
                     { Disposer.dispose(disposable) },
                     dependencyResolver::close
                 )
-            } catch (e: Throwable) {
-                if (e.isFatal) throw e
-                logger.warn(e) { "$name: releasing the session failed" }
             }
         }
         thread.shutdown()
@@ -673,19 +676,30 @@ internal fun releaseAll(vararg releases: () -> Unit) {
     throw thrown
 }
 
-/**
- * The result of the [read], or the [fallback], if it throws, logged by this logger with the [message] at the debug level,
- * except for a fatal error, which is thrown, see [isFatal].
- */
+/** The result of the [read], or the [fallback], if it throws, logged by this logger with the [message] at the debug level, see [runOr]. */
 internal inline fun <T> KLogger.readOr(
     fallback: T,
     crossinline message: () -> String,
     read: () -> T
+): T = runOr(fallback, Level.DEBUG, message, read)
+
+/**
+ * The result of the [block], or the [fallback], if it throws, logged by this logger with the [message] at the [level],
+ * except for a fatal error, which is thrown, see [isFatal].
+ */
+internal inline fun <T> KLogger.runOr(
+    fallback: T,
+    level: Level,
+    crossinline message: () -> String,
+    block: () -> T
 ): T = try {
-    read()
+    block()
 } catch (e: Throwable) {
     if (e.isFatal) throw e
-    debug(e) { message() }
+    at(level) {
+        this.message = message()
+        cause = e
+    }
     fallback
 }
 

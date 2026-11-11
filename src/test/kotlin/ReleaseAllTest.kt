@@ -53,7 +53,7 @@ class ReleaseAllTest {
         // then
         assert(released == listOf("first", "second", "third"))
         assert(failure is IllegalStateException && failure.message == "First failed")
-        assert(failure?.suppressed?.map { it.message } == listOf("Third failed"))
+        assert(failure.suppressed.map { it.message } == listOf("Third failed"))
     }
 
     @Test
@@ -73,7 +73,7 @@ class ReleaseAllTest {
         // then
         assert(released == listOf("first", "second", "third"))
         assert(failure is OutOfMemoryError && failure.message == "Second failed")
-        assert(failure?.suppressed?.map { it.message } == listOf("First failed"))
+        assert(failure.suppressed.map { it.message } == listOf("First failed"))
     }
 
 }

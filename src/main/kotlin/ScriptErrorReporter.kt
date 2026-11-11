@@ -465,8 +465,8 @@ internal fun ScriptErrorReporter.scriptResult(
     dependencies: SnippetDependencyResolver.SnippetDependencies,
     uninitialized: List<UninitializedProperty> = emptyList()
 ): ScriptResult = when (result) {
-    is ResultValue.Value -> ScriptResult.Value(result.value, warnings(compilationReports), dependencies.resolvedVersions)
-    is ResultValue.Unit -> ScriptResult.Value(Unit, warnings(compilationReports), dependencies.resolvedVersions)
+    is ResultValue.Value -> ScriptResult.Value(result.value, warnings(dependencies.supersessions + compilationReports), dependencies.resolvedVersions)
+    is ResultValue.Unit -> ScriptResult.Value(Unit, warnings(dependencies.supersessions + compilationReports), dependencies.resolvedVersions)
     is ResultValue.Error -> {
         val error = result.error
         if (error.isFatal) throw error

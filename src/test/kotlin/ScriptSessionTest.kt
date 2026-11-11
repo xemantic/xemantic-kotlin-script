@@ -18,6 +18,8 @@
 
 package com.xemantic.kotlin.script
 
+import ch.qos.logback.classic.Level
+import com.xemantic.kotlin.script.test.LogCollector
 import com.xemantic.kotlin.script.test.collectGarbageUntilCleared
 import com.xemantic.kotlin.test.assert
 import com.xemantic.kotlin.test.be
@@ -63,6 +65,8 @@ import kotlin.coroutines.ContinuationInterceptor
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.coroutines.startCoroutine
+import kotlin.io.path.createTempDirectory
+import kotlin.io.path.writeText
 import kotlin.reflect.KClassifier
 import kotlin.reflect.KType
 import kotlin.reflect.typeOf
@@ -3635,11 +3639,11 @@ class ScriptSessionTest {
 
     /** See #209. */
     @Test
-    fun `should release dependency resolver of session closed while disposal of its compiler fails`() = runTest {
-        // given a session, with a disposable of its compiler failing to dispose
+    fun `should release session closed while disposal of its compiler fails`() = runTest {
+        // given a session, with a property, a dependency, and a disposable of its compiler failing to dispose
         val threads = CopyOnWriteArrayList<Thread>()
         val uncaught = CopyOnWriteArrayList<Throwable>()
-        val failingSession = DefaultScriptSession(emptyList(), Dispatchers.Default) { threadFactory ->
+        val failingSession = DefaultScriptSession(listOf(property("name", "value")), Dispatchers.Default) { threadFactory ->
             Executors.newSingleThreadExecutor { runnable ->
                 threadFactory.newThread(runnable).apply {
                     setUncaughtExceptionHandler { _, e -> uncaught += e }
@@ -3647,20 +3651,38 @@ class ScriptSessionTest {
                 }
             }
         }
-        failingSession.execute("1")
-        Disposer.register(failingSession.repl!!.disposable, Disposable { error("Disposal failed") })
+        val dependencies = createTempDirectory("dependencies")
+        try {
+            dependencies.resolve("marker.txt").writeText("marker")
+            failingSession.dependencyResolver.classLoader.add(listOf(dependencies.toFile()))
+            failingSession.execute("1")
+            Disposer.register(failingSession.repl!!.disposable, Disposable { error("Disposal failed") })
 
-        // when
-        failingSession.close()
+            // when
+            val warnings = LogCollector("com.xemantic.kotlin.script").use { logs ->
+                failingSession.close()
+                threads.forEach { it.join(TimeUnit.MINUTES.toMillis(1)) }
+                logs.events.filter { it.level == Level.WARN }
+            }
 
-        // then
-        threads.forEach { it.join(TimeUnit.MINUTES.toMillis(1)) }
-        val lookup = runCatching {
-            failingSession.dependencyResolver.versionLookup.latestVersion("com.xemantic.fixture", "greeter", emptyList())
-        }.exceptionOrNull()
-        assert(threads.none { it.isAlive })
-        assert(lookup is IllegalStateException && lookup.message == "The version lookup is closed")
-        assert(uncaught.isEmpty())
+            // then
+            val lookup = runCatching {
+                failingSession.dependencyResolver.versionLookup.latestVersion("com.xemantic.fixture", "greeter", emptyList())
+            }.exceptionOrNull()
+            val value = runCatching { ScriptPropertyValues.get(failingSession.id, "name") }.exceptionOrNull()
+            assert(threads.none { it.isAlive })
+            // the failure of the disposal reaches the release of the session, which logs it instead of throwing it
+            assert(
+                warnings.map { it.formattedMessage to it.throwableProxy?.message } ==
+                    listOf("script-session-${failingSession.id}: releasing the session failed" to "Disposal failed")
+            )
+            assert(lookup is IllegalStateException && lookup.message == "The version lookup is closed")
+            assert(failingSession.dependencyResolver.classLoader.getResource("marker.txt") == null)
+            assert(value is IllegalStateException && value.message == "The session is closed")
+            assert(uncaught.isEmpty())
+        } finally {
+            dependencies.toFile().deleteRecursively()
+        }
     }
 
     /**

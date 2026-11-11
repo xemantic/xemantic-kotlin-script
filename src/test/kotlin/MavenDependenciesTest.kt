@@ -370,7 +370,101 @@ class MavenDependenciesTest {
     }
 
     @Test
-    fun `should not look up metadata of dependency declared without version with wrong credentials of repository corrected since`() = runTest {
+    fun `should warn about declaration of repository with wrong credentials superseded by its corrected credentials`() = runTest {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // given
+            session.execute("""
+                @file:Repository("${server.url}", options = ["username=alice", "password=wrong"])
+                @file:DependsOn("com.xemantic.fixture:greeter")
+                42
+            """.trimIndent())
+
+            // when
+            val result = session.execute("""
+                @file:Repository("${server.url}", options = ["username=alice", "password=secret"])
+                @file:DependsOn("com.xemantic.fixture:greeting-card")
+                42
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == 42)
+                warnings sameAs """
+                    snippet2.kts:2:1: warning: Superseded the declaration of the repository '${server.url}' with the credentials refused (401) by its other declaration, so they are no longer sent — declare it again to restore it
+                      | <error>@file:DependsOn("com.xemantic.fixture:greeting-card")</error>
+                """.trimIndent()
+            }
+        }
+    }
+
+    @Test
+    fun `should warn about superseded declaration of repository in snippet failing to compile`() = runTest {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // given
+            session.execute("""
+                @file:Repository("${server.url}", options = ["username=alice", "password=wrong"])
+                @file:DependsOn("com.xemantic.fixture:greeter")
+                42
+            """.trimIndent())
+
+            // when
+            val result = session.execute("""
+                @file:Repository("${server.url}", options = ["username=alice", "password=secret"])
+                @file:DependsOn("com.xemantic.fixture:preview")
+                undefinedVariable
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Error>()
+                have(phase == ExecutionPhase.COMPILATION)
+                message sameAs """
+                    snippet2.kts:2:1: warning: Superseded the declaration of the repository '${server.url}' with the credentials refused (401) by its other declaration, so they are no longer sent — declare it again to restore it
+                      | <error>@file:DependsOn("com.xemantic.fixture:preview")</error>
+
+                    snippet2.kts:2:1: warning: Resolved 'com.xemantic.fixture:preview' to its latest pre-release version '0.1-beta', as it has no stable one
+                      | <error>@file:DependsOn("com.xemantic.fixture:preview")</error>
+
+                    snippet2.kts:3:1: error: Unresolved reference 'undefinedVariable'.
+                      | <error>undefinedVariable</error>
+                """.trimIndent()
+            }
+        }
+    }
+
+    @Test
+    fun `should not warn again about superseded declaration of repository in later snippets`() = runTest {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // given
+            session.execute("""
+                @file:Repository("${server.url}", options = ["username=alice", "password=wrong"])
+                @file:DependsOn("com.xemantic.fixture:greeter")
+                42
+            """.trimIndent())
+            session.execute("""
+                @file:Repository("${server.url}", options = ["username=alice", "password=secret"])
+                @file:DependsOn("com.xemantic.fixture:greeting-card")
+                42
+            """.trimIndent())
+
+            // when
+            val result = session.execute("""
+                @file:DependsOn("com.xemantic.fixture:preview")
+                fixture.preview.Preview.version()
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == "0.1-beta")
+                have(warnings == null)
+            }
+        }
+    }
+
+    @Test
+    fun `should not send wrong credentials of repository corrected since to look up dependency declared without version`() = runTest {
         MavenRepositoryServer(username = "alice", password = "secret").use { server ->
             // given
             session.execute("""
@@ -432,7 +526,7 @@ class MavenDependenciesTest {
     }
 
     @Test
-    fun `should look up dependency declared without version with wrong credentials of repository corrected since once declared again`() = runTest {
+    fun `should resolve dependencies with wrong credentials of repository corrected since once declared again`() = runTest {
         MavenRepositoryServer(username = "alice", password = "secret").use { server ->
             // given
             val wrong = """@file:Repository("${server.url}", options = ["username=alice", "password=wrong"])"""
@@ -449,19 +543,27 @@ class MavenDependenciesTest {
             val wronglyAuthenticatedRequests = server.wronglyAuthenticatedRequests
 
             // when
-            val result = session.execute("""
+            val restored = session.execute("""
                 $wrong
+                @file:DependsOn("com.xemantic.fixture:missing:1.0")
+                42
+            """.trimIndent())
+            val wronglyAuthenticatedRequestsOfResolution = server.wronglyAuthenticatedRequests
+            val result = session.execute("""
                 @file:DependsOn("com.xemantic.fixture:preview")
                 fixture.preview.Preview.version()
             """.trimIndent())
 
             // then
+            // the superseded declaration is restored, as the credentials might have been changed on the server since,
+            // also in the resolution of a dependency in its version, missing, so every declaration is read
+            assert(restored is ScriptResult.Error)
+            assert(wronglyAuthenticatedRequestsOfResolution > wronglyAuthenticatedRequests)
             result should {
                 be<ScriptResult.Value>()
                 have(value == "0.1-beta")
             }
-            // the superseded declaration is restored, as the credentials might have been changed on the server since
-            assert(server.wronglyAuthenticatedRequests > wronglyAuthenticatedRequests)
+            assert(server.wronglyAuthenticatedRequests > wronglyAuthenticatedRequestsOfResolution)
         }
     }
 

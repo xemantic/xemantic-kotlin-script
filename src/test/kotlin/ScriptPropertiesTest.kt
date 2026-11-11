@@ -22,12 +22,17 @@ package com.xemantic.kotlin.script
 import RootConfig
 import `in`.xemantic.Box
 import `is`
+import ch.qos.logback.classic.Level
+import com.xemantic.kotlin.script.test.LogCollector
 import com.xemantic.kotlin.test.assert
 import com.xemantic.kotlin.test.be
 import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
 import java.net.URLClassLoader
+import java.util.concurrent.atomic.AtomicBoolean
+import org.jetbrains.kotlin.com.intellij.openapi.Disposable
+import org.jetbrains.kotlin.com.intellij.openapi.util.Disposer
 import kotlin.jvm.functions.FunctionN
 import kotlin.reflect.KClassifier
 import kotlin.reflect.KFunction
@@ -638,6 +643,47 @@ class ScriptPropertiesTest {
             // then
             // nothing can be compiled in the compiler of the failed declaration, so only its failure is kept
             assert(result is ScriptResult.Error && session.repl == null)
+        }
+    }
+
+    @Test
+    fun `should report failed declaration of properties also if disposal of its compiler fails`() = runTest {
+        // given a compiler, with a disposable failing to dispose
+        val disposed = AtomicBoolean()
+        DefaultScriptSession(
+            listOf(isolatedProperty()),
+            Dispatchers.Default,
+            newReplDisposable = { name ->
+                Disposer.newDisposable(name).also {
+                    Disposer.register(it, Disposable { disposed.set(true); error("Disposal failed") })
+                }
+            }
+        ).use { session ->
+            // when
+            val (first, warnings) = LogCollector("com.xemantic.kotlin.script").use { logs ->
+                session.execute("42") to logs.events.filter { it.level == Level.WARN }
+            }
+            val next = session.execute("42")
+
+            // then
+            // the failure of the disposal is logged instead of thrown, so the first result is the kept failure of every later execution
+            assert(disposed.get())
+            assert(
+                warnings.map { it.formattedMessage to it.throwableProxy?.message } == listOf(
+                    "script-session-${session.id}: disposing the compiler of the failed declaration of the properties failed" to
+                        "Disposal failed"
+                )
+            )
+            first should {
+                be<ScriptResult.Error>()
+                have(message.startsWith("The properties cannot be declared:\n"))
+            }
+            next should {
+                be<ScriptResult.Error>()
+                have(phase == (first as ScriptResult.Error).phase)
+                have(message == first.message)
+            }
+            assert(session.repl == null)
         }
     }
 

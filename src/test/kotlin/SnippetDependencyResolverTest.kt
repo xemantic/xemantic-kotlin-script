@@ -109,27 +109,30 @@ class SnippetDependencyResolverTest {
         // given a version lookup, which fails to shut down the repository system created by its lookup
         val localRepository = createTempDirectory("maven-local").toFile()
         val dependencies = createTempDirectory("dependencies")
-        dependencies.resolve("marker.txt").writeText("marker")
-        val versionLookup = MavenVersionLookup(
-            settingsFactory = { Settings().apply { this.localRepository = localRepository.path } },
-            repositorySystemFactory = {
-                newRepositorySystem().apply { addOnSystemEndedHandler { error("Shutdown failed") } }
-            }
-        )
-        val resolver = SnippetDependencyResolver(javaClass.classLoader, versionLookup)
-        versionLookup.latestVersion("com.xemantic.fixture", "greeter", emptyList())
-        resolver.classLoader.add(listOf(dependencies.toFile()))
-        val markerBefore = resolver.classLoader.getResource("marker.txt")
+        try {
+            dependencies.resolve("marker.txt").writeText("marker")
+            val versionLookup = MavenVersionLookup(
+                settingsFactory = { Settings().apply { this.localRepository = localRepository.path } },
+                repositorySystemFactory = {
+                    newRepositorySystem().apply { addOnSystemEndedHandler { error("Shutdown failed") } }
+                }
+            )
+            val resolver = SnippetDependencyResolver(javaClass.classLoader, versionLookup)
+            versionLookup.latestVersion("com.xemantic.fixture", "greeter", emptyList())
+            resolver.classLoader.add(listOf(dependencies.toFile()))
+            val markerBefore = resolver.classLoader.getResource("marker.txt")
 
-        // when
-        val failure = runCatching { resolver.close() }.exceptionOrNull()
+            // when
+            val failure = runCatching { resolver.close() }.exceptionOrNull()
 
-        // then
-        assert(markerBefore != null)
-        assert(failure?.suppressed?.map { it.message } == listOf("Shutdown failed"))
-        assert(resolver.classLoader.getResource("marker.txt") == null)
-        localRepository.deleteRecursively()
-        dependencies.toFile().deleteRecursively()
+            // then
+            assert(markerBefore != null)
+            assert(failure?.suppressed?.map { it.message } == listOf("Shutdown failed"))
+            assert(resolver.classLoader.getResource("marker.txt") == null)
+        } finally {
+            localRepository.deleteRecursively()
+            dependencies.toFile().deleteRecursively()
+        }
     }
 
 }
