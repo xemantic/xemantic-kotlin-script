@@ -115,14 +115,21 @@ ScriptSession {
   and one failing there as well, like one always throwing, or the one of an executor shut down,
   is bypassed: the caller resumes without it, on `Dispatchers.Default`, failing with its exception,
   so it never stays suspended forever.
+  A fatal error of the dispatcher, a `VirtualMachineError` other than `StackOverflowError`, like an `OutOfMemoryError`,
+  is not retried, but bypasses the dispatcher at once, failing the caller with it, like a fatal error of the snippet.
+  A caller resumes only once, also when its dispatcher, or `Dispatchers.Default`, takes the resumption and throws after it.
   Separate sessions run in parallel, each with its own state,
   and each holding its own compiler, which loads the whole classpath, so close the sessions no longer needed.
-* A caller waiting for the snippet of another caller, if it would resume in place,
-  is resumed on the thread of the session, when the snippet of the other caller ends, and submits its snippet from there,
-  so it does not need a free worker of `Dispatchers.Default` before its snippet, which might be the one freeing them.
-  If the session is closed meanwhile, such a caller is rejected, with an `IllegalStateException`, from `Dispatchers.Default`,
-  not nested in the rejection of the caller it waited for, also when it started on the thread of that caller,
-  while a caller of `Dispatchers.Main.immediate` is rejected on its own thread, where its dispatcher resumes it.
+* A caller waiting for the snippets of other callers has its snippet queued on the thread of the session at once,
+  so it needs no free worker of `Dispatchers.Default` before its snippet, which might be the one freeing them,
+  and it is never resumed by another caller, or on its thread, only after its own snippet, as above.
+  If the session is closed meanwhile, its snippet is rejected on the thread of the session, with an `IllegalStateException`,
+  which the caller resumes with as above, so a caller of its own dispatcher does not wait for `Dispatchers.Default`,
+  even when queued behind a caller without a dispatcher.
+  A caller cancelled while it waits resumes at once, with its `CancellationException`, without executing its snippet,
+  on the cancelling thread, if it would resume in place, unless that is the thread of the session, like a snippet cancelling it,
+  which resumes it as above.
+  A caller cancelled already when it calls `execute` executes its snippet, cancelled, as the cancellation of a caller whose snippet is compiled would.
 * The snippets are received by the `ScriptScope`, a `CoroutineScope` living as long as the session,
   with `kotlinx.coroutines.*` imported by default:
   * `await { ... }` runs suspending code, like the requests of a ktor client,
