@@ -36,6 +36,10 @@ class SnippetDeclarationsTest {
                     val publicProperty = 1
                     private val privateProperty = 1
                     internal val internalProperty = 1
+                    const val constProperty = 1
+                    @JvmField val jvmFieldProperty = 1
+                    @JvmField var jvmFieldVariable = 1
+                    lateinit var lateinitProperty: String
                     fun publicFunction() = 1
                     private fun privateFunction() = 1
                     internal fun internalFunction() = 1
@@ -73,6 +77,7 @@ class SnippetDeclarationsTest {
 
         // then
         assert(declarations.isProperty("publicProperty"))
+        assert(declarations.isProperty("lateinitProperty"))
         assert(declarations.isFunction("publicFunction"))
         assert(declarations.isFunction("functionOfJvmNameWithDollarSign"))
         assert(declarations.isFunction($$"function$withDollarSign"))
@@ -105,6 +110,17 @@ class SnippetDeclarationsTest {
         assert(!declarations.isFunction("internalFunction"))
         assert(declarations.extensionPropertyReceivers("internalExtensionProperty").isEmpty())
         assert(declarations.extensionFunctionReceivers("internalExtensionFunction").isEmpty())
+    }
+
+    @Test
+    fun `should not keep const and JvmField properties of snippet`() {
+        // when
+        val declarations = declarations
+
+        // then
+        assert(!declarations.isProperty("constProperty"))
+        assert(!declarations.isProperty("jvmFieldProperty"))
+        assert(!declarations.isProperty("jvmFieldVariable"))
     }
 
     @Test
