@@ -180,7 +180,7 @@ public class ScriptProperty<T>(
     internal val isSuspendFunctionReference: Boolean? = when {
         type.isFunctionReferenceType() -> if (value == null) false else functionShape?.isSuspend
         type.classifier == KFunction::class -> functionShape
-            ?.takeIf { it.parameters == 0 && it.isImplementedBy(value) }
+            ?.takeIf { it.parameters == 0 && it.isCallableWithoutParameters(value) }
             ?.isSuspend
         else -> null
     }
@@ -241,14 +241,17 @@ internal fun ScriptProperty<*>.declaration(session: Int): String {
 private class FunctionShape(val parameters: Int, val isSuspend: Boolean) {
 
     /**
-     * Whether this [function] implements the function type of this shape, like `Function0` of no parameters,
-     * or `Function1` of a suspend function of no parameters, taking the continuation, marked by `SuspendFunction`,
-     * which a compiled reference does, but not a `KFunction` implemented otherwise, like by delegation.
+     * Whether this [function] of no parameters can be called as a function of no parameters,
+     * implementing `Function0`, or `Function1` taking the continuation of a suspend function,
+     * as a compiled reference does, and a function of kotlin-reflect,
+     * but not a `KFunction` implemented otherwise, like by delegation, even of `KFunction0`, or declaring an `invoke` method.
      */
-    fun isImplementedBy(function: Any?): Boolean =
-        function is Function<*>
-                && function.arity() == parameters + (if (isSuspend) 1 else 0)
-                && (!isSuspend || suspendFunctionClass?.isInstance(function) == true)
+    fun isCallableWithoutParameters(function: Any?): Boolean = try {
+        if (isSuspend) function is Function1<*, *> else function is Function0<*>
+    } catch (_: Exception) {
+        // the arity of a FunctionBase implemented by the host
+        false
+    }
 
 }
 
@@ -263,7 +266,7 @@ private fun KFunction<*>.shape(): FunctionShape? =
         ?: (this as? FunctionReference)?.let { reference ->
             val isSuspend = suspendFunctionClass?.isInstance(reference) == true
             // the arity counts the continuation of a suspend function, but not a bound receiver
-            reference.arity()?.let { FunctionShape(it - if (isSuspend) 1 else 0, isSuspend) }
+            FunctionShape(reference.arity - if (isSuspend) 1 else 0, isSuspend)
         }
 
 /**

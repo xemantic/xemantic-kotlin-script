@@ -38,8 +38,8 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   Do not fall back to `assertEquals` / `assertTrue` / `assertNotNull` from `kotlin.test`, which discard that information.
 - A test that an object is garbage collected must not create it within `runTest`: a frame of its coroutine can keep a stale reference to it, so the test fails without a leak —
   see `should release closed session with its dependencies`.
-- Keep a function reference which kotlin-reflect cannot resolve out of an `assert(expr)` expression —
-  see `should reject function reference value of another arity unresolved by kotlin-reflect`.
+- Keep a function reference which kotlin-reflect cannot resolve, like of a local function or of `Integer::toHexString`, out of an `assert(expr)` expression:
+  rendering it throws, hiding the actual failure — see `should reject function reference value of another arity unresolved by kotlin-reflect`.
 - Never assert on wall-clock time (a ratio or a bound): tests run under whatever CI load there is, and fail with no code change.
   To guard against, say, quadratic backtracking, feed an input large enough that the regression hangs for minutes while the correct code takes milliseconds.
 
@@ -66,8 +66,8 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   `./gradlew dependencies --configuration runtimeClasspath | grep -E 'maven-resolver-api|maven-core'` shows the versions Kotlin brings now — the failure message names only the requested one.
   Never pin a newer Maven Resolver instead: a pin lifts only its own artifacts, so the API of 2.x meets the implementation of 1.9 on the classpath, which works by luck until a `NoSuchMethodError`.
   Once Kotlin brings Resolver 2.x, re-check `isUnauthorized`.
-- The parameters of a function reference which kotlin-reflect cannot resolve are told by `FunctionReference.arity`, assumed to count the continuation of a suspend function, but not a bound receiver —
-  a compiler detail, re-check it after every Kotlin upgrade, `should reject function reference value of another arity unresolved by kotlin-reflect` and `should provide properties of function reference of no parameters` pin it.
+- The arity of a compiled function reference, read when kotlin-reflect cannot resolve it, is a compiler detail — re-check it after every Kotlin upgrade,
+  see `should provide property of suspend function reference of no parameters unresolved by kotlin-reflect`.
 
 ### The K2 REPL compiler (`K2ReplCompiler`)
 
