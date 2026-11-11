@@ -83,7 +83,9 @@ internal class ScriptErrorReporter(
      */
     fun describe(
         diagnostics: List<ScriptDiagnostic>
-    ): String = diagnostics.reportable().map { describe(it) }.distinct().joinToString("\n").trimEnd().ifEmpty {
+    ): String = inlinedFrames.report().let { report ->
+        diagnostics.reportable().map { describe(it, report) }
+    }.distinct().joinToString("\n").trimEnd().ifEmpty {
         "error: Failed without any diagnostic message."
     }
 
@@ -120,8 +122,10 @@ internal class ScriptErrorReporter(
         it.severity >= ScriptDiagnostic.Severity.WARNING
     }
 
+    /** @param report the frames of the inlined code resolved for all the diagnostics described together. */
     private fun describe(
-        diagnostic: ScriptDiagnostic
+        diagnostic: ScriptDiagnostic,
+        report: InlinedFrames.Report
     ): String = buildString {
         val location = diagnostic.location
         val lines = diagnostic.sourcePath?.let { path -> snippets[path.substringAfterLast('/')] }
@@ -134,7 +138,7 @@ internal class ScriptErrorReporter(
         val exception = diagnostic.exception
         if (exception != null && diagnostic.severity >= ScriptDiagnostic.Severity.ERROR) {
             append("The compiler failed internally: ")
-            appendThrowable(exception, "", "  ", Collections.newSetFromMap(IdentityHashMap()), inlinedFrames.report())
+            appendThrowable(exception, "", "  ", Collections.newSetFromMap(IdentityHashMap()), report)
         } else {
             append(diagnostic.message.indentContinuationLines("  "))
             append('\n')
