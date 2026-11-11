@@ -44,6 +44,15 @@ private val unresolvedReference = Regex("Unresolved reference '(.+?)'(?: on rece
 /** The mangled name of a method taking or returning a value class, like `getTimeout-UwyO8pc`. */
 private val mangledMethod = Regex("[\\p{L}_][\\p{L}\\p{N}_]*-[\\p{L}\\p{N}_]{7}\\(")
 
+/**
+ * The method missing by the message of a [NoSuchMethodError], with its class, and its parameter types,
+ * like `'int Snippet1$Box.open$main(int, java.lang.String)'`.
+ */
+private val missingMethod = Regex("'[^\\s'(]+ ([^\\s(]+)\\.([^.\\s(]+)\\(([^()]*)\\)'")
+
+/** The class of the default methods of an interface, like `Greeter$DefaultImpls`. */
+private const val DEFAULT_IMPLS = "DefaultImpls"
+
 /** The method evaluating the body of a snippet. */
 private const val SNIPPET_BODY_METHOD = "\$\$eval"
 
@@ -238,6 +247,9 @@ internal class ScriptErrorReporter(
         }
         // the exception class of a snippet might override it to contain nulls
         val stackTrace = throwable.read(emptyList()) { stackTrace.filterNotNull() }
+        if (throwable is NoSuchMethodError) {
+            appendInternalMemberHint(throwable, stackTrace, indent, reported)
+        }
         if (throwable is NullPointerException) {
             uninitializedProperties.readBy(throwable, stackTrace)?.let { property ->
                 appendUninitializedReadHint(property, stackTrace, indent)
@@ -254,6 +266,83 @@ internal class ScriptErrorReporter(
     }
 
     /**
+     * The hint at the member of an earlier snippet, declared `internal`, which the [error] thrown at the [stackTrace] failed to call, see [SnippetDeclarations.internalMember],
+     * unless hinted at already by an error of the same message [reported] before, as kotlinx.coroutines wraps the error of a coroutine,
+     * like of `runBlocking`, in a copy of it with the stack trace of its caller, so the stack trace of the error wrapped last, of the coroutine, is read then.
+     */
+    private fun StringBuilder.appendInternalMemberHint(
+        error: NoSuchMethodError,
+        stackTrace: List<StackTraceElement>,
+        indent: String,
+        reported: Set<Throwable>
+    ) {
+        val message = error.read(null) { message } ?: return
+        if (reported.any { it !== error && it is NoSuchMethodError && it.read(null) { this.message } == message }) return
+        val match = missingMethod.matchEntire(message) ?: return
+        val (owner, method, parameters) = match.destructured
+        val member = snippetDeclarations.internalMember(owner, method, parameters.split(", ").filter { it.isNotEmpty() }) ?: return
+        val wrapped = generateSequence<Throwable>(error) { exception -> exception.read(null) { cause } }
+            .take(MAX_REPORTED_EXCEPTIONS)
+            .lastOrNull { exception -> exception is NoSuchMethodError && exception.read(null) { this.message } == message }
+        val calling = if (wrapped == null || wrapped === error) stackTrace else wrapped.read(emptyList()) { this.stackTrace.filterNotNull() }
+        appendInternalMemberHint(member, snippetDeclarations.isFinalClass(owner), calling, indent)
+    }
+
+    /**
+     * The hint at the [member] of an earlier snippet, declared `internal`, which the exception thrown at the [stackTrace] failed to call,
+     * to declare it `public`, unless declared again by a later snippet already,
+     * and to declare again the code calling it, directly or not, and to create again the values depending on it,
+     * as they keep calling the `internal` one even after it is declared again.
+     * The declarations on the [stackTrace], and their [final][SnippetDeclarations.isFinalClass] classes, also the one declaring the member,
+     * if [ownerFinal], are named only as examples, as the stack trace cannot tell all of them,
+     * like a lambda calling it created by an earlier call, and kept by a value.
+     */
+    private fun StringBuilder.appendInternalMemberHint(
+        member: InternalMember,
+        ownerFinal: Boolean,
+        stackTrace: List<StackTraceElement>,
+        indent: String
+    ) {
+        val callerFrames = stackTrace.filter {
+            it.fileName in snippets
+                && it.declarationName() != null
+                // a synthetic method, like a bridge, or a class, like DefaultImpls of an interface
+                && '$' !in it.methodName.removeSuffix(DEFAULT_STUB_SUFFIX)
+                && DEFAULT_IMPLS !in it.ownerClasses()
+        }
+        val callers = callerFrames.declarations()
+        val classes = (listOfNotNull(member.declaringClass.takeIf { ownerFinal }) + callerFrames.filter {
+            snippetDeclarations.isFinalClass(it.className)
+        }.mapNotNull { it.declaringClassName() }).distinct()
+        val (subject, declared) = if (member.internalSetter) "the setter of '${member.name}'" to "the setter" else "'${member.name}'" to "it"
+        append("$indent  hint: $subject is declared internal in ${member.snippet}, which a later snippet cannot call,")
+        append(" as the K2 REPL compiler calls it by a JVM name it is not compiled to - ")
+        if (member.declaredAgain) {
+            append("it is declared again by a later snippet, so ")
+        } else {
+            append("declare $declared public, without the internal modifier, and ")
+        }
+        append("declare again the code calling it, directly or not, ")
+        callers.takeIf { it.isNotEmpty() }?.let { append("like ${it.enumerated()}, ") }
+        append("and create again the values depending on it, like the ones ")
+        classes.takeIf { it.isNotEmpty() }?.let {
+            append("of the ${if (it.size > 1) "classes" else "class"} ${it.map { name -> "'$name'" }.enumerated()}, or ")
+        }
+        append("holding a lambda calling it, as they keep calling the internal one.\n")
+    }
+
+    /** The name of the class of a snippet declaring the declaration of this snippet frame, like `Box` or `Box.Lid`, or `null` for a member of the snippet itself. */
+    private fun StackTraceElement.declaringClassName(): String? =
+        ownerClasses().takeIf { it.isNotEmpty() && snippetClassName.matches(className.substringBefore('$')) }?.joinToString(".")
+
+    /** The declarations of the snippet frames of this stack trace, like `'greet' of snippet2.kts`, see [declarationName]. */
+    private fun List<StackTraceElement>.declarations(): List<String> = filter {
+        it.fileName in snippets
+    }.mapNotNull { frame ->
+        frame.declarationName()?.let { "'$it' of ${frame.fileName}" }
+    }.distinct()
+
+    /**
      * The hint at the [property] of an earlier snippet, read as `null` by the exception thrown at the [stackTrace],
      * naming the declaration reading it, the first snippet frame of a declaration, like `greet`, so not a lambda, or the body of a snippet,
      * and the declarations calling it, which keep calling the one reading the uninitialized property, even after redeclaring both,
@@ -264,11 +353,7 @@ internal class ScriptErrorReporter(
         stackTrace: List<StackTraceElement>,
         indent: String
     ) {
-        val readers = stackTrace.filter {
-            it.fileName in snippets && !property.isGetter(it)
-        }.mapNotNull { frame ->
-            frame.declarationName()?.let { "'$it' of ${frame.fileName}" }
-        }.distinct()
+        val readers = stackTrace.filter { !property.isGetter(it) }.declarations()
         append("$indent  hint: '${property.name}' is declared in ${property.snippet}, which failed in the evaluation,")
         append(" so it might be left uninitialized, null despite its type - ")
         if (property.mutable) {
@@ -394,10 +479,8 @@ internal class ScriptErrorReporter(
      * e.g. `Checker.check`, `<snippet body>`, or `<lambda>`.
      */
     private fun StackTraceElement.functionName(): String {
-        val owner = className.split('$').let { segments ->
-            if (snippetClassName.matches(segments.first())) segments.drop(1) else segments
-        }.filter { it.isNotEmpty() }
-        val methodParts = methodName.removeSuffix("\$default").split('$').filter { it.isNotEmpty() }
+        val owner = ownerClasses()
+        val methodParts = methodName.removeSuffix(DEFAULT_STUB_SUFFIX).split('$').filter { it.isNotEmpty() }
         val isLambda = methodParts.zipWithNext().any { (name, index) ->
             name == "lambda" && index.all { it.isDigit() }
         } || owner.any { segment -> segment.all { it.isDigit() } }
@@ -408,6 +491,11 @@ internal class ScriptErrorReporter(
             else -> listOfNotNull(type, methodParts.lastOrNull() ?: methodName).joinToString(".")
         }
     }
+
+    /** The classes of this frame within its snippet, like `[Box, Lid]` of `Snippet2$Box$Lid`, or all the segments of the class of another frame. */
+    private fun StackTraceElement.ownerClasses(): List<String> = className.split('$').let { segments ->
+        if (snippetClassName.matches(segments.first())) segments.drop(1) else segments
+    }.filter { it.isNotEmpty() }
 
     /**
      * The name of the declaration of this snippet frame, like `greet`, `Checker.check`, or `Config` of its initializer,

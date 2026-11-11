@@ -271,4 +271,17 @@ class ScriptErrorReporterTest {
         report sameAs expected
     }
 
+    @Test
+    fun `should report NoSuchMethodError of long message resembling missing method in linear time`() {
+        // given
+        // a quadratic backtracking of matching the missing method would take minutes, not milliseconds
+        val exception = NoSuchMethodError("'int " + "a.b(".repeat(100_000)).thrownBySnippet()
+
+        // when
+        val report = reporter.describe(exception)
+
+        // then
+        assert(report.startsWith("java.lang.NoSuchMethodError: 'int a.b("))
+    }
+
 }

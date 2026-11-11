@@ -58,6 +58,17 @@ class SnippetDeclarationsTest {
                     class PublicClass
                     private class PrivateClass
                     internal class InternalClass
+                    internal var internalVariable = 1
+                    class ClassOfInternalMember { internal val internalMember = 1 }
+                    var internalSetterProperty = 1
+                        internal set
+                    internal fun internalFunctionWithDefault(n: Int = 1) = n
+                    open class OpenClass
+                    abstract class AbstractClass
+                    interface Interface { fun method() = 1 }
+                    object Object
+                    class ClassWithCompanion { companion object }
+                    enum class EnumClass { ENTRY }
                     Snippet1::class.java
                 """.trimIndent()) }
                 (result as ScriptResult.Value).value as Class<*>
@@ -159,6 +170,86 @@ class SnippetDeclarationsTest {
 
         // then
         assert(declarations.isProperty("publicProperty"))
+    }
+
+    @Test
+    fun `should find internal member of snippet by the JVM name a later snippet calls it by`() {
+        // when
+        val declarations = declarations
+
+        // then
+        assert(declarations.internalMember("Snippet1", $$"getInternalProperty$main", emptyList()) == InternalMember("internalProperty", "snippet1.kts"))
+        assert(declarations.internalMember("Snippet1", $$"setInternalVariable$main", listOf("int")) == InternalMember("internalVariable", "snippet1.kts"))
+        assert(declarations.internalMember("Snippet1", "internalFunction", emptyList()) == InternalMember("internalFunction", "snippet1.kts"))
+        assert(declarations.internalMember("Snippet1", $$"getInternalExtensionProperty$main", listOf("java.lang.String")) == InternalMember("internalExtensionProperty", "snippet1.kts"))
+        assert(declarations.internalMember("Snippet1", "internalExtensionFunction", listOf("java.lang.String")) == InternalMember("internalExtensionFunction", "snippet1.kts"))
+        assert(declarations.internalMember($$"Snippet1$ClassOfInternalMember", $$"getInternalMember$main", emptyList()) == InternalMember("ClassOfInternalMember.internalMember", "snippet1.kts", declaringClass = "ClassOfInternalMember"))
+    }
+
+    @Test
+    fun `should find internal setter of public property of snippet`() {
+        // when
+        val member = declarations.internalMember("Snippet1", $$"setInternalSetterProperty$main", listOf("int"))
+
+        // then
+        assert(member == InternalMember("internalSetterProperty", "snippet1.kts", internalSetter = true))
+    }
+
+    @Test
+    fun `should find internal function of snippet by its stub of default arguments`() {
+        // when
+        val member = declarations.internalMember(
+            "Snippet1", $$"internalFunctionWithDefault$default", listOf("Snippet1", "int", "int", "java.lang.Object")
+        )
+
+        // then
+        assert(member == InternalMember("internalFunctionWithDefault", "snippet1.kts"))
+    }
+
+    @Test
+    fun `should not find internal function of snippet by stub of default arguments of other parameters`() {
+        // when
+        val member = declarations.internalMember(
+            "Snippet1", $$"internalFunctionWithDefault$default", listOf("Snippet1", "long", "int", "java.lang.Object")
+        )
+
+        // then
+        assert(member == null)
+    }
+
+    @Test
+    fun `should not find internal member of snippet by a JVM name of another member`() {
+        // when
+        val declarations = declarations
+
+        // then
+        assert(declarations.internalMember("Snippet1", $$"getPublicProperty$main", emptyList()) == null)
+        assert(declarations.internalMember("Snippet1", "publicFunction", emptyList()) == null)
+        assert(declarations.internalMember("Snippet1", "privateFunction", emptyList()) == null)
+        assert(declarations.internalMember("Snippet1", "internalFunction", listOf("int")) == null)
+        assert(declarations.internalMember("Snippet1", $$"getUndeclared$main", emptyList()) == null)
+        assert(declarations.internalMember($$"Snippet1$Undeclared", $$"getInternalMember$main", emptyList()) == null)
+        assert(declarations.internalMember("Snippet2", "internalFunction", emptyList()) == null)
+        assert(declarations.internalMember("java.lang.String", "internalFunction", emptyList()) == null)
+    }
+
+    @Test
+    fun `should tell final class of snippet whose values a later snippet can create again`() {
+        // when
+        val declarations = declarations
+
+        // then
+        assert(declarations.isFinalClass("Snippet1"))
+        assert(declarations.isFinalClass($$"Snippet1$PublicClass"))
+        assert(!declarations.isFinalClass($$"Snippet1$OpenClass"))
+        assert(!declarations.isFinalClass($$"Snippet1$AbstractClass"))
+        assert(!declarations.isFinalClass($$"Snippet1$Interface"))
+        assert(!declarations.isFinalClass($$"Snippet1$Interface$DefaultImpls"))
+        assert(!declarations.isFinalClass($$"Snippet1$Object"))
+        assert(!declarations.isFinalClass($$"Snippet1$ClassWithCompanion$Companion"))
+        assert(!declarations.isFinalClass($$"Snippet1$EnumClass"))
+        assert(!declarations.isFinalClass($$"Snippet1$Undeclared"))
+        assert(!declarations.isFinalClass("java.lang.String"))
     }
 
     @Test

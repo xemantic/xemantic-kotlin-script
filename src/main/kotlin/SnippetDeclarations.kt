@@ -20,10 +20,13 @@ package com.xemantic.kotlin.script
 
 import io.github.oshai.kotlinlogging.KotlinLogging
 import java.lang.reflect.Member
+import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 import kotlin.reflect.KCallable
 import kotlin.reflect.KClass
 import kotlin.reflect.KFunction
+import kotlin.reflect.KMutableProperty
+import kotlin.reflect.KParameter
 import kotlin.reflect.KProperty
 import kotlin.reflect.KType
 import kotlin.reflect.KTypeParameter
@@ -34,11 +37,18 @@ import kotlin.reflect.full.declaredMemberProperties
 import kotlin.reflect.full.extensionReceiverParameter
 import kotlin.reflect.jvm.javaGetter
 import kotlin.reflect.jvm.javaMethod
+import kotlin.reflect.jvm.javaSetter
 
 private val logger = KotlinLogging.logger {}
 
+/** The suffix of the stub of a function taking the default arguments. */
+internal const val DEFAULT_STUB_SUFFIX = "\$default"
+
 /** A character the compiler replaces with `_` in the name of a module, like `.` of `snippet1.kts`. */
 private val nonIdentifierCharacter = Regex("[^\\p{L}\\p{N}_]")
+
+/** The class of a snippet qualifying the name of a type declared by it, like `Snippet1.` of `Snippet1.Box`. */
+private val snippetQualifier = Regex("(?<![\\p{L}\\p{N}_.])Snippet\\d+\\.")
 
 /**
  * The names of the declarations of the evaluated snippets which a later snippet can access,
@@ -46,8 +56,8 @@ private val nonIdentifierCharacter = Regex("[^\\p{L}\\p{N}_]")
  *
  * A `private` declaration is left out, as it cannot be accessed by a later snippet at all,
  * and so is an `internal` property or function, as a later snippet calls it by a name it is not compiled to,
- * failing at runtime, and so is a `const val` or a `@JvmField` property, failing in any declaration,
- * see [isAccessibleByLaterSnippet].
+ * failing at runtime, hinted at by [internalMember] instead, and so is a `const val` or a `@JvmField` property,
+ * failing in any declaration, see [isAccessibleByLaterSnippet].
  *
  * The classes of the snippets are kept, and their members read by kotlin-reflect only when a name is looked up,
  * which is after a compilation error, as reading them takes long.
@@ -68,9 +78,123 @@ internal class SnippetDeclarations {
 
     private val extensionFunctions = HashMap<String, MutableSet<ExtensionReceiver>>()
 
+    /** The classes of the snippets, with the names of the snippets, by the names of the classes, like `Snippet1`, in the order of the snippets. */
+    private val snippetClasses = LinkedHashMap<String, Pair<Class<*>, String>>()
+
     /** Keeps the [scriptClass] of the snippet of this [name], to be read once a name is looked up. */
     fun keep(scriptClass: Class<*>, name: String) {
         pending += scriptClass to name
+        snippetClasses[scriptClass.name] = scriptClass to name
+    }
+
+    /**
+     * The `internal` member of a snippet, or of a class declared by it, which a later snippet failed to call
+     * as the [method] of the [owner] class taking the [parameterTypes], all named like in the message of a [NoSuchMethodError],
+     * like `getSecret$main` of `Snippet1` or `open` of `Snippet1$Box`,
+     * as the K2 REPL compiler mangles the name of an `internal` member with the module, the snippet, like `getSecret$snippet1_kts`,
+     * while a later snippet calls its accessor mangled with another module, like `getSecret$main`, and a function unmangled,
+     * also by the stub of its default arguments, like `secret$default`, matched to the function by the parameter types the stub takes.
+     * `null` if the [owner] does not declare such a member, so the [method] is missing for another reason.
+     *
+     * @throws VirtualMachineError thrown by the reflection, other than [StackOverflowError].
+     */
+    fun internalMember(owner: String, method: String, parameterTypes: List<String>): InternalMember? {
+        val (scriptClass, snippet) = snippetClasses[owner.substringBefore('$')] ?: return null
+        val internalSuffix = snippet.internalSuffix()
+        val defaultStub = method.endsWith(DEFAULT_STUB_SUFFIX)
+        val called = method.removeSuffix(DEFAULT_STUB_SUFFIX)
+        val names = setOf(called, called.substringBeforeLast('$')).map { it + internalSuffix }
+        return logger.readOr(null, { "$snippet: cannot read the internal member $method of $owner" }) {
+            // not initialized, as a static initializer of the class might not have run yet, or have failed
+            val ownerClass = if (owner == scriptClass.name) scriptClass else Class.forName(owner, false, scriptClass.classLoader)
+            ownerClass.declaredMethods.firstOrNull { declared ->
+                declared.name in names && parameterTypes == if (defaultStub) declared.defaultStubParameterTypes() else declared.parameterTypeNames()
+            }?.let { jvmMethod ->
+                ownerClass.kotlin.members.firstNotNullOfOrNull { member ->
+                    when {
+                        member is KProperty<*> && member.javaGetter == jvmMethod -> member to false
+                        member is KMutableProperty<*> && member.javaSetter == jvmMethod -> member to true
+                        member is KFunction<*> && member.javaMethod == jvmMethod -> member to false
+                        else -> null
+                    }
+                }
+            }?.let { (member, setter) ->
+                val nested = owner.removePrefix(scriptClass.name)
+                val classes = nested.split('$').filter { it.isNotEmpty() }
+                InternalMember(
+                    name = (classes + member.name).joinToString("."),
+                    snippet = snippet,
+                    internalSetter = setter && (member as KProperty<*>).javaGetter?.name?.endsWith(internalSuffix) == false,
+                    declaringClass = classes.joinToString(".").ifEmpty { null },
+                    declaredAgain = isDeclaredAgain(member, setter, scriptClass, nested)
+                )
+            }
+        }
+    }
+
+    /**
+     * Whether a snippet kept after the one of the [scriptClass] declares a [member] of the same name, kind and parameters, see [parameterSignature],
+     * accessible by a later snippet, also its setter, if the [setter] is called, in the snippet class, or in its class of the same [nested] name, like `$Box`,
+     * so a later snippet calls that one, while the code compiled before keeps calling the `internal` one —
+     * not an overload, like `fun secret(x: Int)` of `internal fun secret()`, which a later snippet does not call instead.
+     */
+    private fun isDeclaredAgain(member: KCallable<*>, setter: Boolean, scriptClass: Class<*>, nested: String): Boolean {
+        val signature = member.parameterSignature()
+        return snippetClasses.values.dropWhile { it.first != scriptClass }.drop(1).any { (laterClass, laterSnippet) ->
+            logger.readOr(false, { "$laterSnippet: cannot read the members of $laterClass$nested" }) {
+                val ownerClass = if (nested.isEmpty()) laterClass else try {
+                    Class.forName(laterClass.name + nested, false, laterClass.classLoader)
+                } catch (_: ClassNotFoundException) {
+                    // the later snippet does not declare the class again
+                    return@readOr false
+                }
+                ownerClass.kotlin.members.any {
+                    it.name == member.name
+                        && (it is KProperty<*>) == (member is KProperty<*>)
+                        && it.parameterSignature() == signature
+                        && it.isAccessibleByLaterSnippet(laterSnippet)
+                        && (!setter || it is KMutableProperty<*> && it.javaSetter.isAccessibleByLaterSnippet(laterSnippet))
+                }
+            }
+        }
+    }
+
+    /**
+     * Whether the class of this [name], like `Snippet2$Box`, declared by a snippet, or the class of a snippet itself, has values of this class only,
+     * which a later snippet can create again: a final class, not an interface, nor nested in one, like `DefaultImpls`,
+     * not abstract, nor an enum, an object, or a companion object, nor a local or anonymous class.
+     * `false` if it is not a class of a snippet, or cannot be read.
+     *
+     * @throws VirtualMachineError thrown by the reflection, other than [StackOverflowError].
+     */
+    fun isFinalClass(name: String): Boolean {
+        val (scriptClass, snippet) = snippetClasses[name.substringBefore('$')] ?: return false
+        if (name == scriptClass.name) return true
+        return logger.readOr(false, { "$snippet: cannot read the class $name" }) {
+            // not initialized, as a static initializer of the class might not have run yet, or have failed
+            val type = Class.forName(name, false, scriptClass.classLoader)
+            Modifier.isFinal(type.modifiers)
+                && !Modifier.isAbstract(type.modifiers)
+                && !type.isEnum
+                && !type.isAnonymousClass
+                && !type.isLocalClass
+                && !type.isSynthetic
+                && generateSequence(type) { it.enclosingClass }.takeWhile { it != scriptClass }.none { it.isInterface }
+                && type.declaredFields.none { Modifier.isStatic(it.modifiers) && it.name == "INSTANCE" && it.type == type }
+                && !type.kotlin.isCompanion
+        }
+    }
+
+    /**
+     * The kinds and the types of the parameters of this callable, but the instance, like `[VALUE Int]` of `fun secret(x: Int)`,
+     * and whether they are optional, like `[VALUE Int = default]` of `fun secret(x: Int = 1)`, as a call without the argument fails otherwise,
+     * with the types declared by a snippet named without the class of the snippet, like `Box` of `Snippet1.Box`,
+     * so that a declaration taking a class declared again matches.
+     */
+    private fun KCallable<*>.parameterSignature(): List<String> = parameters.filter {
+        it.kind != KParameter.Kind.INSTANCE
+    }.map {
+        "${it.kind} ${it.type.toString().replace(snippetQualifier, "")}${if (it.isOptional) " = default" else ""}"
     }
 
     /** Whether a class of this simple [name] is declared by a snippet, and is not `private`. */
@@ -157,17 +281,47 @@ internal class SnippetDeclarations {
      * A property is told by its getter only: one of a field only, also a public `const val` or `@JvmField` one, is not accessible,
      * as a later snippet fails on it in any declaration, the compiler crashing on the former, and reading the latter as an instance field, which is static.
      */
-    private fun KCallable<*>.isAccessibleByLaterSnippet(snippet: String): Boolean {
-        val jvmMember: Member? = when (this) {
-            is KProperty<*> -> javaGetter
-            is KFunction<*> -> javaMethod
-            else -> null
-        }
-        val internalSuffix = "$" + snippet.replace(nonIdentifierCharacter, "_")
-        return jvmMember != null && !Modifier.isPrivate(jvmMember.modifiers) && !jvmMember.name.endsWith(internalSuffix)
+    private fun KCallable<*>.isAccessibleByLaterSnippet(snippet: String): Boolean = when (this) {
+        is KProperty<*> -> javaGetter
+        is KFunction<*> -> javaMethod
+        else -> null
+    }.isAccessibleByLaterSnippet(snippet)
+
+    private fun Member?.isAccessibleByLaterSnippet(snippet: String): Boolean =
+        this != null && !Modifier.isPrivate(modifiers) && !name.endsWith(snippet.internalSuffix())
+
+    private fun Method.parameterTypeNames(): List<String> = parameterTypes.map { it.typeName }
+
+    /**
+     * The parameter types of the stub of the default arguments of this method:
+     * the instance, unless static, the parameters, an `int` mask of the given arguments per 32 parameters, and a marker.
+     */
+    private fun Method.defaultStubParameterTypes(): List<String> = buildList {
+        if (!Modifier.isStatic(modifiers)) add(declaringClass.typeName)
+        addAll(parameterTypeNames())
+        repeat(maxOf(1, (parameterCount + Int.SIZE_BITS - 1) / Int.SIZE_BITS)) { add("int") }
+        add("java.lang.Object")
     }
 
+    /** The suffix the compiler mangles the JVM name of an `internal` member of this snippet with, like `$snippet1_kts`. */
+    private fun String.internalSuffix(): String = "$" + replace(nonIdentifierCharacter, "_")
+
 }
+
+/**
+ * An `internal` member of the [snippet], named like `secret`, or qualified by the classes declaring it within the snippet, like `Box.open`,
+ * or a property of an [internalSetter] only, like `var count = 0; internal set`.
+ *
+ * @param declaringClass the classes declaring the member within the snippet, like `Box`, `null` for a member of the snippet itself.
+ * @param declaredAgain whether a later snippet declares a member of the same name accessible by a later snippet, see [SnippetDeclarations.internalMember].
+ */
+internal data class InternalMember(
+    val name: String,
+    val snippet: String,
+    val internalSetter: Boolean = false,
+    val declaringClass: String? = null,
+    val declaredAgain: Boolean = false
+)
 
 /**
  * The receiver of an extension declared by a snippet, of the simple [name] of its class, like `String` or `Entry`,
