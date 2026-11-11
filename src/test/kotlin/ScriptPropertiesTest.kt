@@ -1110,7 +1110,8 @@ class ScriptPropertiesTest {
         fun local(a: String, b: String): Int = a.length + b.length
         @Suppress("RedundantSuspendModifier")
         suspend fun localSuspend(a: String, b: String): Int = a.length + b.length
-        // the toString of such a reference fails, as it resolves the function, so they are not paired with their types
+        // the toString of such a reference resolves the function, and throws KotlinReflectionInternalError,
+        // so they are kept out of assert(expr), which power-assert renders by toString, and not paired with their types
         val types = listOf(
             typeOf<KFunction1<String, Int>>(),
             typeOf<KSuspendFunction1<String, Int>>(),
@@ -1662,6 +1663,30 @@ class ScriptPropertiesTest {
                 have(value == 4)
             }
         }
+    }
+
+    /**
+     * A `KFunction` of no parameters which does not implement the function type, like one delegating to a reference,
+     * stays declared as `KFunction<R>`, as it would fail to be called as `KFunction0<R>`, see [ScriptProperty.type].
+     */
+    @Test
+    fun `should declare KFunction of no parameters not implementing function type as KFunction`() {
+        // given
+        class Delegating(function: KFunction<Int>) : KFunction<Int> by function
+        val properties = listOf(
+            property<KFunction<Int>>("f", Delegating(::answer)),
+            property<KFunction<Int>>("g", Delegating(::suspendAnswer))
+        )
+
+        // when
+        val declarations = properties.map { it.declaration(1) }
+
+        // then
+        val values = "com.xemantic.kotlin.script.ScriptPropertyValues"
+        assert(declarations == listOf(
+            "val f: kotlin.reflect.KFunction<kotlin.Int> = $values.get(1, \"f\") as kotlin.reflect.KFunction<kotlin.Int>",
+            "val g: kotlin.reflect.KFunction<kotlin.Int> = $values.get(1, \"g\") as kotlin.reflect.KFunction<kotlin.Int>"
+        ))
     }
 
     /** A nested function reference type is declared as `KFunction<R>`, as the value cannot tell it from a suspend one. */

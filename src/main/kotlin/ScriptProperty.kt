@@ -80,7 +80,8 @@ import kotlin.reflect.typeOf
  *   A `KFunction<Int>` type is seen as such everywhere, so the snippets can pass a reference of any function to a host taking it,
  *   though [typeOf] produces `KFunction0<Int>` alike, so the type of the property itself is seen as `KFunction0<Int>`
  *   if its value is a reference of no parameters, also a bound one, like `"foo"::uppercase`, called as `f()`,
- *   or `KSuspendFunction0<Int>` of a suspend one,
+ *   or `KSuspendFunction0<Int>` of a suspend one, as long as it implements the function type it is called as,
+ *   like a compiled reference does, but not a `KFunction` implemented by delegation,
  *   while a nested one is seen as `KFunction<Int>` —
  *   a host taking a function of no parameters should take it as `() -> Int` instead.
  *   The value of a function reference type is checked to take as many parameters, if they can be told, alike by kotlin-reflect or by the compiled reference.
@@ -94,6 +95,13 @@ public class ScriptProperty<T>(
     public val type: KType,
     public val value: T
 ) {
+
+    /**
+     * The shape of the value of a `KFunction` type, told once,
+     * as kotlin-reflect failing to resolve its function throws on each attempt, see [shape].
+     */
+    private val functionShape: FunctionShape? =
+        if (type.classifier == KFunction::class) (value as? KFunction<*>)?.shape() else null
 
     init {
         require(name.matches(identifier) && name.any { it != '_' }) {
@@ -142,7 +150,7 @@ public class ScriptProperty<T>(
             // not checked by the cast of the declaration of the property, erased to KFunction
             if (type.isFunctionReferenceType()) {
                 val parameters = type.arguments.size - 1
-                (value as KFunction<*>).shape()?.parameters?.let { actual ->
+                functionShape?.parameters?.let { actual ->
                     require(actual == parameters) {
                         "Property '$name' of type $type has a value of function ${(value as KFunction<*>).name}, which takes $actual parameter${if (actual == 1) "" else "s"}, while the type takes $parameters"
                     }
@@ -158,6 +166,23 @@ public class ScriptProperty<T>(
                 }
             }
         }
+    }
+
+    /**
+     * Whether the value of this property of a function reference type, like `KFunction1<String, Int>`, is a suspend function,
+     * `false` if it is `null`, or `null` if it cannot be told, see [shape].
+     *
+     * Of a `KFunction<R>` type, which [typeOf] produces for `KFunction0<R>` alike, it is told only of a value of no parameters
+     * implementing the function type of no parameters, as the property is then called as `f()`,
+     * and `null` otherwise, as the types of the parameters cannot be told —
+     * so a value other than `null` of such a type also means that it takes no parameters, see [toSource].
+     */
+    internal val isSuspendFunctionReference: Boolean? = when {
+        type.isFunctionReferenceType() -> if (value == null) false else functionShape?.isSuspend
+        type.classifier == KFunction::class -> functionShape
+            ?.takeIf { it.parameters == 0 && it.isImplementedBy(value) }
+            ?.isSuspend
+        else -> null
     }
 
 }
@@ -185,7 +210,7 @@ public inline fun <reified T> property(
  * which a lambda of more than 22 parameters compiled by Kotlin does not implement.
  */
 internal fun ScriptProperty<*>.declaration(session: Int): String {
-    val type = this.type.toSource(isSuspend = isSuspendFunctionReference())
+    val type = this.type.toSource(isSuspend = isSuspendFunctionReference)
     val kClass = this.type.classifier as KClass<*>
     val jvmName = if (kClass.isValue) {
         val suffix = md5base64(
@@ -211,22 +236,21 @@ internal fun ScriptProperty<*>.declaration(session: Int): String {
 }
 
 /**
- * Whether the value of this property of a function reference type, like `KFunction1<String, Int>`, is a suspend function,
- * `false` if it is `null`, or `null` if it cannot be told, see [shape].
- * Of a `KFunction<R>` type, which [typeOf] produces for `KFunction0<R>` alike, it is told only of a value of no parameters,
- * and `null` otherwise, as the types of the parameters cannot be told.
- */
-private fun ScriptProperty<*>.isSuspendFunctionReference(): Boolean? = when {
-    type.isFunctionReferenceType() -> if (value == null) false else (value as KFunction<*>).shape()?.isSuspend
-    type.classifier == KFunction::class && value != null ->
-        (value as KFunction<*>).shape()?.takeIf { it.parameters == 0 }?.isSuspend
-    else -> null
-}
-
-/**
  * The number of the parameters of a function reference, not counting a bound receiver, and whether it is a suspend function.
  */
-private class FunctionShape(val parameters: Int, val isSuspend: Boolean)
+private class FunctionShape(val parameters: Int, val isSuspend: Boolean) {
+
+    /**
+     * Whether this [function] implements the function type of this shape, like `Function0` of no parameters,
+     * or `Function1` of a suspend function of no parameters, taking the continuation, marked by `SuspendFunction`,
+     * which a compiled reference does, but not a `KFunction` implemented otherwise, like by delegation.
+     */
+    fun isImplementedBy(function: Any?): Boolean =
+        function is Function<*>
+                && function.arity() == parameters + (if (isSuspend) 1 else 0)
+                && (!isSuspend || suspendFunctionClass?.isInstance(function) == true)
+
+}
 
 /**
  * The shape of this function reference, told by kotlin-reflect,
@@ -236,23 +260,19 @@ private class FunctionShape(val parameters: Int, val isSuspend: Boolean)
  */
 private fun KFunction<*>.shape(): FunctionShape? =
     runCatching { FunctionShape(parameters.size, isSuspend) }.getOrNull()
-        ?: (this as? FunctionReference)?.let {
-            val isSuspend = it.javaClass.implements(SUSPEND_FUNCTION)
+        ?: (this as? FunctionReference)?.let { reference ->
+            val isSuspend = suspendFunctionClass?.isInstance(reference) == true
             // the arity counts the continuation of a suspend function, but not a bound receiver
-            FunctionShape(it.arity - if (isSuspend) 1 else 0, isSuspend)
+            reference.arity()?.let { FunctionShape(it - if (isSuspend) 1 else 0, isSuspend) }
         }
 
 /**
  * The marker interface which the compiled reference of a suspend function implements,
- * internal to the Kotlin standard library, so it is told by its name only.
+ * internal to the Kotlin standard library, so it is loaded by its name, or `null` if it is not there.
  */
-private const val SUSPEND_FUNCTION = "kotlin.coroutines.jvm.internal.SuspendFunction"
-
-/** Whether this class implements the interface of this [name], directly or not. */
-private fun Class<*>.implements(name: String): Boolean =
-    this.name == name
-            || interfaces.any { it.implements(name) }
-            || superclass?.implements(name) == true
+private val suspendFunctionClass: Class<*>? = runCatching {
+    Class.forName("kotlin.coroutines.jvm.internal.SuspendFunction", false, FunctionReference::class.java.classLoader)
+}.getOrNull()
 
 /** The JVM name of the getter of this property, like `getName`, or `isActive` of `isActive`. */
 private fun ScriptProperty<*>.getterName(): String =
