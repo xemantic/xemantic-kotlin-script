@@ -85,7 +85,7 @@ class RunOrTest {
     }
 
     @Test
-    fun `should throw fatal error of message`() {
+    fun `should throw fatal error of message with failure of block suppressed`() {
         // when
         val failure = runCatching {
             logger.runOr(0, { throw OutOfMemoryError("Fatal") }, Level.WARN) { error("Failure") }
@@ -93,6 +93,7 @@ class RunOrTest {
 
         // then
         assert(failure is OutOfMemoryError && failure.message == "Fatal")
+        assert(failure.suppressed.map { it.message } == listOf("Failure"))
     }
 
 }

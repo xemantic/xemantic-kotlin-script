@@ -71,12 +71,13 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   Once Kotlin brings Resolver 2.x, re-check `isUnauthorized`.
 - The arity of a compiled function reference, read when kotlin-reflect cannot resolve it, is a compiler detail — re-check it after every Kotlin upgrade,
   see `should provide property of suspend function reference of no parameters unresolved by kotlin-reflect`.
+- Dispose a disposable of the compiler through `disposeTree`, not `Disposer.dispose`, which wraps the failure of a disposable in an `AssertionError` of the compiler's logger —
+  it relies on the internals of that logger, re-check it after every Kotlin upgrade, `DisposeTreeTest` pins them.
 
 ### The K2 REPL compiler (`K2ReplCompiler`)
 
 - `K2ReplCompiler.createCompilationState` must get a host configuration with `repl { firReplHistoryProvider(...); isReplSnippetSource { _, _ -> true } }` —
   passing the plain `defaultJvmScriptingHostConfiguration` crashes the first snippet with an NPE in `Fir2IrReplSnippetConfiguratorExtensionImpl`.
-- `Disposer.dispose` never throws the failure of a disposable itself, but an `AssertionError` of the compiler's logger caused by it, so `isFatal` misses a fatal one — dispose through `disposeTree`.
 - Its own history provider keeps the snippets which failed to compile, so the next snippet resolves their declarations, and fails at runtime — see `ReplHistory`.
 - `compile` drops the warnings of a successful snippet (`asSuccess()` without reports), they are read from the message collector instead.
 - `compile` may throw instead of returning a failure, e.g. on a backend crash, also an `Error`, like a `StackOverflowError` of the parser on deeply nested parentheses.

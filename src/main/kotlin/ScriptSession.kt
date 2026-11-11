@@ -819,9 +819,8 @@ internal class DefaultScriptSession(
         val created = try {
             Repl(disposable).also { propertiesFailure = declareProperties(it) }
         } catch (e: Throwable) {
-            // a fatal failure of the disposal is thrown over a non-fatal one of the creation, which is suppressed then, see releaseAll
-            releaseAll({ throw e }, { disposeTree(disposable) })
-            throw e // not reached, as the first release throws
+            // a fatal failure of the disposal is thrown over a non-fatal one of the creation, which is suppressed then
+            throw mostSevere(e, runCatching { disposeTree(disposable) }.exceptionOrNull())
         }
         if (propertiesFailure != null) {
             // the disposer disposes the whole subtree, and then rethrows an exception thrown by any of its disposables,
@@ -937,18 +936,27 @@ internal val Throwable.isFatal: Boolean
  * then throws the first fatal failure, see [isFatal], or else the first failure, if any, with the other ones suppressed.
  */
 internal fun releaseAll(vararg releases: () -> Unit) {
-    val failures = releases.mapNotNull { release -> runCatching(release).exceptionOrNull() }.distinct()
-    val thrown = failures.firstOrNull { it.isFatal } ?: failures.firstOrNull() ?: return
+    val failures = releases.mapNotNull { release -> runCatching(release).exceptionOrNull() }
+    if (failures.isNotEmpty()) throw mostSevere(failures.first(), *failures.drop(1).toTypedArray())
+}
+
+/** The first fatal one of these failures, see [isFatal], or else the [first] one, with the other ones suppressed. */
+private fun mostSevere(first: Throwable, vararg others: Throwable?): Throwable {
+    val failures = (listOf(first) + others.filterNotNull()).distinct()
+    val thrown = failures.firstOrNull { it.isFatal } ?: first
     failures.filter { it !== thrown }.forEach(thrown::addSuppressed)
-    throw thrown
+    return thrown
 }
 
 /**
  * Disposes the [disposable] with its subtree, see [Disposer.dispose],
- * throwing a fatal error of any of its disposables itself, see [isFatal],
- * as the disposer passes a failure to the logger of the compiler, which throws an [AssertionError] of it, see `ObjectTree.handleExceptions`.
+ * throwing a fatal error of a disposable itself, see [isFatal],
+ * as the disposer passes each failure to the logger of the compiler, which throws an [AssertionError] of it, see `ObjectTree.handleExceptions`.
+ *
+ * It covers only the first failure, of the disposables disposed in the reverse order of their registration,
+ * as the logger throws on it, so a fatal error of a disposable disposed after another failing one is lost, see `DisposeTreeTest`.
  */
-private fun disposeTree(disposable: Disposable) {
+internal fun disposeTree(disposable: Disposable) {
     try {
         Disposer.dispose(disposable)
     } catch (e: AssertionError) {
@@ -977,7 +985,7 @@ internal inline fun <T> KLogger.runOr(
         message = try {
             describe()
         } catch (failure: Throwable) {
-            if (failure.isFatal) throw failure
+            if (failure.isFatal) throw failure.apply { if (this !== e) addSuppressed(e) }
             "Log message invocation failed: $failure"
         }
         cause = e
