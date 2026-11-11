@@ -107,6 +107,7 @@ internal class ScriptErrorReporter(
             prefix = "",
             indent = "",
             reported = Collections.newSetFromMap(IdentityHashMap()),
+            report = inlinedFrames.report(),
             uninitialized = uninitialized
         )
         warnings(warnings)?.let {
@@ -133,7 +134,7 @@ internal class ScriptErrorReporter(
         val exception = diagnostic.exception
         if (exception != null && diagnostic.severity >= ScriptDiagnostic.Severity.ERROR) {
             append("The compiler failed internally: ")
-            appendThrowable(exception, "", "  ", Collections.newSetFromMap(IdentityHashMap()))
+            appendThrowable(exception, "", "  ", Collections.newSetFromMap(IdentityHashMap()), inlinedFrames.report())
         } else {
             append(diagnostic.message.indentContinuationLines("  "))
             append('\n')
@@ -217,6 +218,7 @@ internal class ScriptErrorReporter(
     /**
      * @param prefix the lead of the first line, with its indent, like `  Caused by: `, as the caller might continue a line.
      * @param indent the indent of the following lines, the frames, the suppressed exceptions and the causes.
+     * @param report the frames of the inlined code resolved for the whole report, see [InlinedFrames.Report].
      * @param uninitialized the properties left uninitialized by the snippet throwing the [throwable], hinted at after it.
      */
     private fun StringBuilder.appendThrowable(
@@ -224,6 +226,7 @@ internal class ScriptErrorReporter(
         prefix: String,
         indent: String,
         reported: MutableSet<Throwable>,
+        report: InlinedFrames.Report,
         uninitialized: List<UninitializedProperty> = emptyList()
     ): Boolean {
         append(prefix)
@@ -256,12 +259,12 @@ internal class ScriptErrorReporter(
             }
         }
         appendUninitializedHint(uninitialized, indent)
-        appendFrames(stackTrace, indent)
+        appendFrames(stackTrace, indent, report)
         for (suppressed in throwable.read(emptyArray()) { suppressed }) {
-            if (!appendThrowable(suppressed, "$indent  Suppressed: ", "$indent  ", reported)) return false
+            if (!appendThrowable(suppressed, "$indent  Suppressed: ", "$indent  ", reported, report)) return false
         }
         return throwable.read(null) { cause }?.let {
-            appendThrowable(it, "${indent}Caused by: ", indent, reported)
+            appendThrowable(it, "${indent}Caused by: ", indent, reported, report)
         } ?: true
     }
 
@@ -436,10 +439,11 @@ internal class ScriptErrorReporter(
      */
     private fun StringBuilder.appendFrames(
         stackTrace: List<StackTraceElement>,
-        indent: String
+        indent: String,
+        report: InlinedFrames.Report
     ) {
         val frames = stackTrace.flatMap { element ->
-            inlinedFrames.resolve(element) ?: listOf(element)
+            report.resolve(element) ?: listOf(element)
         }.withIndex().mapNotNull { (index, element) ->
             val lines = snippets[element.fileName]
             val line = element.lineNumber.takeIf { lines != null && it in 1..lines.size }

@@ -118,6 +118,9 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 - The state machine of a suspend function splits an inlined body into several ranges of its marker, may start its only line before the first of them,
   and puts lines of the method itself within them — a probe with a suspend inline function inlined just once misses all of it,
   see `should resolve intermediate frames of nested suspend inline functions inlined twice`.
+- The copies of an inline function called on the same line of a snippet share their synthetic lines, also a copy nested in the lambda of another one, like `call { call { … } }` —
+  so a line number does not tell which copy it is of, only the markers the line is positioned in do,
+  see `should resolve frames of error in the body of lambda passed to inline function within lambda on the same line`.
 
 ## Anti-patterns to avoid
 
