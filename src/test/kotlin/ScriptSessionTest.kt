@@ -1941,6 +1941,136 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should call function of earlier snippet of the name of const property once its type is declared as hinted`() = runTest {
+        // given
+        session.execute("const val LIMIT = 1")
+        session.execute("fun LIMIT() = 2")
+        val failure = session.execute("""
+            fun next() = LIMIT() + 1
+            next()
+        """.trimIndent())
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines().last() == "  hint: 'LIMIT' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = LIMIT(...).toString()` - declare the type, like `fun f(): String = LIMIT(...).toString()`.")
+        }
+
+        // when
+        val result = session.execute("""
+            fun next(): Int = LIMIT() + 1
+            next()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 3)
+        }
+    }
+
+    @Test
+    fun `should call function of earlier snippet of the name of JvmField property once its type is declared as hinted`() = runTest {
+        // given
+        session.execute("@JvmField val limit = 1")
+        session.execute("fun limit() = 2")
+        val failure = session.execute("""
+            fun next() = limit() + 1
+            next()
+        """.trimIndent())
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines().last() == "  hint: 'limit' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = limit(...).toString()` - declare the type, like `fun f(): String = limit(...).toString()`.")
+        }
+
+        // when
+        val result = session.execute("""
+            fun next(): Int = limit() + 1
+            next()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 3)
+        }
+    }
+
+    @Test
+    fun `should call internal function of earlier snippet overloaded by later function of other type parameter bound once declared public as hinted`() = runTest {
+        // given
+        session.execute("internal fun <T : Number> kind(x: T) = 1")
+        session.execute("fun <R : CharSequence> kind(x: R) = 2")
+        val failure = session.execute("kind(1)")
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines()[1].startsWith("  hint: 'kind' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and "))
+        }
+        session.execute("fun <T : Number> kind(x: T) = 1")
+
+        // when
+        val result = session.execute("kind(1) + kind(\"a\")")
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 3)
+        }
+    }
+
+    @Test
+    fun `should hint at extensions of earlier snippets of other type parameter bounds`() = runTest {
+        // given
+        session.execute("fun <T : Number> T.dimension() = 1")
+        session.execute("fun <R : CharSequence> R.dimension() = 2")
+        val failure = session.execute("""
+            fun Int.next() = dimension() + 1
+            5.next()
+        """.trimIndent())
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines().last().startsWith("  hint: 'dimension' is an extension of Number or CharSequence declared in an earlier snippet"))
+        }
+
+        // when
+        val result = session.execute("""
+            fun Int.next(): Int = dimension() + 1
+            5.next()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should call function of earlier snippet declared again public with default argument once its type is declared as hinted`() = runTest {
+        // given
+        session.execute("internal fun greet(name: String) = name")
+        session.execute("fun greet(name: String = \"x\") = name")
+        val failure = session.execute("""
+            fun hello() = greet("a")
+            hello()
+        """.trimIndent())
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines().last() == "  hint: 'greet' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = greet(...).toString()` - declare the type, like `fun f(): String = greet(...).toString()`.")
+        }
+
+        // when
+        val result = session.execute("""
+            fun hello(): String = greet("a")
+            hello()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "a")
+        }
+    }
+
+    @Test
     fun `should read internal const property of earlier snippet once declared again public without const as hinted`() = runTest {
         // given
         session.execute("internal const val LIMIT = 1")

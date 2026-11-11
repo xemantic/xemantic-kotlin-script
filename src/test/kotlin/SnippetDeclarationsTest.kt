@@ -93,6 +93,9 @@ class SnippetDeclarationsTest {
                         fun overloadedLater() = 1
                         fun privateFunctionLater() = 1
                         fun <T> genericLater(x: T) = x
+                        internal fun <T : Number> boundedLater(x: T) = 1
+                        fun <T : Number> T.boundedExtensionLater() = 1
+                        internal fun defaultLater(n: String) = n
                         val String.internalExtensionLater get() = 1
                         val String.overloadedExtensionLater get() = 1
                         fun String.internalExtensionFunctionLater() = 1
@@ -110,6 +113,9 @@ class SnippetDeclarationsTest {
                         internal fun overloadedLater(x: Int) = x
                         private fun privateFunctionLater() = 2
                         internal fun <R> genericLater(x: R) = x
+                        fun <R : CharSequence> boundedLater(x: R) = 2
+                        fun <R : CharSequence> R.boundedExtensionLater() = 2
+                        fun defaultLater(n: String = "x") = n
                         internal val String.internalExtensionLater get() = 2
                         internal val Int.overloadedExtensionLater get() = 2
                         internal fun String.internalExtensionFunctionLater() = 2
@@ -254,6 +260,38 @@ class SnippetDeclarationsTest {
 
         // then
         assert(!declarations.isFunction("overloadedLater"))
+        assert(!declarations.isFunction("boundedLater"))
+    }
+
+    @Test
+    fun `should keep overloads of other type parameter bounds`() {
+        // given
+        val declarations = SnippetDeclarations()
+
+        // when
+        redeclaringSnippetClasses.forEachIndexed { index, snippetClass ->
+            declarations.keep(snippetClass, "snippet${index + 1}.kts")
+        }
+
+        // then
+        assert(declarations.extensionFunctionReceivers("boundedExtensionLater") == setOf(
+            ExtensionReceiver("Number", nullable = false),
+            ExtensionReceiver("CharSequence", nullable = false)
+        ))
+    }
+
+    @Test
+    fun `should replace function by later one of the same parameters also with default argument`() {
+        // given
+        val declarations = SnippetDeclarations()
+
+        // when
+        redeclaringSnippetClasses.forEachIndexed { index, snippetClass ->
+            declarations.keep(snippetClass, "snippet${index + 1}.kts")
+        }
+
+        // then
+        assert(declarations.isFunction("defaultLater"))
     }
 
     @Test

@@ -91,7 +91,7 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   while a declaration of a snippet which failed to compile stays unresolved even with the type declared, so it gets no hint,
   an `internal` property or function of an earlier snippet is called by a name it is not compiled to, failing with a `NoSuchMethodError` even with the type declared, so it gets a hint at declaring it public instead,
   a `const val` of an earlier snippet, unresolved in a declaration of an inferred type, crashes the backend wherever else a later snippet reads it (`InterpreterMethodNotFoundError`), also at the top level,
-  and a `@JvmField` property is accessed as an instance field, while it is static, failing with an `IncompatibleClassChangeError` (its HotSpot message names the class, `Snippet1.limit`, which the report strips) —
+  and a `@JvmField` property is accessed as an instance field, while it is static, failing with an `IncompatibleClassChangeError` —
   so both get a hint at declaring it again without `const` / `@JvmField`, while a `const val` of an `object` of an earlier snippet crashes as well (`Unknown function: X(O)`), without a hint,
   a value class property or function of an earlier snippet is called by a mangled name, which is not declared (the provided properties work around it with `@get:JvmName`),
   an `inline` declaration cannot be called across snippets,
