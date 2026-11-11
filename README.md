@@ -105,11 +105,24 @@ ScriptSession {
   and if it has a continuation interceptor which is not a dispatcher, the interceptor takes it over there,
   like one posting it to its own thread.
   Such a caller needs a free worker of `Dispatchers.Default` to resume,
-  so a snippet blocking all of them keeps it waiting.
+  so a snippet blocking all of them, like `repeat(n) { launch { latch.await() } }`, keeps it waiting,
+  and it should not block its thread for long,
+  while the next snippets do not wait for it, as the turn of the caller ends with its snippet,
+  so the snippet freeing the workers can still run.
   Only a dispatcher running its tasks on the dispatching thread, like `Executor(Runnable::run).asCoroutineDispatcher()`,
   resumes its caller on the thread of the session.
+  A dispatcher failing to tell whether it dispatches, or to dispatch, on the thread of the session, is retried from `Dispatchers.Default`,
+  and one failing there as well, like one always throwing, or the one of an executor shut down,
+  is bypassed: the caller resumes without it, on `Dispatchers.Default`, failing with its exception,
+  so it never stays suspended forever.
   Separate sessions run in parallel, each with its own state,
   and each holding its own compiler, which loads the whole classpath, so close the sessions no longer needed.
+* A caller waiting for the snippet of another caller, if it would resume in place,
+  is resumed on the thread of the session, when the snippet of the other caller ends, and submits its snippet from there,
+  so it does not need a free worker of `Dispatchers.Default` before its snippet, which might be the one freeing them.
+  If the session is closed meanwhile, such a caller is rejected, with an `IllegalStateException`, from `Dispatchers.Default`,
+  not nested in the rejection of the caller it waited for, also when it started on the thread of that caller,
+  while a caller of `Dispatchers.Main.immediate` is rejected on its own thread, where its dispatcher resumes it.
 * The snippets are received by the `ScriptScope`, a `CoroutineScope` living as long as the session,
   with `kotlinx.coroutines.*` imported by default:
   * `await { ... }` runs suspending code, like the requests of a ktor client,
