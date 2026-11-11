@@ -19,6 +19,7 @@
 
 package com.xemantic.kotlin.script
 
+import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.runBlocking
 import org.eclipse.aether.repository.RemoteRepository
 import java.io.File
@@ -54,10 +55,12 @@ import kotlin.script.experimental.jvm.updateClasspath
  * as the compiler keeps them on its classpath even if the snippet declaring them fails to compile,
  * so the next snippets can call them, while the evaluator would load them only for an evaluated snippet.
  *
+ * @param name the name of the session, logged with a superseded repository declaration, see [withLatestVersion].
  * @property versionLookup the lookup of the latest version of a dependency, exposed only for the tests.
  */
 internal class SnippetDependencyResolver(
     parent: ClassLoader,
+    private val name: String,
     val versionLookup: MavenVersionLookup = MavenVersionLookup()
 ) : AutoCloseable {
 
@@ -85,16 +88,38 @@ internal class SnippetDependencyResolver(
     private val declarations = mutableListOf<Declaration>()
 
     /**
-     * The resolver of the dependencies in their versions, given the [declarations] so far,
-     * or `null`, once they change, to be created again, as it cannot drop a declaration itself, see [mavenResolver].
+     * The resolver of the dependencies in their versions, given the [declarations] so far, each new one added to it,
+     * or `null`, once one is dropped, to be created again, as it cannot drop a declaration itself, see [mavenResolver].
      */
     private var currentMavenResolver: MavenDependenciesResolver? = null
 
-    /** The resolver of the dependencies in their versions, given the [declarations], which were all valid once added, so it accepts each again. */
+    /**
+     * The resolver of the dependencies in their versions, given the [declarations],
+     * which were all accepted once added, so it accepts each again:
+     * `MavenDependenciesResolver` reads only the syntax of the URL, and the environment variables of the options, which cannot change in the JVM,
+     * so a `file:` repository is accepted also once its directory is deleted, like it is before the directory is created.
+     */
     private fun mavenResolver(): MavenDependenciesResolver = currentMavenResolver ?: MavenDependenciesResolver().apply {
-        declarations.forEach { addRepository(it.coordinates, it.options, it.location) }
+        declarations.forEach { add(it.coordinates, it.options, it.location) }
     }.also {
         currentMavenResolver = it
+    }
+
+    /**
+     * Adds the repository accepted once already to this resolver, see [mavenResolver].
+     *
+     * @throws IllegalStateException if a later version of `MavenDependenciesResolver` rejects it,
+     *   instead of resolving silently without it, while it stays among the [declarations].
+     */
+    private fun MavenDependenciesResolver.add(
+        coordinates: RepositoryCoordinates,
+        options: ExternalDependenciesResolver.Options,
+        location: SourceCode.LocationWithId?
+    ) {
+        val result = addRepository(coordinates, options, location)
+        check(result.valueOrNull() == true) {
+            "The repository '${coordinates.string}' accepted once is no longer accepted: ${result.reports.joinToString { it.message }}"
+        }
     }
 
     /** The resolver of the annotations of a snippet, adding a repository it declares to the [declarations]. */
@@ -120,7 +145,9 @@ internal class SnippetDependencyResolver(
         /**
          * Validates the repository by adding it to a new `MavenDependenciesResolver`, which reports an invalid one,
          * like an unset environment variable of its credentials,
-         * and adds it to the [declarations], if it is accepted, which `remoteRepository` declares alike.
+         * and adds it to the [declarations], if it is accepted, which `remoteRepository` declares alike,
+         * and to the [currentMavenResolver], if any, instead of creating it again from all the [declarations],
+         * which would be quadratic in their number.
          */
         override fun addRepository(
             repositoryCoordinates: RepositoryCoordinates,
@@ -133,7 +160,7 @@ internal class SnippetDependencyResolver(
                 remoteRepository(repositoryCoordinates, options)?.let { repository ->
                     if (declarations.none { it.repository == repository }) {
                         declarations += Declaration(repositoryCoordinates, options, sourceCodeLocation, repository)
-                        currentMavenResolver = null
+                        currentMavenResolver?.add(repositoryCoordinates, options, sourceCodeLocation)
                     }
                 }
             }
@@ -147,30 +174,46 @@ internal class SnippetDependencyResolver(
     /** The resolution of the snippet compiled last, as the compiler refines its configuration more than once. */
     private var last: Resolution? = null
 
+    /**
+     * @property reports the reports of the resolution, returned to the compiler.
+     * @property dependencies the dependencies of the snippet.
+     */
     private class Resolution(
         val snippet: String,
         val files: List<File>,
         val reports: List<ScriptDiagnostic>,
-        val warnings: List<ScriptDiagnostic>,
-        val supersessions: List<ScriptDiagnostic>,
-        val errors: List<ScriptDiagnostic>,
-        val resolvedVersions: Map<String, String>
+        val dependencies: SnippetDependencies
     )
 
     /**
-     * The dependencies of a snippet: the [warnings] reporting the [resolvedVersions]
-     * of the dependencies declared without version, and the [supersessions], and the [errors], if any.
+     * The dependencies of a snippet: the warnings reporting the [resolvedVersions]
+     * of the dependencies declared without version, and the repository declarations superseded, see [versionOf],
+     * and the [errors], if any.
      *
-     * @property supersessions the warnings of the repository declarations superseded by the snippet, see [versionOf],
-     *   also among the [warnings], to be reported even if the snippet succeeds,
-     *   unlike the warnings of the resolved versions, which the [resolvedVersions] report then.
+     * @param diagnostics the warnings and the errors, in the order of the lines of the snippet.
+     * @param versionWarnings the warnings among the [diagnostics] reporting the [resolvedVersions].
      */
     class SnippetDependencies(
-        val warnings: List<ScriptDiagnostic> = emptyList(),
-        val errors: List<ScriptDiagnostic> = emptyList(),
+        val diagnostics: List<ScriptDiagnostic> = emptyList(),
         val resolvedVersions: Map<String, String> = emptyMap(),
-        val supersessions: List<ScriptDiagnostic> = emptyList()
-    )
+        private val versionWarnings: Set<ScriptDiagnostic> = emptySet()
+    ) {
+
+        /** The errors among the [diagnostics], which fail the snippet, returned to the compiler. */
+        internal val errors: List<ScriptDiagnostic> = diagnostics.filter { it.severity >= ScriptDiagnostic.Severity.ERROR }
+
+        /** Whether resolving a dependency failed, reported by the [diagnostics] then. */
+        val failed: Boolean get() = errors.isNotEmpty()
+
+        /**
+         * The warnings, in the order of the lines of the snippet,
+         * of a snippet which [succeeded] without the ones of the [resolvedVersions], which report them then.
+         */
+        fun warnings(succeeded: Boolean): List<ScriptDiagnostic> = diagnostics.filter {
+            it.severity == ScriptDiagnostic.Severity.WARNING && !(succeeded && it in versionWarnings)
+        }
+
+    }
 
     /** Adds the dependencies declared by the snippet of the [context] to its compilation classpath. */
     fun refine(
@@ -182,7 +225,8 @@ internal class SnippetDependencyResolver(
         val resolution = last?.takeIf { it.snippet == snippet } ?: resolve(snippet, annotations, context.script.text.lines()).also {
             last = it
         }
-        if (resolution.errors.isNotEmpty()) return ResultWithDiagnostics.Failure(resolution.errors)
+        val errors = resolution.dependencies.errors
+        if (errors.isNotEmpty()) return ResultWithDiagnostics.Failure(errors)
         return context.compilationConfiguration.with {
             updateClasspath(resolution.files)
         }.asSuccess(resolution.reports)
@@ -194,9 +238,7 @@ internal class SnippetDependencyResolver(
      * On an error, the compiler continues compiling the snippet without the refined configuration,
      * also without the default imports, so the diagnostics of the failed compilation follow from it.
      */
-    fun takeDependencies(): SnippetDependencies = (last?.let {
-        SnippetDependencies(it.supersessions + it.warnings, it.errors, it.resolvedVersions, it.supersessions)
-    } ?: SnippetDependencies()).also {
+    fun takeDependencies(): SnippetDependencies = (last?.dependencies ?: SnippetDependencies()).also {
         last = null
     }
 
@@ -207,9 +249,9 @@ internal class SnippetDependencyResolver(
     ): Resolution {
         val files = mutableListOf<File>()
         val reports = mutableListOf<ScriptDiagnostic>()
-        val warnings = mutableListOf<ScriptDiagnostic>()
-        val supersessions = mutableListOf<ScriptDiagnostic>()
-        val errors = mutableListOf<ScriptDiagnostic>()
+        // in the order of the annotations, which is the one of their lines
+        val diagnostics = mutableListOf<ScriptDiagnostic>()
+        val versionWarnings = mutableSetOf<ScriptDiagnostic>()
         val resolvedVersions = LinkedHashMap<String, String>()
         // each coordinate resolved on its own, to report which one failed
         annotations.flatMap { (annotation, location) ->
@@ -220,33 +262,36 @@ internal class SnippetDependencyResolver(
                 else -> listOf(ScriptSourceAnnotation(annotation, location))
             }
         }.forEach { declared ->
-            val annotation = declared.withLatestVersion(lines, warnings, supersessions, errors, resolvedVersions) ?: return@forEach
+            val annotation = declared.withLatestVersion(lines, diagnostics, versionWarnings, resolvedVersions) ?: return@forEach
             // called on the thread of the session, while compiling, which is never interrupted
             when (val result = runBlocking { resolver.resolveFromScriptSourceAnnotations(listOf(annotation)) }) {
                 is ResultWithDiagnostics.Success -> {
                     files += result.value
                     reports += result.reports
                 }
-                is ResultWithDiagnostics.Failure -> errors += annotation.failure(result.reports, lines)
+                is ResultWithDiagnostics.Failure -> diagnostics += annotation.failure(result.reports, lines)
             }
         }
         // also the dependencies of a snippet failing to compile, which the compiler keeps on its classpath
         classLoader.add(files)
-        return Resolution(snippet, files, reports, warnings, supersessions, errors, resolvedVersions)
+        return Resolution(snippet, files, reports, SnippetDependencies(diagnostics, resolvedVersions, versionWarnings))
     }
 
     /**
      * This annotation, with the dependency it declares without version, like `org.jsoup:jsoup`,
-     * declared in its latest version instead, reported as a warning, as an LLM might not know its API,
-     * and added to the [resolvedVersions],
-     * or `null`, with the error added to the [errors], if it has no version.
-     * A repository declaration superseded by the lookup of its version is reported as a warning added to the [supersessions].
+     * declared in its latest version instead, reported as a warning added to the [diagnostics] and the [versionWarnings],
+     * as an LLM might not know its API, and added to the [resolvedVersions],
+     * or `null`, with the error added to the [diagnostics], if it has no version.
+     *
+     * A repository declaration superseded by the lookup of its version is reported as a warning added to the [diagnostics] before,
+     * naming the line declaring it, as the warning points to this annotation, while the declaration might be in an earlier snippet.
+     * It is also logged, as it is not reported again, while the result of the snippet might be lost,
+     * to a fatal error thrown by the snippet, or to the cancellation of the caller.
      */
     private fun ScriptSourceAnnotation<*>.withLatestVersion(
         lines: List<String>,
-        warnings: MutableList<ScriptDiagnostic>,
-        supersessions: MutableList<ScriptDiagnostic>,
-        errors: MutableList<ScriptDiagnostic>,
+        diagnostics: MutableList<ScriptDiagnostic>,
+        versionWarnings: MutableSet<ScriptDiagnostic>,
         resolvedVersions: MutableMap<String, String>
     ): ScriptSourceAnnotation<*>? {
         val dependsOn = annotation as? DependsOn ?: return this
@@ -255,21 +300,20 @@ internal class SnippetDependencyResolver(
         val latest = try {
             versionOf(coordinates) { superseded ->
                 // the lookup of a version is kept for the session, and the resolution of a snippet for its refinements, so it is reported once
-                supersessions += diagnostic(
-                    message = "Superseded the declaration of the repository '${superseded.coordinates.string}' " +
-                        "with the credentials refused (401) by its other declaration, so they are no longer sent — " +
-                        "declare it again to restore it",
-                    lines = lines,
-                    severity = ScriptDiagnostic.Severity.WARNING
-                )
+                val message = "Superseded the declaration of the repository '${superseded.coordinates.string}'" +
+                    superseded.location.named(" at ", ",") +
+                    " with the credentials refused (401), by its other declaration, so they are no longer sent — " +
+                    "declare it again to restore it"
+                diagnostics += diagnostic(message, lines, ScriptDiagnostic.Severity.WARNING)
+                logger.info { "$name: ${location.named(suffix = ": ")}$message" }
             }
         } catch (e: Exception) {
             val cause = (e.message ?: e.javaClass.name).withRepositoryUrls()
-            errors += diagnostic("Unresolved dependency '$coordinates': $cause", lines)
+            diagnostics += diagnostic("Unresolved dependency '$coordinates': $cause", lines)
             return null
         }
         resolvedVersions[coordinates] = latest.version
-        warnings += diagnostic(
+        diagnostics += diagnostic(
             message = if (latest.stable) {
                 "Resolved '$coordinates' to its latest stable version '${latest.version}'"
             } else {
@@ -277,7 +321,7 @@ internal class SnippetDependencyResolver(
             },
             lines = lines,
             severity = ScriptDiagnostic.Severity.WARNING
-        )
+        ).also { versionWarnings += it }
         return ScriptSourceAnnotation(DependsOn("$coordinates:${latest.version}", options = dependsOn.options), location)
     }
 
@@ -344,6 +388,14 @@ internal class SnippetDependencyResolver(
         return diagnostic("$subject: $cause", lines)
     }
 
+    /** This location named like a frame, `snippet1.kts:2`, between the [prefix] and the [suffix], or empty, if it is `null`. */
+    private fun SourceCode.LocationWithId?.named(
+        prefix: String = "",
+        suffix: String = ""
+    ): String = this?.let { location ->
+        "$prefix${location.codeLocationId.substringAfterLast('/')}:${location.locationInText.start.line}$suffix"
+    } ?: ""
+
     /** The diagnostic of this annotation, spanning its whole line. */
     private fun ScriptSourceAnnotation<*>.diagnostic(
         message: String,
@@ -383,6 +435,8 @@ internal class SnippetDependencyResolver(
     }
 
 }
+
+private val logger = KotlinLogging.logger {}
 
 /**
  * This message of Maven with each repository, like `repo_id (https://repo/)`, shortened to its URL,

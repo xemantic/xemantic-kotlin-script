@@ -19,6 +19,7 @@
 package com.xemantic.kotlin.script
 
 import com.xemantic.kotlin.script.test.MavenRepository
+import com.xemantic.kotlin.script.test.LogCollector
 import com.xemantic.kotlin.script.test.MavenRepositoryServer
 import com.xemantic.kotlin.script.test.collectGarbageUntilCleared
 import com.xemantic.kotlin.test.assert
@@ -391,7 +392,7 @@ class MavenDependenciesTest {
                 be<ScriptResult.Value>()
                 have(value == 42)
                 warnings sameAs """
-                    snippet2.kts:2:1: warning: Superseded the declaration of the repository '${server.url}' with the credentials refused (401) by its other declaration, so they are no longer sent — declare it again to restore it
+                    snippet2.kts:2:1: warning: Superseded the declaration of the repository '${server.url}' at snippet1.kts:1, with the credentials refused (401), by its other declaration, so they are no longer sent — declare it again to restore it
                       | <error>@file:DependsOn("com.xemantic.fixture:greeting-card")</error>
                 """.trimIndent()
             }
@@ -420,7 +421,7 @@ class MavenDependenciesTest {
                 be<ScriptResult.Error>()
                 have(phase == ExecutionPhase.COMPILATION)
                 message sameAs """
-                    snippet2.kts:2:1: warning: Superseded the declaration of the repository '${server.url}' with the credentials refused (401) by its other declaration, so they are no longer sent — declare it again to restore it
+                    snippet2.kts:2:1: warning: Superseded the declaration of the repository '${server.url}' at snippet1.kts:1, with the credentials refused (401), by its other declaration, so they are no longer sent — declare it again to restore it
                       | <error>@file:DependsOn("com.xemantic.fixture:preview")</error>
 
                     snippet2.kts:2:1: warning: Resolved 'com.xemantic.fixture:preview' to its latest pre-release version '0.1-beta', as it has no stable one
@@ -433,6 +434,88 @@ class MavenDependenciesTest {
         }
     }
 
+    /** See #237. */
+    @Test
+    fun `should report warnings and errors of dependencies of snippet failing to compile in the order of its lines`() = runTest {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // given
+            // greeter looked up before the wrong credentials are declared, so its version is kept without superseding them
+            session.execute("""
+                @file:Repository("${server.url}", options = ["username=alice", "password=secret"])
+                @file:DependsOn("com.xemantic.fixture:greeter")
+                42
+            """.trimIndent())
+            session.execute("""@file:Repository("${server.url}", options = ["username=alice", "password=wrong"])""")
+
+            // when
+            val result = session.execute("""
+                @file:DependsOn("com.xemantic.fixture:greeter")
+                @file:DependsOn("com.xemantic.fixture:missing")
+                @file:DependsOn("com.xemantic.fixture:preview")
+                undefinedVariable
+            """.trimIndent())
+
+            // then
+            result should {
+                be<ScriptResult.Error>()
+                have(phase == ExecutionPhase.COMPILATION)
+                message sameAs """
+                    snippet3.kts:1:1: warning: Resolved 'com.xemantic.fixture:greeter' to its latest stable version '1.10'
+                      | <error>@file:DependsOn("com.xemantic.fixture:greeter")</error>
+
+                    snippet3.kts:2:1: error: Unresolved dependency 'com.xemantic.fixture:missing': Could not find any version of it in ${server.url}
+                      | <error>@file:DependsOn("com.xemantic.fixture:missing")</error>
+
+                    snippet3.kts:3:1: warning: Superseded the declaration of the repository '${server.url}' at snippet2.kts:1, with the credentials refused (401), by its other declaration, so they are no longer sent — declare it again to restore it
+                      | <error>@file:DependsOn("com.xemantic.fixture:preview")</error>
+
+                    snippet3.kts:3:1: warning: Resolved 'com.xemantic.fixture:preview' to its latest pre-release version '0.1-beta', as it has no stable one
+                      | <error>@file:DependsOn("com.xemantic.fixture:preview")</error>
+                """.trimIndent()
+            }
+        }
+    }
+
+    /** See #237. */
+    @Test
+    fun `should log superseded declaration of repository in snippet throwing fatal error`() = runTest {
+        MavenRepositoryServer(username = "alice", password = "secret").use { server ->
+            // given
+            session.execute("""
+                @file:Repository("${server.url}", options = ["username=alice", "password=wrong"])
+                @file:DependsOn("com.xemantic.fixture:greeter")
+                42
+            """.trimIndent())
+
+            // when
+            val (failure, messages) = LogCollector("com.xemantic.kotlin.script").use { logs ->
+                // a regression lets the OutOfMemoryError escape, which would abort the Gradle test executor
+                runCatching {
+                    session.execute("""
+                        @file:Repository("${server.url}", options = ["username=alice", "password=secret"])
+                        @file:DependsOn("com.xemantic.fixture:greeting-card")
+                        throw OutOfMemoryError("fake")
+                    """.trimIndent())
+                }.exceptionOrNull() to logs.events.map { it.formattedMessage }
+            }
+
+            // then
+            assert(failure is OutOfMemoryError)
+            assert(
+                messages.any {
+                    it.endsWith(
+                        ": snippet2.kts:2: Superseded the declaration of the repository '${server.url}' at snippet1.kts:1, " +
+                            "with the credentials refused (401), by its other declaration, so they are no longer sent — declare it again to restore it"
+                    )
+                }
+            )
+        }
+    }
+
+    /**
+     * The superseded declaration is dropped, so the lookup of a later dependency cannot supersede it again,
+     * while a regression keeping it would warn again, see #237.
+     */
     @Test
     fun `should not warn again about superseded declaration of repository in later snippets`() = runTest {
         MavenRepositoryServer(username = "alice", password = "secret").use { server ->

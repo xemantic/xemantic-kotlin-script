@@ -25,6 +25,7 @@ import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
 import kotlin.script.experimental.api.ResultValue
 import kotlin.script.experimental.api.ScriptDiagnostic
+import kotlin.script.experimental.api.SourceCode
 import kotlin.test.Test
 
 class ScriptErrorReporterTest {
@@ -58,6 +59,75 @@ class ScriptErrorReporterTest {
         result should {
             be<ScriptResult.Error>()
             have(phase == ExecutionPhase.EVALUATION)
+        }
+    }
+
+    /** A warning of the first line of `snippet1.kts`, like the one of a dependency, or of the compiler. */
+    private fun warning(message: String) = ScriptDiagnostic(
+        code = ScriptDiagnostic.unspecifiedError,
+        message = message,
+        severity = ScriptDiagnostic.Severity.WARNING,
+        sourcePath = "snippet1.kts",
+        location = SourceCode.Location(SourceCode.Position(1, 1), SourceCode.Position(1, 6))
+    )
+
+    /** See #237. */
+    @Test
+    fun `should report warnings of dependencies and compiler after evaluation reports of snippet without result`() {
+        // when
+        val result = reporter.scriptResult(
+            result = null,
+            evaluationReports = listOf(
+                ScriptDiagnostic(ScriptDiagnostic.unspecifiedError, "The evaluator failed")
+            ),
+            compilationReports = listOf(warning("Compiler warning")),
+            dependencies = SnippetDependencyResolver.SnippetDependencies(
+                diagnostics = listOf(warning("Superseded the declaration"))
+            )
+        )
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                error: The evaluator failed
+
+                snippet1.kts:1:1: warning: Superseded the declaration
+                  | <error>throw</error> IllegalStateException("a\nb")
+
+                snippet1.kts:1:1: warning: Compiler warning
+                  | <error>throw</error> IllegalStateException("a\nb")
+            """.trimIndent()
+        }
+    }
+
+    /** See #237. */
+    @Test
+    fun `should report warnings of dependencies and compiler of snippet not evaluated without evaluation reports`() {
+        // when
+        val result = reporter.scriptResult(
+            result = ResultValue.NotEvaluated,
+            evaluationReports = emptyList(),
+            compilationReports = listOf(warning("Compiler warning")),
+            dependencies = SnippetDependencyResolver.SnippetDependencies(
+                diagnostics = listOf(warning("Superseded the declaration"))
+            )
+        )
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            message sameAs """
+                error: Failed without any diagnostic message.
+
+                snippet1.kts:1:1: warning: Superseded the declaration
+                  | <error>throw</error> IllegalStateException("a\nb")
+
+                snippet1.kts:1:1: warning: Compiler warning
+                  | <error>throw</error> IllegalStateException("a\nb")
+            """.trimIndent()
         }
     }
 

@@ -552,8 +552,10 @@ internal class ScriptErrorReporter(
  * The [ScriptResult] of a snippet from the [result] of its evaluation,
  * which is `null` if the evaluation failed without one, reported by the [evaluationReports] then,
  * like [ResultValue.NotEvaluated], which is a failure as well,
- * with the warnings of the [compilationReports], and the [dependencies] of the snippet,
+ * with the warnings of the [dependencies] of the snippet, and of the [compilationReports], on every path,
  * hinting at the properties the snippet left [uninitialized].
+ * The warnings of a fatal error, which is thrown, are lost, but the supersession of a repository declaration,
+ * logged by the [SnippetDependencyResolver].
  *
  * @throws VirtualMachineError thrown by the snippet, other than [StackOverflowError].
  */
@@ -564,21 +566,33 @@ internal fun ScriptErrorReporter.scriptResult(
     dependencies: SnippetDependencyResolver.SnippetDependencies,
     uninitialized: List<UninitializedProperty> = emptyList()
 ): ScriptResult = when (result) {
-    is ResultValue.Value -> ScriptResult.Value(result.value, warnings(dependencies.supersessions + compilationReports), dependencies.resolvedVersions)
-    is ResultValue.Unit -> ScriptResult.Value(Unit, warnings(dependencies.supersessions + compilationReports), dependencies.resolvedVersions)
+    is ResultValue.Value -> ScriptResult.Value(
+        result.value, warnings(dependencies.warnings(succeeded = true) + compilationReports), dependencies.resolvedVersions
+    )
+    is ResultValue.Unit -> ScriptResult.Value(
+        Unit, warnings(dependencies.warnings(succeeded = true) + compilationReports), dependencies.resolvedVersions
+    )
     is ResultValue.Error -> {
         val error = result.error
         if (error.isFatal) throw error
         ScriptResult.Error(
-            describe(error, dependencies.warnings + compilationReports, uninitialized),
+            describe(error, dependencies.warnings(succeeded = false) + compilationReports, uninitialized),
             ExecutionPhase.EVALUATION
         )
     }
     is ResultValue.NotEvaluated, null -> ScriptResult.Error(
-        describe(evaluationReports.ifEmpty { dependencies.warnings + compilationReports }),
+        describe(
+            evaluationReports.withFailure() + dependencies.warnings(succeeded = false) + compilationReports
+        ),
         ExecutionPhase.EVALUATION
     )
 }
+
+/** These reports of a failed evaluation, preceded by an error, if none of them is one, so the warnings following them do not read as the failure. */
+private fun List<ScriptDiagnostic>.withFailure(): List<ScriptDiagnostic> =
+    if (any { it.severity >= ScriptDiagnostic.Severity.ERROR }) this else listOf(
+        ScriptDiagnostic(ScriptDiagnostic.unspecifiedError, "Failed without any diagnostic message.")
+    ) + this
 
 /**
  * This message with its lines after the first indented by the [indent], so that they read as a continuation of the first,
