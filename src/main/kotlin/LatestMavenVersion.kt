@@ -131,7 +131,7 @@ internal fun newRepositorySystem(): RepositorySystem = @Suppress("DEPRECATION") 
  * It is not thread-safe: it is confined to the thread of the session, which compiles the snippets, and closes it after the last one.
  */
 internal class MavenVersionLookup(
-    private val repositorySystemFactory: () -> RepositorySystem = ::newRepositorySystem,
+    repositorySystemFactory: () -> RepositorySystem = ::newRepositorySystem,
     settingsFactory: () -> Settings = ::createMavenSettings
 ) : AutoCloseable {
 
@@ -140,6 +140,8 @@ internal class MavenVersionLookup(
     /** The repository system, created by the first lookup, so a lookup never used creates none to shut down. */
     private val repositorySystem = lazy(LazyThreadSafetyMode.NONE, repositorySystemFactory)
 
+    /** Volatile, so a lookup sees the lookup closed also if it is closed on another thread than the one of the session. */
+    @Volatile
     private var closed = false
 
     /** The active proxy of the Maven settings, if any. */

@@ -104,8 +104,9 @@ dependencies {
     testImplementation(libs.ktor.server.cio)
     testImplementation(libs.ktor.server.auto.head.response)
     testImplementation(libs.ktor.client.cio)
-    // only the tests bind an SLF4J backend, a library leaves this choice to the application
-    testRuntimeOnly(libs.logback.classic)
+    // only the tests bind an SLF4J backend, a library leaves this choice to the application,
+    // and collect the logged events with it, see LogCollector
+    testImplementation(libs.logback.classic)
 }
 
 // the versions of Maven Resolver and Maven must be the ones brought by kotlin-scripting-dependencies-maven,
