@@ -26,6 +26,7 @@ import kotlin.reflect.KCallable
 import kotlin.reflect.KClass
 import kotlin.reflect.KFunction
 import kotlin.reflect.KMutableProperty
+import kotlin.reflect.KParameter
 import kotlin.reflect.KProperty
 import kotlin.reflect.KType
 import kotlin.reflect.KTypeParameter
@@ -45,6 +46,9 @@ private const val DEFAULT_STUB_SUFFIX = "\$default"
 
 /** A character the compiler replaces with `_` in the name of a module, like `.` of `snippet1.kts`. */
 private val nonIdentifierCharacter = Regex("[^\\p{L}\\p{N}_]")
+
+/** The class of a snippet qualifying the name of a type declared by it, like `Snippet1.` of `Snippet1.Box`. */
+private val snippetQualifier = Regex("(?<![\\p{L}\\p{N}_.])Snippet\\d+\\.")
 
 /**
  * The names of the declarations of the evaluated snippets which a later snippet can access,
@@ -130,19 +134,36 @@ internal class SnippetDeclarations {
     }
 
     /**
-     * Whether a snippet kept after the one of the [scriptClass] declares a [member] of the same name and kind, accessible by a later snippet,
-     * in the snippet class, or in its class of the same [nested] name, like `$Box`,
-     * so a later snippet calls that one, while the code compiled before keeps calling the `internal` one.
+     * Whether a snippet kept after the one of the [scriptClass] declares a [member] of the same name, kind and parameters, see [parameterSignature],
+     * accessible by a later snippet, in the snippet class, or in its class of the same [nested] name, like `$Box`,
+     * so a later snippet calls that one, while the code compiled before keeps calling the `internal` one —
+     * not an overload, like `fun secret(x: Int)` of `internal fun secret()`, which a later snippet does not call instead.
      */
-    private fun isDeclaredAgain(member: KCallable<*>, scriptClass: Class<*>, nested: String): Boolean =
-        snippetClasses.values.dropWhile { it.first != scriptClass }.drop(1).any { (laterClass, laterSnippet) ->
+    private fun isDeclaredAgain(member: KCallable<*>, scriptClass: Class<*>, nested: String): Boolean {
+        val signature = member.parameterSignature()
+        return snippetClasses.values.dropWhile { it.first != scriptClass }.drop(1).any { (laterClass, laterSnippet) ->
             logger.readOr(false, { "$laterSnippet: cannot read the members of $laterClass$nested" }) {
                 val ownerClass = if (nested.isEmpty()) laterClass else Class.forName(laterClass.name + nested, false, laterClass.classLoader)
                 ownerClass.kotlin.members.any {
-                    it.name == member.name && (it is KProperty<*>) == (member is KProperty<*>) && it.isAccessibleByLaterSnippet(laterSnippet)
+                    it.name == member.name
+                        && (it is KProperty<*>) == (member is KProperty<*>)
+                        && it.parameterSignature() == signature
+                        && it.isAccessibleByLaterSnippet(laterSnippet)
                 }
             }
         }
+    }
+
+    /**
+     * The kinds and the types of the parameters of this callable, but the instance, like `[VALUE Int]` of `fun secret(x: Int)`,
+     * with the types declared by a snippet named without the class of the snippet, like `Box` of `Snippet1.Box`,
+     * so that a declaration taking a class declared again matches.
+     */
+    private fun KCallable<*>.parameterSignature(): List<String> = parameters.filter {
+        it.kind != KParameter.Kind.INSTANCE
+    }.map {
+        "${it.kind} ${it.type.toString().replace(snippetQualifier, "")}"
+    }
 
     /** Whether a class of this simple [name] is declared by a snippet, and is not `private`. */
     fun isClass(name: String): Boolean = name in read().classes
