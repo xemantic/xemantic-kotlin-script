@@ -193,7 +193,9 @@ internal class ScriptErrorReporter(
      * A declaration of a snippet which failed to compile is not kept, so not hinted at, as it stays unresolved also then,
      * nor an inaccessible one, see [SnippetDeclarations].
      * A reference [called] is hinted at as a function first, and only then as a property, like one of a function type,
+     * unless an inaccessible function of the name is declared, which the compiler calls instead,
      * and one not called as a property only, also a `const val` or a `@JvmField` one, see [appendPropertyHint],
+     * or as a function, if no property of the name is declared, as it might be called with type arguments, like `echo<Int>(1)`,
      * both if it is not known whether it is called.
      */
     private fun StringBuilder.appendUnresolvedEarlierDeclarationHint(name: String, receiverType: String?, called: Boolean?) {
@@ -212,11 +214,13 @@ internal class ScriptErrorReporter(
             return
         }
         if (called != true && appendPropertyHint(name)) return
-        if (called != false && snippetDeclarations.isFunction(name)) {
+        // not followed by a `(` or a `{`, it is still called with type arguments, like `echo<Int>(1)`, if no property of the name is declared
+        if ((called != false || snippetDeclarations.property(name) == null) && snippetDeclarations.isFunction(name)) {
             appendDeclareTypeHint(name, "fun f() = $name(...).toString()", "fun f(): String = $name(...).toString()")
             return
         }
-        if (called == true && appendPropertyHint(name)) return
+        // a call of an inaccessible function of the name, which the compiler calls rather than a property of a function type, fails also then
+        if (called == true && !snippetDeclarations.isAnyFunction(name) && appendPropertyHint(name)) return
         val propertyReceivers = snippetDeclarations.extensionPropertyReceivers(name)
         val (receivers, reference) = if (propertyReceivers.isNotEmpty()) {
             propertyReceivers to name
@@ -361,7 +365,7 @@ internal class ScriptErrorReporter(
 
     /**
      * The hint at the `@JvmField` property of an earlier snippet, which the [error] thrown at the [stackTrace] accessed as an instance field, while it is static,
-     * to declare it again public, without the annotation, unless declared again public by a later snippet already, see [SnippetDeclarations.isJvmFieldProperty],
+     * to declare it again public, without the annotation, or the modifier a later snippet declares it again with, `internal` or `const`, unless declared again public by a later snippet already, see [SnippetDeclarations.isJvmFieldProperty],
      * and to declare again the code accessing it, see [appendDeclareCallersAgainAdvice], unless hinted at already, see [stackTraceToHint].
      */
     private fun StringBuilder.appendJvmFieldPropertyHint(
@@ -382,6 +386,7 @@ internal class ScriptErrorReporter(
         when (snippetDeclarations.property(name)?.kind) {
             SnippetProperty.Kind.ACCESSIBLE -> append("it is declared again by a later snippet, so ")
             SnippetProperty.Kind.INTERNAL -> append("it is declared again internal by a later snippet, so declare it again public, without the internal modifier, and ")
+            SnippetProperty.Kind.CONST -> append("it is declared again const by a later snippet, so declare it again public, without the const modifier, and ")
             else -> append("declare it again public, without the @JvmField annotation, and ")
         }
         appendDeclareCallersAgainAdvice(accessing, ownerClass = null, verb = "accessing", kept = "@JvmField")

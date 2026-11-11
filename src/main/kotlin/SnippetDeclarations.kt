@@ -245,6 +245,9 @@ internal class SnippetDeclarations {
      */
     fun isFunction(name: String): Boolean = read().functions[name]?.values?.all { it.accessible } == true
 
+    /** Whether a function of this [name] declared by a snippet, not an extension, also an inaccessible one, but not a `private` one, is declared. */
+    fun isAnyFunction(name: String): Boolean = read().functions[name] != null
+
     /** The receivers of the extension properties of this [name] declared by the snippets accessible by a later snippet, in the order of the declarations. */
     fun extensionPropertyReceivers(name: String): Set<ExtensionReceiver> = read().extensionProperties.receivers(name)
 

@@ -1921,6 +1921,55 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should call generic function of earlier snippet with type arguments once its type is declared as hinted`() = runTest {
+        // given
+        session.execute("fun <T> echo(x: T) = x")
+        val failure = session.execute("""
+            fun next() = echo<Int>(1) + 1
+            next()
+        """.trimIndent())
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines().last() == "  hint: 'echo' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = echo(...).toString()` - declare the type, like `fun f(): String = echo(...).toString()`.")
+        }
+
+        // when
+        val result = session.execute("""
+            fun next(): Int = echo<Int>(1) + 1
+            next()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should not hint at property of function type of earlier snippet called when function of the name is internal`() = runTest {
+        // given
+        session.execute("internal fun limit() = 2")
+        session.execute("val limit: () -> Int = { 1 }")
+
+        // when
+        val result = session.execute("""
+            fun next() = limit() + 1
+            next()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet3.kts:1:14: error: Unresolved reference 'limit'.
+                  | fun next() = <error>limit</error>() + 1
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should hint at const property rather than function of the same name of earlier snippet`() = runTest {
         // given
         session.execute("const val LIMIT = 1")
@@ -2171,6 +2220,33 @@ class ScriptSessionTest {
         failure should {
             be<ScriptResult.Error>()
             have("declare it again public, without the internal modifier" in message)
+        }
+        session.execute("""
+            val limit = 2
+            fun next(): Int = limit + 1
+        """.trimIndent())
+
+        // when
+        val result = session.execute("next()")
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 3)
+        }
+    }
+
+    @Test
+    fun `should access JvmField property of earlier snippet declared again const once declared again public with the code accessing it as hinted`() = runTest {
+        // given
+        session.execute("@JvmField val limit = 1")
+        session.execute("fun next(): Int = limit + 1")
+        session.execute("const val limit = 2")
+        val failure = session.execute("next()")
+        failure should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.EVALUATION)
+            have(message.lines()[1] == "  hint: 'limit' is declared @JvmField in snippet1.kts, which a later snippet cannot access, as the K2 REPL compiler accesses it as an instance field, while it is static - it is declared again const by a later snippet, so declare it again public, without the const modifier, and declare again the code accessing it, directly or not, like 'next' of snippet2.kts, and create again the values depending on it, like the ones holding a lambda accessing it, as they keep accessing the @JvmField one.")
         }
         session.execute("""
             val limit = 2
