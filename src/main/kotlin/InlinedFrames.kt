@@ -152,8 +152,11 @@ internal class InlinedFrames(
         val inlined = range.mapDestToSource(frame.lineNumber)
         // the lines of the snippet itself are mapped to themselves
         if (inlined.file == frame.fileName && inlined.line == frame.lineNumber) return null
+        // the line the compiler may give to the initialization of an inline marker variable, which cannot throw
+        if (inlined.path == FAKE_PATH) return null
+        // the code of a line out of the scope of every marker, like the prologue of an inline function called by the method itself
         val calls = inlinedCalls(frame.methodName, frame.lineNumber)
-            ?: InlinedCalls(listOf(UNKNOWN_INLINE_FUNCTION to frame.lineNumber), methodLine = null)
+            ?: InlinedCalls(listOf((prologueOf(frame.lineNumber) ?: UNKNOWN_INLINE_FUNCTION) to frame.lineNumber), methodLine = null)
         if (calls === OUT_OF_SCOPES) return null
         val inlinedFrames = calls.functions.mapNotNull { (function, line) -> smap.frameOf(function, line) }
         val debugCallSite = range.callSite?.line
@@ -208,12 +211,21 @@ internal class InlinedFrames(
         if (className in unreadableClasses) return null
         val snippetClass = logger.readOr(null, { "cannot read the class $className of a frame" }) {
             classLoader?.getResourceAsStream(className.replace('.', '/') + ".class")?.use { it.readBytes() }?.let { bytes ->
-                SnippetClass(bytes).also { classes[className] = it }
+                SnippetClass(bytes, ::declarationsOf).also { classes[className] = it }
             }
         }
         if (snippetClass == null) unreadableClasses += className
         return snippetClass
     }
+
+    /**
+     * The declarations of the class of this [position] of inlined code, see [Declarations],
+     * `null` if it is not a class of a snippet, like of the standard library, or it cannot be read.
+     *
+     * @throws VirtualMachineError thrown by reading the class, other than [StackOverflowError].
+     */
+    private fun declarationsOf(position: SourcePosition): Declarations? =
+        if (position.file in snippets) snippetClass(position.path.replace('/', '.'))?.declarations else null
 
 }
 
@@ -348,7 +360,8 @@ private class InlinedMethod(
      * the lines of each copy of an inline function are its own, while a lambda on the line of its call shares it, nested in the function.
      * The prologue is positioned directly in the scopes enclosing the function, unlike an earlier copy of the same function,
      * like of a function inlined twice, of a duplicated `finally` block, or a range of an inlined body split by a suspension point.
-     * The prologue of a function declaring its default arguments on a line its body does not use is not told apart.
+     * The prologue of a function declaring its default arguments on a line its body does not use, or whose body is dead code, without a marker,
+     * is not told apart by the positions, but by the lines the functions declare, see [SnippetClass.isLineOf].
      */
     private val prologues: BitSet by lazy(LazyThreadSafetyMode.NONE) {
         val entriesByLine = lineNumbers.indices.groupBy { lineNumbers[it] }
@@ -420,10 +433,19 @@ private const val THROWS_OUT_OF_SCOPES: Byte = 3
  * and they take only the arrays of the line numbers of these methods, and their markers, of the classes of the frames reported.
  * The methods of a class without an SMAP, which has no inlined code, are not read.
  */
-private class SnippetClass(bytes: ByteArray) {
+private class SnippetClass(
+    bytes: ByteArray,
+    private val declarationsOf: (SourcePosition) -> Declarations?
+) {
 
     /** The SMAP of the class, with the call sites of the `KotlinDebug` stratum, `null` if the class has none. */
     val smap: SMAP?
+
+    /** The declarations of the class, read only once a frame of inlined code is positioned in it, see [Declarations]. */
+    val declarations: Declarations by lazy(LazyThreadSafetyMode.NONE) {
+        val node = ClassNode().also { ClassReader(bytes).accept(it, ClassReader.SKIP_FRAMES) }
+        Declarations(node.methods, ::isMethodLine)
+    }
 
     /** The methods with inlined bodies by their names, several of overloads. */
     private val methods: Map<String, List<InlinedMethod>>
@@ -455,12 +477,36 @@ private class SnippetClass(bytes: ByteArray) {
 
     /**
      * The calls of the lambda and of the inline functions enclosing the [line] of the snippet in the [method], of each copy of the lambda,
-     * see [lambdaCalls], in the only method of its name with an instruction at the [line] which may throw, see [InlinedMethod.throwsByItsCode],
+     * see [lambdaCalls], in the only method of its name with an instruction at the [line] which may throw, see [InlinedMethod.lineThrows],
+     * also only by an allocation out of the scopes of the line, as its frame would tell the same line,
      * while no overload without inlined bodies has the [line].
      */
     fun lambdaCalls(method: String, line: Int): List<List<Pair<String, Int>>>? {
         if (linesWithoutMarkers[method]?.contains(line) == true) return null
-        return methods[method].orEmpty().filter { it.throwsAt(line) }.singleOrNull()?.lambdaCalls(line)
+        return methods[method].orEmpty().filter { it.mayThrowAt(line) }.singleOrNull()?.lambdaCalls(line)
+    }
+
+    /**
+     * The inline function whose default arguments are evaluated at this destination [line] of the class, see [Declarations.prologueOf],
+     * `null` if none, or if it is not known.
+     */
+    fun prologueOf(line: Int): String? = smap?.sourceOf(line)?.let { position ->
+        declarationsOf(position)?.prologueOf(position.line)
+    }
+
+    /**
+     * Whether the code at this destination [line] of the class may be the code of the [scope], as far as the [Declarations] of its class tell:
+     * an inline function must declare the line, and a lambda must not be at a line of the prologue of an inline function, see [Declarations.prologueOf] —
+     * the evaluation of a default argument is inlined with a line of the function declaring it, before its marker,
+     * so also before its body is in the scopes of the line.
+     */
+    private fun isLineOf(scope: InlineMarker, line: Int): Boolean {
+        val position = smap?.sourceOf(line) ?: return true
+        val declarations = declarationsOf(position) ?: return true
+        val prologue = declarations.prologueOf(position.line)
+        if (scope.isLambda) return prologue == null
+        val function = scope.name.inlineFunctionName()
+        return (prologue == null || prologue == function) && declarations.declares(function, position.line) != false
     }
 
     /**
@@ -470,9 +516,9 @@ private class SnippetClass(bytes: ByteArray) {
     fun inlinedCalls(method: String, line: Int): InlinedCalls? =
         methods[method]?.firstNotNullOfOrNull { it.inlinedCalls(line) }
 
-    /** Whether an instruction of this method at the [line] may throw, see [InlinedMethod.throwsByItsCode]. */
-    private fun InlinedMethod.throwsAt(line: Int): Boolean =
-        lineNumbers.indices.any { lineNumbers[it] == line && throwsByItsCode(it) }
+    /** Whether an instruction of this method at the [line] may throw, see [InlinedMethod.lineThrows]. */
+    private fun InlinedMethod.mayThrowAt(line: Int): Boolean =
+        lineNumbers.indices.any { lineNumbers[it] == line && lineThrows[it] != THROWS_NOWHERE }
 
     /**
      * The calls of the lambda and of the inline functions enclosing the [line] of the snippet in this method, innermost first, of each copy of the lambda:
@@ -487,6 +533,8 @@ private class SnippetClass(bytes: ByteArray) {
      *
      * The lambda of an `@InlineOnly` function of the standard library, like `run`, has a marker, unlike the function,
      * so it is a part of the scope enclosing it, see [withoutInlineOnlyLambdas].
+     * The scope enclosing the lambda may be another lambda, calling it in its body, like a lambda of an inline function passing its own lambda argument
+     * to another inline function, as in `inner { block() }`.
      *
      * @return `null` if the [line] is not within such a lambda, or it is not known which of its scopes throws.
      */
@@ -496,7 +544,7 @@ private class SnippetClass(bytes: ByteArray) {
         val copies = entries.map { lineScopes[it].withoutInlineOnlyLambdas() }.distinct()
         val scopes = copies.first()
         if (copies.any { copy -> copy.map { it.name } != scopes.map { it.name } }) return null
-        if (scopes.size < 2 || !scopes[0].isLambda || scopes[1].isLambda || scopes.last().isLambda) return null
+        if (scopes.size < 2 || !scopes[0].isLambda || scopes.last().isLambda) return null
         return copies.map { copy -> callChain(line, copy).takeIf { it.size == copy.size } ?: return null }
     }
 
@@ -541,6 +589,12 @@ private class SnippetClass(bytes: ByteArray) {
      * A lambda argument is a scope as well, called by the inline function receiving it, and calling the nested one in its body,
      * while an `@InlineOnly` function of the standard library, like `require`, has no marker, its body inlined with the lines of its call site.
      *
+     * The innermost scope must be able to have the [line], see [isLineOf], otherwise it is not the scope of its code:
+     * the line of a prologue of a nested inline function, evaluating its default arguments before its marker, see [Declarations.prologueOf],
+     * gives the frame of that function, followed by the frame of the scope at its own line in effect before,
+     * unless the function is in the scopes already, so that it is not known which copy of it the line is of,
+     * while the line of any other code not told apart gives only the frame of an unknown inline function.
+     *
      * @return `null` if the [line] is not in scope of any marker, or [OUT_OF_SCOPES] if it may throw only out of their scopes.
      */
     private fun InlinedMethod.inlinedCalls(line: Int): InlinedCalls? {
@@ -548,7 +602,17 @@ private class SnippetClass(bytes: ByteArray) {
         // the code of a prologue is the code of the function it is inlined before, like its body on the same line
         val candidates = entries.filter { lineThrows[it] != THROWS_OUT_OF_SCOPES && !isPrologue(it) }.mapNotNull { entry ->
             lineScopes[entry].takeIf { it.isNotEmpty() }?.let { scopes ->
-                InlinedCalls(callChain(line, scopes), lineBefore(scopes.last().start, scope = null))
+                val methodLine = lineBefore(scopes.last().start, scope = null)
+                val innermost = scopes.first()
+                if (isLineOf(innermost, line)) return@let InlinedCalls(callChain(line, scopes), methodLine)
+                val prologue = prologueOf(line)?.takeIf { function ->
+                    scopes.none { !it.isLambda && it.name.inlineFunctionName() == function }
+                }
+                if (prologue != null) {
+                    InlinedCalls(listOf(prologue to line) + callChain(lineBefore(lineStarts[entry], innermost), scopes), methodLine)
+                } else {
+                    InlinedCalls(listOf(UNKNOWN_INLINE_FUNCTION to line), methodLine = null)
+                }
             }
         }
         val first = candidates.firstOrNull()
@@ -564,9 +628,12 @@ private class SnippetClass(bytes: ByteArray) {
             smap?.sourceOf(line)?.let { Triple(function, it.path, it.line) } ?: (function to line)
         } + methodLine
 
-    /** The calls of the inline functions and lambdas of these [scopes], innermost first, at the [line] of the innermost one. */
-    private fun InlinedMethod.callChain(line: Int, scopes: List<InlineMarker>): List<Pair<String, Int>> = buildList {
-        add(scopes.first().name.inlineFunctionName() to line)
+    /**
+     * The calls of the inline functions and lambdas of these [scopes], innermost first, at the [line] of the innermost one,
+     * which gives it no frame if `null`.
+     */
+    private fun InlinedMethod.callChain(line: Int?, scopes: List<InlineMarker>): List<Pair<String, Int>> = buildList {
+        line?.let { add(scopes.first().name.inlineFunctionName() to it) }
         scopes.zipWithNext { nested, scope ->
             callLine(nested, scope)?.let { add(scope.name.inlineFunctionName() to it) }
         }
@@ -612,6 +679,7 @@ private class SnippetClass(bytes: ByteArray) {
      * see `should resolve intermediate frames of nested suspend inline functions inlined twice`.
      * The state machine gives its own code within an inlined body, like returning when suspended, a line of the method,
      * which is not a line of an inline function.
+     * Neither is a line of a prologue of a nested inline function a line of the [scope], see [isLineOf].
      */
     private fun InlinedMethod.lineBefore(index: Int, scope: InlineMarker?): Int? {
         val from = scope?.start ?: 0
@@ -623,6 +691,7 @@ private class SnippetClass(bytes: ByteArray) {
                 && markers.none { it !== scope && it.start >= from && position in it }
                 && smap?.sourceOf(lineNumbers[i])?.path != FAKE_PATH
                 && (scope == null || scope.isLambda || !isMethodLine(lineNumbers[i]))
+                && (scope == null || isLineOf(scope, lineNumbers[i]))
         }?.let { lineNumbers[it] }
     }
 
@@ -631,6 +700,58 @@ private class SnippetClass(bytes: ByteArray) {
         smap?.sourceOf(line)?.let { it.line == line && it.path == snippetPath } ?: true
 
 }
+
+/**
+ * The lines the inline functions of a class declare, telling whether inlined code at a line may be the code of a scope, see [SnippetClass.isLineOf]:
+ * the lines of each method of an inline function which are its own, see [isOwnLine], not of the code inlined into it,
+ * by the name of the function, of its method and of its `$default` method alike.
+ * The method of an inline function is told by its own marker, like `$i$f$boom` of `boom`,
+ * while the lines of the other methods, like of the constructor starting at the line of the class, are not of inlined code.
+ *
+ * The prologue of an inline function, evaluating its default arguments, is inlined before its marker, so in the scope calling it,
+ * with the lines its `$default` method gives the code before its own marker, see [prologueOf].
+ *
+ * @param methods the methods of the class.
+ * @param isOwnLine whether a line of a method of the class is its own, mapped to itself by the SMAP of the class.
+ */
+private class Declarations(methods: List<MethodNode>, isOwnLine: (Int) -> Boolean) {
+
+    /** The inline functions declaring each line. */
+    private val functionsByLine = HashMap<Int, MutableSet<String>>()
+
+    /** The lines of the prologue of each inline function with default arguments. */
+    private val prologueLines = HashMap<String, MutableSet<Int>>()
+
+    init {
+        methods.forEach { method ->
+            val function = method.name.removeSuffix(DEFAULT_SUFFIX)
+            val marker = method.localVariables.orEmpty().firstOrNull { it.name == INLINE_FUNCTION_MARKER + function } ?: return@forEach
+            val lineNodes = method.instructions.filterIsInstance<LineNumberNode>().filter { isOwnLine(it.line) }
+            lineNodes.forEach { functionsByLine.getOrPut(it.line) { HashSet() } += function }
+            if (!method.name.endsWith(DEFAULT_SUFFIX)) return@forEach
+            val markerStart = method.instructions.indexOf(marker.start)
+            lineNodes.filter { method.instructions.indexOf(it.start) < markerStart }
+                .forEach { prologueLines.getOrPut(function) { HashSet() } += it.line }
+        }
+    }
+
+    /** The inline functions declared. */
+    private val functions: Set<String> = functionsByLine.values.flatten().toSet()
+
+    /** Whether the inline [function] declares the [line], `null` if the [function] is not declared, like of a name not told by its marker. */
+    fun declares(function: String, line: Int): Boolean? =
+        if (function in functions) function in functionsByLine[line].orEmpty() else null
+
+    /**
+     * The inline function whose prologue, evaluating its default arguments, has the [line], `null` if none,
+     * or if another function declares the [line] as well, so that it is not known which code the line is of.
+     */
+    fun prologueOf(line: Int): String? = functionsByLine[line]?.singleOrNull()?.takeIf { line in prologueLines[it].orEmpty() }
+
+}
+
+/** The suffix of the name of the method evaluating the default arguments of a function, then calling it, or inlining it if it is inline. */
+private const val DEFAULT_SUFFIX = "\$default"
 
 /** The [InlinedMethod] of this method, `null` if it has no inline markers. */
 private fun MethodNode.inlinedMethod(): InlinedMethod? {
@@ -674,7 +795,9 @@ private fun MethodNode.inlinedMethod(): InlinedMethod? {
  * like `call(Checked::class.java) { error("boom") }`, would put the line in two scopes, losing the frames of the lambda.
  */
 private fun AbstractInsnNode.mayThrow(): Boolean = when (this) {
-    is MethodInsnNode, is InvokeDynamicInsnNode, is FieldInsnNode, is MultiANewArrayInsnNode -> true
+    is MethodInsnNode, is InvokeDynamicInsnNode, is MultiANewArrayInsnNode -> true
+    // the class literal of a primitive type, like Int::class.java, the field of a class of the platform loaded already
+    is FieldInsnNode -> !(opcode == Opcodes.GETSTATIC && name == "TYPE" && owner in PRIMITIVE_WRAPPERS)
     is TypeInsnNode -> opcode != Opcodes.INSTANCEOF && opcode != Opcodes.NEW
     is IntInsnNode -> opcode == Opcodes.NEWARRAY
     is InsnNode -> opcode in THROWING_OPCODES
@@ -700,6 +823,12 @@ private fun AbstractInsnNode.constructorCall(): MethodInsnNode? {
     } as MethodInsnNode?
 }
 
+/** The classes of the platform holding the classes of the primitive types in their `TYPE` fields. */
+private val PRIMITIVE_WRAPPERS = setOf(
+    "java/lang/Boolean", "java/lang/Byte", "java/lang/Character", "java/lang/Short",
+    "java/lang/Integer", "java/lang/Long", "java/lang/Float", "java/lang/Double", "java/lang/Void"
+)
+
 /** The opcodes of an [InsnNode] which may throw, other than of an array access. */
 private val THROWING_OPCODES = setOf(
     Opcodes.ATHROW, Opcodes.IDIV, Opcodes.LDIV, Opcodes.IREM, Opcodes.LREM,
@@ -709,9 +838,12 @@ private val THROWING_OPCODES = setOf(
 /** The position in the source of this destination [line], `null` if the SMAP does not map it. */
 private fun SMAP.sourceOf(line: Int): SourcePosition? = findRange(line)?.mapDestToSource(line)
 
-/** The frame of the [function] at the position in the source of this destination [line], `null` if the SMAP does not map it. */
+/**
+ * The frame of the [function] at the position in the source of this destination [line],
+ * `null` if the SMAP does not map it, or maps it to the `fake.kt` file, which is never the code of a frame.
+ */
 private fun SMAP.frameOf(function: String, line: Int): StackTraceElement? =
-    sourceOf(line)?.let { StackTraceElement(it.path.replace('/', '.'), function, it.file, it.line) }
+    sourceOf(line)?.takeIf { it.path != FAKE_PATH }?.let { StackTraceElement(it.path.replace('/', '.'), function, it.file, it.line) }
 
 /** Reads the `SourceDebugExtension` of a class, its [debug], to tell whether its methods are worth reading. */
 private class SourceDebugVisitor : ClassVisitor(Opcodes.ASM9) {
