@@ -1933,97 +1933,142 @@ class ScriptSessionTest {
     }
 
     @Test
-    fun `should hint at extension function of earlier snippet called on implicit receiver rather than at property of the name`() = runTest {
+    fun `should hint declaring the type when property of earlier snippet is unresolved after a word on its line`() = runTest {
         // given
-        session.execute("""
-            fun Int.limit() = this * 2
-            val limit = 2
-        """.trimIndent())
+        session.execute("val limit = 3")
 
         // when
-        val result = session.execute("""
-            fun Int.g() = limit()
-            1.g()
-        """.trimIndent())
+        val results = listOf(
+            "fun a() = \"a\" to limit\na()",
+            "fun b() = (0 until limit).toList()\nb()",
+            "fun c() = listOf(1).map { return@map limit }\nc()"
+        ).map { session.execute(it) }
 
         // then
-        result should {
-            be<ScriptResult.Error>()
-            have(phase == ExecutionPhase.COMPILATION)
-            message sameAs """
-                snippet2.kts:1:15: error: Unresolved reference 'limit'.
-                  | fun Int.g() = <error>limit</error>()
-                  hint: 'limit' is an extension of Int declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, even on an implicit receiver of this type, like `fun Int.f() = limit(...).toString()` - declare the type, like `fun Int.f(): String = limit(...).toString()`, and the compiler tells if there is no such receiver.
-            """.trimIndent()
-        }
+        assert(results.all {
+            it is ScriptResult.Error && "hint: 'limit' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = limit.toString()` - declare the type, like `fun f(): String = limit.toString()`." in it.message
+        })
     }
 
     @Test
-    fun `should call extension function of earlier snippet sharing name with property on implicit receiver in declaration of declared type`() = runTest {
+    fun `should read property of earlier snippet after a word on its line in declaration of declared type`() = runTest {
         // given
-        session.execute("""
-            fun Int.limit() = this * 2
-            val limit = 2
-        """.trimIndent())
+        session.execute("val limit = 3")
 
         // when
         val result = session.execute("""
-            fun Int.g(): String = limit().toString()
-            2.g()
-        """.trimIndent())
-
-        // then
-        result should {
-            be<ScriptResult.Value>()
-            have(value == "4")
-        }
-    }
-
-    @Test
-    fun `should hint at infix extension function of earlier snippet called on integer literal rather than at property of the name`() = runTest {
-        // given
-        session.execute("""
-            infix fun Int.and2(other: Int) = this + other
-            val and2 = 0
-        """.trimIndent())
-
-        // when
-        val result = session.execute("""
-            fun f() = 1 and2 2
-            f()
-        """.trimIndent())
-
-        // then
-        result should {
-            be<ScriptResult.Error>()
-            have(phase == ExecutionPhase.COMPILATION)
-            message sameAs """
-                snippet2.kts:1:13: error: Unresolved reference 'and2'.
-                  | fun f() = 1 <error>and2</error> 2
-                  hint: 'and2' is an extension of Int declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.and2(...).toString()` - declare the type, like `fun f(): String = receiver.and2(...).toString()`, and the compiler tells if the receiver is not of this type.
-            """.trimIndent()
-        }
-    }
-
-    @Test
-    fun `should call infix extension function of earlier snippet sharing name with property on integer literal in declaration of declared type`() = runTest {
-        // given
-        session.execute("""
-            infix fun Int.and2(other: Int) = this + other
-            val and2 = 0
-        """.trimIndent())
-
-        // when
-        val result = session.execute("""
-            fun f(): String = (1 and2 2).toString()
+            fun f(): String = listOf("a" to limit, (0 until limit).toList(), listOf(1).map { return@map limit }).toString()
             f()
         """.trimIndent())
 
         // then
         result should {
             be<ScriptResult.Value>()
-            have(value == "3")
+            have(value == "[(a, 3), [0, 1, 2], [3]]")
         }
+    }
+
+    @Test
+    fun `should hint at const property of earlier snippet unresolved after a word on its line`() = runTest {
+        // given
+        session.execute("const val LIMIT = 3")
+
+        // when
+        val result = session.execute("""
+            fun f() = "a" to LIMIT
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have("hint: 'LIMIT' is declared const in snippet1.kts" in message)
+        }
+    }
+
+    @Test
+    fun `should hint at property of function type of earlier snippet called rather than at extension function of the name`() = runTest {
+        // given
+        session.execute("""
+            val f: () -> Int = { 1 }
+            fun String.f() = 2
+        """.trimIndent())
+
+        // when
+        val result = session.execute("""
+            fun g() = f() + 1
+            g()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have("hint: 'f' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = f.toString()`" in message)
+        }
+    }
+
+    @Test
+    fun `should call property of function type of earlier snippet sharing name with extension function in declaration of declared type`() = runTest {
+        // given
+        session.execute("""
+            val f: () -> Int = { 1 }
+            fun String.f() = 2
+        """.trimIndent())
+
+        // when
+        val result = session.execute("""
+            fun g(): Int = f() + 1
+            g()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should not hint declaring the type when extension function of earlier snippet is unresolved on receiver of type not known accepted by internal extension function`() = runTest {
+        // given
+        session.execute("""
+            fun Any.f1() = 1
+            internal fun Iterable<Int>.f1() = 2
+            fun Any.f2() = 1
+            internal fun CharSequence.f2() = 2
+            fun Any.f3() = 1
+            internal fun Number.f3() = 2
+        """.trimIndent())
+
+        // when
+        val results = listOf(
+            "fun a() = (1..3).f1()\na()",
+            "fun b() = StringBuffer(\"x\").f2()\nb()",
+            "fun c() = java.math.BigDecimal.ONE.f3()\nc()"
+        ).map { session.execute(it) }
+
+        // then
+        assert(results.all { it is ScriptResult.Error && "Unresolved reference" in it.message && "hint:" !in it.message })
+    }
+
+    @Test
+    fun `should not hint declaring the type when declaration of earlier snippet is unresolved on implicit receiver next to internal extension of the name`() = runTest {
+        // given
+        session.execute("""
+            fun limit() = 1
+            internal fun String.limit() = 2
+            val size2 = 1
+            internal val String.size2 get() = 2
+        """.trimIndent())
+
+        // when
+        val results = listOf(
+            "fun String.a() = limit()\n\"x\".a()",
+            "fun String.b() = size2\n\"x\".b()"
+        ).map { session.execute(it) }
+
+        // then
+        assert(results.all { it is ScriptResult.Error && "Unresolved reference" in it.message && "hint:" !in it.message })
     }
 
     @Test
