@@ -47,6 +47,16 @@ private val snippetQualifiedName = Regex("(?:(?<=\\[L)|(?<![\\p{L}\\p{N}_.$]))Sn
 
 private val snippetClassName = Regex("Snippet\\d+")
 
+/**
+ * Type arguments, like `<Int>` or `<List<String>?, *>`, followed by a `(` or a trailing lambda, starting the code after a reference,
+ * which the parser takes for a call, like `echo<Int>(1)`, not for a comparison, like `limit < 3`,
+ * a type argument of a function type, like `<() -> Int>`, not told.
+ */
+private val typeArgumentsCall = Regex("""^<\s*[\p{L}_*][\p{L}\p{N}_.,?*\s]*(?:<[\p{L}\p{N}_.,?*\s<>]*>[\p{L}\p{N}_.,?*\s]*)*>\s*[({]""")
+
+/** Whether this code, following a reference, calls it, with a `(`, a trailing lambda, or type arguments, see [typeArgumentsCall]. */
+private fun String.startsCall(): Boolean = startsWith("(") || startsWith("{") || typeArgumentsCall.containsMatchIn(this)
+
 /** An unresolved reference, with the receiver of an extension, if the reference is qualified, like `"a".shout()`. */
 private val unresolvedReference = Regex("Unresolved reference '(.+?)'(?: on receiver of type '(.+)')?\\.")
 
@@ -58,6 +68,21 @@ private val mangledMethod = Regex("[\\p{L}_][\\p{L}\\p{N}_]*-[\\p{L}\\p{N}_]{7}\
  * like `'int Snippet1$Box.open$main(int, java.lang.String)'`.
  */
 private val missingMethod = Regex("'[^\\s'(]+ ([^\\s(]+)\\.([^.\\s(]+)\\(([^()]*)\\)'")
+
+/** The simple name of the error of the interpreter of the constants of the compiler not finding a function, like the getter of a `const val`. */
+private const val INTERPRETER_METHOD_NOT_FOUND = "InterpreterMethodNotFoundError"
+
+/** The function not found by the interpreter of the constants, with the class declaring it, like `Unknown function: LIMIT(Snippet1)`. */
+private val unknownFunction = Regex("Unknown function: ([^\\s()]+)\\(([^\\s()]+)\\)")
+
+/**
+ * The field accessed as an instance field, while it is static, with the class declaring it,
+ * by the message of an [IncompatibleClassChangeError] of HotSpot, like `Expected non-static field Snippet1.limit`.
+ */
+private val nonStaticField = Regex("Expected non-static field (\\S+)")
+
+/** The lead of the hints at the K2 REPL compiler not resolving a declaration of an earlier snippet, completed by what, and where. */
+private const val K2_REPL_DOES_NOT_RESOLVE = "the K2 REPL compiler does not resolve"
 
 /** The class of the default methods of an interface, like `Greeter$DefaultImpls`. */
 private const val DEFAULT_IMPLS = "DefaultImpls"
@@ -172,8 +197,15 @@ internal class ScriptErrorReporter(
                 append("  | $sourceLine\n")
             }
         }
+        if (exception != null && diagnostic.severity >= ScriptDiagnostic.Severity.ERROR) {
+            appendConstPropertyHint(exception)
+        }
         unresolvedReference.matchEntire(diagnostic.message)?.let { match ->
-            appendUnresolvedEarlierDeclarationHint(match.groupValues[1], receiverType = match.groups[2]?.value)
+            // whether the reference is called, like `limit()`, `limit { }` or `echo<Int>(1)`, told by the source following it
+            val called = location?.end?.let { end ->
+                lines?.getOrNull(end.line - 1)?.drop((end.col - 1).coerceAtLeast(0))?.trimStart()?.ifEmpty { null }
+            }?.startsCall()
+            appendUnresolvedEarlierDeclarationHint(match.groupValues[1], receiverType = match.groups[2]?.value, called)
         }
     }
 
@@ -184,8 +216,13 @@ internal class ScriptErrorReporter(
      * or on an implicit receiver, hinted at conditionally, as the receivers in scope are not known.
      * A declaration of a snippet which failed to compile is not kept, so not hinted at, as it stays unresolved also then,
      * nor an inaccessible one, see [SnippetDeclarations].
+     * A reference [called], also with type arguments, see [startsCall], is hinted at as a function first, and only then as a property, like one of a function type,
+     * unless an inaccessible function of the name is declared, which the compiler calls instead,
+     * and one not called as a property only, also a `const val` or a `@JvmField` one, see [appendPropertyHint],
+     * or as a function, if no property of the name is declared, as it might be called still, like with type arguments of a function type, `echo<() -> Int>(f)`,
+     * both if it is not known whether it is called.
      */
-    private fun StringBuilder.appendUnresolvedEarlierDeclarationHint(name: String, receiverType: String?) {
+    private fun StringBuilder.appendUnresolvedEarlierDeclarationHint(name: String, receiverType: String?, called: Boolean?) {
         if (receiverType != null) {
             val reference = when {
                 snippetDeclarations.extensionPropertyReceivers(name).any { it.accepts(receiverType) } -> "receiver.$name"
@@ -200,16 +237,14 @@ internal class ScriptErrorReporter(
             append(" like `fun f(x: Any) = x is $name` - declare the type, like `fun f(x: Any): Boolean = x is $name`.\n")
             return
         }
-        when {
-            snippetDeclarations.isProperty(name) -> {
-                appendDeclareTypeHint(name, "fun f() = $name.toString()", "fun f(): String = $name.toString()")
-                return
-            }
-            snippetDeclarations.isFunction(name) -> {
-                appendDeclareTypeHint(name, "fun f() = $name(...).toString()", "fun f(): String = $name(...).toString()")
-                return
-            }
+        if (called != true && appendPropertyHint(name)) return
+        // not known to be called, it is still called if no property of the name is declared
+        if ((called != false || snippetDeclarations.property(name) == null) && snippetDeclarations.isFunction(name)) {
+            appendDeclareTypeHint(name, "fun f() = $name(...).toString()", "fun f(): String = $name(...).toString()")
+            return
         }
+        // a call of an inaccessible function of the name, which the compiler calls rather than a property of a function type, fails also then
+        if (called == true && !snippetDeclarations.isAnyFunction(name) && appendPropertyHint(name)) return
         val propertyReceivers = snippetDeclarations.extensionPropertyReceivers(name)
         val (receivers, reference) = if (propertyReceivers.isNotEmpty()) {
             propertyReceivers to name
@@ -223,9 +258,62 @@ internal class ScriptErrorReporter(
         append(" like `fun $receiver.f() = $reference.toString()` - declare the type, like `fun $receiver.f(): String = $reference.toString()`.\n")
     }
 
+    /**
+     * The hint at the last property of this [name] declared by an earlier snippet, if any, whether it was given:
+     * to declare the type, or, for a `const val` or a `@JvmField` one, which a later snippet fails on also then,
+     * to declare it again public, as an `internal` one cannot be told, see [SnippetDeclarations],
+     * and the code of earlier snippets accessing a `@JvmField` one, which compiles, but keeps accessing it,
+     * and then to declare the type.
+     */
+    private fun StringBuilder.appendPropertyHint(name: String): Boolean {
+        val property = snippetDeclarations.property(name) ?: return false
+        val failure = when (property.kind) {
+            SnippetProperty.Kind.ACCESSIBLE -> {
+                appendDeclareTypeHint(name, "fun f() = $name.toString()", "fun f(): String = $name.toString()")
+                return true
+            }
+            SnippetProperty.Kind.CONST -> constFailure(name, property.snippet)
+            SnippetProperty.Kind.JVM_FIELD -> jvmFieldFailure(name, property.snippet)
+            SnippetProperty.Kind.INTERNAL -> return false
+        }
+        val modifier = if (property.kind == SnippetProperty.Kind.CONST) "const modifier" else "@JvmField annotation"
+        append("  hint: $failure - declare it again public, without the $modifier, ")
+        if (property.kind == SnippetProperty.Kind.JVM_FIELD) {
+            appendDeclareCallersAgainAdvice(emptyList(), ownerClass = null, verb = "accessing", kept = "@JvmField", code = "the code of earlier snippets")
+            append(", ")
+        }
+        append("and declare the type of a declaration of a later snippet reading it, like `fun f(): String = $name.toString()`,")
+        append(" as $K2_REPL_DOES_NOT_RESOLVE a property of an earlier snippet within a declaration of an inferred type used in the same snippet.\n")
+        return true
+    }
+
     private fun StringBuilder.appendDeclareTypeHint(name: String, inferred: String, declared: String) {
-        append("  hint: '$name' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet,")
+        append("  hint: '$name' is declared in an earlier snippet, which $K2_REPL_DOES_NOT_RESOLVE within a declaration of an inferred type used in the same snippet,")
         append(" like `$inferred` - declare the type, like `$declared`.\n")
+    }
+
+    private fun constFailure(name: String, snippet: String): String =
+        "'$name' is declared const in $snippet, which a later snippet cannot read, as the K2 REPL compiler fails on it"
+
+    private fun jvmFieldFailure(name: String, snippet: String): String =
+        "'$name' is declared @JvmField in $snippet, which a later snippet cannot access, as the K2 REPL compiler accesses it as an instance field, while it is static"
+
+    /**
+     * The hint at the `const val` of an earlier snippet, which the compiler failed on with this internal [exception],
+     * caused by the interpreter of the constants not finding its getter, like `Unknown function: LIMIT(Snippet1)`,
+     * so it is hinted at only if that snippet declares the last property of the name, a `const val`,
+     * not a `const val` of an object, like `Unknown function: X(O)`, which cannot be told from another class of the name.
+     */
+    private fun StringBuilder.appendConstPropertyHint(exception: Throwable) {
+        val (name, owner) = generateSequence(exception) { it.read(null) { cause } }
+            .take(MAX_REPORTED_EXCEPTIONS)
+            .filter { it.javaClass.simpleName == INTERPRETER_METHOD_NOT_FOUND }
+            .firstNotNullOfOrNull { error -> error.read(null) { message }?.let { unknownFunction.matchEntire(it) } }
+            ?.destructured ?: return
+        val snippet = snippetDeclarations.snippetOf(owner) ?: return
+        val property = snippetDeclarations.property(name) ?: return
+        if (property.kind != SnippetProperty.Kind.CONST || property.snippet != snippet) return
+        append("  hint: ${constFailure(name, snippet)} - declare it again public, without the const modifier.\n")
     }
 
     /**
@@ -265,6 +353,8 @@ internal class ScriptErrorReporter(
         val stackTrace = throwable.read(emptyList()) { stackTrace.filterNotNull() }
         if (throwable is NoSuchMethodError) {
             appendInternalMemberHint(throwable, stackTrace, indent, reported)
+        } else if (throwable is IncompatibleClassChangeError) {
+            appendJvmFieldPropertyHint(throwable, stackTrace, indent, reported)
         }
         if (throwable is NullPointerException) {
             uninitializedProperties.readBy(throwable, stackTrace)?.let { property ->
@@ -283,8 +373,7 @@ internal class ScriptErrorReporter(
 
     /**
      * The hint at the member of an earlier snippet, declared `internal`, which the [error] thrown at the [stackTrace] failed to call, see [SnippetDeclarations.internalMember],
-     * unless hinted at already by an error of the same message [reported] before, as kotlinx.coroutines wraps the error of a coroutine,
-     * like of `runBlocking`, in a copy of it with the stack trace of its caller, so the stack trace of the error wrapped last, of the coroutine, is read then.
+     * unless hinted at already, see [stackTraceToHint].
      */
     private fun StringBuilder.appendInternalMemberHint(
         error: NoSuchMethodError,
@@ -293,31 +382,98 @@ internal class ScriptErrorReporter(
         reported: Set<Throwable>
     ) {
         val message = error.read(null) { message } ?: return
-        if (reported.any { it !== error && it is NoSuchMethodError && it.read(null) { this.message } == message }) return
         val match = missingMethod.matchEntire(message) ?: return
+        val calling = error.stackTraceToHint(message, stackTrace, reported) ?: return
         val (owner, method, parameters) = match.destructured
         val member = snippetDeclarations.internalMember(owner, method, parameters.split(", ").filter { it.isNotEmpty() }) ?: return
-        val wrapped = generateSequence<Throwable>(error) { exception -> exception.read(null) { cause } }
-            .take(MAX_REPORTED_EXCEPTIONS)
-            .lastOrNull { exception -> exception is NoSuchMethodError && exception.read(null) { this.message } == message }
-        val calling = if (wrapped == null || wrapped === error) stackTrace else wrapped.read(emptyList()) { this.stackTrace.filterNotNull() }
         appendInternalMemberHint(member, snippetDeclarations.isFinalClass(owner), calling, indent)
+    }
+
+    /**
+     * The hint at the `@JvmField` property of an earlier snippet, which the [error] thrown at the [stackTrace] accessed as an instance field, while it is static,
+     * to declare it again public, without the annotation, or the modifier a later snippet declares it again with, `internal` or `const`, unless declared again public by a later snippet already, see [SnippetDeclarations.isJvmFieldProperty],
+     * and to declare again the code accessing it, see [appendDeclareCallersAgainAdvice], unless hinted at already, see [stackTraceToHint].
+     */
+    private fun StringBuilder.appendJvmFieldPropertyHint(
+        error: IncompatibleClassChangeError,
+        stackTrace: List<StackTraceElement>,
+        indent: String,
+        reported: Set<Throwable>
+    ) {
+        val message = error.read(null) { message } ?: return
+        val field = nonStaticField.matchEntire(message)?.groupValues?.get(1) ?: return
+        val owner = field.substringBeforeLast('.', missingDelimiterValue = "")
+        val name = field.substringAfterLast('.')
+        // the snippet first, as telling the property reads the classes of the snippets not read yet
+        val snippet = snippetDeclarations.snippetOf(owner) ?: return
+        val accessing = error.stackTraceToHint(message, stackTrace, reported) ?: return
+        if (!snippetDeclarations.isJvmFieldProperty(name, snippet)) return
+        append("$indent  hint: ${jvmFieldFailure(name, snippet)} - ")
+        when (snippetDeclarations.property(name)?.kind) {
+            SnippetProperty.Kind.ACCESSIBLE -> append("it is declared again by a later snippet, so ")
+            SnippetProperty.Kind.INTERNAL -> append("it is declared again internal by a later snippet, so declare it again public, without the internal modifier, and ")
+            SnippetProperty.Kind.CONST -> append("it is declared again const by a later snippet, so declare it again public, without the const modifier, and ")
+            else -> append("declare it again public, without the @JvmField annotation, and ")
+        }
+        appendDeclareCallersAgainAdvice(accessing, ownerClass = null, verb = "accessing", kept = "@JvmField")
+        append(".\n")
+    }
+
+    /**
+     * The stack trace of this [error] of the [message], thrown at the [stackTrace], to hint at,
+     * or `null` if hinted at already by an error of the same class and message [reported] before, as kotlinx.coroutines wraps the error of a coroutine,
+     * like of `runBlocking`, in a copy of it with the stack trace of its caller, so the stack trace of the error wrapped last, of the coroutine, is read then.
+     */
+    private fun Throwable.stackTraceToHint(
+        message: String,
+        stackTrace: List<StackTraceElement>,
+        reported: Set<Throwable>
+    ): List<StackTraceElement>? {
+        fun Throwable.isCopy() = javaClass == this@stackTraceToHint.javaClass && read(null) { this.message } == message
+        if (reported.any { it !== this && it.isCopy() }) return null
+        val wrapped = generateSequence(this) { exception -> exception.read(null) { cause } }
+            .take(MAX_REPORTED_EXCEPTIONS)
+            .lastOrNull { it.isCopy() }
+        return if (wrapped == null || wrapped === this) stackTrace else wrapped.read(emptyList()) { this.stackTrace.filterNotNull() }
     }
 
     /**
      * The hint at the [member] of an earlier snippet, declared `internal`, which the exception thrown at the [stackTrace] failed to call,
      * to declare it `public`, unless declared again by a later snippet already,
-     * and to declare again the code calling it, directly or not, and to create again the values depending on it,
-     * as they keep calling the `internal` one even after it is declared again.
-     * The declarations on the [stackTrace], and their [final][SnippetDeclarations.isFinalClass] classes, also the one declaring the member,
-     * if [ownerFinal], are named only as examples, as the stack trace cannot tell all of them,
-     * like a lambda calling it created by an earlier call, and kept by a value.
+     * and to declare again the code calling it, see [appendDeclareCallersAgainAdvice],
+     * naming also the class declaring the member, if [ownerFinal].
      */
     private fun StringBuilder.appendInternalMemberHint(
         member: InternalMember,
         ownerFinal: Boolean,
         stackTrace: List<StackTraceElement>,
         indent: String
+    ) {
+        val (subject, declared) = if (member.internalSetter) "the setter of '${member.name}'" to "the setter" else "'${member.name}'" to "it"
+        append("$indent  hint: $subject is declared internal in ${member.snippet}, which a later snippet cannot call,")
+        append(" as the K2 REPL compiler calls it by a JVM name it is not compiled to - ")
+        if (member.declaredAgain) {
+            append("it is declared again by a later snippet, so ")
+        } else {
+            append("declare $declared public, without the internal modifier, and ")
+        }
+        appendDeclareCallersAgainAdvice(stackTrace, member.declaringClass.takeIf { ownerFinal }, verb = "calling", kept = "internal")
+        append(".\n")
+    }
+
+    /**
+     * The advice to declare again the [code] [calling][verb] a member of an earlier snippet, directly or not, and to create again the values depending on it,
+     * as they keep calling the [kept] one even after it is declared again, not ending the sentence, which the caller continues or ends.
+     * The declarations on the [stackTrace], and their [final][SnippetDeclarations.isFinalClass] classes, also the [ownerClass] declaring the member,
+     * are named only as examples, as the stack trace cannot tell all of them,
+     * like a lambda calling it created by an earlier call, and kept by a value.
+     */
+    private fun StringBuilder.appendDeclareCallersAgainAdvice(
+        stackTrace: List<StackTraceElement>,
+        ownerClass: String?,
+        verb: String,
+        kept: String,
+        code: String = "the code"
     ) {
         val callerFrames = stackTrace.filter {
             it.fileName in snippets
@@ -327,24 +483,16 @@ internal class ScriptErrorReporter(
                 && DEFAULT_IMPLS !in it.ownerClasses()
         }
         val callers = callerFrames.declarations()
-        val classes = (listOfNotNull(member.declaringClass.takeIf { ownerFinal }) + callerFrames.filter {
+        val classes = (listOfNotNull(ownerClass) + callerFrames.filter {
             snippetDeclarations.isFinalClass(it.className)
         }.mapNotNull { it.declaringClassName() }).distinct()
-        val (subject, declared) = if (member.internalSetter) "the setter of '${member.name}'" to "the setter" else "'${member.name}'" to "it"
-        append("$indent  hint: $subject is declared internal in ${member.snippet}, which a later snippet cannot call,")
-        append(" as the K2 REPL compiler calls it by a JVM name it is not compiled to - ")
-        if (member.declaredAgain) {
-            append("it is declared again by a later snippet, so ")
-        } else {
-            append("declare $declared public, without the internal modifier, and ")
-        }
-        append("declare again the code calling it, directly or not, ")
+        append("declare again $code $verb it, directly or not, ")
         callers.takeIf { it.isNotEmpty() }?.let { append("like ${it.enumerated()}, ") }
         append("and create again the values depending on it, like the ones ")
         classes.takeIf { it.isNotEmpty() }?.let {
             append("of the ${if (it.size > 1) "classes" else "class"} ${it.map { name -> "'$name'" }.enumerated()}, or ")
         }
-        append("holding a lambda calling it, as they keep calling the internal one.\n")
+        append("holding a lambda $verb it, as they keep $verb the $kept one")
     }
 
     /** The name of the class of a snippet declaring the declaration of this snippet frame, like `Box` or `Box.Lid`, or `null` for a member of the snippet itself. */

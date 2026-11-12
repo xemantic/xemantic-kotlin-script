@@ -252,6 +252,16 @@ The K2 REPL compiler is still experimental, and these of its bugs are reported t
   and with the values depending on it created again: the ones of a class declaring it, or calling it, as they keep being of the old class,
   and the ones holding a lambda calling it, like `val f = { secret() }`.
   The hint names the declarations and the classes on the stack trace as examples only, as it cannot tell all of them.
+* A `const val` declared in an earlier snippet cannot be read from another snippet:
+  it is unresolved within a declaration of an inferred type, and crashes the compiler wherever else it is read,
+  also in a top-level expression, or in a property initializer.
+  It works once declared again public, without `const`, as an `internal` one fails like any `internal` property.
+  A `const val` of an `object` declared in an earlier snippet crashes the compiler as well, without a hint.
+* A `@JvmField` property declared in an earlier snippet cannot be accessed from another snippet:
+  it is unresolved within a declaration of an inferred type, and fails with `IncompatibleClassChangeError` wherever else it is accessed,
+  as the compiler accesses it as an instance field, while it is static.
+  It works once declared again public, without `@JvmField`, together with the code accessing it, directly or not, declared again,
+  and with the values depending on it created again, like for an `internal` member.
 * An `inline` function, or property, declared in an earlier snippet cannot be called from another snippet,
   and the one referring to the `ScriptScope`, like `coroutineContext`, cannot be compiled at all,
   reported as an internal failure of the compiler.
