@@ -79,7 +79,7 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   The history provider gets the snippet only after its FIR resolution, so an overflow of the parser or of the resolution does not put it there.
 - `providedProperties` are not resolved by the K2 REPL — the dependencies are declared by a generated first snippet instead.
 - The snippet classes carry no nullability annotations (`@NotNull`), unlike regular Kotlin classes, so the nullability of a property has to be read by kotlin-reflect — see `UninitializedProperties.keep`.
-- Read the visibility of a snippet member as `SnippetDeclarations.isAccessibleByLaterSnippet` does, not by kotlin-reflect.
+- kotlin-reflect reads every member of a snippet class as `PUBLIC`, as the K2 REPL compiler writes no visibility to the metadata — read it as `SnippetDeclarations.isAccessibleByLaterSnippet` does.
 - The evaluator evaluates every compiled snippet not evaluated yet before the given one, so a compiled snippet is always evaluated, even if the caller was cancelled meanwhile.
 - Never interrupt the thread while compiling: an interrupt closes any interruptible NIO channel in use (JDK behaviour), which the compiler's JAR reading might rely on — a precaution, not reproduced.
   An interrupted `runBlocking` (kotlinx.coroutines 1.11) does not throw at once: it runs its pending events first, then cancels its coroutine and waits for it to complete —

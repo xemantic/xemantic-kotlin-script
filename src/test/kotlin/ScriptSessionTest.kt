@@ -1767,6 +1767,266 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should not hint declaring the type when extension function of earlier snippet is unresolved on explicit receiver also accepted by internal extension function`() = runTest {
+        // given
+        session.execute("""
+            fun CharSequence.f() = 1
+            internal fun String.f() = 2
+        """.trimIndent())
+
+        // when
+        val result = session.execute("""
+            fun g() = "a".f()
+            g()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:15: error: Unresolved reference 'f' on receiver of type 'String'.
+                  | fun g() = "a".<error>f</error>()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not hint declaring the type when extension property of earlier snippet is unresolved on integer literal also accepted by internal extension property`() = runTest {
+        // given
+        session.execute("""
+            val Number.p get() = 1
+            internal val Int.p get() = 2
+        """.trimIndent())
+
+        // when
+        val result = session.execute("""
+            fun g() = 1.p
+            g()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:13: error: Unresolved reference 'p'.
+                  | fun g() = 1.<error>p</error>
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not hint declaring the type when extension function of earlier snippet is unresolved on implicit receiver next to internal extension function`() = runTest {
+        // given
+        session.execute("""
+            fun CharSequence.f() = 1
+            internal fun String.f() = 2
+        """.trimIndent())
+
+        // when
+        val result = session.execute("""
+            fun String.g() = f()
+            "a".g()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:18: error: Unresolved reference 'f'.
+                  | fun String.g() = <error>f</error>()
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should not hint declaring the type when extension property of earlier snippet is unresolved on implicit receiver next to internal extension property`() = runTest {
+        // given
+        session.execute("""
+            val Number.p get() = 1
+            internal val Int.p get() = 2
+        """.trimIndent())
+
+        // when
+        val result = session.execute("""
+            fun Int.g() = p
+            1.g()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:15: error: Unresolved reference 'p'.
+                  | fun Int.g() = <error>p</error>
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extension function of earlier snippet is unresolved on explicit receiver not accepted by internal extension function`() = runTest {
+        // given
+        session.execute("""
+            fun CharSequence.f() = 1
+            internal fun Int.f() = 2
+        """.trimIndent())
+
+        // when
+        val result = session.execute("""
+            fun g() = "a".f()
+            g()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:15: error: Unresolved reference 'f' on receiver of type 'String'.
+                  | fun g() = "a".<error>f</error>()
+                  hint: 'f' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.f(...).toString()` - declare the type, like `fun f(): String = receiver.f(...).toString()`.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call extension function of earlier snippet on explicit receiver not accepted by internal extension function in declaration of declared type`() = runTest {
+        // given
+        session.execute("""
+            fun CharSequence.f() = 1
+            internal fun Int.f() = 2
+        """.trimIndent())
+
+        // when
+        val result = session.execute("""
+            fun g(): String = "a".f().toString()
+            g()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "1")
+        }
+    }
+
+    @Test
+    fun `should not hint at function of earlier snippet when callable reference on receiver type is unresolved`() = runTest {
+        // given
+        session.execute("fun shout(s: String) = s.uppercase()")
+
+        // when
+        val result = session.execute("""
+            fun f() = listOf("a").map(String::shout)
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            have("hint:" !in message)
+        }
+    }
+
+    @Test
+    fun `should hint at extension function of earlier snippet called on implicit receiver rather than at property of the name`() = runTest {
+        // given
+        session.execute("""
+            fun Int.limit() = this * 2
+            val limit = 2
+        """.trimIndent())
+
+        // when
+        val result = session.execute("""
+            fun Int.g() = limit()
+            1.g()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:15: error: Unresolved reference 'limit'.
+                  | fun Int.g() = <error>limit</error>()
+                  hint: 'limit' is an extension of Int declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, even on an implicit receiver of this type, like `fun Int.f() = limit(...).toString()` - declare the type, like `fun Int.f(): String = limit(...).toString()`, and the compiler tells if there is no such receiver.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call extension function of earlier snippet sharing name with property on implicit receiver in declaration of declared type`() = runTest {
+        // given
+        session.execute("""
+            fun Int.limit() = this * 2
+            val limit = 2
+        """.trimIndent())
+
+        // when
+        val result = session.execute("""
+            fun Int.g(): String = limit().toString()
+            2.g()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "4")
+        }
+    }
+
+    @Test
+    fun `should hint at infix extension function of earlier snippet called on integer literal rather than at property of the name`() = runTest {
+        // given
+        session.execute("""
+            infix fun Int.and2(other: Int) = this + other
+            val and2 = 0
+        """.trimIndent())
+
+        // when
+        val result = session.execute("""
+            fun f() = 1 and2 2
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet2.kts:1:13: error: Unresolved reference 'and2'.
+                  | fun f() = 1 <error>and2</error> 2
+                  hint: 'and2' is an extension of Int declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = receiver.and2(...).toString()` - declare the type, like `fun f(): String = receiver.and2(...).toString()`, and the compiler tells if the receiver is not of this type.
+            """.trimIndent()
+        }
+    }
+
+    @Test
+    fun `should call infix extension function of earlier snippet sharing name with property on integer literal in declaration of declared type`() = runTest {
+        // given
+        session.execute("""
+            infix fun Int.and2(other: Int) = this + other
+            val and2 = 0
+        """.trimIndent())
+
+        // when
+        val result = session.execute("""
+            fun f(): String = (1 and2 2).toString()
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "3")
+        }
+    }
+
+    @Test
     fun `should not hint declaring the type when property of earlier snippet is unresolved on integer literal`() = runTest {
         // given
         session.execute("val greeting = \"hi\"")

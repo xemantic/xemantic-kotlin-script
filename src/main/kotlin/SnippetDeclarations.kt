@@ -251,11 +251,22 @@ internal class SnippetDeclarations {
     /** Whether a function of this [name] declared by a snippet, not an extension, also an inaccessible one, but not a `private` one, is declared. */
     fun isAnyFunction(name: String): Boolean = read().functions[name] != null
 
+    /** Whether an extension function of this [name] declared by a snippet, also an inaccessible one, but not a `private` one, is declared. */
+    fun isAnyExtensionFunction(name: String): Boolean = read().extensionFunctions[name] != null
+
     /** The receivers of the extension properties of this [name] declared by the snippets accessible by a later snippet, in the order of the declarations. */
     fun extensionPropertyReceivers(name: String): Set<ExtensionReceiver> = read().extensionProperties.receivers(name)
 
     /** The receivers of the extension functions of this [name] declared by the snippets accessible by a later snippet, in the order of the declarations. */
     fun extensionFunctionReceivers(name: String): Set<ExtensionReceiver> = read().extensionFunctions.receivers(name)
+
+    /**
+     * The receivers of the last overloads of the extensions, properties and functions, of this [name] declared by the snippets inaccessible by a later snippet,
+     * `null` for one which cannot be read, as a later snippet calls such an extension of a more specific receiver
+     * rather than an accessible one, like `internal fun String.f()` rather than `fun CharSequence.f()` on a `String`, failing then.
+     */
+    fun inaccessibleExtensionReceivers(name: String): List<ExtensionReceiver?> = read().let { listOf(extensionProperties, extensionFunctions) }
+        .flatMap { extensions -> extensions[name]?.values.orEmpty().filter { !it.accessible }.map { it.receiver } }
 
     /**
      * The receivers of the last overloads of the extensions of this [name], each accessible by a later snippet,

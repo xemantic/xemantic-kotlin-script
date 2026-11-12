@@ -63,14 +63,41 @@ private fun String.startsCall(): Boolean = startsWith("(") || startsWith("{") ||
 
 /**
  * How an unresolved reference is used in the source:
- * [onExplicitReceiver] if it follows a `.`, like `1.tagged()`, but not a range `..`,
- * [callable] if it follows a `::`, like `String::shout`, both `false` if the code before it cannot be told,
- * [called] if a `(`, a trailing lambda, or type arguments followed by either follow it, see [startsCall],
- * otherwise `null`, as it might be called still, like an infix function, `"a" and "b"`, or with type arguments of a function type, `echo<() -> Int>(f)`,
+ * [onExplicitReceiver] if it follows a `.`, like `1.tagged()`, but not a range `..`, or an expression on the same line, as an infix function, like `1 and2 2`,
+ * [callable] if it follows a `::`, like `::shout`, [callableOnReceiver] if also a receiver, like `String::shout`, which cannot be a top-level declaration,
+ * all `false` if the code before it cannot be told,
+ * [called] if a `(`, a trailing lambda, or type arguments followed by either follow it, see [startsCall], or if it is an infix function,
+ * otherwise `false`, as it might be called still, with type arguments of a function type, `echo<() -> Int>(f)`,
  * which cannot be told from a comparison, `size < 3`, by the source alone,
- * and [onIntegerLiteral] if it follows an integer literal without a suffix, like `1.tagged()`, whose type a compiler message does not render.
+ * and [onIntegerLiteral] if it follows an integer literal without a suffix, like `1.tagged()` or `1 and2 2`, whose type a compiler message does not render.
  */
-private class UnresolvedReference(val onExplicitReceiver: Boolean, val callable: Boolean, val called: Boolean?, val onIntegerLiteral: Boolean)
+private class UnresolvedReference(
+    val onExplicitReceiver: Boolean,
+    val callable: Boolean,
+    val callableOnReceiver: Boolean,
+    val called: Boolean,
+    val onIntegerLiteral: Boolean
+)
+
+/** An integer literal without a suffix, ending the code before an infix function, like `1` of `1 and2 2`. */
+private val integerLiteralInfixReceiver = Regex("(?<![\\p{L}\\p{N}_.])(?:0[xXbB][0-9a-fA-F_]+|\\p{N}[\\p{N}_]*)$")
+
+/** The keywords and modifiers which a reference might follow on the same line, so not as an infix function, like `return limit`. */
+private val precedingKeywords = setOf(
+    "as", "break", "by", "catch", "class", "const", "continue", "do", "else", "finally", "for", "fun", "get", "if", "import", "in", "infix",
+    "inline", "interface", "internal", "is", "lateinit", "object", "open", "operator", "out", "override", "package", "private", "protected",
+    "public", "return", "set", "suspend", "throw", "try", "typealias", "val", "var", "vararg", "when", "where", "while"
+)
+
+/**
+ * Whether this code before a reference on its line ends with an expression, like `1` or `"a"`, the receiver of an infix function,
+ * not with a keyword, like `return`, nor with a `)`, which might end a condition, like `if (x) limit`.
+ */
+private fun String.endsWithInfixReceiver(): Boolean {
+    val last = lastOrNull() ?: return false
+    if (!(last.isLetterOrDigit() || last == '_' || last == '"' || last == '\'' || last == '`')) return false
+    return takeLastWhile { it.isLetterOrDigit() || it == '_' } !in precedingKeywords
+}
 
 /** An integer literal without a suffix, followed by a `.`, ending the code before a reference, like `1.` or `0xFF.`, but not `1.0.`. */
 private val integerLiteralReceiver = Regex("(?<![\\p{L}\\p{N}_.])(?:0[xXbB][0-9a-fA-F_]+|\\p{N}[\\p{N}_]*)\\.$")
@@ -281,11 +308,15 @@ internal class ScriptErrorReporter(
             val usage = if (line != null && column != null && column in 0..line.length) {
                 val before = lines.orEmpty().codeBefore(location.start.line - 1, column)
                 val after = line.substring(column).removePrefix("`$name`").removePrefix(name).trimStart()
+                // an infix function follows its receiver on the same line
+                val infix = before != null && line.take(column).isNotBlank() && before.endsWithInfixReceiver()
+                val callable = before != null && before.endsWith("::")
                 UnresolvedReference(
-                    onExplicitReceiver = before != null && before.endsWith(".") && !before.endsWith(".."),
-                    callable = before != null && before.endsWith("::"),
-                    called = if (after.startsCall()) true else null,
-                    onIntegerLiteral = before != null && integerLiteralReceiver.containsMatchIn(before)
+                    onExplicitReceiver = infix || before != null && before.endsWith(".") && !before.endsWith(".."),
+                    callable = callable,
+                    callableOnReceiver = callable && before.dropLast(2).lastOrNull().let { it != null && (it.isLetterOrDigit() || it in "_`>?)]") },
+                    called = infix || after.startsCall(),
+                    onIntegerLiteral = before != null && (integerLiteralReceiver.containsMatchIn(before) || infix && integerLiteralInfixReceiver.containsMatchIn(before))
                 )
             } else null
             appendUnresolvedEarlierDeclarationHint(name, receiverType = match.groups[2]?.value, usage)
@@ -311,7 +342,9 @@ internal class ScriptErrorReporter(
         val reference = name.asReference()
         // a callable reference to an extension of a snippet is not resolved also with the type declared, as a member and an extension at the same time
         val callable = usage?.callable == true
-        val called = usage?.called
+        // a reference to a member or an extension of a receiver, not to a top-level declaration
+        if (usage?.callableOnReceiver == true) return
+        val called = usage?.called == true
         if (receiverType != null) {
             if (callable) return
             appendExplicitReceiverHint(name, listOf(receiverType), called, certain = true)
@@ -324,34 +357,36 @@ internal class ScriptErrorReporter(
                 append(" like `fun f(x: Any) = x is $reference` - declare the type, like `fun f(x: Any): Boolean = x is $reference`.\n")
                 return
             }
-            if (called != true && appendPropertyHint(name)) return
+            if (!called && appendPropertyHint(name)) return
             // not known to be called, it is still called if no property of the name is declared
-            if ((called == true || snippetDeclarations.property(name) == null) && snippetDeclarations.isFunction(name)) {
+            if ((called || snippetDeclarations.property(name) == null) && snippetDeclarations.isFunction(name)) {
                 appendDeclareTypeHint(name, "fun f() = $reference(...).toString()", "fun f(): String = $reference(...).toString()")
                 return
             }
-            // a call of an inaccessible function of the name, which the compiler calls rather than a property of a function type, fails also then
-            if (called == true && !snippetDeclarations.isAnyFunction(name) && appendPropertyHint(name)) return
+            // a call of an inaccessible function of the name, which the compiler calls rather than a property of a function type, fails also then,
+            // and one of an extension function is hinted at as such
+            if (called && !snippetDeclarations.isAnyFunction(name) && !snippetDeclarations.isAnyExtensionFunction(name) && appendPropertyHint(name)) return
         }
         if (callable) return
         if (usage?.onIntegerLiteral == true) {
             appendExplicitReceiverHint(name, integerLiteralTypes, called, certain = false)
             return
         }
+        // the receiver is not known, so an inaccessible extension of a more specific receiver might be called instead, see [SnippetDeclarations.inaccessibleExtensionReceivers]
+        if (snippetDeclarations.inaccessibleExtensionReceivers(name).isNotEmpty()) return
         val propertyReceivers = snippetDeclarations.extensionPropertyReceivers(name)
         val functionReceivers = snippetDeclarations.extensionFunctionReceivers(name)
-        val isCall = called ?: propertyReceivers.isEmpty()
+        val isCall = called || propertyReceivers.isEmpty()
         // the receivers of the form of the reference first, the other ones being possible as well, like a property of a function type called
         val receivers = if (isCall) functionReceivers + propertyReceivers else propertyReceivers + functionReceivers
         if (receivers.isEmpty()) return
         val calledOn = if (isCall) "$reference(...)" else reference
-        val ofType = if (receivers.size == 1) "of this type" else "of one of these types"
-        append("  hint: '$name' is an extension of ${receivers.joinToString(" or ")} declared in an earlier snippet,")
-        append(" which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet,")
         if (onExplicitReceiver) {
-            append(" like `fun f() = receiver.$calledOn.toString()` - declare the type, like `fun f(): String = receiver.$calledOn.toString()`,")
-            append(" and the compiler tells if the receiver is not $ofType.\n")
+            appendConditionalExplicitReceiverHint(name, receivers, "receiver.$calledOn")
         } else {
+            val ofType = if (receivers.size == 1) "of this type" else "of one of these types"
+            append("  hint: '$name' is an extension of ${receivers.joinToString(" or ")} declared in an earlier snippet,")
+            append(" which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet,")
             val declaration = receivers.first().declaration
             val receiver = declaration ?: "Receiver"
             append(" even on an implicit receiver $ofType, like `fun $receiver.f() = $calledOn.toString()` - declare the type, like `fun $receiver.f(): String = $calledOn.toString()`,")
@@ -365,22 +400,32 @@ internal class ScriptErrorReporter(
      * by the extensions whose receiver accepts it, see [ExtensionReceiver.acceptance],
      * hinted at as a function if [called], or if no extension property accepts it, as one of a function type is also called.
      * The hint is conditional, on the compiler reporting the mismatch of the receiver once the type is declared,
-     * unless a receiver surely accepts the type, and the type is [certain], not of an integer literal, which might be a `Long`.
+     * unless a receiver surely accepts the type, and the type is [certain], not of an integer literal.
+     * No hint if an inaccessible extension of the name might accept the type, see [SnippetDeclarations.inaccessibleExtensionReceivers].
      */
-    private fun StringBuilder.appendExplicitReceiverHint(name: String, types: List<String>, called: Boolean?, certain: Boolean) {
+    private fun StringBuilder.appendExplicitReceiverHint(name: String, types: List<String>, called: Boolean, certain: Boolean) {
+        val inaccessible = snippetDeclarations.inaccessibleExtensionReceivers(name)
+        if (inaccessible.any { receiver -> receiver == null || types.any { receiver.acceptance(it) != Acceptance.REJECTED } }) return
         fun Set<ExtensionReceiver>.accepting() = associateWith { receiver -> types.maxOf { receiver.acceptance(it) } }
             .filterValues { it != Acceptance.REJECTED }
         val properties = snippetDeclarations.extensionPropertyReceivers(name).accepting()
         val functions = snippetDeclarations.extensionFunctionReceivers(name).accepting()
         if (properties.isEmpty() && functions.isEmpty()) return
-        val isCall = called == true || properties.isEmpty()
+        val isCall = called || properties.isEmpty()
         val reference = name.asReference()
         val calledOn = if (isCall) "receiver.$reference(...)" else "receiver.$reference"
         if (certain && (properties.containsValue(Acceptance.ACCEPTED) || functions.containsValue(Acceptance.ACCEPTED))) {
             appendDeclareTypeHint(name, "fun f() = $calledOn.toString()", "fun f(): String = $calledOn.toString()")
             return
         }
-        val receivers = if (isCall) functions.keys + properties.keys else properties.keys + functions.keys
+        appendConditionalExplicitReceiverHint(name, if (isCall) functions.keys + properties.keys else properties.keys + functions.keys, calledOn)
+    }
+
+    /**
+     * The hint at an extension of this [name] of these [receivers] [called on][calledOn] an explicit receiver, like `receiver.f(...)`,
+     * conditional on the compiler reporting the mismatch of the receiver once the type is declared.
+     */
+    private fun StringBuilder.appendConditionalExplicitReceiverHint(name: String, receivers: Collection<ExtensionReceiver>, calledOn: String) {
         val ofType = if (receivers.size == 1) "of this type" else "of one of these types"
         append("  hint: '$name' is an extension of ${receivers.joinToString(" or ")} declared in an earlier snippet,")
         append(" which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet,")
