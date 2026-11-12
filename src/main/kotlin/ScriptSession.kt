@@ -23,7 +23,7 @@ import io.github.oshai.kotlinlogging.KLogger
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.github.oshai.kotlinlogging.Level
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CompletableJob
+import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
@@ -34,6 +34,7 @@ import kotlinx.coroutines.asExecutor
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.suspendCancellableCoroutine
 import org.intellij.lang.annotations.Language
 import org.jetbrains.kotlin.com.intellij.openapi.Disposable
 import org.jetbrains.kotlin.com.intellij.openapi.util.Disposer
@@ -54,6 +55,8 @@ import kotlin.coroutines.ContinuationInterceptor
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
 import kotlin.coroutines.intrinsics.suspendCoroutineUninterceptedOrReturn
+import kotlin.coroutines.resume
+import kotlin.coroutines.startCoroutine
 import kotlin.script.experimental.api.ResultValue
 import kotlin.script.experimental.api.ResultWithDiagnostics
 import kotlin.script.experimental.api.CompiledSnippet
@@ -486,6 +489,7 @@ internal class DefaultScriptSession(
      * like a cancelled waiter of a lock, see [Turn.submit].
      *
      * @throws IllegalStateException if the session is closed, with the thread shut down, before the block is submitted.
+     * @throws CancellationException the cancellation of the caller, cancelled before the block started, see [Turn.submit].
      * @throws Throwable whatever else submitting the block to the thread throws, like an [OutOfMemoryError] of creating it,
      * or the continuation interceptor of the caller, as it is.
      */
@@ -553,10 +557,10 @@ internal class DefaultScriptSession(
         private var cancellation: CancellationException? = null
 
         /**
-         * The child of the job of the caller cancelled with it, completed once the task starts, or is not queued,
-         * written before the task is queued, so the [thread] reads it after.
+         * The waiting of the caller for the task, cancelled with the job of the caller, see [watch],
+         * resumed once the task starts, or is not queued, or dropped once the caller is cancelled.
          */
-        private var waiting: CompletableJob? = null
+        private val waiting = AtomicReference<CancellableContinuation<Unit>?>()
 
         /** Resumes the [caller] with the [result], unless it is resumed already. */
         override fun resumeWith(result: Result<T>) {
@@ -590,16 +594,7 @@ internal class DefaultScriptSession(
         fun submit(callerJob: Job?): Any? {
             val free = turns.getAndIncrement() == 0
             try {
-                if (callerJob != null && !(free && !callerJob.isActive)) {
-                    waiting = Job(callerJob).also { waiting ->
-                        waiting.invokeOnCompletion { cause ->
-                            // the cancellation of the parent, or one wrapping its failure, see `Job.cancel`
-                            if (cause != null) {
-                                onCancelled(cause as? CancellationException ?: CancellationException("The caller is cancelled", cause))
-                            }
-                        }
-                    }
-                }
+                if (callerJob != null && !(free && !callerJob.isActive)) watch(callerJob)
             } catch (e: Throwable) {
                 finish()
                 throw e
@@ -615,7 +610,7 @@ internal class DefaultScriptSession(
             if (state.compareAndSet(TurnState.NEW, if (failure == null) TurnState.QUEUED else TurnState.CANCELLED)) {
                 if (failure == null) return COROUTINE_SUSPENDED
                 finish()
-                waiting?.complete()
+                stopWatching()
                 drop()
                 throw if (failure is RejectedExecutionException) IllegalStateException(SESSION_CLOSED_MESSAGE) else failure
             }
@@ -629,6 +624,29 @@ internal class DefaultScriptSession(
             throw cancellation!!
         }
 
+        /**
+         * Watches the cancellation of the [callerJob], calling [onCancelled] with it, in place, on the cancelling thread,
+         * at once if it is cancelled, or completed, already,
+         * by a coroutine of the [callerJob], without an interceptor, [waiting] cancellably until [stopWatching],
+         * so the job of the caller gets no child, which its `cancelChildren` would cancel, while the caller is active,
+         * and which a completed job of the caller would wait for.
+         */
+        private fun watch(callerJob: Job) {
+            suspend {
+                try {
+                    suspendCancellableCoroutine { waiting.set(it) }
+                } catch (e: CancellationException) {
+                    // the cancellation of the job, or one telling it completed, see `Job.getCancellationException`
+                    onCancelled(e)
+                }
+            }.startCoroutine(Continuation(callerJob) { it.getOrThrow() })
+        }
+
+        /** Stops the [watch] of the job of the caller, so it keeps nothing of this turn. */
+        private fun stopWatching() {
+            waiting.getAndSet(null)?.resume(Unit)
+        }
+
         /** Stops counting the task by the [turns], once. */
         private fun finish() {
             if (finished.compareAndSet(false, true)) turns.decrementAndGet()
@@ -639,7 +657,7 @@ internal class DefaultScriptSession(
             queued.turn = null
             task = null
             intercepted = null
-            waiting = null
+            waiting.set(null)
         }
 
         /** Runs the task on the [thread], unless the caller was cancelled before, and resumes the caller with its result. */
@@ -647,10 +665,10 @@ internal class DefaultScriptSession(
             if (!state.compareAndSet(TurnState.NEW, TurnState.STARTED)
                 && !state.compareAndSet(TurnState.QUEUED, TurnState.STARTED)
             ) {
-                finish()
+                // finished by the one which cancelled it
                 return
             }
-            waiting?.complete()
+            stopWatching()
             val task = task!!
             this.task = null
             val result = runCatching(task)

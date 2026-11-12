@@ -37,11 +37,13 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.asContextElement
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.asExecutor
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -7904,6 +7906,150 @@ class ScriptSessionTest {
                 be<ScriptResult.Value>()
                 have(value == 1)
             }
+            runBlocking {
+                session.execute("ran.get()")
+            } should {
+                be<ScriptResult.Value>()
+                have(value == false)
+            }
+        } finally {
+            proceed.countDown()
+            session.close()
+        }
+    }
+
+    /**
+     * A caller cancelling the children of its job while it waits, like a heartbeat it launched,
+     * would cancel its own turn, if the turn watched the cancellation of the caller as a child of its job,
+     * dropping the snippet of a caller which is still active, see #235.
+     */
+    @Test
+    fun `should execute snippet of waiting caller cancelling the children of its job`() {
+        // given
+        val started = CountDownLatch(1)
+        val proceed = CountDownLatch(1)
+        val session = ScriptSession {
+            provide<CountDownLatch>("started", started)
+            provide<CountDownLatch>("proceed", proceed)
+        }
+        try {
+            val holder = CompletableFuture.supplyAsync {
+                runBlocking {
+                    session.execute("started.countDown(); proceed.await(); 1")
+                }
+            }
+            started.await()
+            val callerResult = CompletableFuture<Result<ScriptResult>>()
+            val caller = CoroutineScope(Dispatchers.Unconfined).launch {
+                launch { awaitCancellation() }
+                callerResult.complete(runCatching { session.execute("2") })
+            }
+            // started in place, and not completed, so waiting for the snippet of the holder
+            assert(!callerResult.isDone)
+
+            // when
+            caller.cancelChildren()
+            proceed.countDown()
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build
+            callerResult.get(1, TimeUnit.MINUTES).getOrThrow() should {
+                be<ScriptResult.Value>()
+                have(value == 2)
+            }
+            assert(!caller.isCancelled)
+            holder.get(1, TimeUnit.MINUTES) should {
+                be<ScriptResult.Value>()
+                have(value == 1)
+            }
+        } finally {
+            proceed.countDown()
+            session.close()
+        }
+    }
+
+    /** The turn of a waiting caller is not a child of its job, so it does not show among them, see #235. */
+    @Test
+    fun `should not add child to the job of waiting caller`() {
+        // given
+        val started = CountDownLatch(1)
+        val proceed = CountDownLatch(1)
+        val session = ScriptSession {
+            provide<CountDownLatch>("started", started)
+            provide<CountDownLatch>("proceed", proceed)
+        }
+        try {
+            val holder = CompletableFuture.supplyAsync {
+                runBlocking {
+                    session.execute("started.countDown(); proceed.await(); 1")
+                }
+            }
+            started.await()
+            val callerResult = CompletableFuture<Result<ScriptResult>>()
+
+            // when
+            val caller = CoroutineScope(Dispatchers.Unconfined).launch {
+                callerResult.complete(runCatching { session.execute("2") })
+            }
+
+            // then
+            // started in place, and not completed, so waiting for the snippet of the holder
+            assert(!callerResult.isDone)
+            assert(caller.children.none())
+            proceed.countDown()
+            callerResult.get(1, TimeUnit.MINUTES).getOrThrow() should {
+                be<ScriptResult.Value>()
+                have(value == 2)
+            }
+            assert(holder.get(1, TimeUnit.MINUTES) is ScriptResult.Value)
+        } finally {
+            proceed.countDown()
+            session.close()
+        }
+    }
+
+    /**
+     * A bare job of a waiting caller, completed while it waits, completes at once, as no child of it waits for the turn,
+     * and cancels the caller without its snippet, like a waiter of a lock, see #235.
+     */
+    @Test
+    fun `should complete job of waiting caller completed while it waits`() {
+        // given
+        val started = CountDownLatch(1)
+        val proceed = CountDownLatch(1)
+        val ran = AtomicBoolean()
+        val session = ScriptSession {
+            provide<CountDownLatch>("started", started)
+            provide<CountDownLatch>("proceed", proceed)
+            provide<AtomicBoolean>("ran", ran)
+        }
+        try {
+            val holder = CompletableFuture.supplyAsync {
+                runBlocking {
+                    session.execute("started.countDown(); proceed.await(); 1")
+                }
+            }
+            started.await()
+            val callerJob = Job()
+            val callerResult = CompletableFuture<Result<ScriptResult>>()
+            suspend {
+                session.execute("ran.set(true); 2")
+            }.startCoroutine(Continuation(callerJob) {
+                callerResult.complete(it)
+            })
+            // started in place, and not completed, so waiting for the snippet of the holder
+            assert(!callerResult.isDone)
+
+            // when
+            callerJob.complete()
+
+            // then
+            assert(callerJob.isCompleted)
+            // bounded, so a hang fails the test instead of hanging the build, completed while the holder still blocks
+            assert(callerResult.get(1, TimeUnit.MINUTES).exceptionOrNull() is CancellationException)
+            assert(!holder.isDone)
+            proceed.countDown()
+            assert(holder.get(1, TimeUnit.MINUTES) is ScriptResult.Value)
             runBlocking {
                 session.execute("ran.get()")
             } should {

@@ -126,7 +126,7 @@ ScriptSession {
   If the session is closed meanwhile, its snippet is rejected on the thread of the session, with an `IllegalStateException`,
   which the caller resumes with as above, so a caller of its own dispatcher does not wait for `Dispatchers.Default`,
   even when queued behind a caller without a dispatcher.
-  A caller cancelled while it waits resumes at once, with its `CancellationException`, without executing its snippet,
+  A caller cancelled while it waits, or whose job completes then, resumes at once, with its `CancellationException`, without executing its snippet,
   on the cancelling thread, if it would resume in place, unless that is the thread of the session, like a snippet cancelling it,
   which resumes it as above.
   So does a caller cancelled already when it calls `execute`, so `withTimeout` bounds the wait,
