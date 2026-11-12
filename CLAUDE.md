@@ -79,7 +79,7 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   The history provider gets the snippet only after its FIR resolution, so an overflow of the parser or of the resolution does not put it there.
 - `providedProperties` are not resolved by the K2 REPL — the dependencies are declared by a generated first snippet instead.
 - The snippet classes carry no nullability annotations (`@NotNull`), unlike regular Kotlin classes, so the nullability of a property has to be read by kotlin-reflect — see `UninitializedProperties.keep`.
-- kotlin-reflect reads a `private` or `internal` member of a snippet class as `PUBLIC` — see `SnippetDeclarations.isAccessibleByLaterSnippet`.
+- Never read the visibility of a snippet member by kotlin-reflect — see `SnippetDeclarations.isAccessibleByLaterSnippet` for why.
 - The evaluator evaluates every compiled snippet not evaluated yet before the given one, so a compiled snippet is always evaluated, even if the caller was cancelled meanwhile.
 - Never interrupt the thread while compiling: an interrupt closes any interruptible NIO channel in use (JDK behaviour), which the compiler's JAR reading might rely on — a precaution, not reproduced.
   An interrupted `runBlocking` (kotlinx.coroutines 1.11) does not throw at once: it runs its pending events first, then cancels its coroutine and waits for it to complete —
@@ -89,7 +89,7 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   see `SnippetDependencyResolver.takeDependencies`.
   The classpath added by a refinement stays with the compiler even if the snippet fails to compile.
 - Known compiler bugs, each with a test pinning the hint: a class of an earlier snippet is unresolved in a declaration of an inferred type calling it,
-  and so is a property (also a provided one), a function, or an extension (reported `on receiver of type` on an explicit receiver) of an earlier snippet, but only when that declaration is used in the same snippet, while a property with an initializer, like `val x = name.length`, resolves it,
+  and so is a property (also a provided one), a function, or an extension (reported `on receiver of type`, but on an integer literal, like `1.tagged()`, or on an implicit receiver, where it reads the same as no receiver in scope at all) of an earlier snippet, but only when that declaration is used in the same snippet, while a property with an initializer, like `val x = name.length`, resolves it,
   while a declaration of a snippet which failed to compile stays unresolved even with the type declared, so it gets no hint,
   an `internal` property or function of an earlier snippet is called by a name it is not compiled to, failing with a `NoSuchMethodError` even with the type declared, so it gets a hint at declaring it public instead,
   a `const val` of an earlier snippet, unresolved in a declaration of an inferred type, crashes the backend wherever else a later snippet reads it (`InterpreterMethodNotFoundError`), also at the top level,
