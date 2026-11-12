@@ -2072,6 +2072,171 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should hint declaring the type when extension of earlier snippet is unresolved on explicit receiver next to internal extension of the name not called instead`() = runTest {
+        // given
+        session.execute("""
+            fun String.shout() = 1
+            internal fun CharSequence.shout() = 2
+            val String.p get() = 1
+            internal val CharSequence.p get() = 2
+            fun Int.x() = 1
+            internal fun Any.x() = 2
+            fun String.y() = 1
+            internal fun String?.y() = 2
+            fun String.z() = 1
+            internal fun <T> T.z() = 2
+            fun List<Int>.t() = 1
+            internal fun Map<String, Int>.t() = 2
+            fun List<out Number>.s() = 1
+            internal fun Map<String, Int>.s() = 2
+            fun StringBuilder.u() = 1
+            internal fun Map<String, Int>.u() = 2
+            class Point
+            fun String.f() = 1
+            internal fun Point.f() = 2
+            fun Int.twice() = 1
+            internal fun String.twice() = 2
+            fun Any.tag() = 1
+            internal fun String.tag() = 2
+            fun Int.thrice() = 1
+            internal fun Long.thrice() = 2
+        """.trimIndent())
+        val calls = mapOf(
+            "shout" to "\"hi\".shout()",
+            "p" to "\"hi\".p",
+            "x" to "\"ab\".length.x()",
+            "y" to "\"a\".y()",
+            "z" to "\"a\".z()",
+            "t" to "listOf(1).t()",
+            "s" to "listOf(1).s()",
+            "u" to "StringBuilder().u()",
+            "f" to "\"a\".f()",
+            "twice" to "1.twice()",
+            "tag" to "1.tag()",
+            "thrice" to "1.thrice()"
+        )
+
+        // when
+        val messages = calls.mapValues { (_, call) -> (session.execute("fun g() = $call\ng()") as ScriptResult.Error).message }
+
+        // then
+        assert(messages.filter { (name, message) -> "hint: '$name' is" !in message }.isEmpty())
+    }
+
+    @Test
+    fun `should call extension of earlier snippet on explicit receiver next to internal extension of the name not called instead in declaration of declared type`() = runTest {
+        // given
+        session.execute("""
+            fun String.shout() = 1
+            internal fun CharSequence.shout() = 2
+            val String.p get() = 1
+            internal val CharSequence.p get() = 2
+            fun Int.x() = 1
+            internal fun Any.x() = 2
+            fun String.y() = 1
+            internal fun String?.y() = 2
+            fun String.z() = 1
+            internal fun <T> T.z() = 2
+            fun List<Int>.t() = 1
+            internal fun Map<String, Int>.t() = 2
+            fun List<out Number>.s() = 1
+            internal fun Map<String, Int>.s() = 2
+            fun StringBuilder.u() = 1
+            internal fun Map<String, Int>.u() = 2
+            class Point
+            fun String.f() = 1
+            internal fun Point.f() = 2
+            fun Int.twice() = 1
+            internal fun String.twice() = 2
+            fun Any.tag() = 1
+            internal fun String.tag() = 2
+            fun Int.thrice() = 1
+            internal fun Long.thrice() = 2
+        """.trimIndent())
+
+        // when
+        val result = session.execute("""
+            fun g(): String = listOf("hi".shout(), "hi".p, "ab".length.x(), "a".y(), "a".z(), listOf(1).t(), listOf(1).s(), StringBuilder().u(), "a".f(), 1.twice(), 1.tag(), 1.thrice()).toString()
+            g()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == List(12) { 1 }.toString())
+        }
+    }
+
+    @Test
+    fun `should hint at declaration of earlier snippet unresolved on implicit receiver next to internal extension of the name of another kind or receiver`() = runTest {
+        // given
+        session.execute("""
+            class Box
+            internal fun String.Box() = 2
+            val limit = 5
+            internal fun String.limit() = 2
+            val cap = 5
+            internal fun Double.cap() = 2
+        """.trimIndent())
+        val references = mapOf(
+            "Box" to "fun f(x: Any) = x is Box\nf(1)",
+            "limit" to "fun String.f() = limit * 2\n\"a\".f()",
+            "cap" to "fun f() = \"a\" to cap\nf()"
+        )
+
+        // when
+        val messages = references.mapValues { (_, snippet) -> (session.execute(snippet) as ScriptResult.Error).message }
+
+        // then
+        assert(messages.filter { (name, message) -> "hint: '$name' is declared in an earlier snippet" !in message }.isEmpty())
+    }
+
+    @Test
+    fun `should read declaration of earlier snippet on implicit receiver next to internal extension of the name of another kind or receiver in declaration of declared type`() = runTest {
+        // given
+        session.execute("""
+            class Box
+            internal fun String.Box() = 2
+            val limit = 5
+            internal fun String.limit() = 2
+            val cap = 5
+            internal fun Double.cap() = 2
+        """.trimIndent())
+
+        // when
+        val result = session.execute("""
+            fun String.g(): String = listOf((1 as Any) is Box, limit * 2, "a" to cap).toString()
+            "a".g()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "[false, 10, (a, 5)]")
+        }
+    }
+
+    @Test
+    fun `should not hint at function of earlier snippet when callable reference to it is unresolved on implicit receiver next to internal extension function of the name`() = runTest {
+        // given
+        session.execute("""
+            fun shout() = 1
+            internal fun String.shout() = 2
+        """.trimIndent())
+
+        // when
+        val results = listOf(
+            "fun String.f() = ::shout\n\"a\".f()",
+            "fun String.g(): String = ::shout.toString()\n\"a\".g()"
+        ).map { session.execute(it) as ScriptResult.Error }
+
+        // then
+        assert("Unresolved reference 'shout'" in results[0].message && "hint:" !in results[0].message)
+        // the reason: declaring the type does not help, the compiler takes the internal extension
+        assert("'shout' is a member and an extension at the same time" in results[1].message)
+    }
+
+    @Test
     fun `should not hint declaring the type when property of earlier snippet is unresolved on integer literal`() = runTest {
         // given
         session.execute("val greeting = \"hi\"")

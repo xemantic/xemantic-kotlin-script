@@ -258,12 +258,20 @@ internal class SnippetDeclarations {
     fun extensionFunctionReceivers(name: String): Set<ExtensionReceiver> = read().extensionFunctions.receivers(name)
 
     /**
-     * The receivers of the last overloads of the extensions, properties and functions, of this [name] declared by the snippets inaccessible by a later snippet,
-     * `null` for one which cannot be read, as a later snippet calls such an extension of a more specific receiver
-     * rather than an accessible one, like `internal fun String.f()` rather than `fun CharSequence.f()` on a `String`, failing then.
+     * The receivers of the last overloads of the extension properties of this [name] declared by the snippets inaccessible by a later snippet,
+     * `null` for one which cannot be read, as a later snippet might call such an extension rather than an accessible one,
+     * like `internal val String.p` rather than `val CharSequence.p` on a `String`, failing then.
      */
-    fun inaccessibleExtensionReceivers(name: String): List<ExtensionReceiver?> = read().run { listOf(extensionProperties, extensionFunctions) }
-        .flatMap { extensions -> extensions[name]?.values.orEmpty().filter { !it.accessible }.map { it.receiver } }
+    fun inaccessibleExtensionPropertyReceivers(name: String): List<ExtensionReceiver?> = read().extensionProperties.inaccessibleReceivers(name)
+
+    /** The receivers of the last overloads of the extension functions of this [name] inaccessible by a later snippet, see [inaccessibleExtensionPropertyReceivers]. */
+    fun inaccessibleExtensionFunctionReceivers(name: String): List<ExtensionReceiver?> = read().extensionFunctions.inaccessibleReceivers(name)
+
+    private fun Map<String, Map<List<String>, Overload>>.inaccessibleReceivers(name: String): List<ExtensionReceiver?> =
+        this[name]?.values.orEmpty().filter { !it.accessible }.map { it.receiver }
+
+    /** Whether a class of this simple [name] is declared by a snippet, also a `private` one. */
+    fun isAnyClass(name: String): Boolean = name in read().classes
 
     /**
      * The receivers of the last overloads of the extensions of this [name], each accessible by a later snippet,
@@ -601,6 +609,40 @@ internal data class ExtensionReceiver(
             }
             else -> otherClass
         }
+    }
+
+    /**
+     * Whether an extension of this receiver, of a class declared by a snippet if [snippetClass], might be called on the receiver of a type,
+     * as rendered by a compiler [message], unless it surely cannot, see [acceptance]:
+     * a type of [wellKnownSupertypes] is not a subtype of another type named there, nor of a class of a snippet,
+     * and only a class of a snippet is a subtype of a class of a snippet,
+     * while any other type might be a subtype of a type not known, like `IntRange` of `Iterable<Int>`, or `String` of `Constable`.
+     */
+    fun mightAccept(message: String, snippetClass: Boolean): Boolean {
+        if (acceptance(message) != Acceptance.REJECTED) return true
+        val ofSnippetClass = snippetQualifier.find(message.trimStart('('))?.range?.first == 0
+        val (type, typeNullable) = message.replace(snippetQualifier, "").withoutNullability()
+        if (typeNullable && !nullable) return false
+        return type.splitAtTopLevel(" & ").any { part ->
+            val typeName = part.removeSuffix("!").substringBefore('<')
+            when {
+                snippetClass -> ofSnippetClass
+                typeName in wellKnownSupertypes -> name.matches(className) && name !in wellKnownTypes
+                else -> true
+            }
+        }
+    }
+
+    /**
+     * Whether this receiver is surely less specific than the [other] one, both accepting a type, so the compiler calls an extension of the [other] one:
+     * of `Any`, or of a type parameter, which is of its bound, see [of], or of a well-known supertype of the [other] one, see [wellKnownSupertypes],
+     * or nullable, if the [other] one is not.
+     */
+    fun isLessSpecificThan(other: ExtensionReceiver): Boolean = when {
+        other.nullable && !nullable -> false
+        name == "Any" -> other.name != "Any" || nullable && !other.nullable
+        name == other.name && typeArguments == other.typeArguments -> nullable && !other.nullable
+        else -> name in wellKnownSupertypes[other.name].orEmpty()
     }
 
     private fun argumentsAcceptance(arguments: List<String>): Acceptance =
