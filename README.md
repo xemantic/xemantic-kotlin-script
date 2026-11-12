@@ -249,9 +249,11 @@ The K2 REPL compiler is still experimental, and these of its bugs are reported t
   as the compiler declares it under a name mangled with the module of its snippet, like `getSecret$snippet1_kts`,
   while it calls it by another name, like `getSecret$main`, or `secret` of a function.
   It works once declared `public`, together with the code calling it, directly or not, declared again, as it keeps calling the `internal` one,
-  and with the values depending on it created again: the ones of a class declaring it, or calling it, as they keep being of the old class,
+  also the subclasses of an open class declaring it, or calling it, as they keep extending the old class,
+  and with the values depending on it created again: the ones of a class declaring it, or calling it, or of its subclasses, as they keep being of the old class,
   and the ones holding a lambda calling it, like `val f = { secret() }`.
   The hint names the declarations and the classes on the stack trace as examples only, as it cannot tell all of them.
+  The code referring to an `object` declaring it, or calling it, and the values holding the `object`, keep the old one, so they are declared, and created, again as well.
 * A `const val` declared in an earlier snippet cannot be read from another snippet:
   it is unresolved within a declaration of an inferred type, and crashes the compiler wherever else it is read,
   also in a top-level expression, or in a property initializer.

@@ -3348,7 +3348,7 @@ class ScriptSessionTest {
         val failure = session.execute("call()")
         failure should {
             be<ScriptResult.Error>()
-            have(message.lines()[1] == "  hint: 'secret' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and declare again the code calling it, directly or not, like 'call' of snippet2.kts, and create again the values depending on it, like the ones holding a lambda calling it, as they keep calling the internal one.")
+            have(message.lines()[1] == "  hint: 'secret' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - it is declared again internal by a later snippet, so declare it again public, without the internal modifier, and declare again the code calling it, directly or not, like 'call' of snippet2.kts, and create again the values depending on it, like the ones holding a lambda calling it, as they keep calling the internal one.")
         }
         session.execute("""
             fun secret() = 3
@@ -3552,7 +3552,7 @@ class ScriptSessionTest {
         val failure = session.execute("b.g()")
         failure should {
             be<ScriptResult.Error>()
-            have(message.lines()[1] == "  hint: 'secret' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and declare again the code calling it, directly or not, like 'A.g' of snippet2.kts, and create again the values depending on it, like the ones holding a lambda calling it, as they keep calling the internal one.")
+            have(message.lines()[1] == "  hint: 'secret' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and declare again the code calling it, directly or not, like 'A.g' of snippet2.kts, and the subclasses of 'A', and create again the values depending on it, like the ones of the class 'A' or of its subclasses, or holding a lambda calling it, as they keep calling the internal one.")
         }
         session.execute("""
             fun secret() = 1
@@ -3788,6 +3788,382 @@ class ScriptSessionTest {
 
         // when
         val result = session.execute("secret()")
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 1)
+        }
+    }
+
+    @Test
+    fun `should call inherited internal member of class of earlier snippet once declared public together with its subclass as hinted`() = runTest {
+        // given
+        session.execute("open class A { internal fun f() = 1 }")
+        session.execute("class B : A()")
+        val failure = session.execute("B().f()")
+        failure should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.NoSuchMethodError: 'int B.f${'$'}main()'
+                  hint: 'A.f' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and declare again the code calling it, directly or not, and the subclasses of 'A', like 'B', and create again the values depending on it, like the ones of the class 'A' or of its subclasses, or holding a lambda calling it, as they keep calling the internal one.
+                  at <snippet body>(snippet3.kts:1)
+                  | B().f()
+            """.trimIndent()
+        }
+        session.execute("""
+            open class A { fun f() = 1 }
+            class B : A()
+        """.trimIndent())
+
+        // when
+        val result = session.execute("B().f()")
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 1)
+        }
+    }
+
+    @Test
+    fun `should call internal function of earlier snippet from open class run on value held by object once declared public together with the code depending on it as hinted`() = runTest {
+        // given
+        session.execute("internal fun secret() = 1")
+        session.execute("open class A { fun g() = secret() }")
+        session.execute("object Holder { val a = A() }")
+        val failure = session.execute("Holder.a.g()")
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines()[1] == "  hint: 'secret' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and declare again the code calling it, directly or not, like 'A.g' of snippet2.kts, and the subclasses of 'A', and create again the values depending on it, like the ones of the class 'A' or of its subclasses, or holding a lambda calling it, as they keep calling the internal one.")
+        }
+        session.execute("""
+            fun secret() = 1
+            open class A { fun g() = secret() }
+        """.trimIndent())
+        session.execute("object Holder { val a = A() }")
+
+        // when
+        val result = session.execute("Holder.a.g()")
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 1)
+        }
+    }
+
+    @Test
+    fun `should call internal function of earlier snippet from lambda field of class once declared public together with the class and its values created again as hinted`() = runTest {
+        // given
+        session.execute("internal fun secret() = 1")
+        session.execute("class H { val f: () -> Int = { secret() } }")
+        session.execute("val h = H()")
+        val failure = session.execute("h.f()")
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines()[1] == "  hint: 'secret' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and declare again the code calling it, directly or not, and create again the values depending on it, like the ones of the class 'H', or holding a lambda calling it, as they keep calling the internal one.")
+        }
+        session.execute("""
+            fun secret() = 1
+            class H { val f: () -> Int = { secret() } }
+        """.trimIndent())
+        session.execute("val h = H()")
+
+        // when
+        val result = session.execute("h.f()")
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 1)
+        }
+    }
+
+    @Test
+    fun `should call internal function of earlier snippet from internal function once declared public together with its callers as hinted`() = runTest {
+        // given
+        session.execute("internal fun secret() = 1")
+        session.execute("""
+            internal fun helper(): Int = secret()
+            fun pub() = helper()
+        """.trimIndent())
+        val failure = session.execute("pub()")
+        failure should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.NoSuchMethodError: 'int secret()'
+                  hint: 'secret' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and declare again the code calling it, directly or not, like 'helper' of snippet2.kts and 'pub' of snippet2.kts, and create again the values depending on it, like the ones holding a lambda calling it, as they keep calling the internal one.
+                  at helper(snippet2.kts:1)
+                  | internal fun helper(): Int = secret()
+                  at pub(snippet2.kts:2)
+                  | fun pub() = helper()
+                  at <snippet body>(snippet3.kts:1)
+                  | pub()
+            """.trimIndent()
+        }
+        session.execute("""
+            fun secret() = 1
+            internal fun helper(): Int = secret()
+            fun pub() = helper()
+        """.trimIndent())
+
+        // when
+        val result = session.execute("pub()")
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 1)
+        }
+    }
+
+    @Test
+    fun `should call internal function of object of earlier snippet once declared public as hinted`() = runTest {
+        // given
+        session.execute("object O { internal fun f() = 1 }")
+        val failure = session.execute("O.f()")
+        failure should {
+            be<ScriptResult.Error>()
+            message sameAs """
+                java.lang.NoSuchMethodError: 'int O.f${'$'}main()'
+                  hint: 'O.f' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and declare again the code calling it, directly or not, or referring to the object 'O', and create again the values depending on it, like the ones holding the object 'O', or holding a lambda calling it, as they keep calling the internal one.
+                  at <snippet body>(snippet2.kts:1)
+                  | O.f()
+            """.trimIndent()
+        }
+        session.execute("object O { fun f() = 1 }")
+
+        // when
+        val result = session.execute("O.f()")
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 1)
+        }
+    }
+
+    @Test
+    fun `should call internal function of companion object of earlier snippet once declared public as hinted`() = runTest {
+        // given
+        session.execute("class C { companion object { internal fun f() = 1 } }")
+        val failure = session.execute("C.f()")
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines()[1] == "  hint: 'C.Companion.f' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and declare again the code calling it, directly or not, or referring to the companion object of 'C', and create again the values depending on it, like the ones holding the companion object of 'C', or holding a lambda calling it, as they keep calling the internal one.")
+        }
+        session.execute("class C { companion object { fun f() = 1 } }")
+
+        // when
+        val result = session.execute("C.f()")
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 1)
+        }
+    }
+
+    @Test
+    fun `should call internal function of object of earlier snippet held by value once declared public and the value created again as hinted`() = runTest {
+        // given
+        session.execute("object O { internal fun f() = 1 }")
+        session.execute("val o = O")
+        val failure = session.execute("o.f()")
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines()[1] == "  hint: 'O.f' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and declare again the code calling it, directly or not, or referring to the object 'O', and create again the values depending on it, like the ones holding the object 'O', or holding a lambda calling it, as they keep calling the internal one.")
+        }
+        session.execute("object O { fun f() = 1 }")
+        val failureOfValueCreatedBefore = session.execute("o.f()")
+        failureOfValueCreatedBefore should {
+            be<ScriptResult.Error>()
+            have(message.lines()[1] == "  hint: 'O.f' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - it is declared again by a later snippet, so declare again the code calling it, directly or not, or referring to the object 'O', and create again the values depending on it, like the ones holding the object 'O', or holding a lambda calling it, as they keep calling the internal one.")
+        }
+        session.execute("val o = O")
+
+        // when
+        val result = session.execute("o.f()")
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 1)
+        }
+    }
+
+    @Test
+    fun `should call internal function of earlier snippet declared again public and then internal once declared again public together with its callers as hinted`() = runTest {
+        // given
+        session.execute("internal fun secret() = 1")
+        session.execute("fun next(): Int = secret()")
+        session.execute("fun secret() = 2")
+        session.execute("internal fun secret() = 3")
+        val failure = session.execute("next()")
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines()[1] == "  hint: 'secret' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - it is declared again internal by a later snippet, so declare it again public, without the internal modifier, and declare again the code calling it, directly or not, like 'next' of snippet2.kts, and create again the values depending on it, like the ones holding a lambda calling it, as they keep calling the internal one.")
+        }
+        session.execute("""
+            fun secret() = 2
+            fun next(): Int = secret()
+        """.trimIndent())
+
+        // when
+        val result = session.execute("next()")
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should call internal function of earlier snippet from enum entry with body once declared public together with the enum as hinted`() = runTest {
+        // given
+        session.execute("internal fun secret() = 1")
+        session.execute("enum class E { A { override fun f() = secret() }; open fun f() = 0 }")
+        val failure = session.execute("E.A.f()")
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines()[1] == "  hint: 'secret' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and declare again the code calling it, directly or not, like 'E.A.f' of snippet2.kts, and create again the values depending on it, like the ones holding a lambda calling it, as they keep calling the internal one.")
+        }
+        session.execute("""
+            fun secret() = 1
+            enum class E { A { override fun f() = secret() }; open fun f() = 0 }
+        """.trimIndent())
+
+        // when
+        val result = session.execute("E.A.f()")
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 1)
+        }
+    }
+
+    @Test
+    fun `should call internal function of earlier snippet from nested class once declared public together with the class and its values created again as hinted`() = runTest {
+        // given
+        session.execute("internal fun secret() = 1")
+        session.execute("class O { class I { fun g() = secret() } }")
+        val failure = session.execute("O.I().g()")
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines()[1] == "  hint: 'secret' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and declare again the code calling it, directly or not, like 'O.I.g' of snippet2.kts, and create again the values depending on it, like the ones of the class 'O.I', or holding a lambda calling it, as they keep calling the internal one.")
+        }
+        session.execute("""
+            fun secret() = 1
+            class O { class I { fun g() = secret() } }
+        """.trimIndent())
+
+        // when
+        val result = session.execute("O.I().g()")
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 1)
+        }
+    }
+
+    @Test
+    fun `should call internal function of object of earlier snippet returned by function of earlier snippet once declared public together with the function as hinted`() = runTest {
+        // given
+        session.execute("object O { internal fun f() = 1 }")
+        session.execute("fun getO() = O")
+        val failure = session.execute("getO().f()")
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines()[1] == "  hint: 'O.f' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and declare again the code calling it, directly or not, or referring to the object 'O', and create again the values depending on it, like the ones holding the object 'O', or holding a lambda calling it, as they keep calling the internal one.")
+        }
+        session.execute("""
+            object O { fun f() = 1 }
+            fun getO() = O
+        """.trimIndent())
+
+        // when
+        val result = session.execute("getO().f()")
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 1)
+        }
+    }
+
+    @Test
+    fun `should call internal function of earlier snippet called directly and by function of earlier snippet once declared public together with the function as hinted`() = runTest {
+        // given
+        session.execute("internal fun secret() = 1")
+        session.execute("fun pub() = secret()")
+        val failure = session.execute("secret() + pub()")
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines()[1] == "  hint: 'secret' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and declare again the code calling it, directly or not, and create again the values depending on it, like the ones holding a lambda calling it, as they keep calling the internal one.")
+        }
+        session.execute("""
+            fun secret() = 1
+            fun pub() = secret()
+        """.trimIndent())
+
+        // when
+        val result = session.execute("secret() + pub()")
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should call internal member of class of earlier snippet declared again without it once declared public and its values created again as hinted`() = runTest {
+        // given
+        session.execute("class Box { internal fun open() = 1 }")
+        session.execute("val box = Box()")
+        session.execute("class Box { fun open() = 2 }")
+        session.execute("class Box")
+        val failure = session.execute("box.open()")
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines()[1] == "  hint: 'Box.open' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and declare again the code calling it, directly or not, and create again the values depending on it, like the ones of the class 'Box', or holding a lambda calling it, as they keep calling the internal one.")
+        }
+        session.execute("class Box { fun open() = 1 }")
+        session.execute("val box = Box()")
+
+        // when
+        val result = session.execute("box.open()")
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 1)
+        }
+    }
+
+    @Test
+    fun `should call internal function of earlier snippet from object held by value once declared public together with the object and the value as hinted`() = runTest {
+        // given
+        session.execute("internal fun secret() = 1")
+        session.execute("object Holder { fun g() = secret() }")
+        session.execute("val h = Holder")
+        val failure = session.execute("h.g()")
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines()[1] == "  hint: 'secret' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and declare again the code calling it, directly or not, like 'Holder.g' of snippet2.kts, or referring to the object 'Holder', and create again the values depending on it, like the ones holding the object 'Holder', or holding a lambda calling it, as they keep calling the internal one.")
+        }
+        session.execute("""
+            fun secret() = 1
+            object Holder { fun g() = secret() }
+        """.trimIndent())
+        session.execute("val h = Holder")
+
+        // when
+        val result = session.execute("h.g()")
 
         // then
         result should {
@@ -4383,7 +4759,7 @@ class ScriptSessionTest {
         val failure = session.execute("kind(1)")
         failure should {
             be<ScriptResult.Error>()
-            have(message.lines()[1].startsWith("  hint: 'kind' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and "))
+            have(message.lines()[1] == "  hint: 'kind' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and declare again the code calling it, directly or not, and create again the values depending on it, like the ones holding a lambda calling it, as they keep calling the internal one.")
         }
         session.execute("fun <T : Number> kind(x: T) = 1")
 

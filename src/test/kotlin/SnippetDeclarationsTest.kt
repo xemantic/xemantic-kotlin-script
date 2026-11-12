@@ -88,6 +88,11 @@ class SnippetDeclarationsTest {
                     object Object
                     class ClassWithCompanion { companion object }
                     enum class EnumClass { ENTRY }
+                    open class OpenClassOfInternalMember { internal fun internalMember() = 1 }
+                    class SubclassOfInternalMember : OpenClassOfInternalMember()
+                    enum class EnumClassWithBody { ENTRY { override fun f() = 1 }; open fun f() = 0 }
+                    class ClassOfAnonymousObject { val runnable = object : Runnable { override fun run() {} } }
+                    class OuterClass { class NestedClass }
                     Snippet1::class.java
                 """.trimIndent()) }
                 (result as ScriptResult.Value).value as Class<*>
@@ -383,7 +388,7 @@ class SnippetDeclarationsTest {
         assert(declarations.internalMember("Snippet1", "internalFunction", emptyList()) == InternalMember("internalFunction", "snippet1.kts"))
         assert(declarations.internalMember("Snippet1", $$"getInternalExtensionProperty$main", listOf("java.lang.String")) == InternalMember("internalExtensionProperty", "snippet1.kts"))
         assert(declarations.internalMember("Snippet1", "internalExtensionFunction", listOf("java.lang.String")) == InternalMember("internalExtensionFunction", "snippet1.kts"))
-        assert(declarations.internalMember($$"Snippet1$ClassOfInternalMember", $$"getInternalMember$main", emptyList()) == InternalMember("ClassOfInternalMember.internalMember", "snippet1.kts", declaringClass = "ClassOfInternalMember"))
+        assert(declarations.internalMember($$"Snippet1$ClassOfInternalMember", $$"getInternalMember$main", emptyList()) == InternalMember("ClassOfInternalMember.internalMember", "snippet1.kts", declaringClass = DeclaredClass("ClassOfInternalMember", DeclaredClass.Kind.FINAL)))
     }
 
     @Test
@@ -434,22 +439,71 @@ class SnippetDeclarationsTest {
     }
 
     @Test
-    fun `should tell final class of snippet whose values a later snippet can create again`() {
+    fun `should find internal member of snippet inherited by subclass`() {
+        // when
+        val member = declarations.internalMember($$"Snippet1$SubclassOfInternalMember", "internalMember", emptyList())
+
+        // then
+        assert(
+            member == InternalMember(
+                name = "OpenClassOfInternalMember.internalMember",
+                snippet = "snippet1.kts",
+                declaringClass = DeclaredClass("OpenClassOfInternalMember", DeclaredClass.Kind.OPEN),
+                calledOn = "SubclassOfInternalMember"
+            )
+        )
+    }
+
+    @Test
+    fun `should find internal function of snippet of 32 parameters by its stub of default arguments`() {
+        // given
+        val parameters = (1..32).joinToString { "p$it: Int = 0" }
+        val scriptClass = ScriptSession().use { session ->
+            val result = runBlocking {
+                session.execute("""
+                    internal fun String.extension($parameters) = 1
+                    internal suspend fun suspending($parameters) = 1
+                    Snippet1::class.java
+                """.trimIndent())
+            }
+            (result as ScriptResult.Value).value as Class<*>
+        }
+        val declarations = SnippetDeclarations().apply { keep(scriptClass, "snippet1.kts") }
+        val ints = List(32) { "int" }
+
+        // when
+        val extension = declarations.internalMember(
+            "Snippet1", $$"extension$default", listOf("Snippet1", "java.lang.String") + ints + listOf("int", "java.lang.Object")
+        )
+        val suspending = declarations.internalMember(
+            "Snippet1", $$"suspending$default", listOf("Snippet1") + ints + listOf("kotlin.coroutines.Continuation", "int", "java.lang.Object")
+        )
+
+        // then
+        assert(extension == InternalMember("extension", "snippet1.kts"))
+        assert(suspending == InternalMember("suspending", "snippet1.kts"))
+    }
+
+    @Test
+    fun `should tell class of snippet whose values a later snippet can create again`() {
         // when
         val declarations = declarations
 
         // then
-        assert(declarations.isFinalClass("Snippet1"))
-        assert(declarations.isFinalClass($$"Snippet1$PublicClass"))
-        assert(!declarations.isFinalClass($$"Snippet1$OpenClass"))
-        assert(!declarations.isFinalClass($$"Snippet1$AbstractClass"))
-        assert(!declarations.isFinalClass($$"Snippet1$Interface"))
-        assert(!declarations.isFinalClass($$"Snippet1$Interface$DefaultImpls"))
-        assert(!declarations.isFinalClass($$"Snippet1$Object"))
-        assert(!declarations.isFinalClass($$"Snippet1$ClassWithCompanion$Companion"))
-        assert(!declarations.isFinalClass($$"Snippet1$EnumClass"))
-        assert(!declarations.isFinalClass($$"Snippet1$Undeclared"))
-        assert(!declarations.isFinalClass("java.lang.String"))
+        assert(declarations.declaredClass("Snippet1") == null)
+        assert(declarations.declaredClass($$"Snippet1$PublicClass") == DeclaredClass("PublicClass", DeclaredClass.Kind.FINAL))
+        assert(declarations.declaredClass($$"Snippet1$OuterClass$NestedClass") == DeclaredClass("OuterClass.NestedClass", DeclaredClass.Kind.FINAL))
+        assert(declarations.declaredClass($$"Snippet1$OpenClass") == DeclaredClass("OpenClass", DeclaredClass.Kind.OPEN))
+        assert(declarations.declaredClass($$"Snippet1$AbstractClass") == DeclaredClass("AbstractClass", DeclaredClass.Kind.OPEN))
+        assert(declarations.declaredClass($$"Snippet1$Object") == DeclaredClass("Object", DeclaredClass.Kind.OBJECT))
+        assert(declarations.declaredClass($$"Snippet1$ClassWithCompanion$Companion") == DeclaredClass("ClassWithCompanion.Companion", DeclaredClass.Kind.COMPANION))
+        assert(declarations.declaredClass($$"Snippet1$ClassOfAnonymousObject$runnable$1") == DeclaredClass("ClassOfAnonymousObject", DeclaredClass.Kind.FINAL))
+        assert(declarations.declaredClass($$"Snippet1$Interface") == DeclaredClass("Interface", DeclaredClass.Kind.OTHER))
+        assert(declarations.declaredClass($$"Snippet1$Interface$DefaultImpls") == DeclaredClass("Interface.DefaultImpls", DeclaredClass.Kind.OTHER))
+        assert(declarations.declaredClass($$"Snippet1$EnumClass") == DeclaredClass("EnumClass", DeclaredClass.Kind.OTHER))
+        assert(declarations.declaredClass($$"Snippet1$EnumClassWithBody$ENTRY") == DeclaredClass("EnumClassWithBody", DeclaredClass.Kind.OTHER))
+        assert(declarations.declaredClass($$"Snippet1$Undeclared") == null)
+        assert(declarations.declaredClass("java.lang.String") == null)
     }
 
     @Test
