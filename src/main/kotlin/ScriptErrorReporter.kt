@@ -24,6 +24,15 @@ import java.util.IdentityHashMap
 import kotlin.script.experimental.api.ResultValue
 import kotlin.script.experimental.api.ScriptDiagnostic
 
+/** The message of a failure without any diagnostic. */
+private const val NO_DIAGNOSTIC_MESSAGE = "Failed without any diagnostic message."
+
+/** The line of the snippet of this source path, like `snippet3.kts:2`, as the diagnostics and the frames name it. */
+internal fun snippetLine(
+    sourcePath: String,
+    line: Int
+): String = "${sourcePath.substringAfterLast('/')}:$line"
+
 /** The longest sequence of frames collapsed when repeated, like of a mutual recursion. */
 private const val MAX_REPEATED_FRAMES = 16
 
@@ -86,7 +95,7 @@ internal class ScriptErrorReporter(
     ): String = inlinedFrames.report().let { report ->
         diagnostics.reportable().map { describe(it, report) }
     }.distinct().joinToString("\n").trimEnd().ifEmpty {
-        "error: Failed without any diagnostic message."
+        "error: $NO_DIAGNOSTIC_MESSAGE"
     }
 
     /** The warnings of the [diagnostics], or `null`, if there are none. */
@@ -131,7 +140,7 @@ internal class ScriptErrorReporter(
         val lines = diagnostic.sourcePath?.let { path -> snippets[path.substringAfterLast('/')] }
         val name = diagnostic.sourcePath?.substringAfterLast('/')
         if (location != null && lines != null && name != null) {
-            append("$name:${location.start.line}:${location.start.col}: ")
+            append("${snippetLine(name, location.start.line)}:${location.start.col}: ")
         }
         append(diagnostic.severity.name.lowercase())
         append(": ")
@@ -552,8 +561,10 @@ internal class ScriptErrorReporter(
  * The [ScriptResult] of a snippet from the [result] of its evaluation,
  * which is `null` if the evaluation failed without one, reported by the [evaluationReports] then,
  * like [ResultValue.NotEvaluated], which is a failure as well,
- * with the warnings of the [compilationReports], and the [dependencies] of the snippet,
+ * with the warnings of the [dependencies] of the snippet, and of the [compilationReports], on every path,
  * hinting at the properties the snippet left [uninitialized].
+ * The warnings of a fatal error, which is thrown, are lost, but the supersession of a repository declaration,
+ * logged by the [SnippetDependencyResolver].
  *
  * @throws VirtualMachineError thrown by the snippet, other than [StackOverflowError].
  */
@@ -564,21 +575,33 @@ internal fun ScriptErrorReporter.scriptResult(
     dependencies: SnippetDependencyResolver.SnippetDependencies,
     uninitialized: List<UninitializedProperty> = emptyList()
 ): ScriptResult = when (result) {
-    is ResultValue.Value -> ScriptResult.Value(result.value, warnings(dependencies.supersessions + compilationReports), dependencies.resolvedVersions)
-    is ResultValue.Unit -> ScriptResult.Value(Unit, warnings(dependencies.supersessions + compilationReports), dependencies.resolvedVersions)
+    is ResultValue.Value -> ScriptResult.Value(
+        result.value, warnings(dependencies.warnings(succeeded = true) + compilationReports), dependencies.resolvedVersions
+    )
+    is ResultValue.Unit -> ScriptResult.Value(
+        Unit, warnings(dependencies.warnings(succeeded = true) + compilationReports), dependencies.resolvedVersions
+    )
     is ResultValue.Error -> {
         val error = result.error
         if (error.isFatal) throw error
         ScriptResult.Error(
-            describe(error, dependencies.warnings + compilationReports, uninitialized),
+            describe(error, dependencies.warnings(succeeded = false) + compilationReports, uninitialized),
             ExecutionPhase.EVALUATION
         )
     }
     is ResultValue.NotEvaluated, null -> ScriptResult.Error(
-        describe(evaluationReports.ifEmpty { dependencies.warnings + compilationReports }),
+        describe(
+            evaluationReports.withFailure() + dependencies.warnings(succeeded = false) + compilationReports
+        ),
         ExecutionPhase.EVALUATION
     )
 }
+
+/** These reports of a failed evaluation, preceded by an error, if none of them is one, so the warnings following them do not read as the failure. */
+private fun List<ScriptDiagnostic>.withFailure(): List<ScriptDiagnostic> =
+    if (any { it.severity >= ScriptDiagnostic.Severity.ERROR }) this else listOf(
+        ScriptDiagnostic(ScriptDiagnostic.unspecifiedError, NO_DIAGNOSTIC_MESSAGE)
+    ) + this
 
 /**
  * This message with its lines after the first indented by the [indent], so that they read as a continuation of the first,

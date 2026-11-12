@@ -22,12 +22,15 @@ import com.xemantic.kotlin.test.assert
 import org.apache.maven.settings.Settings
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.writeText
+import kotlin.script.experimental.api.valueOrNull
+import kotlin.script.experimental.dependencies.RepositoryCoordinates
+import kotlin.script.experimental.dependencies.maven.MavenDependenciesResolver
 import kotlin.test.Test
 
 /**
  * The shortening of the repositories in the messages of Maven, which the resolver reports,
  * also of Maven Central, which cannot be reached by a deterministic test, see [withRepositoryUrls],
- * and the release of the resolver.
+ * the release of the resolver, and the behavior of `MavenDependenciesResolver` the resolver relies on.
  */
 class SnippetDependencyResolverTest {
 
@@ -88,10 +91,36 @@ class SnippetDependencyResolverTest {
     }
 
     /** See #209. */
+    /** See #237. */
+    @Test
+    fun `should mask user info of repository URL`() {
+        // given
+        val message = "Superseded the declaration of the repository 'https://alice:token@repo.example.com/maven/'"
+
+        // when
+        val masked = message.withoutUserInfo()
+
+        // then
+        assert(masked == "Superseded the declaration of the repository 'https://***@repo.example.com/maven/'")
+    }
+
+    /** See #237. */
+    @Test
+    fun `should keep repository URL without user info`() {
+        // given
+        val message = "Repository 'https://repo.example.com/maven/@scope', also 'file:/tmp/a@b'"
+
+        // when
+        val masked = message.withoutUserInfo()
+
+        // then
+        assert(masked == message)
+    }
+
     @Test
     fun `should close version lookup once closed`() {
         // given
-        val resolver = SnippetDependencyResolver(javaClass.classLoader)
+        val resolver = SnippetDependencyResolver(javaClass.classLoader, "test-session")
 
         // when
         resolver.close()
@@ -117,7 +146,7 @@ class SnippetDependencyResolverTest {
                     newRepositorySystem().apply { addOnSystemEndedHandler { error("Shutdown failed") } }
                 }
             )
-            val resolver = SnippetDependencyResolver(javaClass.classLoader, versionLookup)
+            val resolver = SnippetDependencyResolver(javaClass.classLoader, "test-session", versionLookup)
             versionLookup.latestVersion("com.xemantic.fixture", "greeter", emptyList())
             resolver.classLoader.add(listOf(dependencies.toFile()))
             val markerBefore = resolver.classLoader.getResource("marker.txt")
@@ -133,6 +162,25 @@ class SnippetDependencyResolverTest {
             localRepository.deleteRecursively()
             dependencies.toFile().deleteRecursively()
         }
+    }
+
+
+    /**
+     * The resolver creates its `MavenDependenciesResolver` again from the repositories accepted once,
+     * relying on it to accept each again, as it reads only the syntax of the URL, and the environment variables, see #237.
+     */
+    @Test
+    fun `should accept file repository of deleted directory`() {
+        // given
+        val directory = createTempDirectory("deleted-repository").toFile()
+        val coordinates = RepositoryCoordinates(directory.toURI().toString())
+        directory.delete()
+
+        // when
+        val result = MavenDependenciesResolver().addRepository(coordinates)
+
+        // then
+        assert(result.valueOrNull() == true)
     }
 
 }

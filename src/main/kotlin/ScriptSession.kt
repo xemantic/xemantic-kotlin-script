@@ -251,7 +251,7 @@ internal class DefaultScriptSession(
     private val disposable = Disposer.newDisposable(name)
 
     /** The resolver of the dependencies declared by the snippets, exposed only for the tests. */
-    internal val dependencyResolver = SnippetDependencyResolver(classLoader)
+    internal val dependencyResolver = SnippetDependencyResolver(classLoader, name)
 
     /** The lines of the snippets by their names, like `snippet3.kts`, accessed on the [thread] only. */
     private val snippets = HashMap<String, List<String>>()
@@ -415,7 +415,8 @@ internal class DefaultScriptSession(
             history.rollback()
             return Compilation(
                 ResultWithDiagnostics.Failure(
-                    dependencies.warnings + dependencies.errors.ifEmpty { result?.reports.orEmpty() }
+                    if (dependencies.failed) dependencies.diagnostics
+                    else dependencies.warnings(succeeded = false) + result?.reports.orEmpty()
                 ),
                 dependencies
             )

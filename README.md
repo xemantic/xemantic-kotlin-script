@@ -215,6 +215,22 @@ ScriptSession {
   is resolved to the latest of its versions present in the local Maven repository.
   A version range, like `[1.0,)`, and the `RELEASE` and `LATEST` versions of Maven are resolved by Maven itself,
   which might select a pre-release version.
+* A repository can be declared again with other options, like corrected credentials,
+  and is then read with each of its declarations.
+  Once the lookup of a version is refused (`401`) with the credentials of one declaration,
+  while another declaration of the repository is served the metadata of the dependency,
+  the refused declaration is superseded:
+  its credentials are no longer sent, neither to look up a version, nor to resolve a dependency.
+  The supersession is reported once, as a warning pointing to the `@file:DependsOn` line whose lookup superseded it,
+  naming the line of the superseded `@file:Repository`, possibly of an earlier snippet,
+  like `Superseded the declaration of the repository 'https://...' at snippet1.kts:1, with the credentials refused (401), by its other declaration, ...`,
+  as a later dependency served only to these credentials would fail without them.
+  Declaring the repository again with them restores the declaration.
+  The warning is part of `ScriptResult.Value.warnings` of a successful snippet, and of the message of a failed one.
+  It is also logged, at the `INFO` level, as the caller gets no result of a snippet throwing a fatal error, like an `OutOfMemoryError`,
+  or of a cancelled `execute`, while the supersession is not reported again —
+  on every path, also when the result reports it.
+  The user info of the repository URL, like `alice:token` of `https://alice:token@host/`, is masked in the warning and in the log.
 
 ### Known limitations
 
@@ -287,9 +303,19 @@ so that they do not break the structure of the report.
 The classes declared by the snippets are named as declared, like `Color.BLUE`,
 not qualified by the generated snippet class, like `Snippet1.Color.BLUE`.
 
-Compiler warnings of a successful snippet are available as `ScriptResult.Value.warnings`.
+The warnings of a successful snippet are available as `ScriptResult.Value.warnings`:
+the warnings of its dependencies other than the resolved versions,
+like a superseded declaration of a repository, in the order of their lines,
+followed by the compiler warnings.
 They might reveal a bug in a snippet which nevertheless succeeded,
 so it is up to the caller whether to show them to the LLM.
+A failed snippet reports these warnings in the error message instead,
+also the resolved versions of its dependencies,
+except for a snippet with a dependency failing to resolve,
+which reports only the warnings and the errors of its dependencies,
+as the diagnostics of the compiler follow from the missing dependency then.
+A snippet throwing a fatal error, like an `OutOfMemoryError`, or executed by a cancelled caller, returns no result,
+so its warnings are lost then, except for the logged supersession of a repository declaration.
 It is up to the caller how to present the error to the LLM, e.g.:
 
 ```kotlin
