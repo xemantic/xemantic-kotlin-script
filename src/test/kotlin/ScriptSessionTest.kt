@@ -7663,13 +7663,14 @@ class ScriptSessionTest {
         val session = DefaultScriptSession(
             emptyList(),
             Dispatchers.Default,
-            resumeExecutor = resumeExecutor
-        ) { threadFactory ->
-            InterceptedExecutor(Executors.newSingleThreadExecutor(threadFactory)) { index, execute ->
-                execute()
-                if (index == 0) throw IllegalStateException("execute failed after queueing")
+            resumeExecutor = resumeExecutor,
+            executor = { threadFactory ->
+                InterceptedExecutor(Executors.newSingleThreadExecutor(threadFactory)) { index, execute ->
+                    execute()
+                    if (index == 0) throw IllegalStateException("execute failed after queueing")
+                }
             }
-        }
+        )
         val resumptions = AtomicInteger()
         try {
             // when
@@ -8367,7 +8368,7 @@ class ScriptSessionTest {
     fun `should fail caller cancelled while its snippet is rejected with its cancellation`() {
         // given
         lateinit var caller: Job
-        val session = DefaultScriptSession(emptyList(), Dispatchers.Default) { threadFactory ->
+        val session = DefaultScriptSession(emptyList(), Dispatchers.Default, executor = { threadFactory ->
             InterceptedExecutor(Executors.newSingleThreadExecutor(threadFactory)) { index, execute ->
                 if (index == 0) {
                     caller.cancel()
@@ -8375,7 +8376,7 @@ class ScriptSessionTest {
                 }
                 execute()
             }
-        }
+        })
         val failure = CompletableFuture<Throwable?>()
         try {
             // when
@@ -8403,7 +8404,7 @@ class ScriptSessionTest {
         // given
         val fatal = OutOfMemoryError("unable to create native thread")
         lateinit var caller: Job
-        val session = DefaultScriptSession(emptyList(), Dispatchers.Default) { threadFactory ->
+        val session = DefaultScriptSession(emptyList(), Dispatchers.Default, executor = { threadFactory ->
             InterceptedExecutor(Executors.newSingleThreadExecutor(threadFactory)) { index, execute ->
                 if (index == 0) {
                     caller.cancel()
@@ -8411,7 +8412,7 @@ class ScriptSessionTest {
                 }
                 execute()
             }
-        }
+        })
         val failure = CompletableFuture<Throwable?>()
         try {
             // when
