@@ -20,8 +20,8 @@ package com.xemantic.kotlin.script
 
 import com.xemantic.kotlin.test.assert
 import org.apache.maven.settings.Settings
+import java.io.File
 import kotlin.io.path.createTempDirectory
-import kotlin.io.path.writeText
 import kotlin.script.experimental.api.valueOrNull
 import kotlin.script.experimental.dependencies.RepositoryCoordinates
 import kotlin.script.experimental.dependencies.maven.MavenDependenciesResolver
@@ -136,9 +136,11 @@ class SnippetDependencyResolverTest {
     @Test
     fun `should close class loader even if closing version lookup fails`() {
         // given a version lookup, which fails to shut down the repository system created by its lookup
-        val localRepository = createTempDirectory("maven-local").toFile()
-        val dependencies = createTempDirectory("dependencies")
+        // created within the try, so the first directory is deleted also if creating the second one fails
+        val directories = mutableListOf<File>()
         try {
+            val localRepository = createTempDirectory("maven-local").toFile().also(directories::add)
+            val dependencies = createTempDirectory("dependencies").toFile().also(directories::add)
             dependencies.resolve("marker.txt").writeText("marker")
             val versionLookup = MavenVersionLookup(
                 settingsFactory = { Settings().apply { this.localRepository = localRepository.path } },
@@ -148,7 +150,7 @@ class SnippetDependencyResolverTest {
             )
             val resolver = SnippetDependencyResolver(javaClass.classLoader, "test-session", versionLookup)
             versionLookup.latestVersion("com.xemantic.fixture", "greeter", emptyList())
-            resolver.classLoader.add(listOf(dependencies.toFile()))
+            resolver.classLoader.add(listOf(dependencies))
             val markerBefore = resolver.classLoader.getResource("marker.txt")
 
             // when
@@ -159,8 +161,7 @@ class SnippetDependencyResolverTest {
             assert(failure?.suppressed?.map { it.message } == listOf("Shutdown failed"))
             assert(resolver.classLoader.getResource("marker.txt") == null)
         } finally {
-            localRepository.deleteRecursively()
-            dependencies.toFile().deleteRecursively()
+            directories.forEach { it.deleteRecursively() }
         }
     }
 

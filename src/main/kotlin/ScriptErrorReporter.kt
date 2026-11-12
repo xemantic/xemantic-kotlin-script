@@ -270,7 +270,7 @@ internal class ScriptErrorReporter(
             appendConstPropertyHint(exception)
         }
         // a hint failing is left out, not to lose the report
-        append(logger.readOr("", { "cannot hint at the unresolved reference of: ${diagnostic.message}" }) {
+        append(logger.runOr("", { "cannot hint at the unresolved reference of: ${diagnostic.message}" }) {
             buildString { appendUnresolvedReferenceHint(diagnostic.message, location, lines) }
         })
     }

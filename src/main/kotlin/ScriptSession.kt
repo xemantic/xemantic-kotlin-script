@@ -212,6 +212,10 @@ private val reservedNames = setOf("coroutineContext", "await")
  * The [ScriptSession], with the thread of its snippets run by the single thread [executor] created with the given thread factory,
  * and a caller which would resume in place, on that thread, resumed from the [resumeExecutor] instead, see [ScriptSession.execute].
  *
+ * The parameters after the [dispatcher] are the seams of the tests, passed by name,
+ * where the last one, which a trailing lambda would be passed to, is the [newReplDisposable],
+ * so a lambda meant for the [executor] does not compile there.
+ *
  * @param newReplDisposable creates the disposable of a compiler of this name, see [createRepl],
  * replaced only by the tests, to make its disposal fail.
  */
@@ -219,8 +223,8 @@ internal class DefaultScriptSession(
     private val properties: List<ScriptProperty<*>>,
     dispatcher: CoroutineDispatcher,
     private val resumeExecutor: Executor = Dispatchers.Default.asExecutor(),
-    private val newReplDisposable: (name: String) -> Disposable = Disposer::newDisposable,
-    executor: (ThreadFactory) -> ExecutorService = Executors::newSingleThreadExecutor
+    executor: (ThreadFactory) -> ExecutorService = Executors::newSingleThreadExecutor,
+    private val newReplDisposable: (name: String) -> Disposable = Disposer::newDisposable
 ) : ScriptSession {
 
     init {
@@ -815,15 +819,15 @@ internal class DefaultScriptSession(
         val created = try {
             Repl(disposable).also { propertiesFailure = declareProperties(it) }
         } catch (e: Throwable) {
-            runCatching { Disposer.dispose(disposable) }.exceptionOrNull()?.takeIf { it !== e }?.let(e::addSuppressed)
-            throw e
+            // a fatal failure of the disposal is thrown over a non-fatal one of the creation, which is suppressed then
+            throw mostSevere(e, runCatching { disposeTree(disposable) }.exceptionOrNull())
         }
         if (propertiesFailure != null) {
             // the disposer disposes the whole subtree, and then rethrows an exception thrown by any of its disposables,
             // which would make this first result differ from the kept failure returned by every later execution,
-            // so it is only logged
-            runCatching { Disposer.dispose(disposable) }.onFailure { e ->
-                logger.warn(e) { "$name: disposing the compiler of the failed declaration of the properties failed" }
+            // so it is only logged, except for a fatal error, like in close
+            logger.runOr(Unit, { "$name: disposing the compiler of the failed declaration of the properties failed" }, Level.WARN) {
+                disposeTree(disposable)
             }
             return null
         }
@@ -885,10 +889,10 @@ internal class DefaultScriptSession(
         thread.execute {
             // each one released even if an earlier one fails, which is logged, as no caller awaits the release,
             // while a fatal error is thrown, to the uncaught exception handler of the thread
-            logger.runOr(Unit, Level.WARN, { "$name: releasing the session failed" }) {
+            logger.runOr(Unit, { "$name: releasing the session failed" }, Level.WARN) {
                 releaseAll(
                     { ScriptPropertyValues.unregister(id) },
-                    { Disposer.dispose(disposable) },
+                    { disposeTree(disposable) },
                     dependencyResolver::close
                 )
             }
@@ -932,34 +936,58 @@ internal val Throwable.isFatal: Boolean
  * then throws the first fatal failure, see [isFatal], or else the first failure, if any, with the other ones suppressed.
  */
 internal fun releaseAll(vararg releases: () -> Unit) {
-    val failures = releases.mapNotNull { release -> runCatching(release).exceptionOrNull() }.distinct()
-    val thrown = failures.firstOrNull { it.isFatal } ?: failures.firstOrNull() ?: return
-    failures.filter { it !== thrown }.forEach(thrown::addSuppressed)
-    throw thrown
+    val failures = releases.mapNotNull { release -> runCatching(release).exceptionOrNull() }
+    if (failures.isNotEmpty()) throw mostSevere(failures.first(), *failures.drop(1).toTypedArray())
 }
 
-/** The result of the [read], or the [fallback], if it throws, logged by this logger with the [message] at the debug level, see [runOr]. */
-internal inline fun <T> KLogger.readOr(
-    fallback: T,
-    crossinline message: () -> String,
-    read: () -> T
-): T = runOr(fallback, Level.DEBUG, message, read)
+/** The first fatal one of these failures, see [isFatal], or else the [first] one, with the other ones suppressed. */
+private fun mostSevere(first: Throwable, vararg others: Throwable?): Throwable {
+    val failures = (listOf(first) + others.filterNotNull()).distinct()
+    val thrown = failures.firstOrNull { it.isFatal } ?: first
+    failures.filter { it !== thrown }.forEach(thrown::addSuppressed)
+    return thrown
+}
 
 /**
- * The result of the [block], or the [fallback], if it throws, logged by this logger with the [message] at the [level],
+ * Disposes the [disposable] with its subtree, see [Disposer.dispose],
+ * throwing a fatal error of a disposable itself, see [isFatal],
+ * as the disposer passes each failure to the logger of the compiler, which throws an [AssertionError] of it, see `ObjectTree.handleExceptions`.
+ *
+ * It covers only the first failure, of the disposables disposed in the reverse order of their registration,
+ * as the logger throws on it, so a fatal error of a disposable disposed after another failing one is lost, see `DisposeTreeTest`.
+ */
+internal fun disposeTree(disposable: Disposable) {
+    try {
+        Disposer.dispose(disposable)
+    } catch (e: AssertionError) {
+        e.cause?.takeIf { it.isFatal }?.let { throw it }
+        throw e
+    }
+}
+
+/**
+ * The result of the [block], or the [fallback], if it throws, logged by this logger at the [level] with the message of the [describe],
  * except for a fatal error, which is thrown, see [isFatal].
+ *
+ * The message is guarded like the one of a kotlin-logging call, so a [describe] which throws logs its failure as the message instead,
+ * still returning the [fallback].
  */
 internal inline fun <T> KLogger.runOr(
     fallback: T,
-    level: Level,
-    crossinline message: () -> String,
+    crossinline describe: () -> String,
+    level: Level = Level.DEBUG,
     block: () -> T
 ): T = try {
     block()
 } catch (e: Throwable) {
     if (e.isFatal) throw e
     at(level) {
-        this.message = message()
+        message = try {
+            describe()
+        } catch (failure: Throwable) {
+            if (failure.isFatal) throw failure.apply { if (this !== e) addSuppressed(e) }
+            "Log message invocation failed: $failure"
+        }
         cause = e
     }
     fallback

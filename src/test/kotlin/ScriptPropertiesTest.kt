@@ -677,7 +677,10 @@ class ScriptPropertiesTest {
         ).use { session ->
             // when
             val (first, warnings) = LogCollector("com.xemantic.kotlin.script").use { logs ->
-                session.execute("42") to logs.events.filter { it.level == Level.WARN }
+                // of this session only, as another one in the same JVM, like one closed by an earlier test, may warn meanwhile
+                session.execute("42") to logs.events.filter {
+                    it.level == Level.WARN && it.formattedMessage.startsWith("script-session-${session.id}:")
+                }
             }
             val next = session.execute("42")
 
@@ -699,6 +702,29 @@ class ScriptPropertiesTest {
                 have(phase == (first as ScriptResult.Error).phase)
                 have(message == first.message)
             }
+            assert(session.repl == null)
+        }
+    }
+
+    /** A fatal error is thrown, like by [ScriptSession.close], see #239. */
+    @Test
+    fun `should throw fatal error of disposal of compiler of failed declaration of properties`() = runTest {
+        // given a compiler, with a disposable failing to dispose with a fatal error
+        DefaultScriptSession(
+            listOf(isolatedProperty()),
+            Dispatchers.Default,
+            newReplDisposable = { name ->
+                Disposer.newDisposable(name).also {
+                    Disposer.register(it, Disposable { throw OutOfMemoryError("Disposal failed") })
+                }
+            }
+        ).use { session ->
+            // when
+            // caught, as an OutOfMemoryError escaping the test would abort the Gradle test executor
+            val failure = runCatching { session.execute("42") }.exceptionOrNull()
+
+            // then
+            assert(failure is OutOfMemoryError && failure.message == "Disposal failed")
             assert(session.repl == null)
         }
     }

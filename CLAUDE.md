@@ -71,6 +71,8 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   Once Kotlin brings Resolver 2.x, re-check `isUnauthorized`.
 - The arity of a compiled function reference, read when kotlin-reflect cannot resolve it, is a compiler detail — re-check it after every Kotlin upgrade,
   see `should provide property of suspend function reference of no parameters unresolved by kotlin-reflect`.
+- Dispose a disposable of the compiler through `disposeTree`, not `Disposer.dispose`, which wraps the failure of a disposable in an `AssertionError` of the compiler's logger —
+  it relies on the internals of that logger, re-check it after every Kotlin upgrade, `DisposeTreeTest` pins them.
 
 ### The K2 REPL compiler (`K2ReplCompiler`)
 
