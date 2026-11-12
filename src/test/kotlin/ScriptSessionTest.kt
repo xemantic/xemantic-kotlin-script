@@ -130,6 +130,56 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should serialize data class declared as Serializable by snippet`() = runTest {
+        // given
+        val snippet = """
+            import kotlinx.serialization.Serializable
+            import kotlinx.serialization.json.Json
+
+            @Serializable
+            data class Answer(val question: String, val answer: Int)
+
+            val answer = Json { ignoreUnknownKeys = true }.decodeFromString<Answer>(
+                "{\"question\": \"ultimate\", \"answer\": 42, \"unknown\": true}"
+            )
+            Json.encodeToString(answer.copy(answer = answer.answer * 2))
+        """.trimIndent()
+
+        // when
+        val result = session.execute(snippet)
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == """{"question":"ultimate","answer":84}""")
+        }
+    }
+
+    @Test
+    fun `should serialize data class declared as Serializable by earlier snippet`() = runTest {
+        // given
+        session.execute("""
+            import kotlinx.serialization.Serializable
+
+            @Serializable
+            data class Answer(val question: String, val answer: Int)
+        """.trimIndent())
+
+        // when
+        val result = session.execute("""
+            import kotlinx.serialization.json.Json
+
+            Json.encodeToString(Answer("ultimate", 42))
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == """{"question":"ultimate","answer":42}""")
+        }
+    }
+
+    @Test
     fun `should keep declarations between snippets`() = runTest {
         // given
         session.execute("""
