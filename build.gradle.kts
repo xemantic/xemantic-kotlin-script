@@ -93,6 +93,8 @@ dependencies {
     implementation(libs.maven.settings)
     // the compiler brings kotlin-reflect 1.6.10, which mutates final fields, deprecated since JDK 26
     implementation(libs.kotlin.reflect)
+    // the plugin compiling the @Serializable classes of the snippets, applied to every session
+    implementation(libs.kotlin.serialization.compiler.plugin.embeddable)
     implementation(libs.xemantic.kotlin.core)
     implementation(libs.kotlin.logging)
     // kotlin-logging 8 no longer brings SLF4J transitively
@@ -104,6 +106,8 @@ dependencies {
     testImplementation(libs.ktor.server.cio)
     testImplementation(libs.ktor.server.auto.head.response)
     testImplementation(libs.ktor.client.cio)
+    // the runtime of the @Serializable classes declared by the snippets
+    testImplementation(libs.kotlinx.serialization.json)
     // only the tests bind an SLF4J backend, a library leaves this choice to the application,
     // and collect the logged events with it, see LogCollector
     testImplementation(libs.logback.classic)

@@ -64,6 +64,7 @@ import org.jetbrains.kotlin.scripting.compiler.plugin.services.firReplHistoryPro
 import org.jetbrains.kotlin.scripting.compiler.plugin.services.isReplSnippetSource
 import kotlin.script.experimental.api.ScriptDiagnostic
 import kotlin.script.experimental.api.ScriptEvaluationConfiguration
+import kotlin.script.experimental.api.compilerOptions
 import kotlin.script.experimental.api.defaultImports
 import kotlin.script.experimental.api.refineConfiguration
 import kotlin.script.experimental.dependencies.DependsOn
@@ -189,6 +190,14 @@ public fun ScriptSession(
     dispatcher: CoroutineDispatcher = Dispatchers.Default
 ): ScriptSession = DefaultScriptSession(properties, dispatcher)
 
+/** The path of the jar of the Kotlin serialization compiler plugin, a dependency of this library. */
+private val serializationPlugin: String by lazy {
+    java.io.File(
+        org.jetbrains.kotlinx.serialization.compiler.extensions.SerializationComponentRegistrar::class.java
+            .protectionDomain.codeSource.location.toURI()
+    ).path
+}
+
 /** The names of the members of the [ScriptScope], which the properties would shadow. */
 private val reservedNames = setOf("coroutineContext", "await")
 
@@ -295,6 +304,8 @@ internal class DefaultScriptSession(
                 // the default 1.8 target cannot inline functions of the classpath
                 jvmTarget(scriptJvmTarget(System.getProperty("java.specification.version")))
             }
+            // the serialization plugin, so that a @Serializable class of a snippet gets its serializer
+            compilerOptions("-Xplugin=$serializationPlugin")
             implicitReceivers(ScriptScope::class)
             // the snippets can launch coroutines, and declare dependencies, without imports
             defaultImports(DependsOn::class, Repository::class)
