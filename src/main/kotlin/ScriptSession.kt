@@ -55,6 +55,7 @@ import kotlin.coroutines.ContinuationInterceptor
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
 import kotlin.coroutines.intrinsics.suspendCoroutineUninterceptedOrReturn
+import kotlin.coroutines.jvm.internal.CoroutineStackFrame
 import kotlin.coroutines.resume
 import kotlin.coroutines.startCoroutine
 import kotlin.script.experimental.api.ResultValue
@@ -529,13 +530,16 @@ internal class DefaultScriptSession(
      * the first resumption reaching the caller wins, and the other ones are dropped.
      * A turn cancelled while it waits is dropped by its [QueuedTurn], so nothing of its caller stays on the queue of the [thread].
      *
+     * A frame of the stack of the caller, so kotlinx.coroutines restores the thread state of the caller,
+     * like a thread context element installed by a `withContext` not dispatching, once its block ends.
+     *
      * @param caller the continuation of the caller, intercepted by its interceptor at once, on its thread,
      * so an interceptor failing to intercept it fails the caller in place, before its task is queued.
      */
     private inner class Turn<T>(
         private var caller: Continuation<T>?,
         private var task: (() -> T)?
-    ) : Continuation<T> {
+    ) : Continuation<T>, CoroutineStackFrame {
 
         private val state = AtomicReference(TurnState.NEW)
 
@@ -561,6 +565,12 @@ internal class DefaultScriptSession(
          * resumed once the task starts, or is not queued, or dropped once the caller is cancelled.
          */
         private val waiting = AtomicReference<CancellableContinuation<Unit>?>()
+
+        /** The frame of the [caller], read anew, as it is dropped once resumed, so this turn retains nothing of a resumed caller. */
+        override val callerFrame: CoroutineStackFrame?
+            get() = caller as? CoroutineStackFrame
+
+        override fun getStackTraceElement(): StackTraceElement? = null
 
         /** Resumes the [caller] with the [result], unless it is resumed already. */
         override fun resumeWith(result: Result<T>) {
@@ -619,8 +629,14 @@ internal class DefaultScriptSession(
                 return COROUTINE_SUSPENDED
             }
             // cancelled before the task is queued, or while it is submitted, which dropped it from the queued runnable,
-            // also when the thread rejects it, as the cancellation of the caller came first
+            // also when the thread rejects it, as the cancellation of the caller came first,
+            // unless the thread failed fatally, which is never swallowed, while another failure is logged,
+            // rather than suppressed by the cancellation, shared by the job of the caller
             finish()
+            failure?.fatalError?.let { throw it }
+            if (failure != null && failure !is RejectedExecutionException) {
+                logger.warn(failure) { "$name: submitting the snippet of the cancelled caller failed" }
+            }
             throw cancellation!!
         }
 
@@ -739,16 +755,19 @@ internal class DefaultScriptSession(
          * without the interceptor, in place, with that failure, as resuming by it again would fail again,
          * while left unresumed, the caller would never return.
          * A fatal error, see [isFatal], is passed unwrapped from the `DispatchException` of kotlinx.coroutines.
-         * A failure thrown when the caller is resumed already is thrown, if it is fatal, or thrown by the caller itself, without an interceptor,
+         * A failure thrown when the caller is resumed already is thrown, if it is fatal, or thrown by the caller itself, resumed in place, without an interceptor wrapping it,
          * while a failure of an interceptor which resumed the caller and then threw is logged.
          */
         private fun resumeOrFail(result: Result<T>) {
+            var continuation: Continuation<T>? = null
             try {
-                intercept().resumeWith(result)
+                continuation = intercept()
+                continuation.resumeWith(result)
             } catch (e: Throwable) {
                 val fatal = e.fatalError
                 if (!tryResume(Result.failure(fatal ?: e))) {
-                    if (fatal != null || interceptor == null) throw fatal ?: e
+                    // also with an interceptor returning the turn it intercepts, as then the caller itself threw
+                    if (fatal != null || continuation === this) throw fatal ?: e
                     logger.warn(e) { "$name: resuming the caller failed after it was resumed" }
                 }
             }

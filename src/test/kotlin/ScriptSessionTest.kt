@@ -8161,6 +8161,42 @@ class ScriptSessionTest {
     }
 
     /**
+     * A caller of an interceptor returning the continuation it intercepts, whose own code throws when it is resumed,
+     * throws to the resume executor, like a caller without an interceptor, see #235.
+     */
+    @Test
+    fun `should throw failure of caller of interceptor not wrapping its continuation to the resume executor`() {
+        // given
+        val failure = IllegalStateException("completion failed")
+        val thrown = CompletableFuture<Throwable?>()
+        val session = DefaultScriptSession(
+            emptyList(),
+            Dispatchers.Default,
+            // inline, on the thread of the session, so done before the next snippet
+            resumeExecutor = { command -> thrown.complete(runCatching { command.run() }.exceptionOrNull()) }
+        )
+        val interceptor = object : AbstractCoroutineContextElement(ContinuationInterceptor), ContinuationInterceptor {
+            override fun <T> interceptContinuation(continuation: Continuation<T>): Continuation<T> = continuation
+        }
+        try {
+            // when
+            suspend {
+                session.execute("1")
+            }.startCoroutine(Continuation(interceptor) {
+                throw failure
+            })
+            runBlocking {
+                session.execute("2")
+            }
+
+            // then
+            assert(thrown.getNow(null) === failure)
+        } finally {
+            session.close()
+        }
+    }
+
+    /**
      * A fatal error, see [isFatal], of a dispatcher which resumed the caller already, running it inline, and threw after it,
      * cannot be passed to the caller, so it is thrown to the resume executor rather than swallowed, see #235.
      */
@@ -8353,6 +8389,45 @@ class ScriptSessionTest {
             // then
             // bounded, so a hang fails the test instead of hanging the build
             assert(failure.get(1, TimeUnit.MINUTES) is CancellationException)
+        } finally {
+            session.close()
+        }
+    }
+
+    /**
+     * A caller cancelled while its snippet is submitted to the thread of the session, failing with a fatal error, see [isFatal],
+     * fails with that error, rather than with its cancellation, so the error is not swallowed, see #235.
+     */
+    @Test
+    fun `should fail caller cancelled while submitting its snippet fails fatally with the fatal error`() {
+        // given
+        val fatal = OutOfMemoryError("unable to create native thread")
+        lateinit var caller: Job
+        val session = DefaultScriptSession(emptyList(), Dispatchers.Default) { threadFactory ->
+            InterceptedExecutor(Executors.newSingleThreadExecutor(threadFactory)) { index, execute ->
+                if (index == 0) {
+                    caller.cancel()
+                    throw fatal
+                }
+                execute()
+            }
+        }
+        val failure = CompletableFuture<Throwable?>()
+        try {
+            // when
+            // lazy, so the caller is known to the executor before the snippet is submitted
+            caller = CoroutineScope(Dispatchers.Unconfined).launch(start = CoroutineStart.LAZY) {
+                try {
+                    session.execute("1")
+                } catch (e: Throwable) {
+                    failure.complete(e)
+                }
+            }
+            caller.start()
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build
+            assert(failure.get(1, TimeUnit.MINUTES) === fatal)
         } finally {
             session.close()
         }
@@ -8708,6 +8783,29 @@ class ScriptSessionTest {
                 be<ScriptResult.Value>()
                 have(value == null)
             }
+        }
+    }
+
+    /**
+     * A thread context element of the caller, installed by a `withContext` not dispatching, is removed from the thread of the caller
+     * once the `withContext` ends, as kotlinx.coroutines restores the thread state only of a continuation whose frames it can walk, see #235.
+     */
+    @Test
+    fun `should remove thread context element of the caller from its thread after withContext`() {
+        // given
+        val threadLocal = ThreadLocal<String>()
+        ScriptSession().use { session ->
+
+            // when
+            val leaked = runBlocking(Dispatchers.Default) {
+                withContext(threadLocal.asContextElement("caller")) {
+                    session.execute("1")
+                }
+                threadLocal.get()
+            }
+
+            // then
+            assert(leaked == null)
         }
     }
 
