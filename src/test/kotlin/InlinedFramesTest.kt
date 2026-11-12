@@ -58,11 +58,11 @@ class InlinedFramesTest {
         val frame = execute("frame()") as StackTraceElement
         val marker = execute("Marker()")!!
         val inlinedFrames = InlinedFrames(snippets)
-        val unresolved = inlinedFrames.resolve(frame)
+        val unresolved = inlinedFrames.report().resolve(frame)
 
         // when
         inlinedFrames.keep(marker.javaClass)
-        val resolved = inlinedFrames.resolve(frame)
+        val resolved = inlinedFrames.report().resolve(frame)
 
         // then
         assert(frame.lineNumber > snippets.getValue("snippet1.kts").size)
@@ -87,7 +87,7 @@ class InlinedFramesTest {
         val marker = execute("Marker()")!!
         val inlinedFrames = InlinedFrames(mapOf("snippet1.kts" to source.lines()))
         inlinedFrames.keep(marker.javaClass)
-        return inlinedFrames.resolve(frame)
+        return inlinedFrames.report().resolve(frame)
     }
 
     /**
@@ -113,7 +113,7 @@ class InlinedFramesTest {
         val classLoader = TransformingClassLoader(execute("Marker()")!!.javaClass, "Snippet1") { it.transform() }
         val inlinedFrames = InlinedFrames(mapOf("snippet1.kts" to source.lines()))
         inlinedFrames.keep(classLoader.marker)
-        return inlinedFrames.resolve(frame)
+        return inlinedFrames.report().resolve(frame)
     }
 
     /** The class `Marker` declared at the end of this [source], executed, of the class loader of its snippet. */
@@ -456,6 +456,42 @@ class InlinedFramesTest {
     }
 
     @Test
+    fun `should omit intermediate frame of suspend inline function without a line before the call in its split range`() = runTest {
+        // when
+        val resolved = resolveTransformedFrame(
+            """
+            suspend inline fun inner(x: Int) { if (x == 2) throw IllegalStateException("x=" + x) }
+            suspend inline fun outer(x: Int) {
+                delay(1)
+                inner(x)
+            }
+            suspend fun suspendingFrame(): StackTraceElement = try { outer(1); outer(2); error("not thrown") } catch (e: IllegalStateException) { e.stackTrace[0] }
+            val awaited = await { suspendingFrame() }
+            fun frame(): StackTraceElement = awaited
+            """.trimIndent(),
+            method = "suspendingFrame"
+        ) {
+            // the second copy of outer is split into a range before delay, and a range resuming after it, calling inner
+            val inners = markers("\$i\$f\$inner")
+            val secondOuter = markers("\$i\$f\$outer").filter { it.first > inners.first().last }
+            // only the line of the second copy of inner is left in its scopes, and no line of the first one shares it
+            removeLines { line ->
+                line in inners.first() || (secondOuter.any { line in it } && line !in inners.last())
+            }
+        }
+
+        // then
+        // the line of outer calling inner is unknown, as both ranges of its copy have no line,
+        // while the earlier ranges are of the first copy, so they do not tell it
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "inner", "snippet1.kts", 1),
+                StackTraceElement("Snippet1", "suspendingFrame", "snippet1.kts", 6)
+            )
+        )
+    }
+
+    @Test
     fun `should resolve frames of error in the body of lambda passed to inline function with class literal`() = runTest {
         // when
         val resolved = resolveFrame("""
@@ -499,42 +535,6 @@ class InlinedFramesTest {
                 StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 3),
                 StackTraceElement("Snippet1", "call", "snippet1.kts", 1),
                 StackTraceElement("Snippet1", "frame", "snippet1.kts", 3)
-            )
-        )
-    }
-
-    @Test
-    fun `should omit intermediate frame of suspend inline function without a line before the call in its split range`() = runTest {
-        // when
-        val resolved = resolveTransformedFrame(
-            """
-            suspend inline fun inner(x: Int) { if (x == 2) throw IllegalStateException("x=" + x) }
-            suspend inline fun outer(x: Int) {
-                delay(1)
-                inner(x)
-            }
-            suspend fun suspendingFrame(): StackTraceElement = try { outer(1); outer(2); error("not thrown") } catch (e: IllegalStateException) { e.stackTrace[0] }
-            val awaited = await { suspendingFrame() }
-            fun frame(): StackTraceElement = awaited
-            """.trimIndent(),
-            method = "suspendingFrame"
-        ) {
-            // the second copy of outer is split into a range before delay, and a range resuming after it, calling inner
-            val inners = markers("\$i\$f\$inner")
-            val secondOuter = markers("\$i\$f\$outer").filter { it.first > inners.first().last }
-            // only the line of the second copy of inner is left in its scopes, and no line of the first one shares it
-            removeLines { line ->
-                line in inners.first() || (secondOuter.any { line in it } && line !in inners.last())
-            }
-        }
-
-        // then
-        // the line of outer calling inner is unknown, as both ranges of its copy have no line,
-        // while the earlier ranges are of the first copy, so they do not tell it
-        assert(
-            resolved == listOf(
-                StackTraceElement("Snippet1", "inner", "snippet1.kts", 1),
-                StackTraceElement("Snippet1", "suspendingFrame", "snippet1.kts", 6)
             )
         )
     }
@@ -659,6 +659,176 @@ class InlinedFramesTest {
                 StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 7),
                 StackTraceElement("Snippet1", "call", "snippet1.kts", 2),
                 StackTraceElement("Snippet1", "frame", "snippet1.kts", 6)
+            )
+        )
+    }
+
+    @Test
+    fun `should resolve frames of error in the body of lambda passed to inline function within lambda on the same line`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            inline fun call(block: () -> Unit) { block() }
+            fun frame(): StackTraceElement = try {
+                call { call { error("boom") } }
+                error("not thrown")
+            } catch (e: IllegalStateException) {
+                e.stackTrace[0]
+            }
+        """.trimIndent())
+
+        // then
+        // the outer lambda reads the instance of the snippet class on the line, to call the inner call, which cannot throw
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 3),
+                StackTraceElement("Snippet1", "call", "snippet1.kts", 1),
+                StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 3),
+                StackTraceElement("Snippet1", "call", "snippet1.kts", 1),
+                StackTraceElement("Snippet1", "frame", "snippet1.kts", 3)
+            )
+        )
+    }
+
+    @Test
+    fun `should resolve frames of error in the body of lambda passed to inline function within lambda of suspend inline function`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            inline fun call(block: () -> Unit) { block() }
+            suspend inline fun scall(block: () -> Unit) { delay(1); block(); delay(1); block() }
+            suspend fun suspendingFrame(): StackTraceElement = try {
+                scall {
+                    call {
+                        error("boom")
+                    }
+                }
+                error("not thrown")
+            } catch (e: IllegalStateException) {
+                e.stackTrace[0]
+            }
+            val awaited = await { suspendingFrame() }
+            fun frame(): StackTraceElement = awaited
+        """.trimIndent())
+
+        // then
+        // the line of the outer lambda, reading only the instance of the snippet class, starts before its marker, right after the state machine resumes
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 6),
+                StackTraceElement("Snippet1", "call", "snippet1.kts", 1),
+                StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 5),
+                StackTraceElement("Snippet1", "scall", "snippet1.kts", 2),
+                StackTraceElement("Snippet1", "suspendingFrame", "snippet1.kts", 4)
+            )
+        )
+    }
+
+    @Test
+    fun `should resolve intermediate frames of inline function throwing after its lambda within lambda of suspend inline function`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            inline fun call(block: () -> Unit) { block(); error("boom") }
+            suspend inline fun scall(block: () -> Unit) { delay(1); block(); delay(1); block() }
+            suspend fun suspendingFrame(): StackTraceElement = try {
+                scall {
+                    call {
+                        println()
+                    }
+                }
+                error("not thrown")
+            } catch (e: IllegalStateException) {
+                e.stackTrace[0]
+            }
+            val awaited = await { suspendingFrame() }
+            fun frame(): StackTraceElement = awaited
+        """.trimIndent())
+
+        // then
+        // scall is called on the line of its call, not on the line of the outer lambda
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "call", "snippet1.kts", 1),
+                StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 5),
+                StackTraceElement("Snippet1", "scall", "snippet1.kts", 2),
+                StackTraceElement("Snippet1", "suspendingFrame", "snippet1.kts", 4)
+            )
+        )
+    }
+
+    @Test
+    fun `should resolve frames of error in the body of lambda passed to inline function with type check`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            inline fun call(check: Boolean, block: () -> Unit) { block() }
+            fun frame(): StackTraceElement = try {
+                val any: Any = "x"
+                call(any is String) { error("boom") }
+                error("not thrown")
+            } catch (e: IllegalStateException) {
+                e.stackTrace[0]
+            }
+        """.trimIndent())
+
+        // then
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 4),
+                StackTraceElement("Snippet1", "call", "snippet1.kts", 1),
+                StackTraceElement("Snippet1", "frame", "snippet1.kts", 4)
+            )
+        )
+    }
+
+    @Test
+    fun `should resolve frames of error in the body of lambda called twice by suspend inline function`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            suspend inline fun call(block: () -> Unit) { delay(1); block(); delay(1); block() }
+            var calls = 0
+            suspend fun suspendingFrame(): StackTraceElement = try {
+                call {
+                    if (calls++ == 1) error("boom")
+                }
+                error("not thrown")
+            } catch (e: IllegalStateException) {
+                e.stackTrace[0]
+            }
+            val awaited = await { suspendingFrame() }
+            fun frame(): StackTraceElement = awaited
+        """.trimIndent())
+
+        // then
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 5),
+                StackTraceElement("Snippet1", "call", "snippet1.kts", 1),
+                StackTraceElement("Snippet1", "suspendingFrame", "snippet1.kts", 4)
+            )
+        )
+    }
+
+    @Test
+    fun `should resolve intermediate frames of error in the body of lambda passed to inline function within suspend inline function`() = runTest {
+        // when
+        val resolved = resolveFrame("""
+            inline fun call(block: () -> Unit) { block() }
+            suspend inline fun outer() {
+                delay(1)
+                call {
+                    error("boom")
+                }
+            }
+            suspend fun suspendingFrame(): StackTraceElement = try { outer(); error("not thrown") } catch (e: IllegalStateException) { e.stackTrace[0] }
+            val awaited = await { suspendingFrame() }
+            fun frame(): StackTraceElement = awaited
+        """.trimIndent())
+
+        // then
+        assert(
+            resolved == listOf(
+                StackTraceElement("Snippet1", "<lambda>", "snippet1.kts", 5),
+                StackTraceElement("Snippet1", "call", "snippet1.kts", 1),
+                StackTraceElement("Snippet1", "outer", "snippet1.kts", 4),
+                StackTraceElement("Snippet1", "suspendingFrame", "snippet1.kts", 8)
             )
         )
     }
@@ -1268,7 +1438,7 @@ class InlinedFramesTest {
         val lines = marker.linesOf("frame")
 
         // when
-        val resolved = lines.map { inlinedFrames.resolve(StackTraceElement("Snippet1", "frame", "snippet1.kts", it)) }
+        val resolved = lines.map { inlinedFrames.report().resolve(StackTraceElement("Snippet1", "frame", "snippet1.kts", it)) }
 
         // then
         // the compiler gives a line of fake.kt to the initialization of the marker of the lambda of run
@@ -1387,7 +1557,7 @@ class InlinedFramesTest {
         val line = marker.lineOfFirstNew("frame")
 
         // when
-        val resolved = inlinedFrames.resolve(StackTraceElement("Snippet1", "frame", "snippet1.kts", line))
+        val resolved = inlinedFrames.report().resolve(StackTraceElement("Snippet1", "frame", "snippet1.kts", line))
 
         // then
         // the allocation follows the inlined body of boom, under the line of its closing brace
@@ -1417,7 +1587,7 @@ class InlinedFramesTest {
         val line = marker.lineOfFirstNew("frame")
 
         // when
-        val resolved = inlinedFrames.resolve(StackTraceElement("Snippet1", "frame", "snippet1.kts", line))
+        val resolved = inlinedFrames.report().resolve(StackTraceElement("Snippet1", "frame", "snippet1.kts", line))
 
         // then
         // the allocation is the code of the lambda called on the line of pre
@@ -1440,10 +1610,10 @@ class InlinedFramesTest {
         val missing = StackTraceElement("Snippet1\$Missing", "run", "snippet1.kts", 3)
 
         // when
-        val resolved = List(3) { inlinedFrames.resolve(missing) }
+        val resolved = List(3) { inlinedFrames.report().resolve(missing) }
         val readsBeforeKeep = classLoader.reads
         inlinedFrames.keep(classLoader.marker)
-        inlinedFrames.resolve(missing)
+        inlinedFrames.report().resolve(missing)
 
         // then
         assert(resolved == listOf(null, null, null))
@@ -1458,12 +1628,14 @@ class InlinedFramesTest {
         val frame = execute("frame()") as StackTraceElement
         val marker = execute("Marker()")!!
         val analyzed = mutableListOf<StackTraceElement>()
-        val inlinedFrames = InlinedFrames(snippets).apply { analyzing = { analyzed += it } }
+        val inlinedFrames = InlinedFrames(snippets) { analyzed += it }
         inlinedFrames.keep(marker.javaClass)
 
         // when
-        // like the repeated frames of a recursion through inlined code overflowing the stack
-        val resolved = List(3) { inlinedFrames.resolve(StackTraceElement(frame.className, frame.methodName, frame.fileName, frame.lineNumber)) }
+        // like the repeated frames of a recursion through inlined code overflowing the stack, also of the reports of later failures
+        val resolved = List(3) {
+            inlinedFrames.report().resolve(StackTraceElement(frame.className, frame.methodName, frame.fileName, frame.lineNumber))
+        }
 
         // then
         assert(analyzed == listOf(frame))
@@ -1484,11 +1656,11 @@ class InlinedFramesTest {
         val marker = execute("Marker()")!!
         var analyses = 0
         // stands in for an unexpected failure of the analysis of odd bytecode
-        val inlinedFrames = InlinedFrames(snippets).apply { analyzing = { analyses++; throw IndexOutOfBoundsException("-1") } }
+        val inlinedFrames = InlinedFrames(snippets) { analyses++; throw IndexOutOfBoundsException("-1") }
         inlinedFrames.keep(marker.javaClass)
 
         // when
-        val resolved = List(2) { inlinedFrames.resolve(frame) }
+        val resolved = List(2) { inlinedFrames.report().resolve(frame) }
 
         // then
         assert(resolved == listOf(null, null))
@@ -1496,30 +1668,133 @@ class InlinedFramesTest {
     }
 
     @Test
-    fun `should resolve frame of inlined code again after its analysis overflows the stack`() = runTest {
+    fun `should analyze frame of inlined code overflowing the stack once per report`() = runTest {
         // given
         execute(snippet)
         val frame = execute("frame()") as StackTraceElement
         val marker = execute("Marker()")!!
         var analyses = 0
-        // stands in for an analysis on a stack too deep to complete it
-        val inlinedFrames = InlinedFrames(snippets).apply { analyzing = { if (++analyses == 1) throw StackOverflowError() } }
+        // stands in for an analysis on a stack too deep to complete it, like of every repeated frame of a deep recursion
+        val inlinedFrames = InlinedFrames(snippets) { if (++analyses == 1) throw StackOverflowError() }
         inlinedFrames.keep(marker.javaClass)
+        val report = inlinedFrames.report()
 
         // when
-        val resolved = List(2) { inlinedFrames.resolve(frame) }
+        val resolvedInReport = List(3) { report.resolve(frame) }
+        val analysesInReport = analyses
+        val resolvedInNextReport = inlinedFrames.report().resolve(frame)
 
         // then
+        assert(resolvedInReport == listOf(null, null, null))
+        assert(analysesInReport == 1)
         assert(
-            resolved == listOf(
-                null,
-                listOf(
-                    StackTraceElement("Snippet1", "boom", "snippet1.kts", 1),
-                    StackTraceElement("Snippet1", "frame", "snippet1.kts", 3)
-                )
+            resolvedInNextReport == listOf(
+                StackTraceElement("Snippet1", "boom", "snippet1.kts", 1),
+                StackTraceElement("Snippet1", "frame", "snippet1.kts", 3)
             )
         )
         assert(analyses == 2)
+    }
+
+    @Test
+    fun `should read class of frame overflowing the stack once per report`() = runTest {
+        // given
+        execute(snippet)
+        val frame = execute("frame()") as StackTraceElement
+        // stands in for reading the class on a stack too deep to complete it
+        val classLoader = CountingClassLoader(execute("Marker()")!!.javaClass) { reads -> if (reads == 1) throw StackOverflowError() }
+        val inlinedFrames = InlinedFrames(snippets)
+        inlinedFrames.keep(classLoader.marker)
+        val report = inlinedFrames.report()
+
+        // when
+        val resolvedInReport = List(2) { report.resolve(frame) }
+        val readsInReport = classLoader.reads
+        val resolvedInNextReport = inlinedFrames.report().resolve(frame)
+
+        // then
+        assert(resolvedInReport == listOf(null, null))
+        assert(readsInReport == 1)
+        assert(
+            resolvedInNextReport == listOf(
+                StackTraceElement("Snippet1", "boom", "snippet1.kts", 1),
+                StackTraceElement("Snippet1", "frame", "snippet1.kts", 3)
+            )
+        )
+    }
+
+    @Test
+    fun `should analyze frame of inlined code again once evicted by the analyses of later frames`() = runTest {
+        // given
+        execute(snippet)
+        val frame = execute("frame()") as StackTraceElement
+        val marker = execute("Marker()")!!
+        val analyzed = mutableListOf<StackTraceElement>()
+        val inlinedFrames = InlinedFrames(snippets) { analyzed += it }
+        inlinedFrames.keep(marker.javaClass)
+        val report = inlinedFrames.report()
+        // the lines beyond the end of the snippet the SMAP does not map, analyzed like any line of inlined code
+        val laterFrames = (1..MAX_INLINED_FRAME_ANALYSES).map { StackTraceElement(frame.className, frame.methodName, frame.fileName, 1000 + it) }
+
+        // when
+        val first = report.resolve(frame)
+        laterFrames.forEach { report.resolve(it) }
+        val again = report.resolve(frame)
+
+        // then
+        assert(first == again)
+        assert(analyzed.count { it == frame } == 2)
+        assert(analyzed.size == MAX_INLINED_FRAME_ANALYSES + 2)
+    }
+
+    @Test
+    fun `should read class of frame again once evicted by the classes of later frames`() = runTest {
+        // given
+        val source = (0..MAX_INLINED_FRAME_CLASSES).joinToString("\n") { "class C$it" } + "\nclass Marker"
+        execute(source)
+        val classLoader = CountingClassLoader(execute("Marker()")!!.javaClass)
+        val inlinedFrames = InlinedFrames(mapOf("snippet1.kts" to source.lines()))
+        inlinedFrames.keep(classLoader.marker)
+        val report = inlinedFrames.report()
+        val frames = (0..MAX_INLINED_FRAME_CLASSES).map { StackTraceElement("Snippet1\$C$it", "<init>", "snippet1.kts", it + 1) }
+
+        // the frames of other methods, not analyzed yet, so that their classes are needed
+        fun StackTraceElement.ofOtherMethod() = StackTraceElement(className, "other", fileName, lineNumber)
+
+        // when
+        frames.forEach { report.resolve(it) }
+        val readsOfAllClasses = classLoader.reads
+        report.resolve(frames.last().ofOtherMethod())
+        val readsOfLatestClass = classLoader.reads
+        report.resolve(frames.first().ofOtherMethod())
+
+        // then
+        assert(readsOfAllClasses == MAX_INLINED_FRAME_CLASSES + 1)
+        assert(readsOfLatestClass == readsOfAllClasses)
+        assert(classLoader.reads == readsOfAllClasses + 1)
+    }
+
+    @Test
+    fun `should not take switch on field named label for resume of state machine`() = runTest {
+        // given
+        val marker = markerOf("""
+            class Holder { @JvmField var label = 1 }
+            fun frame(holder: Holder) {
+                when (holder.label) { 0 -> println(0); 1 -> println(1); 2 -> println(2) }
+            }
+            suspend fun suspending() { delay(1); println(1); delay(1) }
+            class Marker
+        """.trimIndent())
+        val methods = marker.snippetNode().methods
+
+        // when
+        val labelsOfWhen = methods.single { it.name == "frame" }.resumeLabels()
+        val labelsOfStateMachine = methods.single { it.name == "suspending" }.resumeLabels()
+
+        // then
+        // the switch of the when reads the field named label directly, like the state machine reads the one of its continuation
+        assert(labelsOfWhen.isEmpty)
+        assert(labelsOfStateMachine.cardinality() == 3)
     }
 
     @Test
@@ -1531,7 +1806,7 @@ class InlinedFramesTest {
         inlinedFrames.keep(marker.javaClass)
 
         // when
-        val resolved = inlinedFrames.resolve(StackTraceElement("Snippet1", "frame", "snippet1.kts", 3))
+        val resolved = inlinedFrames.report().resolve(StackTraceElement("Snippet1", "frame", "snippet1.kts", 3))
 
         // then
         assert(resolved == null)
@@ -1546,7 +1821,7 @@ class InlinedFramesTest {
         inlinedFrames.keep(classLoader.marker)
 
         // when
-        val resolved = inlinedFrames.resolve(StackTraceElement("Snippet1", "frame", "snippet1.kts", -1))
+        val resolved = inlinedFrames.report().resolve(StackTraceElement("Snippet1", "frame", "snippet1.kts", -1))
 
         // then
         assert(resolved == null)
@@ -1562,7 +1837,7 @@ class InlinedFramesTest {
         inlinedFrames.keep(marker.javaClass)
 
         // when
-        val resolved = inlinedFrames.resolve(StackTraceElement("java.lang.Class", "getDeclaredField", "Class.java", 2794))
+        val resolved = inlinedFrames.report().resolve(StackTraceElement("java.lang.Class", "getDeclaredField", "Class.java", 2794))
 
         // then
         assert(resolved == null)
@@ -1571,10 +1846,13 @@ class InlinedFramesTest {
 }
 
 /**
- * A class loader counting the class files read through it,
+ * A class loader counting the class files read through it, calling the [reading] with the count before each read,
  * defining the [marker] class again, so that it is the class loader of its [marker].
  */
-private class CountingClassLoader(marker: Class<*>) : ClassLoader(marker.classLoader) {
+private class CountingClassLoader(
+    marker: Class<*>,
+    private val reading: (reads: Int) -> Unit = {}
+) : ClassLoader(marker.classLoader) {
 
     var reads = 0
 
@@ -1583,7 +1861,7 @@ private class CountingClassLoader(marker: Class<*>) : ClassLoader(marker.classLo
         .let { defineClass(marker.name, it, 0, it.size) }
 
     override fun getResourceAsStream(name: String): InputStream? {
-        reads++
+        reading(++reads)
         return super.getResourceAsStream(name)
     }
 

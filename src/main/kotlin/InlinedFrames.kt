@@ -32,6 +32,8 @@ import org.jetbrains.org.objectweb.asm.tree.FieldInsnNode
 import org.jetbrains.org.objectweb.asm.tree.InsnNode
 import org.jetbrains.org.objectweb.asm.tree.IntInsnNode
 import org.jetbrains.org.objectweb.asm.tree.InvokeDynamicInsnNode
+import org.jetbrains.org.objectweb.asm.tree.JumpInsnNode
+import org.jetbrains.org.objectweb.asm.tree.LdcInsnNode
 import org.jetbrains.org.objectweb.asm.tree.LineNumberNode
 import org.jetbrains.org.objectweb.asm.tree.LookupSwitchInsnNode
 import org.jetbrains.org.objectweb.asm.tree.MethodInsnNode
@@ -55,6 +57,9 @@ private const val FAKE_PATH = "kotlin/jvm/internal/FakeKt"
 /** The field of the continuation of a suspend function, which its state machine switches on to resume. */
 private const val STATE_MACHINE_LABEL = "label"
 
+/** The message of the exception the state machine of a suspend function throws on a label it cannot resume at, the default of its switch. */
+private const val STATE_MACHINE_DEFAULT = "call to 'resume' before 'invoke' with coroutine"
+
 /** The function of inlined code without a marker in scope at its line. */
 private const val UNKNOWN_INLINE_FUNCTION = "<inlined>"
 
@@ -75,27 +80,26 @@ private const val INLINE_LAMBDA = "<lambda>"
  * Accessed on the thread of the session only, like the snippets.
  *
  * @param snippets the lines of the snippets by their names, like `snippet3.kts`.
+ * @param analyzing called before each analysis of a frame of inlined code, a seam of the tests of its memoization and its failure.
  */
 internal class InlinedFrames(
-    private val snippets: Map<String, List<String>>
+    private val snippets: Map<String, List<String>>,
+    private val analyzing: (frame: StackTraceElement) -> Unit = {}
 ) {
 
     private var classLoader: ClassLoader? = null
 
-    /** The classes of the frames read so far. */
-    private val classes = HashMap<String, SnippetClass>()
+    /** The classes of the frames read so far, the [MAX_INLINED_FRAME_CLASSES] used most recently. */
+    private val classes = LruMap<String, SnippetClass>(MAX_INLINED_FRAME_CLASSES)
 
     /** The names of the classes of the frames which cannot be read by the class loader of the latest snippet, until the next one is kept. */
     private val unreadableClasses = HashSet<String>()
 
     /**
-     * The analyses of the frames so far, by the class, the method and the line of a frame,
-     * wrapped, so that an analysis resolving no frames, or failing, is told apart from a frame not analyzed yet.
+     * The frames resolved by the analyses of the frames so far, the [MAX_INLINED_FRAME_ANALYSES] used most recently,
+     * by the class, the method and the line of a frame, `null` of an analysis resolving no frames, or failing.
      */
-    private val analyses = HashMap<FrameLine, Analysis>()
-
-    /** Called before each analysis of a frame of inlined code, a seam of the tests of its memoization and its failure. */
-    internal var analyzing: (frame: StackTraceElement) -> Unit = {}
+    private val analyses = LruMap<FrameLine, List<StackTraceElement>?>(MAX_INLINED_FRAME_ANALYSES)
 
     /** Keeps the class loader of the [scriptClass] of the latest evaluated snippet. */
     fun keep(scriptClass: Class<*>) {
@@ -103,48 +107,65 @@ internal class InlinedFrames(
         unreadableClasses.clear()
     }
 
-    /**
-     * The frames of the [frame] of inlined code, its line beyond the end of its snippet, or within a lambda inlined into it, see [resolveLambda]:
-     * the frame of the inlined function, followed by the frames of the inline functions calling it, if nested,
-     * and by the frame of the outermost call site in the method of the [frame],
-     * which is the [frame] itself if the call site is unknown,
-     * or `null` if the [frame] is not of a snippet, its line is unknown, or a line of the snippet itself, not inlined,
-     * or the class of the [frame] cannot be read, or its bytecode cannot be analyzed.
-     *
-     * The body of a lambda passed to an inline function keeps the lines of the snippet,
-     * so the class is read for the frame of any line of the snippet, which is resolved if the line lies within an inlined lambda.
-     *
-     * The `KotlinDebug` stratum flattens nested inlining to the call site in the method,
-     * so the calls of the nested inline functions are read from the ranges of their inline markers instead, see [SnippetClass.inlinedCalls].
-     * The frames are memoized by the class, the method and the line of the [frame],
-     * as a recursion through inlined code, like the one overflowing the stack, repeats the same frame many times,
-     * and so is a failure of the analysis on unexpected bytecode, which would fail again,
-     * but not a [StackOverflowError], which depends on the depth of the stack the analysis starts on, not on the bytecode.
-     *
-     * @throws VirtualMachineError thrown by the analysis, other than [StackOverflowError].
-     */
-    fun resolve(frame: StackTraceElement): List<StackTraceElement>? {
-        val lines = snippets[frame.fileName] ?: return null
-        // the class is not read for a frame without a line
-        if (frame.lineNumber < 1) return null
-        val snippetClass = snippetClass(frame.className) ?: return null
-        val key = FrameLine(frame.className, frame.methodName, frame.lineNumber)
-        analyses[key]?.let { return it.frames }
-        val analysis = try {
-            analyzing(frame)
-            Analysis(snippetClass.resolve(frame, lines.size))
-        } catch (e: Throwable) {
-            if (e.isFatal) throw e
-            // a failure on unexpected bytecode loses only the frames of the inlined code, not the report of the error
-            logger.debug(e) { "cannot resolve the inlined frames of $frame" }
-            if (e is StackOverflowError) return null
-            Analysis(frames = null)
+    /** A new [Report], resolving the frames of the report of a failure. */
+    fun report(): Report = Report()
+
+    /** The frames of the code inlined into the snippets, resolved for the report of a failure, see [resolve]. */
+    inner class Report {
+
+        /** The frames whose analysis overflowed the stack in this report. */
+        private val overflowed = HashSet<FrameLine>()
+
+        /**
+         * The frames of the [frame] of inlined code, its line beyond the end of its snippet, or within a lambda inlined into it, see [resolveLambda]:
+         * the frame of the inlined function, followed by the frames of the inline functions calling it, if nested,
+         * and by the frame of the outermost call site in the method of the [frame],
+         * which is the [frame] itself if the call site is unknown,
+         * or `null` if the [frame] is not of a snippet, its line is unknown, or a line of the snippet itself, not inlined,
+         * or the class of the [frame] cannot be read, or its bytecode cannot be analyzed.
+         *
+         * The body of a lambda passed to an inline function keeps the lines of the snippet,
+         * so the class is read for the frame of any line of the snippet, which is resolved if the line lies within an inlined lambda.
+         *
+         * The `KotlinDebug` stratum flattens nested inlining to the call site in the method,
+         * so the calls of the nested inline functions are read from the ranges of their inline markers instead, see [SnippetClass.inlinedCalls].
+         * The frames are memoized by the class, the method and the line of the [frame],
+         * as a recursion through inlined code, like the one overflowing the stack, repeats the same frame many times,
+         * and so is a failure of the analysis on unexpected bytecode, which would fail again,
+         * while a [StackOverflowError] of the analysis, also of reading a class, which depends on the depth of the stack the analysis starts on, not on the bytecode,
+         * is memoized only for this report, which resolves all its frames on about the same depth.
+         *
+         * @throws VirtualMachineError thrown by the analysis, other than [StackOverflowError].
+         */
+        fun resolve(frame: StackTraceElement): List<StackTraceElement>? {
+            val lines = snippets[frame.fileName] ?: return null
+            // the class is not read for a frame without a line
+            if (frame.lineNumber < 1) return null
+            val key = FrameLine(frame.className, frame.methodName, frame.lineNumber)
+            if (analyses.containsKey(key)) return analyses[key]
+            if (key in overflowed) return null
+            val frames = try {
+                // a class which cannot be read is kept until the next snippet, not memoized as the frames of its analysis
+                val snippetClass = snippetClass(frame.className) ?: return null
+                analyzing(frame)
+                snippetClass.resolve(frame, lines.size)
+            } catch (e: Throwable) {
+                if (e.isFatal) throw e
+                // a failure on unexpected bytecode loses only the frames of the inlined code, not the report of the error
+                logger.debug(e) { "cannot resolve the inlined frames of $frame" }
+                if (e is StackOverflowError) {
+                    overflowed += key
+                    return null
+                }
+                null
+            }
+            analyses[key] = frames
+            return frames
         }
-        analyses[key] = analysis
-        return analysis.frames
+
     }
 
-    /** The frames of the [frame] of the code inlined into this class, see [resolve]. */
+    /** The frames of the [frame] of the code inlined into this class, see [Report.resolve]. */
     private fun SnippetClass.resolve(frame: StackTraceElement, snippetSize: Int): List<StackTraceElement>? {
         if (frame.lineNumber <= snippetSize) return resolveLambda(frame)
         val smap = smap ?: return null
@@ -204,15 +225,20 @@ internal class InlinedFrames(
      * `null` if it cannot be read, which is kept only until the next snippet, see [keep],
      * as the class loader might not be known yet, or not load the class yet.
      *
-     * @throws VirtualMachineError thrown by reading the class, other than [StackOverflowError].
+     * @throws VirtualMachineError thrown by reading the class, also a [StackOverflowError], which depends on the depth of the stack,
+     * so it is not kept as the class not readable, but memoized only for the report, see [Report.resolve].
      */
     private fun snippetClass(className: String): SnippetClass? {
         classes[className]?.let { return it }
         if (className in unreadableClasses) return null
-        val snippetClass = logger.readOr(null, { "cannot read the class $className of a frame" }) {
+        val snippetClass = try {
             classLoader?.getResourceAsStream(className.replace('.', '/') + ".class")?.use { it.readBytes() }?.let { bytes ->
                 SnippetClass(bytes, ::declarationsOf).also { classes[className] = it }
             }
+        } catch (e: Throwable) {
+            if (e is VirtualMachineError) throw e
+            logger.debug(e) { "cannot read the class $className of a frame" }
+            null
         }
         if (snippetClass == null) unreadableClasses += className
         return snippetClass
@@ -222,18 +248,20 @@ internal class InlinedFrames(
      * The declarations of the class of this [position] of inlined code, see [Declarations],
      * `null` if it is not a class of a snippet, like of the standard library, or it cannot be read.
      *
-     * @throws VirtualMachineError thrown by reading the class, other than [StackOverflowError].
+     * @throws VirtualMachineError thrown by reading the class, see [snippetClass].
      */
     private fun declarationsOf(position: SourcePosition): Declarations? =
         if (position.file in snippets) snippetClass(position.path.replace('/', '.'))?.declarations else null
 
 }
 
-/** The line of a method of a class, of the frames analyzed, see [InlinedFrames.resolve]. */
+/** The line of a method of a class, of the frames analyzed, see [InlinedFrames.Report.resolve]. */
 private data class FrameLine(val className: String, val method: String, val line: Int)
 
-/** The [frames] resolved by an analysis of a frame, `null` if none, see [InlinedFrames.resolve]. */
-private class Analysis(val frames: List<StackTraceElement>?)
+/** A map keeping only the [maxSize] entries accessed most recently. */
+private class LruMap<K, V>(private val maxSize: Int) : LinkedHashMap<K, V>(16, 0.75f, true) {
+    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<K, V>): Boolean = size > maxSize
+}
 
 /**
  * The calls of a line whose instructions which may throw are all out of the scopes of its markers, see [THROWS_OUT_OF_SCOPES],
@@ -277,7 +305,7 @@ private class InlineMarker(
  * of the [instructionCount] instructions of the method, of which the [throwing] ones may throw, see [mayThrow],
  * and the [allocations], the indices of the constructor calls of the `NEW` instructions by their indices,
  * and the [resumeLabels], the indices of the labels the state machine of a suspend function resumes at,
- * the targets of a switch on a field named `label`, so also of a `when` on such a field accessed directly, which is not told apart.
+ * the targets of the switch of the state machine, see [resumeLabels].
  * The scopes of the lines are computed on the first frame of the method resolved.
  */
 private class InlinedMethod(
@@ -285,6 +313,7 @@ private class InlinedMethod(
     val lineNumbers: IntArray,
     val lineStarts: IntArray,
     private val throwing: BitSet,
+    private val ownStatics: BitSet,
     private val allocations: Map<Int, Int>,
     val resumeLabels: BitSet,
     private val instructionCount: Int
@@ -293,7 +322,7 @@ private class InlinedMethod(
     /**
      * The index of the instruction telling the scope of each line:
      * the first instruction which may throw while the line is in effect, until the start of the next line,
-     * or the start of the line, if none may throw.
+     * or the first access of a static field of the class itself, see [isOwnStatic], or the start of the line, if none may throw.
      *
      * The line may start outside the scope of the code it is given to,
      * like at the label of the state machine of a suspend function resuming into an inlined body, before the initialization of its marker.
@@ -328,14 +357,14 @@ private class InlinedMethod(
             val range = lineRange(line)
             val throwingIndices = range.filter { throwing[it] }
             val throwingScopes = throwingIndices.map { scopesAt(it) }.distinct()
-            positions[line] = throwingIndices.firstOrNull() ?: range.first
+            positions[line] = throwingIndices.firstOrNull() ?: range.firstOrNull { ownStatics[it] } ?: range.first
             throws[line] = when {
                 throwingScopes.size > 1 -> THROWS_IN_SCOPES
                 throwingScopes.size == 1 -> THROWS_IN_ONE_SCOPE
                 allocationOutOfScopes(range) -> THROWS_OUT_OF_SCOPES
                 else -> THROWS_NOWHERE
             }
-            throwingScopes.firstOrNull() ?: scopesAt(range.first)
+            throwingScopes.firstOrNull() ?: scopesAt(positions[line])
         }
         Lines(positions, throws, scopes)
     }
@@ -359,7 +388,9 @@ private class InlinedMethod(
      * the line also positioned directly in the scope of the function, not in a lambda nested in it —
      * the lines of each copy of an inline function are its own, while a lambda on the line of its call shares it, nested in the function.
      * The prologue is positioned directly in the scopes enclosing the function, unlike an earlier copy of the same function,
-     * like of a function inlined twice, of a duplicated `finally` block, or a range of an inlined body split by a suspension point.
+     * like of a function inlined twice, of a duplicated `finally` block, or a range of an inlined body split by a suspension point,
+     * nor directly in a copy of the same function, as an inline function cannot call itself —
+     * the copy enclosing it through a lambda, like in `call { call { error("boom") } }`, shares the lines of the nested one, called on the same line.
      * The prologue of a function declaring its default arguments on a line its body does not use, or whose body is dead code, without a marker,
      * is not told apart by the positions, but by the lines the functions declare, see [SnippetClass.isLineOf].
      */
@@ -368,9 +399,11 @@ private class InlinedMethod(
         BitSet(lineNumbers.size).apply {
             lineNumbers.indices.forEach { line ->
                 val prologue = linePositions[line]
+                val innermost = scopesAt(prologue).firstOrNull()
                 val isPrologue = markers.any { function ->
                     !function.isLambda && prologue < function.start
                         && markers.all { prologue !in it || function.start in it }
+                        && innermost?.name != function.name
                         && entriesByLine.getValue(lineNumbers[line]).any { j ->
                             val position = linePositions[j]
                             j != line && position in function
@@ -466,7 +499,7 @@ private class SnippetClass(
         } else {
             // the node is not kept, only what the frames need
             val node = ClassNode().also { reader.accept(it, ClassReader.SKIP_FRAMES) }
-            val inlinedMethods = node.methods.map { it to it.inlinedMethod() }
+            val inlinedMethods = node.methods.map { it to it.inlinedMethod(node.name) }
             methods = inlinedMethods.mapNotNull { (method, inlined) -> inlined?.let { method.name to it } }
                 .groupBy({ it.first }, { it.second })
             linesWithoutMarkers = inlinedMethods.filter { it.second == null }
@@ -673,7 +706,7 @@ private class SnippetClass(
      * positioned in the [scope], not in another scope nested in it, nor a `fake.kt` line,
      * nor a line of the method itself, if the [scope] is an inline function.
      *
-     * The line may start before the [scope], if positioned in it, see [InlinedMethod.linePositions]:
+     * The line may start before the [scope] only if positioned in it, see [InlinedMethod.linePositions], and starting right after the state machine resumes, see [resumesBefore]:
      * in a suspend function, the first line of an inlined body may start at the label the code continues at after a suspension point,
      * before the initialization of its marker, and be the only line of the [scope] in all the ranges of its body split by the state machine —
      * see `should resolve intermediate frames of nested suspend inline functions inlined twice`.
@@ -686,6 +719,7 @@ private class SnippetClass(
         return lineNumbers.indices.lastOrNull { i ->
             val position = linePositions[i]
             lineStarts[i] < index
+                && (lineStarts[i] >= from || resumesBefore(lineStarts[i]))
                 && !isPrologue(i)
                 && (scope == null || position in scope)
                 && markers.none { it !== scope && it.start >= from && position in it }
@@ -693,6 +727,18 @@ private class SnippetClass(
                 && (scope == null || scope.isLambda || !isMethodLine(lineNumbers[i]))
                 && (scope == null || isLineOf(scope, lineNumbers[i]))
         }?.let { lineNumbers[it] }
+    }
+
+    /**
+     * Whether the state machine of a suspend function resumes right before the instruction at the [index], without a line starting in between,
+     * the only case a line of a scope may start before its marker, see [lineBefore].
+     * It keeps a line of an enclosing scope, starting before the marker, from being taken for a line of the scope its code runs into without a line of its own —
+     * a defensive bound, not pinned by a test: the compiler starts an inlined body with a line of its own,
+     * and [isLineOf] rejects such a line whenever the declarations of the class of the scope are known.
+     */
+    private fun InlinedMethod.resumesBefore(index: Int): Boolean {
+        val label = resumeLabels.previousSetBit(index)
+        return label >= 0 && lineStarts.none { it in label..<index }
     }
 
     /** Whether the [line] is a line of the snippet itself, mapped to itself by the SMAP, not a line of inlined code. */
@@ -753,8 +799,8 @@ private class Declarations(methods: List<MethodNode>, isOwnLine: (Int) -> Boolea
 /** The suffix of the name of the method evaluating the default arguments of a function, then calling it, or inlining it if it is inline. */
 private const val DEFAULT_SUFFIX = "\$default"
 
-/** The [InlinedMethod] of this method, `null` if it has no inline markers. */
-private fun MethodNode.inlinedMethod(): InlinedMethod? {
+/** The [InlinedMethod] of this method of the class of this internal [className], `null` if it has no inline markers. */
+private fun MethodNode.inlinedMethod(className: String): InlinedMethod? {
     val markers = localVariables.orEmpty().filter {
         it.name.startsWith(INLINE_FUNCTION_MARKER) || it.name.startsWith(INLINE_LAMBDA_MARKER)
     }.map { InlineMarker(it.name, it.index, instructions.indexOf(it.start), instructions.indexOf(it.end)) }
@@ -762,29 +808,53 @@ private fun MethodNode.inlinedMethod(): InlinedMethod? {
     val lineNodes = instructions.filterIsInstance<LineNumberNode>()
     val lineStarts = IntArray(lineNodes.size) { instructions.indexOf(lineNodes[it].start) }
     val throwing = BitSet(instructions.size())
-    val resumeLabels = BitSet(instructions.size())
+    val ownStatics = BitSet(instructions.size())
     val allocations = HashMap<Int, Int>()
     instructions.forEachIndexed { index, instruction ->
-        if (instruction.mayThrow()) throwing.set(index)
+        if (instruction.mayThrow(className)) throwing.set(index)
+        if (instruction.isOwnStatic(className)) ownStatics.set(index)
         if (instruction.opcode == Opcodes.NEW) {
             instruction.constructorCall()?.let { allocations[index] = instructions.indexOf(it) }
         }
-        // the state machine switches on the label field of its continuation, unlike a `when`, which reads a getter of a property
-        val labels = when {
-            (instruction.previous as? FieldInsnNode)?.name != STATE_MACHINE_LABEL -> emptyList()
-            instruction is TableSwitchInsnNode -> instruction.labels
-            instruction is LookupSwitchInsnNode -> instruction.labels
-            else -> emptyList()
-        }
-        labels.forEach { resumeLabels.set(instructions.indexOf(it)) }
     }
     return InlinedMethod(
-        markers, IntArray(lineNodes.size) { lineNodes[it].line }, lineStarts, throwing, allocations, resumeLabels, instructions.size()
+        markers, IntArray(lineNodes.size) { lineNodes[it].line }, lineStarts, throwing, ownStatics, allocations, resumeLabels(), instructions.size()
     )
 }
 
 /**
- * Whether this instruction may throw, or call a method which may throw, so its line may be the line of a frame.
+ * The indices of the labels of this method the state machine of a suspend function resumes at, see [InlinedMethod.resumeLabels]:
+ * the targets of a switch on the `label` field of its continuation, whose default throws the exception of [STATE_MACHINE_DEFAULT],
+ * unlike a `when` on a field of that name read directly, not through the getter of its property, like of a `@JvmField`.
+ */
+internal fun MethodNode.resumeLabels(): BitSet = BitSet(instructions.size()).also { resumeLabels ->
+    instructions.forEach { instruction ->
+        if ((instruction.previous as? FieldInsnNode)?.name != STATE_MACHINE_LABEL) return@forEach
+        val (labels, default) = when (instruction) {
+            is TableSwitchInsnNode -> instruction.labels to instruction.dflt
+            is LookupSwitchInsnNode -> instruction.labels to instruction.dflt
+            else -> return@forEach
+        }
+        val defaultBlock = generateSequence(default.next) { it.next }.takeWhile { !it.endsBlock() }
+        if (defaultBlock.none { it is LdcInsnNode && it.cst == STATE_MACHINE_DEFAULT }) return@forEach
+        labels.forEach { resumeLabels.set(instructions.indexOf(it)) }
+    }
+}
+
+/** Whether this instruction ends a basic block, by a jump, a switch, a return or a throw. */
+private fun AbstractInsnNode.endsBlock(): Boolean =
+    this is JumpInsnNode || this is TableSwitchInsnNode || this is LookupSwitchInsnNode
+        || opcode in Opcodes.IRETURN..Opcodes.RETURN || opcode == Opcodes.ATHROW
+
+/** The maximum number of the analyses of the frames memoized, see [InlinedFrames.Report.resolve]. */
+internal const val MAX_INLINED_FRAME_ANALYSES = 1024
+
+/** The maximum number of the classes of the frames kept, see [InlinedFrames.Report.resolve]. */
+internal const val MAX_INLINED_FRAME_CLASSES = 64
+
+/**
+ * Whether this instruction of a method of the class of this internal [className] may throw, or call a method which may throw,
+ * so its line may be the line of a frame.
  *
  * A `NEW` is not considered: the compiler may allocate an object before the line of the code creating it starts,
  * like the exception of a lambda starting with `error("…")`, allocated within the line of the inline function calling the lambda,
@@ -793,11 +863,12 @@ private fun MethodNode.inlinedMethod(): InlinedMethod? {
  * Neither is an `INSTANCEOF`, nor an `LDC` of a class: they throw only a `LinkageError` of a class which cannot be loaded,
  * while a class literal or a type check passed to an inline function on the line of the lambda it receives,
  * like `call(Checked::class.java) { error("boom") }`, would put the line in two scopes, losing the frames of the lambda.
+ * Nor is a static field of the class itself, see [isOwnStatic].
  */
-private fun AbstractInsnNode.mayThrow(): Boolean = when (this) {
+private fun AbstractInsnNode.mayThrow(className: String): Boolean = when (this) {
     is MethodInsnNode, is InvokeDynamicInsnNode, is MultiANewArrayInsnNode -> true
     // the class literal of a primitive type, like Int::class.java, the field of a class of the platform loaded already
-    is FieldInsnNode -> !(opcode == Opcodes.GETSTATIC && name == "TYPE" && owner in PRIMITIVE_WRAPPERS)
+    is FieldInsnNode -> !isOwnStatic(className) && !(opcode == Opcodes.GETSTATIC && name == "TYPE" && owner in PRIMITIVE_WRAPPERS)
     is TypeInsnNode -> opcode != Opcodes.INSTANCEOF && opcode != Opcodes.NEW
     is IntInsnNode -> opcode == Opcodes.NEWARRAY
     is InsnNode -> opcode in THROWING_OPCODES
@@ -822,6 +893,16 @@ private fun AbstractInsnNode.constructorCall(): MethodInsnNode? {
         }
     } as MethodInsnNode?
 }
+
+/**
+ * Whether this instruction of a method of the class of this internal [className] accesses a static field of the class itself,
+ * which is initialized already, or by the same thread, so that it throws only a `LinkageError`, like the instance of the snippet
+ * an inline function is called on, read within a lambda calling it on the line of the lambda, as in `call { call { error("boom") } }`.
+ * It cannot throw, see [mayThrow], but it positions a line without an instruction which may throw in the scope of its code, see [InlinedMethod.linePositions]:
+ * the start of the line may be out of the scope, like right after the state machine of a suspend function resumes, before the marker of a lambda.
+ */
+private fun AbstractInsnNode.isOwnStatic(className: String): Boolean =
+    this is FieldInsnNode && (opcode == Opcodes.GETSTATIC || opcode == Opcodes.PUTSTATIC) && owner == className
 
 /** The classes of the platform holding the classes of the primitive types in their `TYPE` fields. */
 private val PRIMITIVE_WRAPPERS = setOf(

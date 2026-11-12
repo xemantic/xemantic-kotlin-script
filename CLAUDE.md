@@ -118,6 +118,9 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 - The state machine of a suspend function splits an inlined body into several ranges of its marker, may start its only line before the first of them,
   and puts lines of the method itself within them — a probe with a suspend inline function inlined just once misses all of it,
   see `should resolve intermediate frames of nested suspend inline functions inlined twice`.
+- The copies of an inline function called on the same line of a snippet share their synthetic lines, even when nested — see `InlinedMethod.prologues`.
+- The resume labels of the state machine are told by the message its switch throws by default, `call to 'resume' before 'invoke' with coroutine` —
+  re-check it after every Kotlin upgrade, `should not take switch on field named label for resume of state machine` pins it.
 
 ## Anti-patterns to avoid
 
