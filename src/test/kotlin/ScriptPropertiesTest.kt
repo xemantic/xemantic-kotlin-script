@@ -44,6 +44,8 @@ import kotlin.reflect.KSuspendFunction1
 import kotlin.reflect.KType
 import kotlin.reflect.KTypeProjection
 import kotlin.reflect.full.createType
+import kotlin.reflect.jvm.javaMethod
+import kotlin.reflect.jvm.kotlinFunction
 import kotlin.reflect.typeOf
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
@@ -1110,7 +1112,8 @@ class ScriptPropertiesTest {
         fun local(a: String, b: String): Int = a.length + b.length
         @Suppress("RedundantSuspendModifier")
         suspend fun localSuspend(a: String, b: String): Int = a.length + b.length
-        // the toString of such a reference fails, as it resolves the function, so they are not paired with their types
+        // the toString of such a reference resolves the function, and throws KotlinReflectionInternalError,
+        // so they are kept out of assert(expr), which power-assert renders by toString, and not paired with their types
         val types = listOf(
             typeOf<KFunction1<String, Int>>(),
             typeOf<KSuspendFunction1<String, Int>>(),
@@ -1649,6 +1652,51 @@ class ScriptPropertiesTest {
         }
     }
 
+    /**
+     * A suspend function reference of no parameters unresolved by kotlin-reflect, like a local one, is told by its compiled class,
+     * whose arity counts the continuation, see [ScriptProperty.type].
+     */
+    @Test
+    fun `should provide property of suspend function reference of no parameters unresolved by kotlin-reflect`() = runTest {
+        // given
+        @Suppress("RedundantSuspendModifier")
+        suspend fun local(): Int = 7
+        ScriptSession(listOf(property("f", ::local))).use { session ->
+            // when
+            val result = session.execute("await { f() }")
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == 7)
+            }
+        }
+    }
+
+    /**
+     * A function of no parameters obtained by kotlin-reflect, rather than by a reference,
+     * implements the function types, but not the marker of a compiled suspend reference, see [ScriptProperty.type].
+     */
+    @Test
+    fun `should provide properties of function of no parameters obtained by kotlin-reflect`() = runTest {
+        // given
+        val function = ::answer.javaMethod!!.kotlinFunction!!
+        val suspendFunction = ::suspendAnswer.javaMethod!!.kotlinFunction!!
+        ScriptSession(listOf(
+            property<KFunction<Int>>("f", function as KFunction<Int>),
+            property<KFunction<Int>>("g", suspendFunction as KFunction<Int>)
+        )).use { session ->
+            // when
+            val result = session.execute("f() + await { g() }")
+
+            // then
+            result should {
+                be<ScriptResult.Value>()
+                have(value == 6)
+            }
+        }
+    }
+
     /** A `KFunction<R>` type of a value of parameters stays as such, as the types of the parameters cannot be told. */
     @Test
     fun `should provide property of KFunction type of function reference of parameters`() = runTest {
@@ -1662,6 +1710,39 @@ class ScriptPropertiesTest {
                 have(value == 4)
             }
         }
+    }
+
+    /**
+     * A `KFunction` of no parameters which does not implement the function type, like one delegating to a reference,
+     * stays declared as `KFunction<R>`, as it would fail to be called as `KFunction0<R>`, see [ScriptProperty.type].
+     */
+    @Test
+    fun `should declare KFunction of no parameters not implementing function type as KFunction`() {
+        // given
+        class Delegating(function: KFunction<Int>) : KFunction<Int> by function
+        class DelegatingKFunction0(function: KFunction0<Int>) : KFunction0<Int> by function
+        class DelegatingWithInvoke(function: KFunction<Int>) : KFunction<Int> by function {
+            @Suppress("unused")
+            operator fun invoke(): Int = 42
+        }
+        val properties = listOf(
+            property<KFunction<Int>>("f", Delegating(::answer)),
+            property<KFunction<Int>>("g", Delegating(::suspendAnswer)),
+            property<KFunction<Int>>("h", DelegatingKFunction0(::answer)),
+            property<KFunction<Int>>("i", DelegatingWithInvoke(::answer))
+        )
+
+        // when
+        val declarations = properties.map { it.declaration(1) }
+
+        // then
+        val values = "com.xemantic.kotlin.script.ScriptPropertyValues"
+        assert(declarations == listOf(
+            "val f: kotlin.reflect.KFunction<kotlin.Int> = $values.get(1, \"f\") as kotlin.reflect.KFunction<kotlin.Int>",
+            "val g: kotlin.reflect.KFunction<kotlin.Int> = $values.get(1, \"g\") as kotlin.reflect.KFunction<kotlin.Int>",
+            "val h: kotlin.reflect.KFunction<kotlin.Int> = $values.get(1, \"h\") as kotlin.reflect.KFunction<kotlin.Int>",
+            "val i: kotlin.reflect.KFunction<kotlin.Int> = $values.get(1, \"i\") as kotlin.reflect.KFunction<kotlin.Int>"
+        ))
     }
 
     /** A nested function reference type is declared as `KFunction<R>`, as the value cannot tell it from a suspend one. */
