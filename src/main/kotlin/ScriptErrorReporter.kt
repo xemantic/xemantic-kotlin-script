@@ -305,7 +305,7 @@ internal class ScriptErrorReporter(
      * A reference called, see [UnresolvedReference.called], also with type arguments, see [startsCall], is hinted at as a function first, and only then as a property, like one of a function type,
      * unless an inaccessible function of the name is declared, which the compiler calls instead,
      * and one not known to be called as a property first, also a `const val` or a `@JvmField` one, see [appendPropertyHint],
-     * and only then as a function, unless a property of the name is declared, which the compiler takes then instead.
+     * and only then as a function, unless a property of the name is declared, which the compiler takes instead.
      */
     private fun StringBuilder.appendUnresolvedEarlierDeclarationHint(name: String, receiverType: String?, usage: UnresolvedReference?) {
         val reference = name.asReference()

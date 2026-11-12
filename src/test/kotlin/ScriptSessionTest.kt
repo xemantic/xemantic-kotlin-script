@@ -3370,6 +3370,29 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should not hint at function of earlier snippet when internal property of the name is unresolved in declaration of inferred type`() = runTest {
+        // given
+        session.execute("fun limit() = 1")
+        session.execute("internal val limit = 2")
+
+        // when
+        val result = session.execute("""
+            fun next() = limit + 1
+            next()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            message sameAs """
+                snippet3.kts:1:14: error: Unresolved reference 'limit'.
+                  | fun next() = <error>limit</error> + 1
+            """.trimIndent()
+        }
+    }
+
+    @Test
     fun `should not hint declaring the type when function declared again internal is unresolved in declaration of inferred type`() = runTest {
         // given
         session.execute("fun limit() = 1")
