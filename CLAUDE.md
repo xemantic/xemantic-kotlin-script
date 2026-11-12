@@ -40,6 +40,9 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   see `should release closed session with its dependencies`.
 - Keep a function reference which kotlin-reflect cannot resolve, like of a local function or of `Integer::toHexString`, out of an `assert(expr)` expression:
   rendering it throws, hiding the actual failure — see `should reject function reference value of another arity unresolved by kotlin-reflect`.
+- A compiled suspend frame resumed twice throws in its `releaseIntercepted` (an NPE without an interceptor, a `ClassCastException` with a `CoroutineDispatcher`) before it reaches its caller,
+  so a test counting the resumptions in the calling lambda stays green when they are doubled —
+  give the caller a `ContinuationInterceptor` which is not a dispatcher, see `should resume caller once when its interceptor queues the resumption and then fails`.
 - Never assert on wall-clock time (a ratio or a bound): tests run under whatever CI load there is, and fail with no code change.
   To guard against, say, quadratic backtracking, feed an input large enough that the regression hangs for minutes while the correct code takes milliseconds.
 
@@ -128,8 +131,14 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 - Inside a lambda walking a chain of exceptions in a `Throwable` extension, like `generateSequence(this) { read(null) { cause } }`,
   an unqualified `read` binds to the outer receiver, not the lambda parameter, so every step returns the first cause —
   always qualify it, `exception.read(null) { cause }`, and test the chain at least two causes deep.
+- Inside `Job(parent).apply { invokeOnCompletion { cancel(e) } }`, an unqualified `cancel` binds to `Job.cancel` of the receiver, not to a `cancel` of the enclosing class,
+  so the handler silently cancels the completed job again — use `also`, and a name no receiver has, like `Turn.onCancelled`.
+- Never watch the cancellation of a caller by a child `Job(callerJob)`, which the caller's own `cancelChildren()` cancels —
+  see `Turn.watch`.
+- A hand-made continuation resumed in place of the caller's must implement `CoroutineStackFrame`,
+  or kotlinx.coroutines leaks a thread context element of an undispatched `withContext` past it — see `Turn.callerFrame`.
 - A test of cancellation must signal "started" from within the block to be cancelled, like inside `await { }`, not before it —
   otherwise the cancellation can arrive before the block starts, so its `finally` never runs, and the test is flaky.
-- Never give a private helper the name of a public method taking the lock, like an `execute` of `Repl` next to `ScriptSession.execute` —
-  a slip like `execute(source)` compiles, re-enters the non-reentrant mutex, and deadlocks.
+- Never give a private helper the name of a public method taking the turn of the session, like an `execute` of `Repl` next to `ScriptSession.execute` —
+  a slip like `execute(source)` compiles, queues its snippet on the session thread behind the one calling it, and deadlocks.
 - Do not add content to this file that is already discoverable by reading the source or build scripts — that inflates context without adding signal, reducing AI agent task success rates (see [arxiv 2602.11988](https://arxiv.org/abs/2602.11988)).

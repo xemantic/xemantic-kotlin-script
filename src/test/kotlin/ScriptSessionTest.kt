@@ -26,25 +26,30 @@ import com.xemantic.kotlin.test.be
 import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.sameAs
 import com.xemantic.kotlin.test.should
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CompletableJob
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.asContextElement
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.asExecutor
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
 import org.jetbrains.kotlin.com.intellij.openapi.Disposable
 import org.jetbrains.kotlin.com.intellij.openapi.util.Disposer
@@ -7056,7 +7061,7 @@ class ScriptSessionTest {
 
     /**
      * A dispatcher failing to tell whether it dispatches, on the thread of the session,
-     * would leave its caller unresumed, holding the lock of the session,
+     * would leave its caller unresumed,
      * so the caller is resumed through [Dispatchers.Default] instead, where its dispatcher is asked again, see #201.
      */
     @Test
@@ -7098,29 +7103,31 @@ class ScriptSessionTest {
     }
 
     /**
-     * A caller without a dispatcher waiting for the snippet of another caller would be resumed by the unlocking of that caller,
-     * in place, on its thread, like the main thread of a UI, rejected there by the session closed meanwhile, see #147, #172 and #201.
+     * A caller without a dispatcher waiting for the snippet of another caller, rejected by the session closed meanwhile,
+     * is resumed after its own snippet, not by that caller, in place, on its thread, like the main thread of a UI,
+     * as it was when it waited for the lock of the session, see #147, #172, #201 and #235.
      */
     @Test
-    fun `should not resume waiting caller without a dispatcher on the thread of the unlocking caller`() {
+    fun `should not resume waiting caller without a dispatcher on the thread of the caller it waited for`() {
         // when
-        val (waitingThread, unlockingThread) = waitingCallerAndUnlockingThreads(EmptyCoroutineContext)
+        val (waitingThread, holderThread) = waitingCallerAndHolderThreads(EmptyCoroutineContext)
 
         // then
-        assert(waitingThread !== unlockingThread)
+        assert(waitingThread !== holderThread)
     }
 
     /**
-     * A caller on [Dispatchers.Unconfined] waiting for the snippet of another caller would be resumed by the unlocking of that caller,
-     * in place, on its thread, like the main thread of a UI, rejected there by the session closed meanwhile, see #201.
+     * A caller on [Dispatchers.Unconfined] waiting for the snippet of another caller, rejected by the session closed meanwhile,
+     * is resumed after its own snippet, not by that caller, in place, on its thread, like the main thread of a UI,
+     * as it was when it waited for the lock of the session, see #201 and #235.
      */
     @Test
-    fun `should not resume waiting caller on Dispatchers Unconfined on the thread of the unlocking caller`() {
+    fun `should not resume waiting caller on Dispatchers Unconfined on the thread of the caller it waited for`() {
         // when
-        val (waitingThread, unlockingThread) = waitingCallerAndUnlockingThreads(Dispatchers.Unconfined)
+        val (waitingThread, holderThread) = waitingCallerAndHolderThreads(Dispatchers.Unconfined)
 
         // then
-        assert(waitingThread !== unlockingThread)
+        assert(waitingThread !== holderThread)
     }
 
     /**
@@ -7139,7 +7146,7 @@ class ScriptSessionTest {
             Dispatchers.Default,
             resumeExecutor = countingHops(hops)
         )
-        val unlockingExecutor = Executors.newSingleThreadExecutor()
+        val holderExecutor = Executors.newSingleThreadExecutor()
         val executor = Executors.newSingleThreadExecutor()
         val dispatcherThread = CompletableFuture.supplyAsync({ Thread.currentThread() }, executor).get()
         val immediate = object : CoroutineDispatcher() {
@@ -7147,12 +7154,12 @@ class ScriptSessionTest {
             override fun dispatch(context: CoroutineContext, block: Runnable) = executor.execute(block)
         }
         try {
-            CoroutineScope(unlockingExecutor.asCoroutineDispatcher()).launch {
+            CoroutineScope(holderExecutor.asCoroutineDispatcher()).launch {
                 session.execute("started.countDown(); Thread.sleep(Long.MAX_VALUE)")
             }
             started.await()
             val waitingResult = CompletableFuture<Result<ScriptResult>>()
-            // started in place on the thread of the dispatcher, so suspended on the lock held by the unlocking caller when it returns
+            // started in place on the thread of the dispatcher, so waiting for the snippet of the holder when it returns
             val suspended = CompletableFuture.supplyAsync({
                 suspend {
                     session.execute("42")
@@ -7162,9 +7169,9 @@ class ScriptSessionTest {
                 !waitingResult.isDone
             }, executor).get()
             assert(suspended)
-            // the unlocking caller resumes only after the session is closed, with its thread shut down
+            // the holder resumes only after the session is closed, with its thread shut down
             val gate = CountDownLatch(1)
-            unlockingExecutor.execute { gate.await() }
+            holderExecutor.execute { gate.await() }
 
             // when
             session.close()
@@ -7176,13 +7183,13 @@ class ScriptSessionTest {
             assert(hops.get() == 0)
         } finally {
             session.close()
-            unlockingExecutor.shutdownNow()
+            holderExecutor.shutdownNow()
             executor.shutdown()
         }
     }
 
     /**
-     * A caller on [Dispatchers.Unconfined] waiting for the snippet of another caller, resumed in place by the unlocking of that caller,
+     * A caller on [Dispatchers.Unconfined] waiting for the snippet of another caller
      * runs its snippet without a free worker of [Dispatchers.Default], needed only to resume it after the snippet,
      * as the snippet might be the one freeing the workers, blocked by the coroutines of the earlier snippets, see #201.
      */
@@ -7200,7 +7207,7 @@ class ScriptSessionTest {
     }
 
     /**
-     * A caller without a dispatcher waiting for the snippet of another caller, resumed in place by the unlocking of that caller,
+     * A caller without a dispatcher waiting for the snippet of another caller
      * runs its snippet without a free worker of [Dispatchers.Default], needed only to resume it after the snippet,
      * as the snippet might be the one freeing the workers, blocked by the coroutines of the earlier snippets, see #201 and #224.
      */
@@ -7273,7 +7280,7 @@ class ScriptSessionTest {
 
     /**
      * A caller on [Dispatchers.Unconfined] resumed from [Dispatchers.Default] runs in the unconfined event loop of kotlinx.coroutines there,
-     * which would queue the resumption of a caller on [Dispatchers.Unconfined] waiting for it, if it were resumed by its unlocking,
+     * which would queue the resumption of a caller on [Dispatchers.Unconfined] waiting for it, if it resumed it, like when it unlocked the session,
      * until the resumed caller suspends, so a resumed caller blocking its thread on the waiting one would hang both, see #224.
      */
     @Test
@@ -7301,8 +7308,8 @@ class ScriptSessionTest {
             }.startCoroutine(Continuation(Dispatchers.Unconfined) {
                 waitingResult.complete(it)
             })
-            // started in place, and not completed, so suspended on the lock held by the other caller,
-            // as execute suspends only there before submitting the snippet
+            // started in place, and not completed, so waiting for the snippet of the other caller,
+            // as execute suspends only once its snippet is submitted
             assert(!waitingResult.isDone)
 
             // when
@@ -7319,164 +7326,7 @@ class ScriptSessionTest {
     }
 
     /**
-     * A caller without a dispatcher waiting for the snippet of another caller, started on the thread of that caller,
-     * would be rejected by the session closed meanwhile in place, on that thread, nested in the unlocking of the other caller,
-     * as if it were back on its own thread, see #224.
-     */
-    @Test
-    fun `should not reject waiting caller without a dispatcher on the thread of the unlocking caller it started on`() {
-        // when
-        val (waitingThread, unlockingThread) = waitingCallerAndUnlockingThreads(
-            EmptyCoroutineContext,
-            startedOnUnlockingThread = true
-        )
-
-        // then
-        assert(waitingThread !== unlockingThread)
-    }
-
-    /**
-     * A caller on [Dispatchers.Unconfined] waiting for the snippet of another caller, started on the thread of that caller,
-     * would be rejected by the session closed meanwhile in place, on that thread, nested in the unlocking of the other caller,
-     * as if it were back on its own thread, see #224.
-     */
-    @Test
-    fun `should not reject waiting caller on Dispatchers Unconfined on the thread of the unlocking caller it started on`() {
-        // when
-        val (waitingThread, unlockingThread) = waitingCallerAndUnlockingThreads(
-            Dispatchers.Unconfined,
-            startedOnUnlockingThread = true
-        )
-
-        // then
-        assert(waitingThread !== unlockingThread)
-    }
-
-    /**
-     * A caller without a dispatcher, started on the thread of a caller rejected by the session closed before taking its snippet,
-     * and waiting for that caller, is resumed by its unlocking in place, on that thread, also its own,
-     * so it is rejected off that thread, not nested in the rejection of the other caller, see #224.
-     */
-    @Test
-    fun `should not reject waiting caller without a dispatcher nested in the rejection of the caller it waited for`() {
-        // given
-        val unlockingThread = Thread.currentThread()
-        val waitingThread = CompletableFuture<Thread>()
-        val waitingResult = CompletableFuture<Result<ScriptResult>>()
-        val rejections = AtomicInteger(2)
-        lateinit var session: ScriptSession
-        session = DefaultScriptSession(
-            emptyList(),
-            Dispatchers.Default,
-            executor = { threadFactory ->
-                val delegate = Executors.newSingleThreadExecutor(threadFactory)
-                // stands in for the session closed before taking the snippets of both callers
-                object : ExecutorService by delegate {
-                    override fun execute(command: Runnable) {
-                        when (rejections.getAndDecrement()) {
-                            2 -> {
-                                // the first caller holds the turn, so the second one waits for it, suspended
-                                suspend {
-                                    session.execute("2")
-                                }.startCoroutine(Continuation(EmptyCoroutineContext) {
-                                    waitingThread.complete(Thread.currentThread())
-                                    waitingResult.complete(it)
-                                })
-                                throw RejectedExecutionException()
-                            }
-                            1 -> throw RejectedExecutionException()
-                            else -> delegate.execute(command)
-                        }
-                    }
-                }
-            }
-        )
-        try {
-            // when
-            val unlockingResult = runCatching {
-                runBlocking {
-                    session.execute("1")
-                }
-            }
-
-            // then
-            assert(unlockingResult.exceptionOrNull() is IllegalStateException)
-            // bounded, so a hang fails the test instead of hanging the build
-            assert(waitingResult.get(1, TimeUnit.MINUTES).exceptionOrNull() is IllegalStateException)
-            assert(waitingThread.get() !== unlockingThread)
-        } finally {
-            session.close()
-        }
-    }
-
-    /**
-     * A waiting caller without a dispatcher, rejected by the session closed before taking its snippet,
-     * is resumed from the resume executor, which might fail otherwise than by rejecting it,
-     * like by an [OutOfMemoryError] of creating a worker, so it is rejected in place then,
-     * and would keep its turn forever otherwise, so every next caller would wait for it, see #224.
-     */
-    @Test
-    fun `should release turn of waiting caller rejected while the resume executor fails`() {
-        // given
-        val waitingResult = CompletableFuture<Result<ScriptResult>>()
-        val rejections = AtomicInteger(2)
-        lateinit var session: ScriptSession
-        session = DefaultScriptSession(
-            emptyList(),
-            Dispatchers.Default,
-            resumeExecutor = { throw IllegalStateException("resumeExecutor failed") },
-            executor = { threadFactory ->
-                val delegate = Executors.newSingleThreadExecutor(threadFactory)
-                // stands in for the session closed before taking the snippets of both callers
-                object : ExecutorService by delegate {
-                    override fun execute(command: Runnable) {
-                        when (rejections.getAndDecrement()) {
-                            2 -> {
-                                // the first caller holds the turn, so the second one waits for it, suspended
-                                suspend {
-                                    session.execute("2")
-                                }.startCoroutine(Continuation(EmptyCoroutineContext) {
-                                    waitingResult.complete(it)
-                                })
-                                throw RejectedExecutionException()
-                            }
-                            1 -> throw RejectedExecutionException()
-                            else -> delegate.execute(command)
-                        }
-                    }
-                }
-            }
-        )
-        try {
-            val unlockingResult = runCatching {
-                runBlocking {
-                    session.execute("1")
-                }
-            }
-            assert(unlockingResult.exceptionOrNull() is IllegalStateException)
-            // bounded, so a hang fails the test instead of hanging the build
-            assert(waitingResult.get(1, TimeUnit.MINUTES).exceptionOrNull() is IllegalStateException)
-
-            // when
-            val next = CompletableFuture.supplyAsync {
-                runBlocking {
-                    session.execute("3")
-                }
-            }
-
-            // then
-            // bounded, so a hang fails the test instead of hanging the build
-            next.get(1, TimeUnit.MINUTES) should {
-                be<ScriptResult.Value>()
-                have(value == 3)
-            }
-        } finally {
-            session.close()
-        }
-    }
-
-    /**
-     * A dispatcher always failing to tell whether it dispatches would leave its caller unresumed, holding the lock of the session,
+     * A dispatcher always failing to tell whether it dispatches would leave its caller unresumed,
      * so the caller is resumed without it, with its failure, see #224.
      */
     @Test
@@ -7496,8 +7346,8 @@ class ScriptSessionTest {
     }
 
     /**
-     * A dispatcher failing with a fatal error to tell whether it dispatches would leave its caller unresumed, holding the lock of the session,
-     * so the caller is resumed without it, with the fatal error, like a fatal error of the snippet, see #224.
+     * A dispatcher failing with a fatal error to tell whether it dispatches would leave its caller unresumed,
+     * so the caller is resumed without it, with the fatal error, like a fatal error of the snippet, without retrying it, see #224 and #235.
      */
     @Test
     fun `should resume caller of dispatcher failing with fatal error to tell whether it dispatches`() {
@@ -7516,7 +7366,7 @@ class ScriptSessionTest {
     }
 
     /**
-     * A dispatcher failing to dispatch, like one of an executor shut down, would leave its caller unresumed, holding the lock of the session,
+     * A dispatcher failing to dispatch, like one of an executor shut down, would leave its caller unresumed,
      * so the caller is resumed without it, with its failure, see #224.
      */
     @Test
@@ -7534,6 +7384,1148 @@ class ScriptSessionTest {
             have(value == 43)
         }
     }
+
+    /**
+     * A dispatcher failing with a fatal error, see [isFatal], to resume its caller is not retried from [Dispatchers.Default],
+     * unlike a failure which is not fatal, as the session passes a fatal error to the caller rather than swallowing it, see #235.
+     */
+    @Test
+    fun `should fail caller with fatal error of its dispatcher without retrying it`() {
+        // given
+        val failure = InternalError("isDispatchNeeded failed")
+        val failures = AtomicInteger()
+        val session = ScriptSession {
+            provide<AtomicInteger>("failures", failures)
+        }
+        val executor = Executors.newSingleThreadExecutor()
+        val dispatcher = object : CoroutineDispatcher() {
+            // fails only once, so a retry would resume the caller with the value of its snippet
+            override fun isDispatchNeeded(context: CoroutineContext): Boolean {
+                if (failures.getAndDecrement() > 0) throw failure
+                return true
+            }
+            override fun dispatch(context: CoroutineContext, block: Runnable) = executor.execute(block)
+        }
+        try {
+            val callerResult = CompletableFuture<Result<ScriptResult>>()
+
+            // when
+            suspend {
+                session.execute("failures.set(1); 42")
+            }.startCoroutine(Continuation(dispatcher) {
+                callerResult.complete(it)
+            })
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build
+            assert(callerResult.get(1, TimeUnit.MINUTES).exceptionOrNull() === failure)
+        } finally {
+            session.close()
+            executor.shutdown()
+        }
+    }
+
+    /**
+     * A waiting caller whose dispatcher fails to resume it after the snippet of the caller it waited for
+     * would stay unresumed, keeping the turn of the session, so every next caller would wait for it, see #235.
+     */
+    @Test
+    fun `should resume waiting caller whose dispatcher fails to resume it`() {
+        // given
+        val started = CountDownLatch(1)
+        val proceed = CountDownLatch(1)
+        val session = ScriptSession {
+            provide<CountDownLatch>("started", started)
+            provide<CountDownLatch>("proceed", proceed)
+        }
+        val failure = RejectedExecutionException("dispatch failed")
+        val failing = AtomicBoolean()
+        val executor = Executors.newSingleThreadExecutor()
+        val dispatcher = failingDispatcher(executor, failing, failure)
+        try {
+            val holder = CompletableFuture.supplyAsync {
+                runBlocking {
+                    session.execute("started.countDown(); proceed.await(); 1")
+                }
+            }
+            started.await()
+            val waitingResult = CompletableFuture<Result<ScriptResult>>()
+            suspend {
+                session.execute("2")
+            }.startCoroutine(Continuation(dispatcher) {
+                waitingResult.complete(it)
+            })
+            // started in place, as its dispatcher does not dispatch yet, and not completed, so waiting for the snippet of the holder
+            assert(!waitingResult.isDone)
+            failing.set(true)
+
+            // when
+            proceed.countDown()
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build
+            assert(waitingResult.get(1, TimeUnit.MINUTES).exceptionOrNull()?.causes()?.any { it === failure } == true)
+            holder.get(1, TimeUnit.MINUTES) should {
+                be<ScriptResult.Value>()
+                have(value == 1)
+            }
+            val next = CompletableFuture.supplyAsync {
+                runBlocking {
+                    session.execute("3")
+                }
+            }
+            next.get(1, TimeUnit.MINUTES) should {
+                be<ScriptResult.Value>()
+                have(value == 3)
+            }
+        } finally {
+            proceed.countDown()
+            session.close()
+            executor.shutdown()
+        }
+    }
+
+    /**
+     * A caller whose continuation interceptor fails, while a caller waiting for it has a dispatcher failing to resume it,
+     * would get the failure of that dispatcher instead of its own, see #235.
+     */
+    @Test
+    fun `should fail caller whose interceptor fails with its own failure while the dispatcher of a waiting caller fails`() {
+        // given
+        val proceed = CountDownLatch(1)
+        val session = ScriptSession {
+            provide<CountDownLatch>("proceed", proceed)
+        }
+        val failure = IllegalStateException("interceptContinuation failed")
+        val dispatchFailure = RejectedExecutionException("dispatch failed")
+        val failing = AtomicBoolean()
+        val executor = Executors.newSingleThreadExecutor()
+        val dispatcher = failingDispatcher(executor, failing, dispatchFailure)
+        val waitingResult = CompletableFuture<Result<ScriptResult>>()
+        val interceptions = AtomicInteger()
+        val interceptor = object : AbstractCoroutineContextElement(ContinuationInterceptor), ContinuationInterceptor {
+            override fun <T> interceptContinuation(continuation: Continuation<T>): Continuation<T> {
+                // the first interception starts the caller, the next one is the one of its execution
+                if (interceptions.incrementAndGet() == 2) {
+                    // started in place, as its dispatcher does not dispatch yet, so waiting for the failing caller
+                    suspend {
+                        session.execute("proceed.await(); 2")
+                    }.startCoroutine(Continuation(dispatcher) {
+                        waitingResult.complete(it)
+                    })
+                    failing.set(true)
+                    throw failure
+                }
+                return continuation
+            }
+        }
+        try {
+            val callerResult = CompletableFuture<Result<ScriptResult>>()
+
+            // when
+            suspend {
+                session.execute("1")
+            }.startCoroutine(Continuation(interceptor) {
+                callerResult.complete(it)
+            })
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build
+            assert(callerResult.get(1, TimeUnit.MINUTES).exceptionOrNull() === failure)
+            proceed.countDown()
+            assert(waitingResult.get(1, TimeUnit.MINUTES).exceptionOrNull()?.causes()?.any { it === dispatchFailure } == true)
+            val next = CompletableFuture.supplyAsync {
+                runBlocking {
+                    session.execute("3")
+                }
+            }
+            next.get(1, TimeUnit.MINUTES) should {
+                be<ScriptResult.Value>()
+                have(value == 3)
+            }
+        } finally {
+            proceed.countDown()
+            session.close()
+            executor.shutdown()
+        }
+    }
+
+    /**
+     * A continuation interceptor queueing the resumption of its caller, and throwing after it, like a dispatcher doing so,
+     * would get the caller resumed again from [Dispatchers.Default], without the interceptor, see #235.
+     * Not a [CoroutineDispatcher], whose release of the continuation would throw on the second resumption, before it reaches the caller.
+     */
+    @Test
+    fun `should resume caller once when its interceptor queues the resumption and then fails`() {
+        // given
+        val failing = AtomicBoolean()
+        val resumeExecutor = Executors.newSingleThreadExecutor()
+        val session = DefaultScriptSession(
+            listOf(ScriptProperty("failing", typeOf<AtomicBoolean>(), failing)),
+            Dispatchers.Default,
+            resumeExecutor = resumeExecutor
+        )
+        val executor = Executors.newSingleThreadExecutor()
+        val interceptor = object : AbstractCoroutineContextElement(ContinuationInterceptor), ContinuationInterceptor {
+            override fun <T> interceptContinuation(continuation: Continuation<T>) = object : Continuation<T> {
+                override val context = continuation.context
+                // in place until failing, so the caller is suspended in execute once started
+                override fun resumeWith(result: Result<T>) {
+                    if (!failing.get()) return continuation.resumeWith(result)
+                    executor.execute { continuation.resumeWith(result) }
+                    throw IllegalStateException("resumption failed after queueing")
+                }
+            }
+        }
+        val resumptions = AtomicInteger()
+        try {
+            // when
+            suspend {
+                try {
+                    session.execute("failing.set(true); 42")
+                } finally {
+                    resumptions.incrementAndGet()
+                }
+            }.startCoroutine(Continuation(interceptor) {})
+            // every resumption is queued once the session ran the next snippet, and the executors are drained
+            runBlocking {
+                session.execute("43")
+            }
+            resumeExecutor.shutdown()
+            assert(resumeExecutor.awaitTermination(1, TimeUnit.MINUTES))
+            executor.shutdown()
+            assert(executor.awaitTermination(1, TimeUnit.MINUTES))
+
+            // then
+            assert(resumptions.get() == 1)
+        } finally {
+            session.close()
+            resumeExecutor.shutdownNow()
+            executor.shutdownNow()
+        }
+    }
+
+    /**
+     * The resume executor queueing the resumption of a caller, and throwing after it, like [Dispatchers.Default]
+     * failing with an [OutOfMemoryError] to start a worker for the task queued already,
+     * would get the caller resumed in place, and again by the queued task, see #235.
+     * The caller has a continuation interceptor which is not a [CoroutineDispatcher], resumed off the session thread like a caller without one,
+     * as without it, the second resumption would throw before it reaches the caller.
+     */
+    @Test
+    fun `should resume caller once when the resume executor queues the resumption and then fails`() {
+        // given
+        val queue = Executors.newSingleThreadExecutor()
+        val session = DefaultScriptSession(
+            emptyList(),
+            Dispatchers.Default,
+            resumeExecutor = { command ->
+                queue.execute(command)
+                throw IllegalStateException("resumeExecutor failed after queueing")
+            }
+        )
+        val interceptor = object : AbstractCoroutineContextElement(ContinuationInterceptor), ContinuationInterceptor {
+            override fun <T> interceptContinuation(continuation: Continuation<T>): Continuation<T> = continuation
+        }
+        val resumptions = AtomicInteger()
+        try {
+            // when
+            suspend {
+                try {
+                    session.execute("42")
+                } finally {
+                    resumptions.incrementAndGet()
+                }
+            }.startCoroutine(Continuation(interceptor) {})
+            // every resumption is queued once the session ran the next snippet, and the queue is drained
+            runBlocking {
+                session.execute("43")
+            }
+            queue.shutdown()
+            assert(queue.awaitTermination(1, TimeUnit.MINUTES))
+
+            // then
+            assert(resumptions.get() == 1)
+        } finally {
+            session.close()
+            queue.shutdownNow()
+        }
+    }
+
+    /**
+     * The thread of the session queueing the snippet of a caller, and throwing after it,
+     * would fail the caller, and resume it again after its snippet, see #235.
+     */
+    @Test
+    fun `should resume caller once when the thread of the session queues its snippet and then fails`() {
+        // given
+        val resumeExecutor = Executors.newSingleThreadExecutor()
+        val session = DefaultScriptSession(
+            emptyList(),
+            Dispatchers.Default,
+            resumeExecutor = resumeExecutor
+        ) { threadFactory ->
+            InterceptedExecutor(Executors.newSingleThreadExecutor(threadFactory)) { index, execute ->
+                execute()
+                if (index == 0) throw IllegalStateException("execute failed after queueing")
+            }
+        }
+        val resumptions = AtomicInteger()
+        try {
+            // when
+            suspend {
+                try {
+                    session.execute("42")
+                } finally {
+                    resumptions.incrementAndGet()
+                }
+            }.startCoroutine(Continuation(EmptyCoroutineContext) {})
+            // every resumption is queued once the session ran the next snippet, and the resume executor is drained
+            runBlocking {
+                session.execute("43")
+            }
+            resumeExecutor.shutdown()
+            assert(resumeExecutor.awaitTermination(1, TimeUnit.MINUTES))
+
+            // then
+            assert(resumptions.get() == 1)
+        } finally {
+            session.close()
+            resumeExecutor.shutdownNow()
+        }
+    }
+
+    /**
+     * A caller cancelled while it waits for the snippet of another caller resumes at once, without its snippet,
+     * not after the snippet of the other caller, see #235.
+     */
+    @Test
+    fun `should resume waiting caller cancelled before its snippet without running it`() {
+        // given
+        val started = CountDownLatch(1)
+        val proceed = CountDownLatch(1)
+        val ran = AtomicBoolean()
+        val session = ScriptSession {
+            provide<CountDownLatch>("started", started)
+            provide<CountDownLatch>("proceed", proceed)
+            provide<AtomicBoolean>("ran", ran)
+        }
+        try {
+            val holder = CompletableFuture.supplyAsync {
+                runBlocking {
+                    session.execute("started.countDown(); proceed.await(); 1")
+                }
+            }
+            started.await()
+            val waitingFailure = CompletableFuture<Throwable?>()
+            val waiting = CoroutineScope(Dispatchers.Unconfined).launch {
+                session.execute("ran.set(true); 2")
+            }
+            waiting.invokeOnCompletion { waitingFailure.complete(it) }
+            // started in place, and not completed, so waiting for the snippet of the holder
+            assert(!waiting.isCompleted)
+
+            // when
+            waiting.cancel()
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build, completed while the holder still blocks
+            assert(waitingFailure.get(1, TimeUnit.MINUTES) is CancellationException)
+            assert(!holder.isDone)
+            proceed.countDown()
+            holder.get(1, TimeUnit.MINUTES) should {
+                be<ScriptResult.Value>()
+                have(value == 1)
+            }
+            runBlocking {
+                session.execute("ran.get()")
+            } should {
+                be<ScriptResult.Value>()
+                have(value == false)
+            }
+        } finally {
+            proceed.countDown()
+            session.close()
+        }
+    }
+
+    /**
+     * A caller on [Dispatchers.Unconfined] cancelled by a snippet while it waits for that snippet
+     * would resume in place, on the thread of the session, blocking the next snippet with whatever blocks the caller then, see #235.
+     */
+    @Test
+    fun `should not resume waiting caller on Dispatchers Unconfined cancelled by a snippet on the session thread`() {
+        // given
+        val started = CountDownLatch(1)
+        val proceed = CountDownLatch(1)
+        val waitingJob = Job()
+        val session = ScriptSession {
+            provide<CountDownLatch>("started", started)
+            provide<CountDownLatch>("proceed", proceed)
+            provide<Job>("waitingJob", waitingJob)
+        }
+        try {
+            val holder = CompletableFuture.supplyAsync {
+                runBlocking {
+                    session.execute("started.countDown(); proceed.await(); waitingJob.cancel(); Thread.currentThread()")
+                }
+            }
+            started.await()
+            val waitingThread = CompletableFuture<Thread>()
+            CoroutineScope(waitingJob + Dispatchers.Unconfined).launch {
+                try {
+                    session.execute("2")
+                } finally {
+                    waitingThread.complete(Thread.currentThread())
+                }
+            }
+            // started in place, and not completed, so waiting for the snippet of the holder
+            assert(!waitingThread.isDone)
+
+            // when
+            proceed.countDown()
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build
+            val sessionThread = (holder.get(1, TimeUnit.MINUTES) as ScriptResult.Value).value
+            assert(waitingThread.get(1, TimeUnit.MINUTES) !== sessionThread)
+        } finally {
+            proceed.countDown()
+            session.close()
+        }
+    }
+
+    /**
+     * A caller of its own dispatcher, waiting for the snippets of other callers, is rejected by the session closed meanwhile
+     * without waiting for a free worker of [Dispatchers.Default], which a waiting caller without a dispatcher before it
+     * needs to resume, see #235.
+     */
+    @Test
+    fun `should reject waiting caller of a dispatcher of session closed meanwhile while caller without a dispatcher before it waits for Dispatchers Default`() {
+        // given
+        val started = CountDownLatch(1)
+        // stands in for Dispatchers.Default with all its workers blocked until freed
+        val freed = CountDownLatch(1)
+        val saturated = Executors.newSingleThreadExecutor()
+        saturated.execute { freed.await() }
+        val session = DefaultScriptSession(
+            listOf(ScriptProperty("started", typeOf<CountDownLatch>(), started)),
+            Dispatchers.Default,
+            resumeExecutor = saturated
+        )
+        val holderExecutor = Executors.newSingleThreadExecutor()
+        val executor = Executors.newSingleThreadExecutor()
+        val dispatcherThread = CompletableFuture.supplyAsync({ Thread.currentThread() }, executor).get()
+        val immediate = object : CoroutineDispatcher() {
+            override fun isDispatchNeeded(context: CoroutineContext) = Thread.currentThread() !== dispatcherThread
+            override fun dispatch(context: CoroutineContext, block: Runnable) = executor.execute(block)
+        }
+        try {
+            val holder = CoroutineScope(holderExecutor.asCoroutineDispatcher()).async {
+                session.execute("started.countDown(); Thread.sleep(Long.MAX_VALUE)")
+            }
+            started.await()
+            val withoutDispatcherResult = CompletableFuture<Result<ScriptResult>>()
+            suspend {
+                session.execute("1")
+            }.startCoroutine(Continuation(EmptyCoroutineContext) {
+                withoutDispatcherResult.complete(it)
+            })
+            val dispatcherResult = CompletableFuture<Result<ScriptResult>>()
+            // started in place on the thread of the dispatcher, so waiting for the snippets of the other callers when it returns
+            val waiting = CompletableFuture.supplyAsync({
+                suspend {
+                    session.execute("2")
+                }.startCoroutine(Continuation(immediate) {
+                    dispatcherResult.complete(it)
+                })
+                !dispatcherResult.isDone
+            }, executor).get()
+            assert(!withoutDispatcherResult.isDone && waiting)
+
+            // when
+            session.close()
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build
+            assert(dispatcherResult.get(1, TimeUnit.MINUTES).exceptionOrNull() is IllegalStateException)
+            assert(!withoutDispatcherResult.isDone)
+            freed.countDown()
+            assert(withoutDispatcherResult.get(1, TimeUnit.MINUTES).exceptionOrNull() is IllegalStateException)
+            runBlocking { holder.await() } should {
+                be<ScriptResult.Error>()
+            }
+        } finally {
+            freed.countDown()
+            session.close()
+            holderExecutor.shutdownNow()
+            executor.shutdown()
+            saturated.shutdown()
+        }
+    }
+
+    /**
+     * A caller cancelled already when it calls execute, while the snippets of other callers are ahead of its own,
+     * would wait for them, and then run its snippet nevertheless, so a `withTimeout` around execute would not bound the wait,
+     * as it did when the caller waited for the lock of the session, see #235.
+     */
+    @Test
+    fun `should reject caller cancelled already while snippets of other callers are ahead of it`() {
+        // given
+        val started = CountDownLatch(1)
+        val proceed = CountDownLatch(1)
+        val ran = AtomicBoolean()
+        val session = ScriptSession {
+            provide<CountDownLatch>("started", started)
+            provide<CountDownLatch>("proceed", proceed)
+            provide<AtomicBoolean>("ran", ran)
+        }
+        try {
+            val holder = CompletableFuture.supplyAsync {
+                runBlocking {
+                    session.execute("started.countDown(); proceed.await(); 1")
+                }
+            }
+            started.await()
+            val failure = CompletableFuture<Throwable?>()
+
+            // when
+            // started in place, so completed once execute returns, if it does not wait
+            val cancelled = CoroutineScope(Dispatchers.Unconfined).launch {
+                cancel()
+                session.execute("ran.set(true); 2")
+            }
+            cancelled.invokeOnCompletion { failure.complete(it) }
+
+            // then
+            assert(cancelled.isCompleted)
+            assert(failure.get() is CancellationException)
+            assert(!holder.isDone)
+            proceed.countDown()
+            holder.get(1, TimeUnit.MINUTES) should {
+                be<ScriptResult.Value>()
+                have(value == 1)
+            }
+            runBlocking {
+                session.execute("ran.get()")
+            } should {
+                be<ScriptResult.Value>()
+                have(value == false)
+            }
+        } finally {
+            proceed.countDown()
+            session.close()
+        }
+    }
+
+    /**
+     * A caller cancelling the children of its job while it waits, like a heartbeat it launched,
+     * would cancel its own turn, if the turn watched the cancellation of the caller as a child of its job,
+     * dropping the snippet of a caller which is still active, see #235.
+     */
+    @Test
+    fun `should execute snippet of waiting caller cancelling the children of its job`() {
+        // given
+        val started = CountDownLatch(1)
+        val proceed = CountDownLatch(1)
+        val session = ScriptSession {
+            provide<CountDownLatch>("started", started)
+            provide<CountDownLatch>("proceed", proceed)
+        }
+        try {
+            val holder = CompletableFuture.supplyAsync {
+                runBlocking {
+                    session.execute("started.countDown(); proceed.await(); 1")
+                }
+            }
+            started.await()
+            val callerResult = CompletableFuture<Result<ScriptResult>>()
+            val caller = CoroutineScope(Dispatchers.Unconfined).launch {
+                launch { awaitCancellation() }
+                callerResult.complete(runCatching { session.execute("2") })
+            }
+            // started in place, and not completed, so waiting for the snippet of the holder
+            assert(!callerResult.isDone)
+
+            // when
+            caller.cancelChildren()
+            proceed.countDown()
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build
+            callerResult.get(1, TimeUnit.MINUTES).getOrThrow() should {
+                be<ScriptResult.Value>()
+                have(value == 2)
+            }
+            assert(!caller.isCancelled)
+            holder.get(1, TimeUnit.MINUTES) should {
+                be<ScriptResult.Value>()
+                have(value == 1)
+            }
+        } finally {
+            proceed.countDown()
+            session.close()
+        }
+    }
+
+    /** The turn of a waiting caller is not a child of its job, so it does not show among them, see #235. */
+    @Test
+    fun `should not add child to the job of waiting caller`() {
+        // given
+        val started = CountDownLatch(1)
+        val proceed = CountDownLatch(1)
+        val session = ScriptSession {
+            provide<CountDownLatch>("started", started)
+            provide<CountDownLatch>("proceed", proceed)
+        }
+        try {
+            val holder = CompletableFuture.supplyAsync {
+                runBlocking {
+                    session.execute("started.countDown(); proceed.await(); 1")
+                }
+            }
+            started.await()
+            val callerResult = CompletableFuture<Result<ScriptResult>>()
+
+            // when
+            val caller = CoroutineScope(Dispatchers.Unconfined).launch {
+                callerResult.complete(runCatching { session.execute("2") })
+            }
+
+            // then
+            // started in place, and not completed, so waiting for the snippet of the holder
+            assert(!callerResult.isDone)
+            assert(caller.children.none())
+            proceed.countDown()
+            callerResult.get(1, TimeUnit.MINUTES).getOrThrow() should {
+                be<ScriptResult.Value>()
+                have(value == 2)
+            }
+            assert(holder.get(1, TimeUnit.MINUTES) is ScriptResult.Value)
+        } finally {
+            proceed.countDown()
+            session.close()
+        }
+    }
+
+    /**
+     * A bare job of a waiting caller, completed while it waits, completes at once, as no child of it waits for the turn,
+     * and cancels the caller without its snippet, like a waiter of a lock, see #235.
+     */
+    @Test
+    fun `should complete job of waiting caller completed while it waits`() {
+        // given
+        val started = CountDownLatch(1)
+        val proceed = CountDownLatch(1)
+        val ran = AtomicBoolean()
+        val session = ScriptSession {
+            provide<CountDownLatch>("started", started)
+            provide<CountDownLatch>("proceed", proceed)
+            provide<AtomicBoolean>("ran", ran)
+        }
+        try {
+            val holder = CompletableFuture.supplyAsync {
+                runBlocking {
+                    session.execute("started.countDown(); proceed.await(); 1")
+                }
+            }
+            started.await()
+            val callerJob = Job()
+            val callerResult = CompletableFuture<Result<ScriptResult>>()
+            suspend {
+                session.execute("ran.set(true); 2")
+            }.startCoroutine(Continuation(callerJob) {
+                callerResult.complete(it)
+            })
+            // started in place, and not completed, so waiting for the snippet of the holder
+            assert(!callerResult.isDone)
+
+            // when
+            callerJob.complete()
+
+            // then
+            assert(callerJob.isCompleted)
+            // bounded, so a hang fails the test instead of hanging the build, completed while the holder still blocks
+            assert(callerResult.get(1, TimeUnit.MINUTES).exceptionOrNull() is CancellationException)
+            assert(!holder.isDone)
+            proceed.countDown()
+            assert(holder.get(1, TimeUnit.MINUTES) is ScriptResult.Value)
+            runBlocking {
+                session.execute("ran.get()")
+            } should {
+                be<ScriptResult.Value>()
+                have(value == false)
+            }
+        } finally {
+            proceed.countDown()
+            session.close()
+        }
+    }
+
+    /**
+     * A caller cancelled while it waits for the snippets of other callers would leave its snippet,
+     * with its context and continuation, queued on the thread of the session until the snippets ahead end,
+     * so many callers timing out behind a blocked snippet would retain all of them, see #235.
+     */
+    @Test
+    fun `should release snippet of caller cancelled while it waits`() {
+        // given
+        val started = CountDownLatch(1)
+        val proceed = CountDownLatch(1)
+        val session = ScriptSession {
+            provide<CountDownLatch>("started", started)
+            provide<CountDownLatch>("proceed", proceed)
+        }
+        try {
+            val holder = CompletableFuture.supplyAsync {
+                runBlocking {
+                    session.execute("started.countDown(); proceed.await(); 1")
+                }
+            }
+            started.await()
+
+            // when
+            val snippet = snippetOfCallerCancelledWhileWaiting(session)
+
+            // then
+            collectGarbageUntilCleared(snippet)
+            assert(snippet.refersTo(null))
+            assert(!holder.isDone)
+        } finally {
+            proceed.countDown()
+            session.close()
+        }
+    }
+
+    /**
+     * A caller whose job has completed already, calling execute on an idle session, executes its snippet,
+     * like a caller cancelled already, as it did when it took the free lock of the session, and fails only after it, see #235.
+     */
+    @Test
+    fun `should execute snippet of caller with a completed job in an idle session`() {
+        // given
+        val ran = AtomicBoolean()
+        val session = ScriptSession {
+            provide<AtomicBoolean>("ran", ran)
+        }
+        val completed = Job().apply { complete() }
+        val callerResult = CompletableFuture<Result<ScriptResult>>()
+        try {
+            // when
+            suspend {
+                session.execute("ran.set(true)")
+            }.startCoroutine(Continuation(completed) {
+                callerResult.complete(it)
+            })
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build
+            assert(callerResult.get(1, TimeUnit.MINUTES).exceptionOrNull() is CancellationException)
+            assert(ran.get())
+        } finally {
+            session.close()
+        }
+    }
+
+    /**
+     * A caller without an interceptor, whose own code throws when it is resumed, like its completion,
+     * throws to the resume executor, as the failure is not one of resuming it, see #235.
+     */
+    @Test
+    fun `should throw failure of caller without an interceptor to the resume executor`() {
+        // given
+        val failure = IllegalStateException("completion failed")
+        val thrown = CompletableFuture<Throwable?>()
+        val session = DefaultScriptSession(
+            emptyList(),
+            Dispatchers.Default,
+            // inline, on the thread of the session, so done before the next snippet
+            resumeExecutor = { command -> thrown.complete(runCatching { command.run() }.exceptionOrNull()) }
+        )
+        try {
+            // when
+            suspend {
+                session.execute("1")
+            }.startCoroutine(Continuation(EmptyCoroutineContext) {
+                throw failure
+            })
+            runBlocking {
+                session.execute("2")
+            }
+
+            // then
+            assert(thrown.getNow(null) === failure)
+        } finally {
+            session.close()
+        }
+    }
+
+    /**
+     * A caller of an interceptor returning the continuation it intercepts, whose own code throws when it is resumed,
+     * throws to the resume executor, like a caller without an interceptor, see #235.
+     */
+    @Test
+    fun `should throw failure of caller of interceptor not wrapping its continuation to the resume executor`() {
+        // given
+        val failure = IllegalStateException("completion failed")
+        val thrown = CompletableFuture<Throwable?>()
+        val session = DefaultScriptSession(
+            emptyList(),
+            Dispatchers.Default,
+            // inline, on the thread of the session, so done before the next snippet
+            resumeExecutor = { command -> thrown.complete(runCatching { command.run() }.exceptionOrNull()) }
+        )
+        val interceptor = object : AbstractCoroutineContextElement(ContinuationInterceptor), ContinuationInterceptor {
+            override fun <T> interceptContinuation(continuation: Continuation<T>): Continuation<T> = continuation
+        }
+        try {
+            // when
+            suspend {
+                session.execute("1")
+            }.startCoroutine(Continuation(interceptor) {
+                throw failure
+            })
+            runBlocking {
+                session.execute("2")
+            }
+
+            // then
+            assert(thrown.getNow(null) === failure)
+        } finally {
+            session.close()
+        }
+    }
+
+    /**
+     * A fatal error, see [isFatal], of a dispatcher which resumed the caller already, running it inline, and threw after it,
+     * cannot be passed to the caller, so it is thrown to the resume executor rather than swallowed, see #235.
+     */
+    @Test
+    fun `should throw fatal error of dispatcher which resumed its caller to the resume executor`() {
+        // given
+        val failure = InternalError("dispatch failed after running the resumption")
+        val failing = AtomicBoolean()
+        val thrown = CompletableFuture<Throwable?>()
+        val session = DefaultScriptSession(
+            listOf(ScriptProperty("failing", typeOf<AtomicBoolean>(), failing)),
+            Dispatchers.Default,
+            // inline, on the thread of the session, so done before the next snippet, catching the fatal error, see CLAUDE.md
+            resumeExecutor = { command -> thrown.complete(runCatching { command.run() }.exceptionOrNull()) }
+        )
+        val dispatcher = object : CoroutineDispatcher() {
+            // in place until failing, so the caller is queued before the next snippet once started
+            override fun isDispatchNeeded(context: CoroutineContext) = failing.get()
+            override fun dispatch(context: CoroutineContext, block: Runnable) {
+                block.run()
+                throw failure
+            }
+        }
+        val callerResult = CompletableFuture<Result<ScriptResult>>()
+        try {
+            // when
+            suspend {
+                session.execute("failing.set(true); 42")
+            }.startCoroutine(Continuation(dispatcher) {
+                callerResult.complete(it)
+            })
+            runBlocking {
+                session.execute("43")
+            }
+
+            // then
+            assert(callerResult.getNow(null)?.getOrNull() is ScriptResult.Value)
+            assert(thrown.getNow(null) === failure)
+        } finally {
+            session.close()
+        }
+    }
+
+    /**
+     * A caller cancelled while it waits for the snippets of other callers would leave its turn queued on the thread of the session
+     * until the snippets ahead end, keeping its coroutine context, with whatever its elements hold, see #235.
+     */
+    @Test
+    fun `should release context of caller cancelled while it waits`() {
+        withSessionBlockedBySnippet { session ->
+            // when
+            val element = contextElementOfCallerCancelledWhileWaiting(session)
+
+            // then
+            collectGarbageUntilCleared(element)
+            assert(element.refersTo(null))
+        }
+    }
+
+    /**
+     * A caller timing out while it waits for the snippets of other callers would leave its turn queued on the thread of the session
+     * until the snippets ahead end, keeping its cancellation, which refers to the frames of the caller, with their locals, see #235.
+     */
+    @Test
+    fun `should release frame of caller timing out while it waits`() {
+        withSessionBlockedBySnippet { session ->
+            // when
+            val local = localOfCallerTimingOutWhileWaiting(session)
+
+            // then
+            collectGarbageUntilCleared(local)
+            assert(local.refersTo(null))
+        }
+    }
+
+    /** Runs the [block] with a session whose thread is blocked by the snippet of another caller until the [block] returns. */
+    private fun withSessionBlockedBySnippet(block: (ScriptSession) -> Unit) {
+        val started = CountDownLatch(1)
+        val proceed = CountDownLatch(1)
+        val session = ScriptSession {
+            provide<CountDownLatch>("started", started)
+            provide<CountDownLatch>("proceed", proceed)
+        }
+        try {
+            val holder = CompletableFuture.supplyAsync {
+                runBlocking {
+                    session.execute("started.countDown(); proceed.await(); 1")
+                }
+            }
+            started.await()
+            block(session)
+            assert(!holder.isDone)
+        } finally {
+            proceed.countDown()
+            session.close()
+        }
+    }
+
+    /**
+     * Executes a snippet in the [session], with a context element, cancelled while it waits for the snippet ahead of it,
+     * outside of the test, so no frame of the test keeps it, see [collectGarbageUntilCleared].
+     *
+     * @return the reference to the context element.
+     */
+    private fun contextElementOfCallerCancelledWhileWaiting(session: ScriptSession): WeakReference<Ballast> {
+        val element = Ballast()
+        // started in place, so waiting for the snippet ahead once launch returns
+        val waiting = CoroutineScope(Dispatchers.Unconfined + element).launch {
+            session.execute("1")
+        }
+        assert(!waiting.isCompleted)
+        // resumed in place, on this thread, so completed once cancel returns
+        waiting.cancel()
+        assert(waiting.isCompleted)
+        return WeakReference(element)
+    }
+
+    /**
+     * Executes a snippet in the [session], timing out while it waits for the snippet ahead of it, with a local of the caller kept across it,
+     * outside of the test, so no frame of the test keeps it, see [collectGarbageUntilCleared].
+     *
+     * @return the reference to the local.
+     */
+    private fun localOfCallerTimingOutWhileWaiting(session: ScriptSession): WeakReference<ByteArray> {
+        val local = ByteArray(1_000_000)
+        val result = runBlocking {
+            val timedOut = withTimeoutOrNull(1) {
+                session.execute("1")
+            }
+            // read after the execution, so kept by the frame of the caller while it waits
+            timedOut to local.size
+        }
+        assert(result.first == null)
+        return WeakReference(local)
+    }
+
+    /** A coroutine context element holding a megabyte. */
+    private class Ballast : AbstractCoroutineContextElement(Ballast) {
+        companion object Key : CoroutineContext.Key<Ballast>
+        @Suppress("unused")
+        val bytes = ByteArray(1_000_000)
+    }
+
+    /**
+     * Executes a snippet in the [session], cancelled while it waits for the snippet ahead of it,
+     * outside of the test, so no frame of the test keeps it, see [collectGarbageUntilCleared].
+     *
+     * @return the reference to the snippet.
+     */
+    private fun snippetOfCallerCancelledWhileWaiting(session: ScriptSession): WeakReference<String> {
+        val snippet = "\"${"x".repeat(100_000)}\""
+        // started in place, so waiting for the snippet ahead once launch returns
+        val waiting = CoroutineScope(Dispatchers.Unconfined).launch {
+            session.execute(snippet)
+        }
+        assert(!waiting.isCompleted)
+        // resumed in place, on this thread, so completed once cancel returns
+        waiting.cancel()
+        assert(waiting.isCompleted)
+        return WeakReference(snippet)
+    }
+
+    /**
+     * A caller cancelled while its snippet is submitted to the thread of the session, rejecting it as the session is closed meanwhile,
+     * fails with its cancellation, like any caller cancelled before its snippet starts, rather than with the rejection, see #235.
+     */
+    @Test
+    fun `should fail caller cancelled while its snippet is rejected with its cancellation`() {
+        // given
+        lateinit var caller: Job
+        val session = DefaultScriptSession(emptyList(), Dispatchers.Default) { threadFactory ->
+            InterceptedExecutor(Executors.newSingleThreadExecutor(threadFactory)) { index, execute ->
+                if (index == 0) {
+                    caller.cancel()
+                    throw RejectedExecutionException()
+                }
+                execute()
+            }
+        }
+        val failure = CompletableFuture<Throwable?>()
+        try {
+            // when
+            // lazy, so the caller is known to the executor before the snippet is submitted
+            caller = CoroutineScope(Dispatchers.Unconfined).launch(start = CoroutineStart.LAZY) {
+                session.execute("1")
+            }
+            caller.invokeOnCompletion { failure.complete(it) }
+            caller.start()
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build
+            assert(failure.get(1, TimeUnit.MINUTES) is CancellationException)
+        } finally {
+            session.close()
+        }
+    }
+
+    /**
+     * A caller cancelled while its snippet is submitted to the thread of the session, failing with a fatal error, see [isFatal],
+     * fails with that error, rather than with its cancellation, so the error is not swallowed, see #235.
+     */
+    @Test
+    fun `should fail caller cancelled while submitting its snippet fails fatally with the fatal error`() {
+        // given
+        val fatal = OutOfMemoryError("unable to create native thread")
+        lateinit var caller: Job
+        val session = DefaultScriptSession(emptyList(), Dispatchers.Default) { threadFactory ->
+            InterceptedExecutor(Executors.newSingleThreadExecutor(threadFactory)) { index, execute ->
+                if (index == 0) {
+                    caller.cancel()
+                    throw fatal
+                }
+                execute()
+            }
+        }
+        val failure = CompletableFuture<Throwable?>()
+        try {
+            // when
+            // lazy, so the caller is known to the executor before the snippet is submitted
+            caller = CoroutineScope(Dispatchers.Unconfined).launch(start = CoroutineStart.LAZY) {
+                try {
+                    session.execute("1")
+                } catch (e: Throwable) {
+                    failure.complete(e)
+                }
+            }
+            caller.start()
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build
+            assert(failure.get(1, TimeUnit.MINUTES) === fatal)
+        } finally {
+            session.close()
+        }
+    }
+
+    /**
+     * A fatal error, see [isFatal], thrown by the `dispatch` of a dispatcher, is wrapped by kotlinx.coroutines,
+     * and passed to the caller unwrapped, like a fatal error of the snippet, see #235.
+     */
+    @Test
+    fun `should fail caller with unwrapped fatal error thrown by dispatch of its dispatcher`() {
+        // given
+        val failure = InternalError("dispatch failed")
+        val failures = AtomicInteger()
+        val session = ScriptSession {
+            provide<AtomicInteger>("failures", failures)
+        }
+        val executor = Executors.newSingleThreadExecutor()
+        val dispatcher = object : CoroutineDispatcher() {
+            // fails only once, so a retry would resume the caller with the value of its snippet
+            override fun dispatch(context: CoroutineContext, block: Runnable) {
+                if (failures.getAndDecrement() > 0) throw failure
+                executor.execute(block)
+            }
+        }
+        try {
+            val callerResult = CompletableFuture<Result<ScriptResult>>()
+
+            // when
+            suspend {
+                session.execute("failures.set(1); 42")
+            }.startCoroutine(Continuation(dispatcher) {
+                callerResult.complete(it)
+            })
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build
+            assert(callerResult.get(1, TimeUnit.MINUTES).exceptionOrNull() === failure)
+        } finally {
+            session.close()
+            executor.shutdown()
+        }
+    }
+
+    /**
+     * A caller resuming in place, on the thread of the session, is resumed there after all, if the resume executor fails to take it,
+     * like [Dispatchers.Default] failing to start a worker, as left unresumed, it would never return, see #224 and #235.
+     */
+    @Test
+    fun `should resume caller in place when the resume executor fails`() {
+        // given
+        val session = DefaultScriptSession(
+            emptyList(),
+            Dispatchers.Default,
+            resumeExecutor = { throw IllegalStateException("resumeExecutor failed") }
+        )
+        val callerResult = CompletableFuture<Result<Pair<Any?, Thread>>>()
+        try {
+            // when
+            suspend {
+                val result = session.execute("Thread.currentThread()")
+                assert(result is ScriptResult.Value)
+                result.value to Thread.currentThread()
+            }.startCoroutine(Continuation(EmptyCoroutineContext) {
+                callerResult.complete(it)
+            })
+
+            // then
+            // bounded, so a hang fails the test instead of hanging the build
+            val (sessionThread, callerThread) = callerResult.get(1, TimeUnit.MINUTES).getOrThrow()
+            assert(callerThread === sessionThread)
+            runBlocking {
+                session.execute("2")
+            } should {
+                be<ScriptResult.Value>()
+                have(value == 2)
+            }
+        } finally {
+            session.close()
+        }
+    }
+
+    /**
+     * A dispatcher which does not dispatch until [failing], and then fails to dispatch with the [failure],
+     * dispatching to the [executor] before.
+     */
+    private fun failingDispatcher(
+        executor: Executor,
+        failing: AtomicBoolean,
+        failure: Throwable
+    ) = object : CoroutineDispatcher() {
+        override fun isDispatchNeeded(context: CoroutineContext) = failing.get()
+        override fun dispatch(context: CoroutineContext, block: Runnable) {
+            if (failing.get()) throw failure
+            executor.execute(block)
+        }
+    }
+
 
     /**
      * Executes a snippet of a caller of a dispatcher, which fails with the [failure] once the snippet is evaluated,
@@ -7610,7 +8602,7 @@ class ScriptSessionTest {
         )
         val executor = Executors.newSingleThreadExecutor()
         try {
-            val unlocking = CoroutineScope(executor.asCoroutineDispatcher()).async {
+            val holder = CoroutineScope(executor.asCoroutineDispatcher()).async {
                 session.execute("started.countDown(); proceed.await(); 1")
             }
             started.await()
@@ -7620,15 +8612,15 @@ class ScriptSessionTest {
             }.startCoroutine(Continuation(context) {
                 waitingResult.complete(it)
             })
-            // started in place, and not completed, so suspended on the lock held by the unlocking caller,
-            // as execute suspends only there before submitting the snippet
+            // started in place, and not completed, so waiting for the snippet of the holder,
+            // as execute suspends only once its snippet is submitted
             assert(!waitingResult.isDone)
             proceed.countDown()
             // bounded, so a hang fails the test instead of hanging the build
             val ranSaturated = ran.await(1, TimeUnit.MINUTES)
             freed.countDown()
             val result = waitingResult.get(1, TimeUnit.MINUTES)
-            runBlocking { unlocking.await() } should {
+            runBlocking { holder.await() } should {
                 be<ScriptResult.Value>()
                 have(value == 1)
             }
@@ -7642,44 +8634,38 @@ class ScriptSessionTest {
     }
 
     /**
-     * Starts a caller in the [context], waiting for the snippet of a caller on the dispatcher of a single thread, the unlocking one,
-     * on that thread if [startedOnUnlockingThread],
-     * and closes the session, which fails the snippet of the unlocking caller, and rejects the waiting one,
-     * with the thread of the session shut down before the unlocking caller resumes.
+     * Starts a caller in the [context], waiting for the snippet of a caller on the dispatcher of a single thread, the holder,
+     * and closes the session, which fails the snippet of the holder, and rejects the waiting one,
+     * with the thread of the session shut down before the holder resumes.
      *
-     * @return the thread on which the waiting caller completed, and the thread of the unlocking caller.
+     * @return the thread on which the waiting caller completed, and the thread of the holder.
      */
-    private fun waitingCallerAndUnlockingThreads(
-        context: CoroutineContext,
-        startedOnUnlockingThread: Boolean = false
+    private fun waitingCallerAndHolderThreads(
+        context: CoroutineContext
     ): Pair<Thread, Thread> {
         val executor = Executors.newSingleThreadExecutor()
-        val unlockingThread = CompletableFuture.supplyAsync({ Thread.currentThread() }, executor).get()
+        val holderThread = CompletableFuture.supplyAsync({ Thread.currentThread() }, executor).get()
         val started = CountDownLatch(1)
         val session = ScriptSession {
             provide<CountDownLatch>("started", started)
         }
         try {
-            val unlocking = CoroutineScope(executor.asCoroutineDispatcher()).async {
+            val holder = CoroutineScope(executor.asCoroutineDispatcher()).async {
                 session.execute("started.countDown(); Thread.sleep(Long.MAX_VALUE)")
             }
             started.await()
             val waitingThread = CompletableFuture<Thread>()
             val waitingResult = CompletableFuture<Result<ScriptResult>>()
-            val start = {
-                suspend {
-                    session.execute("42")
-                }.startCoroutine(Continuation(context) {
-                    waitingThread.complete(Thread.currentThread())
-                    waitingResult.complete(it)
-                })
-                // started in place, and not completed, so suspended on the lock held by the unlocking caller,
-                // as execute suspends only there before submitting the snippet
-                !waitingResult.isDone
-            }
-            val suspended = if (startedOnUnlockingThread) CompletableFuture.supplyAsync({ start() }, executor).get() else start()
-            assert(suspended)
-            // the unlocking caller resumes only after the session is closed, with its thread shut down
+            suspend {
+                session.execute("42")
+            }.startCoroutine(Continuation(context) {
+                waitingThread.complete(Thread.currentThread())
+                waitingResult.complete(it)
+            })
+            // started in place, and not completed, so waiting for the snippet of the holder,
+            // as execute suspends only once its snippet is submitted
+            assert(!waitingResult.isDone)
+            // the holder resumes only after the session is closed, with its thread shut down
             val gate = CountDownLatch(1)
             executor.execute { gate.await() }
 
@@ -7689,10 +8675,10 @@ class ScriptSessionTest {
 
             // bounded, so a hang fails the test instead of hanging the build
             assert(waitingResult.get(1, TimeUnit.MINUTES).exceptionOrNull() is IllegalStateException)
-            runBlocking { unlocking.await() } should {
+            runBlocking { holder.await() } should {
                 be<ScriptResult.Error>()
             }
-            return waitingThread.get() to unlockingThread
+            return waitingThread.get() to holderThread
         } finally {
             session.close()
             executor.shutdown()
@@ -7797,6 +8783,29 @@ class ScriptSessionTest {
                 be<ScriptResult.Value>()
                 have(value == null)
             }
+        }
+    }
+
+    /**
+     * A thread context element of the caller, installed by a `withContext` not dispatching, is removed from the thread of the caller
+     * once the `withContext` ends, as kotlinx.coroutines restores the thread state only of a continuation whose frames it can walk, see #235.
+     */
+    @Test
+    fun `should remove thread context element of the caller from its thread after withContext`() {
+        // given
+        val threadLocal = ThreadLocal<String>()
+        ScriptSession().use { session ->
+
+            // when
+            val leaked = runBlocking(Dispatchers.Default) {
+                withContext(threadLocal.asContextElement("caller")) {
+                    session.execute("1")
+                }
+                threadLocal.get()
+            }
+
+            // then
+            assert(leaked == null)
         }
     }
 

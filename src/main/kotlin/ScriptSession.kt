@@ -22,6 +22,8 @@ package com.xemantic.kotlin.script
 import io.github.oshai.kotlinlogging.KLogger
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.github.oshai.kotlinlogging.Level
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
@@ -32,7 +34,7 @@ import kotlinx.coroutines.asExecutor
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.suspendCancellableCoroutine
 import org.intellij.lang.annotations.Language
 import org.jetbrains.kotlin.com.intellij.openapi.Disposable
 import org.jetbrains.kotlin.com.intellij.openapi.util.Disposer
@@ -47,12 +49,15 @@ import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadFactory
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.ContinuationInterceptor
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
-import kotlin.coroutines.intrinsics.intercepted
 import kotlin.coroutines.intrinsics.suspendCoroutineUninterceptedOrReturn
+import kotlin.coroutines.jvm.internal.CoroutineStackFrame
+import kotlin.coroutines.resume
+import kotlin.coroutines.startCoroutine
 import kotlin.script.experimental.api.ResultValue
 import kotlin.script.experimental.api.ResultWithDiagnostics
 import kotlin.script.experimental.api.CompiledSnippet
@@ -146,6 +151,8 @@ public interface ScriptSession : AutoCloseable {
      * so such a caller needs a free worker of [Dispatchers.Default], which the coroutines launched by the snippets share by default, see [ScriptScope],
      * while the next snippets do not wait for it, as the turn of the caller ends with its snippet.
      * A caller whose dispatcher fails to resume it, like the one of an executor shut down, resumes without it, failing with that exception.
+     * A caller cancelled while its snippet waits for the ones executed concurrently resumes at once, without executing it,
+     * and so does a caller cancelled already when it calls this function, unless no other snippet is executed, or waiting.
      * The README details these cases, and the ones of a caller waiting for the snippet of another caller.
      * A cancellation, or closing the session, while the snippet is compiled waits for the compilation to end,
      * as the compiler is never interrupted, and the snippet is evaluated then, cancelled already,
@@ -230,9 +237,19 @@ internal class DefaultScriptSession(
 
     private val name = "script-session-$id"
 
+    /** The thread run by the [thread] executor, replaced only if an exception escapes a task of it. */
+    @Volatile
+    private var sessionThread: Thread? = null
+
     private val thread = executor { runnable ->
-        Thread(null, runnable, name, SESSION_THREAD_STACK_SIZE).apply { isDaemon = true }
+        Thread(null, runnable, name, SESSION_THREAD_STACK_SIZE).apply {
+            isDaemon = true
+            sessionThread = this
+        }
     }
+
+    /** The turns whose tasks are queued, or run, on the [thread], see [Turn.submit]. */
+    private val turns = AtomicInteger()
 
     private val job = SupervisorJob()
 
@@ -243,8 +260,6 @@ internal class DefaultScriptSession(
     init {
         ScriptPropertyValues.register(id, properties.associate { it.name to it.value })
     }
-
-    private val mutex = Mutex()
 
     private val classLoader = ScriptSession::class.java.classLoader
 
@@ -429,46 +444,36 @@ internal class DefaultScriptSession(
     override suspend fun execute(
         snippet: String
     ): ScriptResult {
-        val callerThread = Thread.currentThread()
         checkNotClosed()
-        // the turn of the caller, taken at once if it is free,
-        // so a caller resumed by the unlocking of another one, maybe in place on the thread it started on, is told apart,
-        // while a caller taking it after all without suspending, as it is released meanwhile, counts as waiting,
-        // which only makes its rejection by the session closed meanwhile resume it from the resumeExecutor, see onSessionThread
-        val waited = !mutex.tryLock()
-        if (waited) mutex.lock()
-        // the turn is released by the code it is handed off to, see onSessionThread, or else here, whatever throws before
-        val handedOff = AtomicBoolean()
-        val result = try {
-            // a caller without a job, like `suspend fun main`, cannot cancel the evaluation
-            val callerJob = currentCoroutineContext()[Job] ?: Job()
-            onSessionThread(callerThread, waited, handedOff) {
-                // checked on the thread, as the session could be closed before the block was submitted to it,
-                // with the disposal of the compiler queued before the block then,
-                // while a session closed later disposes the compiler only after this block, queued after it on the thread
+        val callerJob = currentCoroutineContext()[Job]
+        val result = onSessionThread(callerJob) {
+            // checked on the thread, as the session could be closed before the block was submitted to it,
+            // with the disposal of the compiler queued before the block then,
+            // while a session closed later disposes the compiler only after this block, queued after it on the thread
+            checkNotClosed()
+            propertiesFailure ?: run {
+                val repl = repl ?: createRepl()
+                // a snippet of the session closed while the properties were declared would be evaluated cancelled already,
+                // so it is rejected instead, like one executed after closing, while the properties are declared, see close
                 checkNotClosed()
-                propertiesFailure ?: run {
-                    val repl = repl ?: createRepl()
-                    // a snippet of the session closed while the properties were declared would be evaluated cancelled already,
-                    // so it is rejected instead, like one executed after closing, while the properties are declared, see close
-                    checkNotClosed()
-                    // null only if declaring the properties failed just now, with their failure kept, see createRepl
-                    repl?.compileAndEvaluate(snippet, "snippet${++snippetCount}.kts", callerJob) ?: propertiesFailure!!
-                }
+                // null only if declaring the properties failed just now, with their failure kept, see createRepl,
+                // while a caller without a job, like `suspend fun main`, cannot cancel the evaluation
+                repl?.compileAndEvaluate(snippet, "snippet${++snippetCount}.kts", callerJob ?: Job())
+                    ?: propertiesFailure!!
             }
-        } catch (e: Throwable) {
-            // like a continuation interceptor of the caller failing, which would keep the turn forever otherwise
-            if (!handedOff.get()) mutex.unlock()
-            throw e
         }
         currentCoroutineContext().ensureActive()
         return result
     }
 
     /**
-     * Runs the [block] on the [thread], and returns its result, or throws its exception,
-     * releasing the turn of the caller, the lock of the [mutex] it holds, by the code it is [handedOff] to,
-     * while the caller releases it itself if this function throws without handing it off.
+     * Runs the [block] on the [thread], and returns its result, or throws its exception.
+     *
+     * The turn of the caller is its [Turn], queued on the [thread] at once, behind the ones of the earlier callers,
+     * so the queue of the single thread executor orders the callers, and the next caller runs as soon as the block ends,
+     * without waiting for this caller to resume, which might need a free worker of the [resumeExecutor],
+     * which the coroutines of the snippets might all block, while the snippet of the next caller might be the one freeing them.
+     * No caller is resumed to take its turn, so none is resumed by another one, nested in it, or on its thread.
      *
      * The block is run by `runBlocking` in the context of the caller, without its job and dispatcher,
      * so a thread context element of the caller, like a thread local as its `asContextElement`, is installed on the thread for the block,
@@ -479,141 +484,303 @@ internal class DefaultScriptSession(
      * If the evaluator ever suspended, and the interrupt of [close] arrived while `runBlocking` is parked,
      * kotlinx.coroutines 1.11 would cancel the blocking coroutine with an [InterruptedException],
      * so [execute] would throw it instead of returning an [ExecutionPhase.EVALUATION] error.
-     * The caller waits for the block also when it is cancelled,
-     * as a cancelled compilation would leave the compiled snippet to be evaluated before the next one.
-     *
-     * The turn is released on the thread, after the block, and before the caller resumes, see [resumeCaller],
-     * as a caller resuming from the [resumeExecutor] needs a free worker of it, which the coroutines of the snippets might all block,
-     * while the snippet of the next caller might be the one freeing them.
-     * So the next caller, if it would resume in place, is resumed on the thread, and submits its snippet from there.
-     *
-     * A caller rejected by the session closed with the thread shut down is rejected in place,
-     * unless it [waited] for the turn, and was resumed by the unlocking of another caller in place, on its thread:
-     * then it is resumed from the [resumeExecutor] instead, releasing the turn there,
-     * if it has no continuation interceptor, or [Dispatchers.Unconfined], also on the [callerThread] it called [execute] on,
-     * or if it would resume in place on another thread, so a caller of a dispatcher which does not dispatch on its own thread,
-     * like `Dispatchers.Main.immediate`, is rejected in place, when its dispatcher resumes it there.
-     *
-     * The turn of a waiting caller rejected on the thread is released only from the [resumeExecutor] as well,
-     * as releasing it in place would resume the next waiting caller nested in it, rejected the same way,
-     * so the stack would grow with every waiting caller.
+     * The caller waits for the block also when it is cancelled after the block started,
+     * as a cancelled compilation would leave the compiled snippet to be evaluated before the next one,
+     * while a caller cancelled before, while the block waits for the earlier ones, resumes at once, without its block,
+     * like a cancelled waiter of a lock, see [Turn.submit].
      *
      * @throws IllegalStateException if the session is closed, with the thread shut down, before the block is submitted.
+     * @throws CancellationException the cancellation of the caller, cancelled before the block started, see [Turn.submit].
      * @throws Throwable whatever else submitting the block to the thread throws, like an [OutOfMemoryError] of creating it,
      * or the continuation interceptor of the caller, as it is.
      */
     private suspend fun <T> onSessionThread(
-        callerThread: Thread,
-        waited: Boolean,
-        handedOff: AtomicBoolean,
+        callerJob: Job?,
         block: suspend CoroutineScope.() -> T
     ): T {
-        val callerContext = currentCoroutineContext()
-        val context = callerContext.minusKey(Job).minusKey(ContinuationInterceptor) + CoroutineName(name)
+        val context = currentCoroutineContext().minusKey(Job).minusKey(ContinuationInterceptor) + CoroutineName(name)
         // always suspended, unless thrown, as a caller resumed before suspendCoroutine returns would continue on the current thread
         return suspendCoroutineUninterceptedOrReturn { uninterceptedContinuation ->
-            val continuation = uninterceptedContinuation.intercepted()
-            // set before handing off, as the caller resumed there might read it at once, and reset if neither hand-off takes it
-            handedOff.set(true)
+            Turn(uninterceptedContinuation) { runBlocking(context, block) }.submit(callerJob)
+        }
+    }
+
+    /**
+     * The runnable queued on the [thread] for a [turn], keeping it only until the [thread] takes it, or the turn is dropped,
+     * so a turn cancelled while it waits leaves only this runnable on the queue, holding nothing, see [Turn.onCancelled].
+     */
+    private class QueuedTurn(
+        @Volatile var turn: Turn<*>?
+    ) : Runnable {
+
+        override fun run() {
+            val turn = turn ?: return
+            this.turn = null
+            turn.start()
+        }
+
+    }
+
+    /**
+     * The turn of a caller of [execute], whose [task], the block of [onSessionThread], is queued on the [thread] by a [QueuedTurn],
+     * resuming the [caller] exactly once, after the task, or when the caller is cancelled before it, or when it is not queued.
+     *
+     * A failing dispatcher, or resume executor, cannot resume the caller twice, as the ones taking the resumption, and then throwing,
+     * like [Dispatchers.Default] queueing the task before it fails to start a worker for it:
+     * the first resumption reaching the caller wins, and the other ones are dropped.
+     * A turn cancelled while it waits is dropped by its [QueuedTurn], so nothing of its caller stays on the queue of the [thread].
+     *
+     * A frame of the stack of the caller, so kotlinx.coroutines restores the thread state of the caller,
+     * like a thread context element installed by a `withContext` not dispatching, once its block ends.
+     *
+     * @param caller the continuation of the caller, intercepted by its interceptor at once, on its thread,
+     * so an interceptor failing to intercept it fails the caller in place, before its task is queued.
+     */
+    private inner class Turn<T>(
+        private var caller: Continuation<T>?,
+        private var task: (() -> T)?
+    ) : Continuation<T>, CoroutineStackFrame {
+
+        private val state = AtomicReference(TurnState.NEW)
+
+        private val resumed = AtomicBoolean()
+
+        /** Whether the task is counted by the [turns] no more. */
+        private val finished = AtomicBoolean()
+
+        private val queued = QueuedTurn(this)
+
+        override val context: CoroutineContext = caller!!.context
+
+        private val interceptor = context[ContinuationInterceptor]
+
+        /** The continuation of the first resumption of the caller, see [resumeCaller]. */
+        private var intercepted: Continuation<T>? = intercept()
+
+        /** The cancellation of the job of the caller, if it cancelled this turn, see [onCancelled]. */
+        private var cancellation: CancellationException? = null
+
+        /**
+         * The waiting of the caller for the task, cancelled with the job of the caller, see [watch],
+         * resumed once the task starts, or is not queued, or dropped once the caller is cancelled.
+         */
+        private val waiting = AtomicReference<CancellableContinuation<Unit>?>()
+
+        /** The frame of the [caller], read anew, as it is dropped once resumed, so this turn retains nothing of a resumed caller. */
+        override val callerFrame: CoroutineStackFrame?
+            get() = caller as? CoroutineStackFrame
+
+        override fun getStackTraceElement(): StackTraceElement? = null
+
+        /** Resumes the [caller] with the [result], unless it is resumed already. */
+        override fun resumeWith(result: Result<T>) {
+            tryResume(result)
+        }
+
+        private fun tryResume(result: Result<T>): Boolean {
+            if (!resumed.compareAndSet(false, true)) return false
+            val caller = caller!!
+            // dropped before resuming, as resuming might not return for long, like a caller blocking its thread
+            this.caller = null
+            caller.resumeWith(result)
+            return true
+        }
+
+        /** This turn, intercepted by the [interceptor] of the caller, anew for each attempt, as a dispatched continuation is used once. */
+        private fun intercept(): Continuation<T> = interceptor?.interceptContinuation(this) ?: this
+
+        /**
+         * Queues the task on the [thread], counted by the [turns] until it ends there,
+         * watching the cancellation of the [callerJob] while it waits for the earlier ones, so the caller resumes at once,
+         * without its task, like a cancelled waiter of a lock, see [onCancelled].
+         * A caller cancelled already, or with its job completed, when it calls [execute] is rejected the same way, at once,
+         * unless its turn is free, like the tryLock of a lock taking it, as no other task is counted:
+         * then it runs its snippet, cancelled, as a cancellation while its snippet is compiled would leave it to be evaluated anyway.
+         *
+         * @return [COROUTINE_SUSPENDED] if the task is queued, or taken by the [thread] although it threw, which is logged then.
+         * @throws Throwable the failure of the [thread] to take it, as an [IllegalStateException] if it rejected the task,
+         * the session closed, or the cancellation of the caller, cancelled before the task is queued, unless it is taken.
+         */
+        fun submit(callerJob: Job?): Any? {
+            val free = turns.getAndIncrement() == 0
             try {
-                thread.execute {
-                    val result = runCatching { runBlocking(context, block) }
-                    // a failure of a waiting caller resumed in place must not leave this caller unresumed
-                    val unlocking = runCatching { mutex.unlock() }
-                    resumeCaller(continuation, uninterceptedContinuation, callerContext, result)
-                    unlocking.onFailure { e ->
-                        if (e.isFatal) throw e
-                        logger.warn(e) { "$name: releasing the turn of the caller failed" }
-                    }
-                }
-                COROUTINE_SUSPENDED
+                if (callerJob != null && !(free && !callerJob.isActive)) watch(callerJob)
             } catch (e: Throwable) {
-                val failure = if (e is RejectedExecutionException) IllegalStateException(SESSION_CLOSED_MESSAGE) else e
-                var resumedOff = false
+                finish()
+                throw e
+            }
+            // not queued if cancelled already, as it would be skipped
+            val failure = if (state.get() == TurnState.CANCELLED) null else try {
+                thread.execute(queued)
+                null
+            } catch (e: Throwable) {
+                e
+            }
+            // a task not taken by the thread is dropped like a cancelled one, as it might be queued nevertheless
+            if (state.compareAndSet(TurnState.NEW, if (failure == null) TurnState.QUEUED else TurnState.CANCELLED)) {
+                if (failure == null) return COROUTINE_SUSPENDED
+                finish()
+                stopWatching()
+                drop()
+                throw if (failure is RejectedExecutionException) IllegalStateException(SESSION_CLOSED_MESSAGE) else failure
+            }
+            if (state.get() == TurnState.STARTED) {
+                failure?.let { e -> logger.warn(e) { "$name: submitting the snippet failed after the thread took it" } }
+                return COROUTINE_SUSPENDED
+            }
+            // cancelled before the task is queued, or while it is submitted, which dropped it from the queued runnable,
+            // also when the thread rejects it, as the cancellation of the caller came first,
+            // unless the thread failed fatally, which is never swallowed, while another failure is logged,
+            // rather than suppressed by the cancellation, shared by the job of the caller
+            finish()
+            failure?.fatalError?.let { throw it }
+            if (failure != null && failure !is RejectedExecutionException) {
+                logger.warn(failure) { "$name: submitting the snippet of the cancelled caller failed" }
+            }
+            throw cancellation!!
+        }
+
+        /**
+         * Watches the cancellation of the [callerJob], calling [onCancelled] with it, in place, on the cancelling thread,
+         * at once if it is cancelled, or completed, already,
+         * by a coroutine of the [callerJob], without an interceptor, [waiting] cancellably until [stopWatching],
+         * so the job of the caller gets no child, which its `cancelChildren` would cancel, while the caller is active,
+         * and which a completed job of the caller would wait for.
+         */
+        private fun watch(callerJob: Job) {
+            suspend {
                 try {
-                    resumedOff = e is RejectedExecutionException
-                            && waited
-                            && isResumedInPlaceByUnlocking(callerContext, callerThread)
-                            && resumeOff {
-                                try {
-                                    mutex.unlock()
-                                } finally {
-                                    resumeOrFail(continuation, uninterceptedContinuation, Result.failure(failure))
-                                }
-                            }
-                } finally {
-                    // handed off only once the resumeExecutor took it, whatever throws, so the caller releases the turn otherwise
-                    if (!resumedOff) handedOff.set(false)
+                    suspendCancellableCoroutine { waiting.set(it) }
+                } catch (e: CancellationException) {
+                    // the cancellation of the job, or one telling it completed, see `Job.getCancellationException`
+                    onCancelled(e)
                 }
-                if (!resumedOff) throw failure
-                COROUTINE_SUSPENDED
+            }.startCoroutine(Continuation(callerJob) { it.getOrThrow() })
+        }
+
+        /** Stops the [watch] of the job of the caller, so it keeps nothing of this turn. */
+        private fun stopWatching() {
+            waiting.getAndSet(null)?.resume(Unit)
+        }
+
+        /** Stops counting the task by the [turns], once. */
+        private fun finish() {
+            if (finished.compareAndSet(false, true)) turns.decrementAndGet()
+        }
+
+        /** Drops the task, and what refers to the caller, but the [caller] itself, dropped once resumed, see [tryResume]. */
+        private fun drop() {
+            queued.turn = null
+            task = null
+            intercepted = null
+            waiting.set(null)
+        }
+
+        /** Runs the task on the [thread], unless the caller was cancelled before, and resumes the caller with its result. */
+        fun start() {
+            if (!state.compareAndSet(TurnState.NEW, TurnState.STARTED)
+                && !state.compareAndSet(TurnState.QUEUED, TurnState.STARTED)
+            ) {
+                // finished by the one which cancelled it
+                return
+            }
+            stopWatching()
+            val task = task!!
+            this.task = null
+            val result = runCatching(task)
+            finish()
+            resumeCaller(result)
+        }
+
+        /**
+         * Resumes the caller cancelled while its task waits, with the [cancellation] of its job,
+         * on the cancelling thread, unless it is the [thread], where it is resumed like after its task, see [resumeCaller],
+         * dropping the task, so the turn left on the queue of the [thread] keeps nothing of the caller once it is resumed.
+         */
+        private fun onCancelled(cancellation: CancellationException) {
+            // written before the state, which publishes it
+            this.cancellation = cancellation
+            val waited = when {
+                state.compareAndSet(TurnState.NEW, TurnState.CANCELLED) -> false
+                state.compareAndSet(TurnState.QUEUED, TurnState.CANCELLED) -> true
+                else -> return
+            }
+            drop()
+            // still submitting otherwise, which throws the cancellation then, see submit
+            if (!waited) return
+            finish()
+            val result = Result.failure<T>(cancellation)
+            if (Thread.currentThread() === sessionThread) resumeCaller(result) else resumeOrFail(result)
+        }
+
+        /**
+         * Resumes the caller with the [result], from the [thread],
+         * by its dispatcher, if it does not resume in place, on the [thread], see [execute],
+         * or else from the [resumeExecutor], and also if its dispatcher fails to resume it here,
+         * where it is resumed again, then without its dispatcher, if that fails as well, see [resumeOrFail].
+         * A fatal failure of the dispatcher, see [isFatal], is not retried, but passed to the caller from the [resumeExecutor] at once,
+         * unwrapped, like a fatal error of the snippet, so it is never swallowed by a retry succeeding, while the caller is never left unresumed.
+         * The caller is resumed in place only if the [resumeExecutor] fails to take it, see [resumeOff], rather than never.
+         *
+         * The dispatcher is asked whether it dispatches here, on the [thread], as `Dispatchers.Main.immediate` dispatches off the main thread only,
+         * and then once again by the dispatched continuation of kotlinx.coroutines, resuming the caller on its dispatcher.
+         */
+        private fun resumeCaller(result: Result<T>) {
+            val failure = try {
+                val dispatcher = interceptor as? CoroutineDispatcher
+                if (dispatcher != null && dispatcher.isDispatchNeeded(context)) {
+                    val continuation = intercepted ?: intercept()
+                    intercepted = null
+                    continuation.resumeWith(result)
+                    return
+                }
+                null
+            } catch (e: Throwable) {
+                e
+            }
+            intercepted = null
+            val fatal = failure?.fatalError
+            val resume: () -> Unit = if (fatal != null) {
+                // thrown if the dispatcher resumed the caller already, and then threw, so it is never swallowed
+                { if (!tryResume(Result.failure(fatal))) throw fatal }
+            } else {
+                { resumeOrFail(result) }
+            }
+            if (!resumeOff(resume)) resume()
+        }
+
+        /**
+         * Resumes the caller with the [result] by its interceptor, intercepting it anew,
+         * or, if that throws, like a dispatcher of an executor shut down, or one always failing to tell whether it dispatches,
+         * without the interceptor, in place, with that failure, as resuming by it again would fail again,
+         * while left unresumed, the caller would never return.
+         * A fatal error, see [isFatal], is passed unwrapped from the `DispatchException` of kotlinx.coroutines.
+         * A failure thrown when the caller is resumed already is thrown, if it is fatal, or thrown by the caller itself, resumed in place, without an interceptor wrapping it,
+         * while a failure of an interceptor which resumed the caller and then threw is logged.
+         */
+        private fun resumeOrFail(result: Result<T>) {
+            var continuation: Continuation<T>? = null
+            try {
+                continuation = intercept()
+                continuation.resumeWith(result)
+            } catch (e: Throwable) {
+                val fatal = e.fatalError
+                if (!tryResume(Result.failure(fatal ?: e))) {
+                    // also with an interceptor returning the turn it intercepts, as then the caller itself threw
+                    if (fatal != null || continuation === this) throw fatal ?: e
+                    logger.warn(e) { "$name: resuming the caller failed after it was resumed" }
+                }
             }
         }
-    }
 
-    /**
-     * Whether the caller of the [callerContext], which waited for its turn, is resumed in place, on the current thread,
-     * by the unlocking of another caller, rather than by its own dispatcher,
-     * which a caller back on its [callerThread] cannot tell, unless it has no interceptor, or [Dispatchers.Unconfined],
-     * see [onSessionThread].
-     */
-    private fun isResumedInPlaceByUnlocking(
-        callerContext: CoroutineContext,
-        callerThread: Thread
-    ): Boolean {
-        val interceptor = callerContext[ContinuationInterceptor]
-        return interceptor == null
-                || interceptor === Dispatchers.Unconfined
-                || (Thread.currentThread() !== callerThread && wouldResumeInPlace(callerContext))
-    }
-
-    /**
-     * Resumes the [continuation] of the caller of the [callerContext] with the [result], from the [thread],
-     * by its dispatcher, if it would not resume in place, see [wouldResumeInPlace],
-     * or else from the [resumeExecutor], also if its dispatcher fails to resume it here,
-     * as it is resumed again there, then on another thread, and without its dispatcher, if that fails as well, see [resumeOrFail].
-     * It is resumed in place only if the [resumeExecutor] rejects it, like [Dispatchers.Default] after `Dispatchers.shutdown()`,
-     * rather than never.
-     */
-    private fun <T> resumeCaller(
-        continuation: Continuation<T>,
-        uninterceptedContinuation: Continuation<T>,
-        callerContext: CoroutineContext,
-        result: Result<T>
-    ) {
-        val resumed = !wouldResumeInPlace(callerContext) && try {
-            continuation.resumeWith(result)
-            true
-        } catch (_: Throwable) {
-            false
-        }
-        if (!resumed && !resumeOff { resumeOrFail(continuation, uninterceptedContinuation, result) }) {
-            resumeOrFail(continuation, uninterceptedContinuation, result)
-        }
-    }
-
-    /**
-     * Whether the caller of the [callerContext] would resume in place, on the current thread, see [execute],
-     * also if its dispatcher fails to tell.
-     * It is asked on the current thread, as `Dispatchers.Main.immediate` dispatches off the main thread only.
-     */
-    private fun wouldResumeInPlace(
-        callerContext: CoroutineContext
-    ): Boolean {
-        val dispatcher = callerContext[ContinuationInterceptor] as? CoroutineDispatcher ?: return true
-        return try {
-            !dispatcher.isDispatchNeeded(callerContext)
-        } catch (_: Throwable) {
-            true
-        }
     }
 
     /**
      * Runs the [resume] of a caller by the [resumeExecutor].
      *
      * @return `false` if the [resumeExecutor] does not take it, rejecting it, like [Dispatchers.Default] after `Dispatchers.shutdown()`,
-     * or failing otherwise, like by an [OutOfMemoryError] of creating a worker, which is logged then,
-     * so the caller is resumed in place instead, rather than never.
+     * or failing otherwise, like by an [OutOfMemoryError] of creating a worker, also a fatal one, which is logged then,
+     * so the caller is resumed in place instead, rather than never, and only once, also if the [resumeExecutor] queued it, see [Turn].
      */
     private fun resumeOff(
         resume: () -> Unit
@@ -625,29 +792,6 @@ internal class DefaultScriptSession(
             logger.warn(e) { "$name: resuming the caller off the thread failed, it is resumed in place" }
         }
         false
-    }
-
-    /**
-     * Resumes the [continuation] of the caller with the [result],
-     * or, if its interceptor throws instead, like a dispatcher of an executor shut down, or one always failing to tell whether it dispatches,
-     * the [uninterceptedContinuation] with that failure, in place, as resuming it by the interceptor again would fail again,
-     * while left unresumed, the caller would never return.
-     * A fatal error, see [isFatal], is passed to the caller as well, like the one thrown by the snippet.
-     * A dispatcher which runs the resumption inline, on the dispatching thread, and throws only after it,
-     * gets the caller resumed twice, which cannot be told apart from a dispatcher failing before running it.
-     */
-    private fun <T> resumeOrFail(
-        continuation: Continuation<T>,
-        uninterceptedContinuation: Continuation<T>,
-        result: Result<T>
-    ) {
-        try {
-            continuation.resumeWith(result)
-        } catch (e: Throwable) {
-            // without an interceptor, the failure is the one of the caller resumed already
-            if (continuation === uninterceptedContinuation) throw e
-            uninterceptedContinuation.resumeWith(Result.failure(e))
-        }
     }
 
     /** @throws IllegalStateException if the session is closed. */
@@ -756,6 +900,25 @@ internal class DefaultScriptSession(
 
 /** The name of the snippet declaring the properties of the session, preceding the ones of the caller. */
 private const val PROPERTIES_SNIPPET = "properties.kts"
+
+/** The states of a turn of a caller of [ScriptSession.execute], see [DefaultScriptSession.onSessionThread]. */
+private enum class TurnState {
+    /** Its task is being submitted to the thread of the session. */
+    NEW,
+    /** Its task waits on the thread of the session for the ones of the earlier callers. */
+    QUEUED,
+    /** Its task is run, and its caller is resumed after it. */
+    STARTED,
+    /** Its caller was cancelled before its task started, or its task was not taken by the thread, so it is skipped. */
+    CANCELLED
+}
+
+/**
+ * This throwable, or its cause, if fatal, see [isFatal],
+ * like a fatal failure of a dispatcher wrapped by kotlinx.coroutines in its `DispatchException`.
+ */
+private val Throwable.fatalError: Throwable?
+    get() = takeIf { it.isFatal } ?: cause?.takeIf { it.isFatal }
 
 /**
  * Whether this throwable is thrown by the session instead of being reported:
