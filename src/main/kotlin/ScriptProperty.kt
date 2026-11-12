@@ -27,8 +27,10 @@ import org.jetbrains.kotlin.name.FqNameUnsafe
 import org.jetbrains.kotlin.lexer.KtTokens
 import java.lang.reflect.Modifier
 import kotlin.jvm.functions.FunctionN
+import kotlin.jvm.internal.CallableReference
 import kotlin.jvm.internal.FunctionBase
 import kotlin.jvm.internal.FunctionReference
+import kotlin.jvm.internal.KTypeBase
 import kotlin.reflect.KClass
 import kotlin.reflect.KFunction
 import kotlin.reflect.KType
@@ -88,6 +90,9 @@ import kotlin.reflect.typeOf
  *   The value of a function type of more than 22 parameters is checked to take as many parameters,
  *   unless they cannot be told: a Kotlin lambda of more than 22 parameters does not implement `getArity`,
  *   so they are told by its `invoke` method of typed parameters instead, if it declares exactly one.
+ *   A suspend function type, like `suspend Int.(Int) -> Int`, which [typeOf] does not support, can be provided as the type of a member,
+ *   also keeping the receiver, while its value is checked only to be of the function class of its arity counting the continuation,
+ *   like `Function3`, not to be a suspend function.
  * @param value the value of the property, of the [type].
  */
 public class ScriptProperty<T>(
@@ -149,22 +154,24 @@ public class ScriptProperty<T>(
             }
             // not checked by the cast of the declaration of the property, erased to KFunction
             if (type.isFunctionReferenceType()) {
-                val parameters = type.arguments.size - 1
-                functionShape?.parameters?.let { actual ->
-                    require(actual == parameters) {
-                        "Property '$name' of type $type has a value of function ${(value as KFunction<*>).name}, which takes $actual parameter${if (actual == 1) "" else "s"}, while the type takes $parameters"
-                    }
-                }
+                requireParameters(functionShape?.parameters) { (value as KFunction<*>).description() }
             }
             // not checked by the declaration of the property, see declaration
             if (type.isBigArityFunctionType()) {
-                val parameters = type.arguments.size - 1
-                (value as Function<*>).arity()?.let { arity ->
-                    require(arity == parameters) {
-                        "Property '$name' of type $type has a value of class ${value::class.java.name}, which takes $arity parameter${if (arity == 1) "" else "s"}, while the type takes $parameters"
-                    }
-                }
+                requireParameters((value as Function<*>).arity()) { "class ${value::class.java.name}" }
             }
+        }
+    }
+
+    /**
+     * Requires the value of this property of a type of the parameter types and the return type as arguments
+     * to take as many [parameters], unless they cannot be told, `null`, naming the value by its [description].
+     */
+    private fun requireParameters(parameters: Int?, description: () -> String) {
+        if (parameters == null) return
+        val expected = type.arguments.size - 1
+        require(parameters == expected) {
+            "Property '$name' of type $type has a value of ${description()}, which takes ${parameters.counted("parameter")}, while the type takes $expected"
         }
     }
 
@@ -262,12 +269,39 @@ private class FunctionShape(val parameters: Int, val isSuspend: Boolean) {
  * or `null` if neither can tell it.
  */
 private fun KFunction<*>.shape(): FunctionShape? =
-    runCatching { FunctionShape(parameters.size, isSuspend) }.getOrNull()
+    reflected { FunctionShape(parameters.size, isSuspend) }
         ?: (this as? FunctionReference)?.let { reference ->
             val isSuspend = suspendFunctionClass?.isInstance(reference) == true
             // the arity counts the continuation of a suspend function, but not a bound receiver
             FunctionShape(reference.arity - if (isSuspend) 1 else 0, isSuspend)
         }
+
+/**
+ * The result of this [read] by kotlin-reflect, or `null` if it fails, like with `KotlinReflectionInternalError`, an [Error],
+ * when it cannot resolve the function, except for a [VirtualMachineError], which is thrown,
+ * also a [StackOverflowError], as it is not of a snippet here, unlike in [isFatal].
+ */
+private inline fun <T> reflected(read: () -> T): T? = try {
+    read()
+} catch (e: Throwable) {
+    if (e is VirtualMachineError) throw e
+    null
+}
+
+/**
+ * This function as named in a message, like `function twice`,
+ * or `constructor of class Foo` of a constructor, whose name is the one of the JVM, `<init>`,
+ * its class told by the owner of the compiled reference, or else by kotlin-reflect.
+ */
+private fun KFunction<*>.description(): String {
+    if (name != "<init>") return "function $name"
+    val kClass = (this as? CallableReference)?.owner as? KClass<*>
+        ?: reflected { returnType.classifier as? KClass<*> }
+    return if (kClass != null) "constructor of class ${kClass.java.name}" else "constructor"
+}
+
+/** This number with the [noun], in the plural unless it is 1, like `1 parameter` or `2 parameters`. */
+private fun Int.counted(noun: String): String = "$this $noun${if (this == 1) "" else "s"}"
 
 /**
  * The marker interface which the compiled reference of a suspend function implements,
@@ -299,6 +333,8 @@ private fun ScriptProperty<*>.getterName(): String =
  *
  * A function type marked by `@ExtensionFunctionType` in its annotations is rendered with its receiver,
  * like `@kotlin.ExtensionFunctionType kotlin.Function2<Int, Int, Unit>`, or `Int.(…) -> Unit` of more than 22 parameters.
+ * A suspend function type of a member is rendered as written, like `suspend Int.(Int) -> Int`,
+ * or as `Function<R>` in a covariant position, if its parameters cannot be rendered exactly.
  *
  * @param isSuspend whether this function reference type is of a suspend function, like `KSuspendFunction1<String, Int>`,
  *   which [typeOf] produces like `KFunction1<String, Int>`, so it can be told by the value only,
@@ -308,14 +344,7 @@ private fun ScriptProperty<*>.getterName(): String =
  */
 internal fun KType.toSource(isSuspend: Boolean? = null): String =
     // nothing fails to render in a covariant position, as it can be widened
-    if (isSuspend != null && classifier == KFunction::class && arguments.isNotEmpty()) {
-        val kind = if (isSuspend) "KSuspendFunction" else "KFunction"
-        "kotlin.reflect.$kind${arguments.size - 1}" +
-                arguments.toSource(functionReferenceVariances(), Position.OUT)!!.text +
-                if (isMarkedNullable) "?" else ""
-    } else {
-        toSource(Position.OUT)!!.text
-    }
+    toSource(Position.OUT, isSuspend)!!.text
 
 /**
  * The position of a type in the type of the property, which tells whether the snippets may see a supertype of it.
@@ -354,10 +383,20 @@ private enum class Position {
  */
 private class Source(val text: String, val isExact: Boolean)
 
-/** This type as written in the source in this [position], or `null` if it cannot be rendered exactly where it has to be. */
-private fun KType.toSource(position: Position): Source? {
+/**
+ * This type as written in the source in this [position], or `null` if it cannot be rendered exactly where it has to be.
+ *
+ * @param isSuspend whether this function reference type, the type of the property itself, is of a suspend function, see [toSource].
+ */
+private fun KType.toSource(position: Position, isSuspend: Boolean? = null): Source? {
     val mutable = mutableCollectionType()
     val source = when {
+        isSuspend != null && classifier == KFunction::class && arguments.isNotEmpty() -> {
+            val kind = if (isSuspend) "KSuspendFunction" else "KFunction"
+            arguments.toSource(functionReferenceVariances(), position)?.let {
+                Source("kotlin.reflect.$kind${arguments.size - 1}" + it.text, it.isExact)
+            }
+        }
         mutable != null -> arguments.toSource(mutable.variances, position)?.let {
             Source(mutable.name.quotedQualified() + it.text, it.isExact)
         }
@@ -368,7 +407,8 @@ private fun KType.toSource(position: Position): Source? {
         } else {
             null
         }
-        isBigArityFunctionType() -> bigArityFunctionTypeToSource(position)
+        isBigArityFunctionType() -> functionTypeToSource(position, modifier = "", supertype = "kotlin.jvm.functions.FunctionN")
+        isSuspendFunctionType() -> functionTypeToSource(position, modifier = "suspend ", supertype = "kotlin.Function")
         else -> (classifier as KClass<*>).toSource(arguments, position)?.let {
             if (isExtensionFunctionType()) Source("@kotlin.ExtensionFunctionType " + it.text, it.isExact) else it
         }
@@ -377,32 +417,46 @@ private fun KType.toSource(position: Position): Source? {
 }
 
 /**
- * This function type of more than 22 parameters as written in the source in this [position],
- * like `(Int, …, Int) -> Unit`, or `Int.(…) -> Unit` if it has a receiver,
- * or `FunctionN<R>` in a covariant position, if its parameters cannot be rendered exactly, as they cannot be projected,
- * or `null` otherwise.
+ * This function type of more than 22 parameters, or a suspend one, as written in the source in this [position],
+ * like `(Int, …, Int) -> Unit`, or `Int.(…) -> Unit` if it has a receiver, preceded by the [modifier], like `suspend `,
+ * or else, in a covariant position, as the [supertype] of all such function types of its return type, like `FunctionN<R>`,
+ * if its parameters cannot be rendered exactly, as they cannot be projected, or `null` otherwise.
  */
-private fun KType.bigArityFunctionTypeToSource(position: Position): Source? {
+private fun KType.functionTypeToSource(position: Position, modifier: String, supertype: String): Source? {
     val parameters = arguments.dropLast(1).map { it.type!!.toSource(position.nested(KVariance.IN)) }
     // never null in a covariant position
     val returnType = arguments.last().type!!.toSource(position.nested(KVariance.OUT))
+    val sources = parameters.filterNotNull()
     return when {
-        parameters.all { it != null } && returnType != null -> {
-            val sources = parameters.map { it!! }
-            val functionType = if (isExtensionFunctionType()) {
-                // a function type, also an annotated one, is parenthesized as a receiver
-                val receiver = sources.first().text.let { if (it.startsWith('(') || it.startsWith('@')) "($it)" else it }
+        sources.size == parameters.size && returnType != null -> {
+            val functionType = modifier + if (annotations.any { it is ExtensionFunctionType }) {
+                // a function type, also an annotated or a suspend one, is parenthesized as a receiver
+                val receiver = sources.first().text.let {
+                    if (it.startsWith('(') || it.startsWith('@') || it.startsWith("suspend ")) "($it)" else it
+                }
                 receiver + "." + sources.drop(1).joinToString(prefix = "(", postfix = ")") { it.text } + " -> " + returnType.text
             } else {
                 sources.joinToString(prefix = "(", postfix = ")") { it.text } + " -> " + returnType.text
             }
             Source(if (isMarkedNullable) "($functionType)" else functionType, sources.all { it.isExact } && returnType.isExact)
         }
-        // the supertype of all the function types of more than 22 parameters
-        position == Position.OUT -> Source("kotlin.jvm.functions.FunctionN<${returnType!!.text}>", isExact = false)
+        position == Position.OUT -> Source("$supertype<${returnType!!.text}>", isExact = false)
         else -> null
     }
 }
+
+/**
+ * Whether this is a suspend function type of a member, like `suspend Int.(Int) -> Int`, which [typeOf] does not support,
+ * while kotlin-reflect produces it of the function class of its arity counting the continuation, like `Function3`,
+ * but with the parameter types and the return type as arguments only, one fewer than the class takes,
+ * which no other type of kotlin-reflect has, while a [KType] implemented by hand may lack an argument.
+ * Its Java type cannot tell it, as the one of a type argument of a suspend function type is misaligned by the continuation,
+ * like `Continuation<? super Integer>` of the return type `Int`.
+ */
+private fun KType.isSuspendFunctionType(): Boolean =
+    this is KTypeBase
+            && arguments.isNotEmpty()
+            && (classifier as? KClass<*>)?.java?.name == "kotlin.jvm.functions.Function${arguments.size}"
 
 /**
  * Whether this function type has a receiver, its first parameter,
@@ -605,7 +659,9 @@ private fun KType.nonClassType(): KType? =
  * `KFunction` of a function reference type, like `KFunction1<String, Int>` or `KSuspendFunction1<String, Int>`,
  * of the contravariant parameter types and the covariant return type, as `KFunction1<in P1, out R>`,
  * and `FunctionN` of a function type of more than 22 parameters, which, unless the plain `FunctionN<R>` of the covariant return type,
- * has 23 parameters at least, a receiver included, of invariant types.
+ * has 23 parameters at least, a receiver included, of invariant types,
+ * while a suspend function type of a member takes one fewer than its class, see [isSuspendFunctionType],
+ * of the contravariant parameter types and the covariant return type.
  */
 private fun KType.invalidArguments(): Pair<KType, String>? {
     val kClass = classifier as KClass<*>
@@ -614,23 +670,25 @@ private fun KType.invalidArguments(): Pair<KType, String>? {
         FunctionN::class -> "1, or 24 or more invariant ones of a function type".takeUnless {
             arguments.size == 1 || isBigArityFunctionType()
         }
-        else -> kClass.typeParameterVariances().size.takeIf { it != arguments.size }?.toString()
+        else -> kClass.typeParameterVariances().size.takeIf { it != arguments.size && !isSuspendFunctionType() }?.toString()
     }
     if (expected != null) {
-        val count = arguments.size
-        return this to "which has $count type argument${if (count == 1) "" else "s"}, " +
+        return this to "which has ${arguments.size.counted("type argument")}, " +
                 "while ${kClass.qualifiedName} takes $expected - provide it as a complete type"
     }
-    val variances = when {
-        kClass == KFunction::class -> functionReferenceVariances()
-        kClass == FunctionN::class && arguments.size == 1 -> listOf(KVariance.OUT)
-        kClass == FunctionN::class -> List(arguments.size) { KVariance.INVARIANT }
-        else -> mutableCollectionType()?.variances ?: kClass.typeParameterVariances()
-    }
-    arguments.zip(variances).firstOrNull { (argument, variance) ->
-        argument.variance == KVariance.IN && variance == KVariance.OUT || argument.variance == KVariance.OUT && variance == KVariance.IN
-    }?.let { (argument, variance) ->
-        return this to "whose type argument $argument conflicts with the ${variance.name.lowercase()} variance of its type parameter - provide it as a valid type"
+    // only a projected argument can conflict with the variance of its type parameter, so most types skip telling them
+    if (arguments.any { it.variance == KVariance.IN || it.variance == KVariance.OUT }) {
+        val variances = when {
+            kClass == KFunction::class || isSuspendFunctionType() -> functionReferenceVariances()
+            kClass == FunctionN::class && arguments.size == 1 -> listOf(KVariance.OUT)
+            kClass == FunctionN::class -> List(arguments.size) { KVariance.INVARIANT }
+            else -> mutableCollectionType()?.variances ?: kClass.typeParameterVariances()
+        }
+        arguments.zip(variances).firstOrNull { (argument, variance) ->
+            argument.variance == KVariance.IN && variance == KVariance.OUT || argument.variance == KVariance.OUT && variance == KVariance.IN
+        }?.let { (argument, variance) ->
+            return this to "whose type argument $argument conflicts with the ${variance.name.lowercase()} variance of its type parameter - provide it as a valid type"
+        }
     }
     return arguments.firstNotNullOfOrNull { it.type?.invalidArguments() }
 }
