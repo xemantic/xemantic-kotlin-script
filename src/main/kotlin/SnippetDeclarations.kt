@@ -33,6 +33,7 @@ import kotlin.reflect.KType
 import kotlin.reflect.KTypeProjection
 import kotlin.reflect.KTypeParameter
 import kotlin.reflect.KVariance
+import kotlin.reflect.full.allSupertypes
 import kotlin.reflect.full.declaredMemberExtensionFunctions
 import kotlin.reflect.full.declaredMemberExtensionProperties
 import kotlin.reflect.full.declaredMemberFunctions
@@ -54,6 +55,9 @@ private val nonIdentifierCharacter = Regex("[^\\p{L}\\p{N}_]")
 
 /** A name within a rendered type, like `T` or `kotlin.collections.List` of `kotlin.collections.List<T>`. */
 private val typeName = Regex("[\\p{L}\\p{N}_.]+")
+
+/** The JVM name of a class declared by a snippet, like `Snippet1$Box`. */
+private val snippetClassName = Regex("Snippet\\d+\\$.*")
 
 /** The class of a snippet qualifying the name of a type declared by it, like `Snippet1.` of `Snippet1.Box`. */
 private val snippetQualifier = Regex("(?<![\\p{L}\\p{N}_.])Snippet\\d+\\.")
@@ -93,6 +97,9 @@ internal class SnippetDeclarations {
     private val extensionProperties = HashMap<String, MutableMap<List<String>, Overload>>()
 
     private val extensionFunctions = HashMap<String, MutableMap<List<String>, Overload>>()
+
+    /** The number of the snippets read so far, the index of the next one, see [Overload.snippetIndex]. */
+    private var readSnippets = 0
 
     /** The classes of the snippets, with the names of the snippets, by the names of the classes, like `Snippet1`, in the order of the snippets. */
     private val snippetClasses = LinkedHashMap<String, Pair<Class<*>, String>>()
@@ -258,20 +265,54 @@ internal class SnippetDeclarations {
     fun extensionFunctionReceivers(name: String): Set<ExtensionReceiver> = read().extensionFunctions.receivers(name)
 
     /**
-     * The receivers of the last overloads of the extension properties of this [name] declared by the snippets inaccessible by a later snippet,
-     * `null` for one which cannot be read, as a later snippet might call such an extension rather than an accessible one,
-     * like `internal val String.p` rather than `val CharSequence.p` on a `String`, failing then.
+     * The last overloads of the extension properties of this [name] declared by the snippets inaccessible by a later snippet,
+     * as a later snippet might call such an extension rather than an accessible one, failing then,
+     * like `internal val String.p` rather than `val CharSequence.p` on a `String`.
      */
-    fun inaccessibleExtensionPropertyReceivers(name: String): List<ExtensionReceiver?> = read().extensionProperties.inaccessibleReceivers(name)
+    fun inaccessibleExtensionProperties(name: String): List<SnippetExtension> = read().extensionProperties.extensions(name, accessible = false)
 
-    /** The receivers of the last overloads of the extension functions of this [name] inaccessible by a later snippet, see [inaccessibleExtensionPropertyReceivers]. */
-    fun inaccessibleExtensionFunctionReceivers(name: String): List<ExtensionReceiver?> = read().extensionFunctions.inaccessibleReceivers(name)
+    /** The last overloads of the extension functions of this [name] inaccessible by a later snippet, see [inaccessibleExtensionProperties]. */
+    fun inaccessibleExtensionFunctions(name: String): List<SnippetExtension> = read().extensionFunctions.extensions(name, accessible = false)
 
-    private fun Map<String, Map<List<String>, Overload>>.inaccessibleReceivers(name: String): List<ExtensionReceiver?> =
-        this[name]?.values.orEmpty().filter { !it.accessible }.map { it.receiver }
+    /** The last overloads of the extension properties of this [name] accessible by a later snippet, of the receivers of [extensionPropertyReceivers]. */
+    fun accessibleExtensionProperties(name: String): List<SnippetExtension> = read().extensionProperties.extensions(name, accessible = true)
 
-    /** Whether a class of this simple [name] is declared by a snippet, also a `private` one. */
-    fun isAnyClass(name: String): Boolean = name in read().classes
+    /** The last overloads of the extension functions of this [name] accessible by a later snippet, of the receivers of [extensionFunctionReceivers]. */
+    fun accessibleExtensionFunctions(name: String): List<SnippetExtension> = read().extensionFunctions.extensions(name, accessible = true)
+
+    private fun Map<String, Map<List<String>, Overload>>.extensions(name: String, accessible: Boolean): List<SnippetExtension> {
+        val overloads = this[name]?.values.orEmpty()
+        val receivers = if (accessible) receivers(name) else emptySet()
+        return overloads.filter { it.accessible == accessible && (!accessible || it.receiver in receivers) }
+            .map { SnippetExtension(it.receiver, it.receiverClass, it.snippetIndex) }
+    }
+
+    /**
+     * The class of this name of a type, as rendered by a compiler message, like `List`, `IntRange` or `Snippet1.Point`,
+     * a class of a snippet, a built-in class, or a class of a package imported by default, or of a type alias of one, like `ArrayList`,
+     * `null` if not known, like `BigDecimal`, as a compiler message renders a type of another package without it, so it could be of any.
+     */
+    fun classOf(name: String): KClass<*>? {
+        if (!name.matches(className)) return null
+        builtInClasses[name]?.let { return it }
+        snippetQualifier.find(name)?.takeIf { it.range.first == 0 }?.let { qualifier ->
+            val (scriptClass, _) = snippetClasses[qualifier.value.removeSuffix(".")] ?: return null
+            return loadClass(scriptClass.name + "$" + name.substring(qualifier.range.last + 1).replace('.', '$'), scriptClass.classLoader)
+        }
+        val classLoader = snippetClasses.values.lastOrNull()?.first?.classLoader ?: SnippetDeclarations::class.java.classLoader
+        val binaryName = name.replace('.', '$')
+        aliasedClasses[name]?.let { return loadClass(it, classLoader) }
+        return defaultPackages.firstNotNullOfOrNull { loadClass(it + binaryName, classLoader) }
+    }
+
+    private fun loadClass(name: String, classLoader: ClassLoader): KClass<*>? = try {
+        // not initialized, as a static initializer of the class might not have run yet, or fail
+        Class.forName(name, false, classLoader).kotlin
+    } catch (_: ClassNotFoundException) {
+        null
+    } catch (_: LinkageError) {
+        null
+    }
 
     /**
      * The receivers of the last overloads of the extensions of this [name], each accessible by a later snippet,
@@ -301,6 +342,7 @@ internal class SnippetDeclarations {
     }
 
     private fun read(scriptClass: Class<*>, snippet: String) {
+        val snippetIndex = readSnippets++
         logger.readOr(Unit, { "$snippet: cannot read the classes of the snippet" }) {
             scriptClass.declaredClasses.forEach { declared ->
                 // the InnerClasses attribute keeps the Kotlin visibility of a nested class, but internal, which is public
@@ -316,13 +358,13 @@ internal class SnippetDeclarations {
             if (kind == SnippetProperty.Kind.JVM_FIELD) jvmFieldProperties.getOrPut(property.name) { HashSet() } += snippet
         }
         readVisible(snippet, "functions", { kClass.declaredMemberFunctions }) { function, accessible, _ ->
-            functions.addOverload(function, accessible, receiver = null, snippet)
+            functions.addOverload(function, accessible, receiver = null, receiverClass = null, snippet, snippetIndex)
         }
         readVisible(snippet, "extension properties", { kClass.declaredMemberExtensionProperties }) { extension, accessible, _ ->
-            extensionProperties.addOverload(extension, accessible, extension.receiver(snippet), snippet)
+            extensionProperties.addOverload(extension, accessible, extension.receiver(snippet), extension.receiverClass(snippet), snippet, snippetIndex)
         }
         readVisible(snippet, "extension functions", { kClass.declaredMemberExtensionFunctions }) { extension, accessible, _ ->
-            extensionFunctions.addOverload(extension, accessible, extension.receiver(snippet), snippet)
+            extensionFunctions.addOverload(extension, accessible, extension.receiver(snippet), extension.receiverClass(snippet), snippet, snippetIndex)
         }
     }
 
@@ -355,12 +397,14 @@ internal class SnippetDeclarations {
         callable: KCallable<*>,
         accessible: Boolean,
         receiver: ExtensionReceiver?,
-        snippet: String
+        receiverClass: KClass<*>?,
+        snippet: String,
+        snippetIndex: Int
     ) {
         val signature = logger.readOr(null, { "$snippet: cannot read the parameters of ${callable.name} of the snippet" }) {
             callable.parameterSignature(optional = false)
         } ?: listOf("$snippet ${System.identityHashCode(callable)}")
-        getOrPut(callable.name) { LinkedHashMap() }[signature] = Overload(receiver, accessible)
+        getOrPut(callable.name) { LinkedHashMap() }[signature] = Overload(receiver, receiverClass, accessible, snippetIndex)
     }
 
     /** The receiver of this extension, `null` if it cannot be read, as no receiver could be matched then. */
@@ -369,8 +413,24 @@ internal class SnippetDeclarations {
             extensionReceiverParameter?.type?.let { ExtensionReceiver.of(it) }
         }
 
-    /** A function or an extension of a name, of the [receiver] of an extension, if it can be read, and whether it is [accessible] by a later snippet. */
-    private class Overload(val receiver: ExtensionReceiver?, val accessible: Boolean)
+    /**
+     * The class of the receiver of this extension, or of the bound of its type parameter, `Any` if unbounded,
+     * `null` if it cannot be read, or the bound is not a single class.
+     */
+    private fun KCallable<*>.receiverClass(snippet: String): KClass<*>? =
+        logger.readOr(null, { "$snippet: cannot read the receiver class of $name of the snippet" }) {
+            when (val classifier = extensionReceiverParameter?.type?.classifier) {
+                is KClass<*> -> classifier
+                is KTypeParameter -> classifier.upperBounds.singleOrNull()?.classifier as? KClass<*>
+                else -> null
+            }
+        }
+
+    /**
+     * A function or an extension of a name, of the [receiver] of an extension, if it can be read, and of its [receiverClass],
+     * whether it is [accessible] by a later snippet, and the [snippetIndex] of the snippet declaring it, in the order of the snippets.
+     */
+    private class Overload(val receiver: ExtensionReceiver?, val receiverClass: KClass<*>?, val accessible: Boolean, val snippetIndex: Int)
 
     private enum class Visibility { ACCESSIBLE, INTERNAL, PRIVATE }
 
@@ -438,6 +498,33 @@ internal class SnippetDeclarations {
     private fun String.internalSuffix(): String = "$" + replace(nonIdentifierCharacter, "_")
 
 }
+
+/**
+ * An extension of the [receiver], `null` if it cannot be read, of the [receiverClass], see [ExtensionReceiver.mightAccept],
+ * declared by a snippet of the [snippetIndex], in the order of the snippets, as the compiler calls an extension of a later snippet first.
+ */
+internal class SnippetExtension(val receiver: ExtensionReceiver?, val receiverClass: KClass<*>?, val snippetIndex: Int)
+
+/** The classes of the built-in types, by their names, which share their JVM classes, like `List` and `MutableList`, or have none, like `Int`. */
+private val builtInClasses: Map<String, KClass<*>> = mapOf(
+    "Any" to Any::class, "Nothing" to Nothing::class, "Unit" to Unit::class,
+    "String" to String::class, "CharSequence" to CharSequence::class, "Comparable" to Comparable::class, "Number" to Number::class,
+    "Int" to Int::class, "Long" to Long::class, "Short" to Short::class, "Byte" to Byte::class,
+    "Double" to Double::class, "Float" to Float::class, "Char" to Char::class, "Boolean" to Boolean::class,
+    "Iterable" to Iterable::class, "MutableIterable" to MutableIterable::class, "Collection" to Collection::class, "MutableCollection" to MutableCollection::class,
+    "List" to List::class, "MutableList" to MutableList::class, "Set" to Set::class, "MutableSet" to MutableSet::class,
+    "Map" to Map::class, "MutableMap" to MutableMap::class, "Map.Entry" to Map.Entry::class, "MutableMap.MutableEntry" to MutableMap.MutableEntry::class,
+    "Iterator" to Iterator::class, "MutableIterator" to MutableIterator::class, "Throwable" to Throwable::class
+)
+
+/** The classes of the type aliases of the standard library to a class of a package not imported by default, by the names of the aliases. */
+private val aliasedClasses = listOf("ArrayList", "HashMap", "HashSet", "LinkedHashMap", "LinkedHashSet", "RandomAccess").associateWith { "java.util.$it" }
+
+/** The packages imported by default, which a compiler message renders a type of without its package. */
+private val defaultPackages = listOf(
+    "kotlin.", "kotlin.annotation.", "kotlin.collections.", "kotlin.comparisons.", "kotlin.io.", "kotlin.ranges.", "kotlin.sequences.", "kotlin.text.",
+    "kotlin.jvm.", "java.lang."
+)
 
 /** A property of the [snippet], not an extension, of the [kind] telling whether a later snippet can access it. */
 internal data class SnippetProperty(val kind: Kind, val snippet: String) {
@@ -612,22 +699,25 @@ internal data class ExtensionReceiver(
     }
 
     /**
-     * Whether an extension of this receiver, of a class declared by a snippet if [snippetClass], might be called on the receiver of a type,
-     * as rendered by a compiler [message], unless it surely cannot, see [acceptance]:
-     * a type of [wellKnownSupertypes] is not a subtype of another type named there, nor of a class of a snippet,
-     * and only a class of a snippet is a subtype of a class of a snippet,
-     * while any other type might be a subtype of a type not known, like `IntRange` of `Iterable<Int>`, or `String` of `Constable`.
+     * Whether an extension of this receiver, of the [receiverClass], might be called on the receiver of a type, as rendered by a compiler [message],
+     * unless it surely cannot: a type of a known class, see [classOf], is a subtype of the classes of its supertypes only,
+     * as kotlin-reflect reads them like the compiler, like `Serializable` of `String`, but not `Constable`,
+     * and of the same class only of the type arguments it accepts, see [acceptance],
+     * while a type of a class not known is not a subtype of a class of a snippet, unless of a snippet itself,
+     * nor of another final class, told by its name.
      */
-    fun mightAccept(message: String, snippetClass: Boolean): Boolean {
-        if (acceptance(message) != Acceptance.REJECTED) return true
-        val ofSnippetClass = snippetQualifier.find(message.trimStart('('))?.range?.first == 0
-        val (type, typeNullable) = message.replace(snippetQualifier, "").withoutNullability()
+    fun mightAccept(message: String, receiverClass: KClass<*>?, classOf: (String) -> KClass<*>?): Boolean {
+        val (type, typeNullable) = message.withoutNullability()
         if (typeNullable && !nullable) return false
+        if (receiverClass == null) return true
         return type.splitAtTopLevel(" & ").any { part ->
             val typeName = part.removeSuffix("!").substringBefore('<')
+            val typeClass = classOf(typeName)
             when {
-                snippetClass -> ofSnippetClass
-                typeName in wellKnownSupertypes -> name.matches(className) && name !in wellKnownTypes
+                typeClass == receiverClass -> acceptance(part) != Acceptance.REJECTED
+                typeClass != null -> typeClass.allSupertypes.any { it.classifier == receiverClass }
+                snippetClassName.matches(receiverClass.java.name) -> snippetQualifier.find(typeName)?.range?.first == 0
+                receiverClass.isFinal -> typeName.substringAfterLast('.') == receiverClass.simpleName
                 else -> true
             }
         }

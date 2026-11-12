@@ -22,6 +22,7 @@ package com.xemantic.kotlin.script
 import io.github.oshai.kotlinlogging.KotlinLogging
 import java.util.Collections
 import java.util.IdentityHashMap
+import kotlin.reflect.full.allSupertypes
 import kotlin.script.experimental.api.ResultValue
 import kotlin.script.experimental.api.ScriptDiagnostic
 import kotlin.script.experimental.api.SourceCode
@@ -331,11 +332,11 @@ internal class ScriptErrorReporter(
         val onExplicitReceiver = usage?.onExplicitReceiver == true
         // on a receiver not known, an inaccessible extension of the name of the kind of the reference might be called instead,
         // which a callable reference on an implicit receiver fails on also with the type declared
-        val inaccessibleMightBeCalled = inaccessibleExtensionReceivers(name, call = called || callable).isNotEmpty()
+        val inaccessibleMightBeCalled = inaccessibleExtensions(name, call = called || callable).isNotEmpty()
         if (!onExplicitReceiver) {
             if (snippetDeclarations.isClass(name)) {
                 // a call of the constructor might call an inaccessible extension function of the name instead
-                if (called && snippetDeclarations.inaccessibleExtensionFunctionReceivers(name).isNotEmpty()) return
+                if (called && snippetDeclarations.inaccessibleExtensionFunctions(name).isNotEmpty()) return
                 append("  hint: '$name' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type,")
                 append(" like `fun f(x: Any) = x is $reference` - declare the type, like `fun f(x: Any): Boolean = x is $reference`.\n")
                 return
@@ -355,7 +356,9 @@ internal class ScriptErrorReporter(
             appendExplicitReceiverHint(name, integerLiteralTypes, called, certain = false)
             return
         }
-        if (inaccessibleMightBeCalled) return
+        // a reference to an extension not known to be called might be an infix call, if no accessible extension property of the name could be read
+        val call = called || callable || snippetDeclarations.extensionPropertyReceivers(name).isEmpty()
+        if (inaccessibleExtensions(name, call).isNotEmpty()) return
         val propertyReceivers = snippetDeclarations.extensionPropertyReceivers(name)
         val functionReceivers = snippetDeclarations.extensionFunctionReceivers(name)
         val isCall = called || propertyReceivers.isEmpty()
@@ -383,9 +386,8 @@ internal class ScriptErrorReporter(
      * hinted at as a function if [called], or if no extension property accepts it, as one of a function type is also called.
      * The hint is conditional, on the compiler reporting the mismatch of the receiver once the type is declared,
      * unless a receiver surely accepts the type, and the type is [certain], not of an integer literal.
-     * No hint if an inaccessible extension of the name might accept the type, see [ExtensionReceiver.mightAccept],
-     * unless an accessible one surely accepting it is more specific than each of them, see [ExtensionReceiver.isLessSpecificThan],
-     * as the compiler calls the most specific one.
+     * No hint if an inaccessible extension of the name, of the kind of the reference, might accept the type, see [ExtensionReceiver.mightAccept],
+     * unless an accessible one surely accepting it is called rather than each of them, see [isCalledRatherThan].
      */
     private fun StringBuilder.appendExplicitReceiverHint(name: String, types: List<String>, called: Boolean, certain: Boolean) {
         fun Set<ExtensionReceiver>.accepting() = associateWith { receiver -> types.maxOf { receiver.acceptance(it) } }
@@ -394,12 +396,15 @@ internal class ScriptErrorReporter(
         val functions = snippetDeclarations.extensionFunctionReceivers(name).accepting()
         if (properties.isEmpty() && functions.isEmpty()) return
         val isCall = called || properties.isEmpty()
-        val inaccessible = inaccessibleExtensionReceivers(name, call = isCall).filter { receiver ->
-            receiver == null || types.any { receiver.mightAccept(it, snippetDeclarations.isAnyClass(receiver.name.substringBefore('.'))) }
+        val inaccessible = inaccessibleExtensions(name, isCall).filter { extension ->
+            extension.receiver == null || types.any { extension.receiver.mightAccept(it, extension.receiverClass, snippetDeclarations::classOf) }
         }
         if (inaccessible.isNotEmpty()) {
-            val accepting = (properties + functions).filterValues { it == Acceptance.ACCEPTED }.keys
-            if (accepting.none { accessible -> inaccessible.all { it != null && it.isLessSpecificThan(accessible) } }) return
+            // a read resolves only a property, a call a function or a property of a function type
+            val accessible = snippetDeclarations.accessibleExtensionProperties(name) +
+                if (isCall) snippetDeclarations.accessibleExtensionFunctions(name) else emptyList()
+            val accepting = accessible.filter { extension -> types.any { extension.receiver?.acceptance(it) == Acceptance.ACCEPTED } }
+            if (accepting.none { extension -> inaccessible.all { extension.isCalledRatherThan(it) } }) return
         }
         val reference = name.asReference()
         val calledOn = if (isCall) "receiver.$reference(...)" else "receiver.$reference"
@@ -414,9 +419,27 @@ internal class ScriptErrorReporter(
      * The receivers of the inaccessible extensions of this [name] which a reference to it might call instead of an accessible one:
      * of the properties, as of a function type a [call] calls too, and of the functions, if a [call].
      */
-    private fun inaccessibleExtensionReceivers(name: String, call: Boolean): List<ExtensionReceiver?> =
-        snippetDeclarations.inaccessibleExtensionPropertyReceivers(name) +
-            if (call) snippetDeclarations.inaccessibleExtensionFunctionReceivers(name) else emptyList()
+    private fun inaccessibleExtensions(name: String, call: Boolean): List<SnippetExtension> =
+        snippetDeclarations.inaccessibleExtensionProperties(name) +
+            if (call) snippetDeclarations.inaccessibleExtensionFunctions(name) else emptyList()
+
+    /**
+     * Whether the compiler calls this extension rather than the [other] one, both accepting a receiver:
+     * of a later snippet, as the compiler resolves the snippets from the last one, whatever the receivers,
+     * or of the same snippet, of a receiver differing only by its nullability, like `String?` and `String`, or `Any` and a type parameter,
+     * or more specific, see [ExtensionReceiver.isLessSpecificThan], also by the supertypes of its class.
+     */
+    private fun SnippetExtension.isCalledRatherThan(other: SnippetExtension): Boolean {
+        if (snippetIndex != other.snippetIndex) return snippetIndex > other.snippetIndex
+        val receiver = receiver ?: return false
+        val otherReceiver = other.receiver ?: return false
+        if (receiver.name == otherReceiver.name && receiver.typeArguments == otherReceiver.typeArguments) return true
+        if (otherReceiver.isLessSpecificThan(receiver)) return true
+        val receiverClass = receiverClass ?: return false
+        return (!receiver.nullable || otherReceiver.nullable) &&
+            other.receiverClass != receiverClass &&
+            receiverClass.allSupertypes.any { it.classifier == other.receiverClass }
+    }
 
     /**
      * The hint at an extension of this [name] of these [receivers] [called on][calledOn] an explicit receiver, like `receiver.f(...)`,

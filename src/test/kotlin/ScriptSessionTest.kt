@@ -2237,6 +2237,176 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should not hint declaring the type when extension of earlier snippet is unresolved next to internal extension of the name of a later snippet`() = runTest {
+        // given
+        session.execute("""
+            fun CharSequence.f() = 1
+            fun Collection<Int>.c() = 1
+            fun String.t() = 1
+            val String.p get() = 1
+        """.trimIndent())
+        session.execute("""
+            internal fun Any.f() = 2
+            internal fun Iterable<Int>.c() = 2
+            internal fun <T> T.t() = 2
+            internal val CharSequence.p get() = 2
+        """.trimIndent())
+
+        // when
+        val results = listOf("\"a\".f()", "listOf(1).c()", "\"a\".t()", "\"a\".p").map { session.execute("fun g() = $it\ng()") }
+
+        // then
+        assert(results.all { it is ScriptResult.Error && "Unresolved reference" in it.message && "hint:" !in it.message })
+    }
+
+    @Test
+    fun `should call extension of earlier snippet next to internal extension of the name of a later snippet only by its JVM name in declaration of declared type`() = runTest {
+        // given
+        session.execute("fun CharSequence.f() = 1")
+        session.execute("internal fun Any.f() = 2")
+
+        // when
+        val result = session.execute("""
+            fun g(): String = "a".f().toString()
+            g()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have("NoSuchMethodError" in message)
+        }
+    }
+
+    @Test
+    fun `should hint declaring the type when extension of later snippet is unresolved next to more specific internal extension of the name of an earlier snippet`() = runTest {
+        // given
+        session.execute("internal fun String.r() = 2")
+        session.execute("fun CharSequence.r() = 1")
+
+        // when
+        val results = listOf(
+            "fun g() = \"a\".r()\ng()",
+            "fun h(): String = \"a\".r().toString()\nh()"
+        ).map { session.execute(it) }
+
+        // then
+        assert(results[0] is ScriptResult.Error && "hint: 'r' is declared in an earlier snippet" in (results[0] as ScriptResult.Error).message)
+        assert(results[1] is ScriptResult.Value && (results[1] as ScriptResult.Value).value == "1")
+    }
+
+    @Test
+    fun `should not hint declaring the type when extension of earlier snippet is unresolved next to internal extension of the name of a JVM supertype`() = runTest {
+        // given
+        session.execute("""
+            fun List<Int>.total() = 1
+            internal fun java.io.Serializable.total() = 2
+            fun CharSequence.cs() = 1
+            internal fun Comparable<StringBuilder>.cs() = 2
+            fun Iterable<Int>.it() = 1
+            internal fun java.io.Serializable.it() = 2
+        """.trimIndent())
+
+        // when
+        val results = listOf("arrayListOf(1).total()", "StringBuilder(\"a\").cs()", "linkedSetOf(1).it()").map { session.execute("fun g() = $it\ng()") }
+
+        // then
+        assert(results.all { it is ScriptResult.Error && "Unresolved reference" in it.message && "hint:" !in it.message })
+    }
+
+    @Test
+    fun `should hint declaring the type when extension of earlier snippet is unresolved on receiver of class not known next to internal extension of the name of a final class`() = runTest {
+        // given
+        session.execute("""
+            fun Any.f() = 1
+            internal fun String.f() = 2
+            class Date
+            fun Any.d() = 1
+            internal fun Date.d() = 2
+        """.trimIndent())
+
+        // when
+        val results = listOf(
+            "fun a() = java.math.BigDecimal.ONE.f()\na()",
+            "fun b() = (1..2).f()\nb()",
+            "fun c() = java.util.Date().d()\nc()",
+            "fun d(): String = listOf(java.math.BigDecimal.ONE.f(), (1..2).f(), java.util.Date().d()).toString()\nd()"
+        ).map { session.execute(it) }
+
+        // then
+        assert(results.take(3).all { it is ScriptResult.Error && "hint: '" in it.message })
+        assert(results[3] is ScriptResult.Value && (results[3] as ScriptResult.Value).value == "[1, 1, 1]")
+    }
+
+    @Test
+    fun `should hint declaring the type when extension of earlier snippet is unresolved next to internal extension of the name differing only by nullability`() = runTest {
+        // given
+        session.execute("""
+            fun String?.n() = 1
+            internal fun String.n() = 2
+            fun Any?.m() = 1
+            internal fun Any.m() = 2
+            fun <T> T.g2() = 1
+            internal fun Any.g2() = 2
+        """.trimIndent())
+
+        // when
+        val results = listOf(
+            "fun a() = \"a\".n()\na()",
+            "fun b() = \"a\".m()\nb()",
+            "fun c() = \"a\".g2()\nc()",
+            "fun d(): String = listOf(\"a\".n(), \"a\".m(), \"a\".g2()).toString()\nd()"
+        ).map { session.execute(it) }
+
+        // then
+        assert(results.take(3).all { it is ScriptResult.Error && "hint: '" in it.message })
+        assert(results[3] is ScriptResult.Value && (results[3] as ScriptResult.Value).value == "[1, 1, 1]")
+    }
+
+    @Test
+    fun `should not hint declaring the type when extension property of earlier snippet is read next to more specific internal extension property of the name`() = runTest {
+        // given
+        session.execute("""
+            val Any.x get() = 1
+            fun String.x() = 2
+            internal val CharSequence.x get() = 3
+        """.trimIndent())
+
+        // when
+        val result = session.execute("""
+            fun g() = "a".x
+            g()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have("Unresolved reference 'x'" in message && "hint:" !in message)
+        }
+    }
+
+    @Test
+    fun `should not hint at infix extension of earlier snippet called on integer literal next to internal infix extension of the name`() = runTest {
+        // given
+        session.execute("""
+            infix fun Any.and2(other: Int) = 1
+            internal infix fun Int.and2(other: Int) = 2
+        """.trimIndent())
+
+        // when
+        val result = session.execute("""
+            fun f() = 1 and2 2
+            f()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have("Unresolved reference 'and2'" in message && "hint:" !in message)
+        }
+    }
+
+    @Test
     fun `should not hint declaring the type when property of earlier snippet is unresolved on integer literal`() = runTest {
         // given
         session.execute("val greeting = \"hi\"")
