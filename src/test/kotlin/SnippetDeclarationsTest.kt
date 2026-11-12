@@ -22,6 +22,9 @@ import com.xemantic.kotlin.test.assert
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 
+/** Whether the last property of this [name] declared by a snippet is accessible by a later snippet, for which a hint at declaring the type is given. */
+private fun SnippetDeclarations.isProperty(name: String): Boolean = property(name)?.kind == SnippetProperty.Kind.ACCESSIBLE
+
 class SnippetDeclarationsTest {
 
     companion object {

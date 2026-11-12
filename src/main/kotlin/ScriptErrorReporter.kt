@@ -38,6 +38,16 @@ private val snippetQualifiedName = Regex("(?:(?<=\\[L)|(?<![\\p{L}\\p{N}_.$]))Sn
 
 private val snippetClassName = Regex("Snippet\\d+")
 
+/**
+ * Type arguments, like `<Int>` or `<List<String>?, *>`, followed by a `(` or a trailing lambda, starting the code after a reference,
+ * which the parser takes for a call, like `echo<Int>(1)`, not for a comparison, like `limit < 3`,
+ * a type argument of a function type, like `<() -> Int>`, not told.
+ */
+private val typeArgumentsCall = Regex("""^<\s*[\p{L}_*][\p{L}\p{N}_.,?*\s]*(?:<[\p{L}\p{N}_.,?*\s<>]*>[\p{L}\p{N}_.,?*\s]*)*>\s*[({]""")
+
+/** Whether this code, following a reference, calls it, with a `(`, a trailing lambda, or type arguments, see [typeArgumentsCall]. */
+private fun String.startsCall(): Boolean = startsWith("(") || startsWith("{") || typeArgumentsCall.containsMatchIn(this)
+
 /** An unresolved reference, with the receiver of an extension, if the reference is qualified, like `"a".shout()`. */
 private val unresolvedReference = Regex("Unresolved reference '(.+?)'(?: on receiver of type '(.+)')?\\.")
 
@@ -177,10 +187,10 @@ internal class ScriptErrorReporter(
             appendConstPropertyHint(exception)
         }
         unresolvedReference.matchEntire(diagnostic.message)?.let { match ->
-            // whether the reference is called, like `limit()` or `limit { }`, told by the source following it
+            // whether the reference is called, like `limit()`, `limit { }` or `echo<Int>(1)`, told by the source following it
             val called = location?.end?.let { end ->
-                lines?.getOrNull(end.line - 1)?.drop((end.col - 1).coerceAtLeast(0))?.trimStart()?.firstOrNull()
-            }?.let { it == '(' || it == '{' }
+                lines?.getOrNull(end.line - 1)?.drop((end.col - 1).coerceAtLeast(0))?.trimStart()?.ifEmpty { null }
+            }?.startsCall()
             appendUnresolvedEarlierDeclarationHint(match.groupValues[1], receiverType = match.groups[2]?.value, called)
         }
     }
@@ -192,10 +202,10 @@ internal class ScriptErrorReporter(
      * or on an implicit receiver, hinted at conditionally, as the receivers in scope are not known.
      * A declaration of a snippet which failed to compile is not kept, so not hinted at, as it stays unresolved also then,
      * nor an inaccessible one, see [SnippetDeclarations].
-     * A reference [called] is hinted at as a function first, and only then as a property, like one of a function type,
+     * A reference [called], also with type arguments, see [startsCall], is hinted at as a function first, and only then as a property, like one of a function type,
      * unless an inaccessible function of the name is declared, which the compiler calls instead,
      * and one not called as a property only, also a `const val` or a `@JvmField` one, see [appendPropertyHint],
-     * or as a function, if no property of the name is declared, as it might be called with type arguments, like `echo<Int>(1)`,
+     * or as a function, if no property of the name is declared, as it might be called still, like with type arguments of a function type, `echo<() -> Int>(f)`,
      * both if it is not known whether it is called.
      */
     private fun StringBuilder.appendUnresolvedEarlierDeclarationHint(name: String, receiverType: String?, called: Boolean?) {
@@ -214,7 +224,7 @@ internal class ScriptErrorReporter(
             return
         }
         if (called != true && appendPropertyHint(name)) return
-        // not followed by a `(` or a `{`, it is still called with type arguments, like `echo<Int>(1)`, if no property of the name is declared
+        // not known to be called, it is still called if no property of the name is declared
         if ((called != false || snippetDeclarations.property(name) == null) && snippetDeclarations.isFunction(name)) {
             appendDeclareTypeHint(name, "fun f() = $name(...).toString()", "fun f(): String = $name(...).toString()")
             return

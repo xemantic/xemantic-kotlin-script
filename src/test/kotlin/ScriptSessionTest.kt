@@ -1185,6 +1185,33 @@ class ScriptSessionTest {
     }
 
     @Test
+    fun `should call internal function of earlier snippet declared again public and then internal once declared public with its callers as hinted`() = runTest {
+        // given
+        session.execute("internal fun secret() = 1")
+        session.execute("fun call(): Int = secret()")
+        session.execute("fun secret() = 2")
+        session.execute("internal fun secret() = 3")
+        val failure = session.execute("call()")
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines()[1] == "  hint: 'secret' is declared internal in snippet1.kts, which a later snippet cannot call, as the K2 REPL compiler calls it by a JVM name it is not compiled to - declare it public, without the internal modifier, and declare again the code calling it, directly or not, like 'call' of snippet2.kts, and create again the values depending on it, like the ones holding a lambda calling it, as they keep calling the internal one.")
+        }
+        session.execute("""
+            fun secret() = 3
+            fun call(): Int = secret()
+        """.trimIndent())
+
+        // when
+        val result = session.execute("call()")
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 3)
+        }
+    }
+
+    @Test
     fun `should hint declaring public internal function of earlier snippet shadowing public one of earlier snippet`() = runTest {
         // given
         session.execute("fun secret() = 0")
@@ -1943,6 +1970,134 @@ class ScriptSessionTest {
         result should {
             be<ScriptResult.Value>()
             have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should call generic function of earlier snippet with type arguments rather than internal property of the name once its type is declared as hinted`() = runTest {
+        // given
+        session.execute("fun <T> echo(x: T) = x")
+        session.execute("internal val echo = 5")
+        val failure = session.execute("""
+            fun next() = echo <Int>(1) + 1
+            next()
+        """.trimIndent())
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines().last() == "  hint: 'echo' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = echo(...).toString()` - declare the type, like `fun f(): String = echo(...).toString()`.")
+        }
+
+        // when
+        val result = session.execute("""
+            fun next(): Int = echo <Int>(1) + 1
+            next()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should call generic function of earlier snippet with type arguments and trailing lambda rather than internal property of the name once its type is declared as hinted`() = runTest {
+        // given
+        session.execute("fun <T> run3(block: () -> T) = block()")
+        session.execute("internal val run3 = 5")
+        val failure = session.execute("""
+            fun next() = run3<Int> { 1 } + 1
+            next()
+        """.trimIndent())
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines().last() == "  hint: 'run3' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = run3(...).toString()` - declare the type, like `fun f(): String = run3(...).toString()`.")
+        }
+
+        // when
+        val result = session.execute("""
+            fun next(): Int = run3<Int> { 1 } + 1
+            next()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should call generic function of earlier snippet with type arguments rather than property of the name once its type is declared as hinted`() = runTest {
+        // given
+        session.execute("val limit = 1")
+        session.execute("fun <T> limit(x: T) = x")
+        val failure = session.execute("""
+            fun next() = limit<Int>(1) + 1
+            next()
+        """.trimIndent())
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines().last() == "  hint: 'limit' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = limit(...).toString()` - declare the type, like `fun f(): String = limit(...).toString()`.")
+        }
+
+        // when
+        val result = session.execute("""
+            fun next(): Int = limit<Int>(1) + 1
+            next()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should call generic function of earlier snippet with type arguments rather than const property of the name once its type is declared as hinted`() = runTest {
+        // given
+        session.execute("const val echo = 5")
+        session.execute("fun <T> echo(x: T) = x")
+        val failure = session.execute("""
+            fun next() = echo<Int>(1) + 1
+            next()
+        """.trimIndent())
+        failure should {
+            be<ScriptResult.Error>()
+            have(message.lines().last() == "  hint: 'echo' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = echo(...).toString()` - declare the type, like `fun f(): String = echo(...).toString()`.")
+        }
+
+        // when
+        val result = session.execute("""
+            fun next(): Int = echo<Int>(1) + 1
+            next()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == 2)
+        }
+    }
+
+    @Test
+    fun `should hint at property of earlier snippet compared rather than generic function of the name`() = runTest {
+        // given
+        session.execute("val limit = 1")
+        session.execute("fun <T> limit(x: T) = x")
+
+        // when
+        val result = session.execute("""
+            fun next() = limit < 3
+            next()
+        """.trimIndent())
+
+        // then
+        result should {
+            be<ScriptResult.Error>()
+            have(phase == ExecutionPhase.COMPILATION)
+            have(message.lines().last() == "  hint: 'limit' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = limit.toString()` - declare the type, like `fun f(): String = limit.toString()`.")
         }
     }
 

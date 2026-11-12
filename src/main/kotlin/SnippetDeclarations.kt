@@ -149,30 +149,33 @@ internal class SnippetDeclarations {
     }
 
     /**
-     * Whether a snippet kept after the one of the [scriptClass] declares a [member] of the same name, kind and parameters, see [parameterSignature],
-     * accessible by a later snippet, also its setter, if the [setter] is called, in the snippet class, or in its class of the same [nested] name, like `$Box`,
+     * Whether the last snippet kept after the one of the [scriptClass] declaring a [member] of the same name, kind and parameters, see [parameterSignature],
+     * not a `private` one, which does not replace it, in the snippet class, or in its class of the same [nested] name, like `$Box`,
+     * declares it accessible by a later snippet, also its setter, if the [setter] is called,
      * so a later snippet calls that one, while the code compiled before keeps calling the `internal` one —
      * not an overload, like `fun secret(x: Int)` of `internal fun secret()`, which a later snippet does not call instead.
      */
     private fun isDeclaredAgain(member: KCallable<*>, setter: Boolean, scriptClass: Class<*>, nested: String): Boolean {
         val signature = member.parameterSignature()
-        return snippetClasses.values.dropWhile { it.first != scriptClass }.drop(1).any { (laterClass, laterSnippet) ->
-            logger.readOr(false, { "$laterSnippet: cannot read the members of $laterClass$nested" }) {
+        return snippetClasses.values.dropWhile { it.first != scriptClass }.drop(1).asReversed().firstNotNullOfOrNull { (laterClass, laterSnippet) ->
+            logger.readOr(null, { "$laterSnippet: cannot read the members of $laterClass$nested" }) {
                 val ownerClass = if (nested.isEmpty()) laterClass else try {
                     Class.forName(laterClass.name + nested, false, laterClass.classLoader)
                 } catch (_: ClassNotFoundException) {
                     // the later snippet does not declare the class again
-                    return@readOr false
+                    return@readOr null
                 }
-                ownerClass.kotlin.members.any {
+                ownerClass.kotlin.members.firstOrNull {
                     it.name == member.name
                         && (it is KProperty<*>) == (member is KProperty<*>)
                         && it.parameterSignature() == signature
-                        && it.isAccessibleByLaterSnippet(laterSnippet)
+                        && it.jvmMember().visibility(laterSnippet) != Visibility.PRIVATE
+                }?.let {
+                    it.isAccessibleByLaterSnippet(laterSnippet)
                         && (!setter || it is KMutableProperty<*> && it.javaSetter.isAccessibleByLaterSnippet(laterSnippet))
                 }
             }
-        }
+        } ?: false
     }
 
     /**
@@ -226,9 +229,6 @@ internal class SnippetDeclarations {
 
     /** Whether the last class of this simple [name] declared by a snippet is not `private`. */
     fun isClass(name: String): Boolean = read().classes[name] == true
-
-    /** Whether the last property of this [name] declared by a snippet, not an extension, also a provided one, is accessible by a later snippet. */
-    fun isProperty(name: String): Boolean = property(name)?.kind == SnippetProperty.Kind.ACCESSIBLE
 
     /** The last property of this [name] declared by a snippet, not an extension, also a provided one, `null` if none, or only a `private` one. */
     fun property(name: String): SnippetProperty? = read().properties[name]
