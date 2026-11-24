@@ -13,9 +13,7 @@ plugins {
     alias(libs.plugins.xemantic.conventions)
 }
 
-// only the modules, as the root, which only aggregates them, is named after the repository, like the library module,
-// and two projects of the same group and name would be taken for each other by the dependency resolution
-subprojects {
+allprojects {
     group = "com.xemantic.kotlin"
     repositories {
         mavenCentral()
