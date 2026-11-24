@@ -40,7 +40,7 @@ In `build.gradle.kts` add:
 
 ```kotlin
 dependencies {
-    implementation("com.xemantic.kotlin:xemantic-kotlin-script:0.1.0")
+    implementation("com.xemantic.kotlin:xemantic-kotlin-script:0.2.2")
 }
 ```
 

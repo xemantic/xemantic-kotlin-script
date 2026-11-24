@@ -1,3 +1,6 @@
 rootProject.name = "xemantic-kotlin-script"
 
-include(":xemantic-kotlin-script-compiler-plugin")
+include(
+    ":xemantic-kotlin-script",
+    ":xemantic-kotlin-script-compiler-plugin"
+)
