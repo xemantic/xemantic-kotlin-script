@@ -41,6 +41,7 @@ class SnippetDeclarationsTest {
                     private val privateProperty = 1
                     internal val internalProperty = 1
                     const val constProperty = 1
+                    const val isConstReady = true
                     @JvmField val jvmFieldProperty = 1
                     @JvmField var jvmFieldVariable = 1
                     lateinit var lateinitProperty: String
@@ -49,31 +50,8 @@ class SnippetDeclarationsTest {
                     internal fun internalFunction() = 1
                     @JvmName("jvm\$name") fun functionOfJvmNameWithDollarSign() = 1
                     fun `function$withDollarSign`() = 1
-                    val String.publicExtensionProperty get() = 1
-                    private val String.privateExtensionProperty get() = 1
                     internal val String.internalExtensionProperty get() = 1
-                    fun String.publicExtensionFunction() = 1
-                    private fun String.privateExtensionFunction() = 1
                     internal fun String.internalExtensionFunction() = 1
-                    fun String?.nullableExtensionFunction() = 1
-                    fun <T> T.genericExtensionFunction() = 1
-                    fun <T : Number> T.boundedExtensionFunction() = 1
-                    fun ((Int) -> Int).functionTypeExtensionFunction() = 1
-                    fun <T> ((T) -> Unit).genericFunctionTypeExtensionFunction() = 1
-                    fun MutableList<Int>.mutableListExtensionFunction() = 1
-                    val <T> List<T>.genericListExtensionProperty get() = 1
-                    fun Map.Entry<Int, String>.entryExtensionFunction() = 1
-                    fun PublicClass.classExtensionFunction() = 1
-                    fun List<*>.starListExtensionFunction() = 1
-                    typealias Name = String
-                    fun Name.aliasExtensionFunction() = 1
-                    fun List<Name>.aliasListExtensionFunction() = 1
-                    val StringBuilder.builderExtensionProperty get() = 1
-                    fun MutableList<out Number>.outMutableListExtensionFunction() = 1
-                    fun (List<Int>.() -> Pair<String, Int>).receiverFunctionTypeExtensionFunction() = 1
-                    fun <T : Number> MutableList<T>.boundedListExtensionFunction() = 1
-                    fun <K> Map<K, K>.repeatedMapExtensionFunction() = 1
-                    fun <T> List<List<T>>.nestedListExtensionFunction() = 1
                     class PublicClass
                     private class PrivateClass
                     internal class InternalClass
@@ -86,6 +64,7 @@ class SnippetDeclarationsTest {
                     abstract class AbstractClass
                     interface Interface { fun method() = 1 }
                     object Object
+                    object ObjectOfConst { const val LIMIT = 1 }
                     class ClassWithCompanion { companion object }
                     enum class EnumClass { ENTRY }
                     open class OpenClassOfInternalMember { internal fun internalMember() = 1 }
@@ -167,13 +146,6 @@ class SnippetDeclarationsTest {
         // then
         assert(declarations.isProperty("publicProperty"))
         assert(declarations.isProperty("lateinitProperty"))
-        assert(declarations.isFunction("publicFunction"))
-        assert(declarations.isFunction("functionOfJvmNameWithDollarSign"))
-        assert(declarations.isFunction($$"function$withDollarSign"))
-        assert(declarations.extensionPropertyReceivers("publicExtensionProperty") == setOf(ExtensionReceiver("String")))
-        assert(declarations.extensionFunctionReceivers("publicExtensionFunction") == setOf(ExtensionReceiver("String")))
-        assert(declarations.isClass("PublicClass"))
-        assert(declarations.isClass("InternalClass"))
     }
 
     @Test
@@ -183,10 +155,6 @@ class SnippetDeclarationsTest {
 
         // then
         assert(!declarations.isProperty("privateProperty"))
-        assert(!declarations.isFunction("privateFunction"))
-        assert(declarations.extensionPropertyReceivers("privateExtensionProperty").isEmpty())
-        assert(declarations.extensionFunctionReceivers("privateExtensionFunction").isEmpty())
-        assert(!declarations.isClass("PrivateClass"))
     }
 
     @Test
@@ -196,9 +164,6 @@ class SnippetDeclarationsTest {
 
         // then
         assert(!declarations.isProperty("internalProperty"))
-        assert(!declarations.isFunction("internalFunction"))
-        assert(declarations.extensionPropertyReceivers("internalExtensionProperty").isEmpty())
-        assert(declarations.extensionFunctionReceivers("internalExtensionFunction").isEmpty())
     }
 
     @Test
@@ -229,6 +194,75 @@ class SnippetDeclarationsTest {
     }
 
     @Test
+    fun `should find const property of snippet by the getter a later snippet reads it by`() {
+        // when
+        val property = declarations.constProperty("Snippet1", "getConstProperty", emptyList())
+
+        // then
+        assert(property == ConstProperty(name = "constProperty", snippet = "snippet1.kts", declaringClass = null))
+    }
+
+    @Test
+    fun `should find internal const property of snippet by the getter mangled with the module of a later snippet`() {
+        // when
+        val property = declarations.constProperty("Snippet1", $$"getConstProperty$main", emptyList())
+
+        // then
+        assert(property?.name == "constProperty")
+    }
+
+    @Test
+    fun `should find const property of snippet named like a getter by its name`() {
+        // when
+        val property = declarations.constProperty("Snippet1", "isConstReady", emptyList())
+
+        // then
+        assert(property?.name == "isConstReady")
+    }
+
+    @Test
+    fun `should find const property of object of snippet`() {
+        // when
+        val property = declarations.constProperty($$"Snippet1$ObjectOfConst", "getLIMIT", emptyList())
+
+        // then
+        assert(
+            property == ConstProperty(
+                name = "ObjectOfConst.LIMIT",
+                snippet = "snippet1.kts",
+                declaringClass = DeclaredClass("ObjectOfConst", DeclaredClass.Kind.OBJECT)
+            )
+        )
+    }
+
+    @Test
+    fun `should not find const property by the getter of a property which is not const`() {
+        // when
+        val property = declarations.constProperty("Snippet1", "getPublicProperty", emptyList())
+
+        // then
+        assert(property == null)
+    }
+
+    @Test
+    fun `should not find const property by a getter taking parameters`() {
+        // when
+        val property = declarations.constProperty("Snippet1", "getConstProperty", listOf("int"))
+
+        // then
+        assert(property == null)
+    }
+
+    @Test
+    fun `should not find const property of class not declared by a snippet`() {
+        // when
+        val property = declarations.constProperty("java.lang.Integer", "getMAX_VALUE", emptyList())
+
+        // then
+        assert(property == null)
+    }
+
+    @Test
     fun `should keep the declaration of a name declared again by later snippet instead of the earlier one`() {
         // given
         val declarations = SnippetDeclarations()
@@ -249,118 +283,6 @@ class SnippetDeclarationsTest {
         assert(declarations.isProperty("publicLaterJvmField"))
         assert(declarations.isJvmFieldProperty("publicLaterJvmField", "snippet1.kts"))
         assert(!declarations.isJvmFieldProperty("publicLaterJvmField", "snippet2.kts"))
-        assert(!declarations.isFunction("internalFunctionLater"))
-        assert(!declarations.isFunction("genericLater"))
-        assert(declarations.extensionPropertyReceivers("internalExtensionLater").isEmpty())
-        assert(declarations.extensionFunctionReceivers("internalExtensionFunctionLater").isEmpty())
-        assert(!declarations.isClass("PrivateClassLater"))
-    }
-
-    @Test
-    fun `should keep the declaration of a name not replaced by private declaration or extension of another receiver of later snippet`() {
-        // given
-        val declarations = SnippetDeclarations()
-
-        // when
-        redeclaringSnippetClasses.forEachIndexed { index, snippetClass ->
-            declarations.keep(snippetClass, "snippet${index + 1}.kts")
-        }
-
-        // then
-        assert(declarations.isProperty("privateLater"))
-        assert(declarations.isFunction("privateFunctionLater"))
-        assert(declarations.extensionPropertyReceivers("overloadedExtensionLater") == setOf(ExtensionReceiver("String", nullable = false)))
-    }
-
-    @Test
-    fun `should not tell function accessible when an overload of it is internal`() {
-        // given
-        val declarations = SnippetDeclarations()
-
-        // when
-        redeclaringSnippetClasses.forEachIndexed { index, snippetClass ->
-            declarations.keep(snippetClass, "snippet${index + 1}.kts")
-        }
-
-        // then
-        assert(!declarations.isFunction("overloadedLater"))
-        assert(!declarations.isFunction("boundedLater"))
-    }
-
-    @Test
-    fun `should keep overloads of other type parameter bounds`() {
-        // given
-        val declarations = SnippetDeclarations()
-
-        // when
-        redeclaringSnippetClasses.forEachIndexed { index, snippetClass ->
-            declarations.keep(snippetClass, "snippet${index + 1}.kts")
-        }
-
-        // then
-        assert(declarations.extensionFunctionReceivers("boundedExtensionLater") == setOf(
-            ExtensionReceiver("Number", nullable = false),
-            ExtensionReceiver("CharSequence", nullable = false)
-        ))
-    }
-
-    @Test
-    fun `should replace function by later one of the same parameters also with default argument`() {
-        // given
-        val declarations = SnippetDeclarations()
-
-        // when
-        redeclaringSnippetClasses.forEachIndexed { index, snippetClass ->
-            declarations.keep(snippetClass, "snippet${index + 1}.kts")
-        }
-
-        // then
-        assert(declarations.isFunction("defaultLater"))
-    }
-
-    @Test
-    fun `should tell extensions from other members`() {
-        // when
-        val declarations = declarations
-
-        // then
-        assert(!declarations.isProperty("publicExtensionProperty"))
-        assert(!declarations.isFunction("publicExtensionFunction"))
-        assert(declarations.extensionPropertyReceivers("publicProperty").isEmpty())
-        assert(declarations.extensionFunctionReceivers("publicFunction").isEmpty())
-    }
-
-    @Test
-    fun `should keep receivers of extensions by their classes`() {
-        // when
-        val declarations = declarations
-
-        // then
-        assert(declarations.extensionFunctionReceivers("nullableExtensionFunction") == setOf(ExtensionReceiver("String", nullable = true)))
-        assert(declarations.extensionFunctionReceivers("genericExtensionFunction") == setOf(ExtensionReceiver("Any", nullable = true)))
-        assert(declarations.extensionFunctionReceivers("boundedExtensionFunction") == setOf(ExtensionReceiver("Number", nullable = false)))
-        assert(declarations.extensionFunctionReceivers("functionTypeExtensionFunction") == setOf(ExtensionReceiver("(Int) -> Int")))
-    }
-
-    @Test
-    fun `should keep receivers of extensions by their types without packages`() {
-        // when
-        val declarations = declarations
-
-        // then
-        assert(declarations.extensionFunctionReceivers("mutableListExtensionFunction") == setOf(ExtensionReceiver("MutableList", listOf("Int"), variances = listOf(KVariance.INVARIANT))))
-        assert(declarations.extensionPropertyReceivers("genericListExtensionProperty") == setOf(ExtensionReceiver("List", listOf(null), variances = listOf(KVariance.OUT))))
-        assert(declarations.extensionFunctionReceivers("entryExtensionFunction") == setOf(ExtensionReceiver("Map.Entry", listOf("Int", "String"), variances = listOf(KVariance.OUT, KVariance.OUT))))
-        assert(declarations.extensionFunctionReceivers("classExtensionFunction") == setOf(ExtensionReceiver("PublicClass")))
-    }
-
-    @Test
-    fun `should not keep receiver of function type of type parameter`() {
-        // when
-        val declarations = declarations
-
-        // then
-        assert(declarations.extensionFunctionReceivers("genericFunctionTypeExtensionFunction").isEmpty())
     }
 
     @Test
@@ -504,419 +426,6 @@ class SnippetDeclarationsTest {
         assert(declarations.declaredClass($$"Snippet1$EnumClassWithBody$ENTRY") == DeclaredClass("EnumClassWithBody", DeclaredClass.Kind.OTHER))
         assert(declarations.declaredClass($$"Snippet1$Undeclared") == null)
         assert(declarations.declaredClass("java.lang.String") == null)
-    }
-
-    @Test
-    fun `should accept receiver of type of its class`() {
-        // given
-        val receiver = ExtensionReceiver("Map.Entry", listOf("Int", "String"))
-
-        // when
-        val accepted = receiver.acceptance("Map.Entry<Int, String>") == Acceptance.ACCEPTED
-
-        // then
-        assert(accepted)
-    }
-
-    @Test
-    fun `should not accept receiver of another type`() {
-        // given
-        val receiver = ExtensionReceiver("String")
-
-        // when
-        val accepted = receiver.acceptance("List<Int>") == Acceptance.ACCEPTED
-
-        // then
-        assert(!accepted)
-    }
-
-    @Test
-    fun `should not accept receiver of nested class of another outer class`() {
-        // given
-        val receiver = ExtensionReceiver("Map.Entry", listOf("Int", "Int"))
-
-        // when
-        val accepted = receiver.acceptance("Other.Entry<Int, Int>") == Acceptance.ACCEPTED
-
-        // then
-        assert(!accepted)
-    }
-
-    @Test
-    fun `should not accept receiver of other type arguments`() {
-        // given
-        val receiver = ExtensionReceiver("List", listOf("String"))
-
-        // when
-        val accepted = receiver.acceptance("List<Int>") == Acceptance.ACCEPTED
-
-        // then
-        assert(!accepted)
-    }
-
-    @Test
-    fun `should accept receiver of any type argument by type parameter`() {
-        // given
-        val receiver = ExtensionReceiver("Map.Entry", listOf(null, "String"))
-
-        // when
-        val accepted = receiver.acceptance("Map.Entry<List<Int>, String>") == Acceptance.ACCEPTED
-
-        // then
-        assert(accepted)
-    }
-
-    @Test
-    fun `should accept receiver of function type`() {
-        // given
-        val receiver = ExtensionReceiver("(Int) -> Int")
-
-        // when
-        val accepted = receiver.acceptance("(Int) -> Int") == Acceptance.ACCEPTED
-
-        // then
-        assert(accepted)
-    }
-
-    @Test
-    fun `should not accept nullable receiver by non-null one`() {
-        // given
-        val receiver = ExtensionReceiver("String")
-
-        // when
-        val accepted = receiver.acceptance("String?") == Acceptance.ACCEPTED
-
-        // then
-        assert(!accepted)
-    }
-
-    @Test
-    fun `should accept non-null receiver by nullable one`() {
-        // given
-        val receiver = ExtensionReceiver("String", nullable = true)
-
-        // when
-        val accepted = receiver.acceptance("String") == Acceptance.ACCEPTED
-
-        // then
-        assert(accepted)
-    }
-
-    @Test
-    fun `should accept receiver of any type by receiver of Any`() {
-        // given
-        val receiver = ExtensionReceiver("Any", nullable = true)
-
-        // when
-        val accepted = receiver.acceptance("List<Int>?") == Acceptance.ACCEPTED
-
-        // then
-        assert(accepted)
-    }
-
-    @Test
-    fun `should accept receiver of well-known subtype`() {
-        // given
-        val collection = ExtensionReceiver("Collection", listOf("Int"))
-        val charSequence = ExtensionReceiver("CharSequence")
-        val entry = ExtensionReceiver("Map.Entry", listOf("Int", "String"))
-
-        // when
-        val accepted = listOf(
-            collection.acceptance("MutableList<Int>") == Acceptance.ACCEPTED,
-            charSequence.acceptance("String") == Acceptance.ACCEPTED,
-            entry.acceptance("MutableMap.MutableEntry<Int, String>") == Acceptance.ACCEPTED
-        )
-
-        // then
-        assert(accepted == listOf(true, true, true))
-    }
-
-    @Test
-    fun `should accept receiver of subtype of other type arity by type parameters only`() {
-        // given
-        val generic = ExtensionReceiver("Comparable", listOf(null))
-        val concrete = ExtensionReceiver("Comparable", listOf("String"))
-
-        // when
-        val accepted = listOf(generic.acceptance("String") == Acceptance.ACCEPTED, concrete.acceptance("String") == Acceptance.ACCEPTED)
-
-        // then
-        assert(accepted == listOf(true, false))
-    }
-
-    @Test
-    fun `should not accept read-only type by receiver of mutable one`() {
-        // given
-        val receiver = ExtensionReceiver("MutableList", listOf("Int"))
-
-        // when
-        val accepted = receiver.acceptance("List<Int>") == Acceptance.ACCEPTED
-
-        // then
-        assert(!accepted)
-    }
-
-    @Test
-    fun `should not accept receiver of subtype not known`() {
-        // given
-        val receiver = ExtensionReceiver("Shape")
-
-        // when
-        val accepted = receiver.acceptance("Circle") == Acceptance.ACCEPTED
-
-        // then
-        assert(!accepted)
-    }
-
-    @Test
-    fun `should keep star projection of receiver as declared`() {
-        // when
-        val receivers = declarations.extensionFunctionReceivers("starListExtensionFunction")
-
-        // then
-        assert(receivers == setOf(ExtensionReceiver("List", listOf("*"), variances = listOf(null))))
-        assert(receivers.single().declaration == "List<*>")
-    }
-
-    @Test
-    fun `should accept receiver of any type argument by star projection`() {
-        // given
-        val receiver = ExtensionReceiver("List", listOf("*"))
-
-        // when
-        val accepted = receiver.acceptance("List<Int>") == Acceptance.ACCEPTED
-
-        // then
-        assert(accepted)
-    }
-
-    @Test
-    fun `should accept receiver of function type of nullable result`() {
-        // given
-        val receiver = ExtensionReceiver("(Int) -> String?")
-
-        // when
-        val accepted = listOf(receiver.acceptance("(Int) -> String?") == Acceptance.ACCEPTED, receiver.acceptance("((Int) -> String?)?") == Acceptance.ACCEPTED)
-
-        // then
-        assert(accepted == listOf(true, false))
-    }
-
-    @Test
-    fun `should keep receivers of type aliases by their expansions`() {
-        // when
-        val declarations = declarations
-
-        // then
-        assert(declarations.extensionFunctionReceivers("aliasExtensionFunction") == setOf(ExtensionReceiver("String")))
-        assert(declarations.extensionFunctionReceivers("aliasListExtensionFunction") == setOf(ExtensionReceiver("List", listOf("String"), variances = listOf(KVariance.OUT))))
-        assert(declarations.extensionPropertyReceivers("builderExtensionProperty") == setOf(ExtensionReceiver("StringBuilder")))
-    }
-
-    @Test
-    fun `should accept receiver of class of snippet named by its snippet`() {
-        // given
-        val point = ExtensionReceiver("Point")
-        val inner = ExtensionReceiver("Box.Inner")
-        val list = ExtensionReceiver("List", listOf("Point"))
-
-        // when
-        val accepted = listOf(
-            point.acceptance("Snippet1.Point") == Acceptance.ACCEPTED,
-            inner.acceptance("Snippet1.Box.Inner") == Acceptance.ACCEPTED,
-            list.acceptance("List<Snippet1.Point>") == Acceptance.ACCEPTED
-        )
-
-        // then
-        assert(accepted == listOf(true, true, true))
-    }
-
-    @Test
-    fun `should keep variance of type arguments of receivers`() {
-        // when
-        val declarations = declarations
-
-        // then
-        assert(declarations.extensionFunctionReceivers("mutableListExtensionFunction").single().variances == listOf(KVariance.INVARIANT))
-        assert(declarations.extensionFunctionReceivers("outMutableListExtensionFunction").single().variances == listOf(KVariance.OUT))
-        assert(declarations.extensionFunctionReceivers("entryExtensionFunction").single().variances == listOf(KVariance.OUT, KVariance.OUT))
-        assert(declarations.extensionFunctionReceivers("aliasListExtensionFunction").single().variances == listOf(KVariance.OUT))
-    }
-
-    @Test
-    fun `should keep receiver of function type with receiver as declared`() {
-        // when
-        val receivers = declarations.extensionFunctionReceivers("receiverFunctionTypeExtensionFunction")
-
-        // then
-        assert(receivers == setOf(ExtensionReceiver("List<Int>.() -> Pair<String, Int>")))
-        assert(receivers.single().declaration == "(List<Int>.() -> Pair<String, Int>)")
-    }
-
-    @Test
-    fun `should accept receiver of function type with receiver`() {
-        // given
-        val receiver = ExtensionReceiver("List<Int>.() -> Pair<String, Int>")
-
-        // when
-        val accepted = listOf(
-            receiver.acceptance("List<Int>.() -> Pair<String, Int>") == Acceptance.ACCEPTED,
-            receiver.acceptance("List<String>.() -> Pair<String, Int>") == Acceptance.ACCEPTED
-        )
-
-        // then
-        assert(accepted == listOf(true, false))
-    }
-
-    @Test
-    fun `should accept receiver of covariant type argument of supertype`() {
-        // given
-        val map = ExtensionReceiver("Map", listOf("String", "Any"), variances = listOf(KVariance.INVARIANT, KVariance.OUT))
-        val numbers = ExtensionReceiver("List", listOf("Number"), variances = listOf(KVariance.OUT))
-        val projected = ExtensionReceiver("MutableList", listOf("out Number"), variances = listOf(KVariance.OUT))
-        val anything = ExtensionReceiver("List", listOf("Any"), variances = listOf(KVariance.OUT))
-        val pair = ExtensionReceiver("Pair", listOf("Any", "Any"), variances = listOf(KVariance.OUT, KVariance.OUT))
-        val texts = ExtensionReceiver("Collection", listOf("CharSequence"), variances = listOf(KVariance.OUT))
-
-        // when
-        val accepted = listOf(
-            map.acceptance("Map<String, Int>") == Acceptance.ACCEPTED,
-            numbers.acceptance("List<Int>") == Acceptance.ACCEPTED,
-            projected.acceptance("MutableList<Int>") == Acceptance.ACCEPTED,
-            anything.acceptance("List<Comparable<*> & Serializable>") == Acceptance.ACCEPTED,
-            pair.acceptance("Pair<Int, String>") == Acceptance.ACCEPTED,
-            texts.acceptance("List<StringBuilder>") == Acceptance.ACCEPTED
-        )
-
-        // then
-        assert(accepted == listOf(true, true, true, true, true, true))
-    }
-
-    @Test
-    fun `should not accept receiver of covariant type argument of non-null supertype by nullable one`() {
-        // given
-        val receiver = ExtensionReceiver("List", listOf("Any"), variances = listOf(KVariance.OUT))
-
-        // when
-        val acceptance = receiver.acceptance("List<Int?>")
-
-        // then
-        assert(acceptance == Acceptance.REJECTED)
-    }
-
-    @Test
-    fun `should not accept receiver of invariant type argument of supertype`() {
-        // given
-        val receiver = ExtensionReceiver("MutableList", listOf("Number"), variances = listOf(KVariance.INVARIANT))
-
-        // when
-        val acceptance = receiver.acceptance("MutableList<Int>")
-
-        // then
-        assert(acceptance == Acceptance.REJECTED)
-    }
-
-    @Test
-    fun `should not accept receiver of covariant type argument of well-known final type of other supertypes`() {
-        // given
-        val receiver = ExtensionReceiver("List", listOf("Number"), variances = listOf(KVariance.OUT))
-
-        // when
-        val acceptance = receiver.acceptance("List<String>")
-
-        // then
-        assert(acceptance == Acceptance.REJECTED)
-    }
-
-    @Test
-    fun `should possibly accept receiver of covariant type argument of type not known`() {
-        // given
-        val texts = ExtensionReceiver("List", listOf("CharSequence"), variances = listOf(KVariance.OUT))
-        val lists = ExtensionReceiver("List", listOf("Collection<Int>"), variances = listOf(KVariance.OUT))
-        val comparables = ExtensionReceiver("List", listOf("Comparable<Int>"), variances = listOf(KVariance.OUT))
-
-        // when
-        val acceptances = listOf(
-            texts.acceptance("List<Text>"),
-            lists.acceptance("List<List<Number>>"),
-            comparables.acceptance("List<Int>")
-        )
-
-        // then
-        assert(acceptances == listOf(Acceptance.POSSIBLE, Acceptance.POSSIBLE, Acceptance.POSSIBLE))
-    }
-
-    @Test
-    fun `should accept receiver of well-known concrete subtype`() {
-        // given
-        val collection = ExtensionReceiver("Collection", listOf("Int"), variances = listOf(KVariance.OUT))
-        val map = ExtensionReceiver("Map", listOf("String", "Int"), variances = listOf(KVariance.INVARIANT, KVariance.OUT))
-        val charSequence = ExtensionReceiver("CharSequence")
-
-        // when
-        val accepted = listOf(
-            collection.acceptance("ArrayList<Int>") == Acceptance.ACCEPTED,
-            collection.acceptance("HashSet<Int>") == Acceptance.ACCEPTED,
-            collection.acceptance("LinkedHashSet<Int>") == Acceptance.ACCEPTED,
-            map.acceptance("HashMap<String, Int>") == Acceptance.ACCEPTED,
-            map.acceptance("LinkedHashMap<String, Int>") == Acceptance.ACCEPTED,
-            charSequence.acceptance("StringBuilder") == Acceptance.ACCEPTED,
-            ExtensionReceiver("MutableSet", listOf("Int")).acceptance("HashSet<Int>") == Acceptance.ACCEPTED,
-            ExtensionReceiver("MutableSet", listOf("Int")).acceptance("LinkedHashSet<Int>") == Acceptance.ACCEPTED,
-            ExtensionReceiver("MutableList", listOf("Int")).acceptance("ArrayList<Int>") == Acceptance.ACCEPTED,
-            ExtensionReceiver("MutableMap", listOf("String", "Int")).acceptance("HashMap<String, Int>") == Acceptance.ACCEPTED,
-            ExtensionReceiver("MutableMap", listOf("String", "Int")).acceptance("LinkedHashMap<String, Int>") == Acceptance.ACCEPTED
-        )
-
-        // then
-        assert(accepted == List(11) { true })
-    }
-
-    @Test
-    fun `should accept receiver of intersection type by any of its types`() {
-        // given
-        val comparable = ExtensionReceiver("Comparable", listOf("*"))
-        val number = ExtensionReceiver("Number")
-
-        // when
-        val acceptances = listOf(
-            comparable.acceptance("Comparable<*> & Serializable"),
-            number.acceptance("Comparable<*> & Serializable")
-        )
-
-        // then
-        assert(acceptances == listOf(Acceptance.ACCEPTED, Acceptance.REJECTED))
-    }
-
-    @Test
-    fun `should keep type arguments of bounded or repeated type parameters of receivers as constrained`() {
-        // when
-        val declarations = declarations
-
-        // then
-        assert(declarations.extensionFunctionReceivers("boundedListExtensionFunction").single().constrainedArguments == setOf(0))
-        assert(declarations.extensionFunctionReceivers("repeatedMapExtensionFunction").single().constrainedArguments == setOf(0, 1))
-        assert(declarations.extensionFunctionReceivers("nestedListExtensionFunction").single().constrainedArguments == setOf(0))
-        assert(declarations.extensionPropertyReceivers("genericListExtensionProperty").single().constrainedArguments.isEmpty())
-    }
-
-    @Test
-    fun `should possibly accept receiver of constrained type argument`() {
-        // given
-        val bounded = ExtensionReceiver("MutableList", listOf(null), constrainedArguments = setOf(0))
-        val repeated = ExtensionReceiver("Map", listOf(null, null), constrainedArguments = setOf(0, 1))
-        val comparable = ExtensionReceiver("Comparable", listOf(null), constrainedArguments = setOf(0))
-
-        // when
-        val acceptances = listOf(
-            bounded.acceptance("MutableList<String>"),
-            repeated.acceptance("MutableMap<Int, String>"),
-            comparable.acceptance("String")
-        )
-
-        // then
-        assert(acceptances == listOf(Acceptance.POSSIBLE, Acceptance.POSSIBLE, Acceptance.POSSIBLE))
     }
 
 }

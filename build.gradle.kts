@@ -4,6 +4,7 @@ import org.jetbrains.kotlin.gradle.ExperimentalKotlinGradlePluginApi
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.dsl.KotlinVersion
 import org.jetbrains.kotlin.gradle.dsl.abi.ExperimentalAbiValidation
+import com.vanniktech.maven.publish.MavenPublishBaseExtension
 import org.jreleaser.model.Active
 
 plugins {
@@ -16,7 +17,12 @@ plugins {
     alias(libs.plugins.xemantic.conventions)
 }
 
-group = "com.xemantic.kotlin"
+allprojects {
+    group = "com.xemantic.kotlin"
+    repositories {
+        mavenCentral()
+    }
+}
 
 xemantic {
     description = "Kotlin script execution with LLM-friendly diagnostics"
@@ -67,12 +73,10 @@ java {
     targetCompatibility = JavaVersion.toVersion(javaTarget)
 }
 
-repositories {
-    mavenCentral()
-}
-
 dependencies {
     api(libs.kotlinx.coroutines.core)
+    // the plugin making the snippets suspending, passed to the compiler of a session with -Xplugin
+    implementation(project(":xemantic-kotlin-script-compiler-plugin"))
     implementation(libs.kotlin.scripting.common)
     implementation(libs.kotlin.scripting.jvm)
     implementation(libs.kotlin.scripting.jvm.host)
@@ -170,50 +174,65 @@ versionCatalogUpdate {
     }
 }
 
-mavenPublishing {
+// the values of the xemantic extension of the root project, for the publications of all the projects
+val projectDescription = xemantic.description
+val projectInceptionYear = xemantic.inceptionYear
+val gitHubAccount = xemantic.gitHubAccount
+val organizationName = xemantic.organization
+val organizationUrl = xemantic.organizationUrl
 
-    signAllPublications()
+allprojects {
 
-    publishToMavenCentral(automaticRelease = true)
+    plugins.withId("com.vanniktech.maven.publish") {
 
-    pom {
+        configure<MavenPublishBaseExtension> {
 
-        name = rootProject.name
-        description = xemantic.description
-        inceptionYear = xemantic.inceptionYear
-        url = "https://github.com/${xemantic.gitHubAccount}/${rootProject.name}"
+            signAllPublications()
 
-        organization {
-            name = xemantic.organization
-            url = xemantic.organizationUrl
-        }
+            publishToMavenCentral(automaticRelease = true)
 
-        licenses {
-            license {
-                name = "GNU Affero General Public License v3.0"
-                url = "https://www.gnu.org/licenses/agpl-3.0.txt"
-                distribution = "https://www.gnu.org/licenses/agpl-3.0.txt"
+            pom {
+
+                name = project.name
+                description = project.description ?: projectDescription
+                inceptionYear = projectInceptionYear
+                url = "https://github.com/$gitHubAccount/${rootProject.name}"
+
+                organization {
+                    name = organizationName
+                    url = organizationUrl
+                }
+
+                licenses {
+                    license {
+                        name = "GNU Affero General Public License v3.0"
+                        url = "https://www.gnu.org/licenses/agpl-3.0.txt"
+                        distribution = "https://www.gnu.org/licenses/agpl-3.0.txt"
+                    }
+                }
+
+                scm {
+                    url = "https://github.com/$gitHubAccount/${rootProject.name}"
+                    connection = "scm:git:git://github.com/$gitHubAccount/${rootProject.name}.git"
+                    developerConnection = "scm:git:ssh://git@github.com/$gitHubAccount/${rootProject.name}.git"
+                }
+
+                ciManagement {
+                    system = "GitHub"
+                    url = "https://github.com/$gitHubAccount/${rootProject.name}/actions"
+                }
+
+                issueManagement {
+                    system = "GitHub"
+                    url = "https://github.com/$gitHubAccount/${rootProject.name}/issues"
+                }
+
+                developers {
+                    projectDevs()
+                }
+
             }
-        }
 
-        scm {
-            url = "https://github.com/${xemantic.gitHubAccount}/${rootProject.name}"
-            connection = "scm:git:git://github.com/${xemantic.gitHubAccount}/${rootProject.name}.git"
-            developerConnection = "scm:git:ssh://git@github.com/${xemantic.gitHubAccount}/${rootProject.name}.git"
-        }
-
-        ciManagement {
-            system = "GitHub"
-            url = "https://github.com/${xemantic.gitHubAccount}/${rootProject.name}/actions"
-        }
-
-        issueManagement {
-            system = "GitHub"
-            url = "https://github.com/${xemantic.gitHubAccount}/${rootProject.name}/issues"
-        }
-
-        developers {
-            projectDevs()
         }
 
     }

@@ -132,6 +132,48 @@ class ScriptErrorReporterTest {
     }
 
     @Test
+    fun `should omit frame of continuation of suspend function of snippet without a line`() {
+        // given
+        val exception = IllegalStateException("a").apply {
+            stackTrace = arrayOf(
+                StackTraceElement("Snippet1", "\$\$eval", "snippet1.kts", 1),
+                StackTraceElement("Snippet1\$\$\$eval\$1", "invokeSuspend", "snippet1.kts", -1),
+                StackTraceElement("kotlin.coroutines.jvm.internal.BaseContinuationImpl", "resumeWith", "ContinuationImpl.kt", 34)
+            )
+        }
+
+        // when
+        val report = reporter.describe(exception)
+
+        // then
+        report sameAs """
+            java.lang.IllegalStateException: a
+              at <snippet body>(snippet1.kts:1)
+              | throw IllegalStateException("a\nb")
+        """.trimIndent()
+    }
+
+    @Test
+    fun `should keep frame of suspend lambda of snippet of a line`() {
+        // given
+        val exception = IllegalStateException("a").apply {
+            stackTrace = arrayOf(
+                StackTraceElement("Snippet1\$1", "invokeSuspend", "snippet1.kts", 1)
+            )
+        }
+
+        // when
+        val report = reporter.describe(exception)
+
+        // then
+        report sameAs """
+            java.lang.IllegalStateException: a
+              at <lambda>(snippet1.kts:1)
+              | throw IllegalStateException("a\nb")
+        """.trimIndent()
+    }
+
+    @Test
     fun `should indent later lines of multi-line message`() {
         // given
         val exception = IllegalStateException("a\nb").thrownBySnippet()

@@ -21,61 +21,61 @@ package com.xemantic.kotlin.script
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.job
-import kotlinx.coroutines.runBlocking
-import kotlin.coroutines.ContinuationInterceptor
 import kotlin.coroutines.CoroutineContext
 
 /**
  * The implicit receiver of every snippet of a [ScriptSession].
  *
- * Its [coroutineContext] lives as long as the session,
+ * The body of a snippet is suspending, so a snippet calls a suspend function directly, like `client.get(url)`,
+ * in the coroutine of the caller executing it, on the thread of the session, cancelled with the caller, or when the session is closed.
+ *
+ * Its [coroutineContext] lives as long as the session, with a supervisor job,
  * so the coroutines launched by a snippet, like `launch { }`, keep running after the snippet,
- * until they complete, or the session is closed.
+ * until they complete, or the session is closed, and the failure of one of them fails neither the snippet, nor the session.
+ * The [isActive] and [ensureActive] of the scope tell about the snippet being evaluated, though,
+ * like the ones of a coroutine, while `currentCoroutineContext()` is the context of the snippet.
  */
 public class ScriptScope internal constructor(
     override val coroutineContext: CoroutineContext
 ) : CoroutineScope {
 
-    /** The evaluation of the snippet on the current thread, see [evaluate]. */
-    private val evaluation = ThreadLocal<SnippetEvaluation?>()
+    /** The evaluation of the snippet of the session, at most one at a time, see [evaluate]. */
+    @Volatile
+    private var evaluation: SnippetEvaluation? = null
+
+    /** The job of the snippet being evaluated, or of the session, if none is. */
+    private val job: Job get() = evaluation?.job ?: coroutineContext.job
 
     /**
-     * Runs the suspending [block] and returns its result, blocking the thread of the snippet until it completes,
-     * like `await { client.get(url) }`.
-     *
-     * The [block] runs on the thread of the snippet,
-     * and it is cancelled when the session is closed,
-     * or, within a snippet, also when the caller executing the snippet is cancelled.
+     * Whether the snippet being evaluated is active, `false` once its caller is cancelled, or the session is closed,
+     * like `isActive` of a coroutine, so a snippet computing without suspending can stop then, like `while (isActive) step()`,
+     * also read by a function of a snippet called while one is evaluated,
+     * and, when none is, like by a function called by a coroutine launched by a snippet, whether the session is not closed.
+     * Within `launch { }`, or another coroutine builder, `isActive` is the one of that coroutine.
      */
-    public fun <T> await(
-        block: suspend CoroutineScope.() -> T
-    ): T {
-        val evaluation = evaluation.get()
-        // so the failure of the block, thrown from here, does not cancel the caller as well
-        val job = SupervisorJob(evaluation?.job ?: coroutineContext.job)
-        try {
-            // the event loop of runBlocking keeps the block on the thread of the snippet
-            val context = coroutineContext.minusKey(ContinuationInterceptor) + job
-            return if (evaluation != null) {
-                evaluation.uninterruptible { runBlocking(context, block) }
-            } else {
-                runBlocking(context, block)
-            }
-        } finally {
-            job.cancel()
-        }
+    public val isActive: Boolean get() = job.isActive
+
+    /**
+     * Throws the [kotlinx.coroutines.CancellationException] of the snippet being evaluated, if it is cancelled, see [isActive],
+     * like `ensureActive()` of a coroutine.
+     */
+    public fun ensureActive() {
+        job.ensureActive()
     }
 
-    /** Evaluates the snippet [block] on the current thread, cancelled together with the [callerJob], or when the session is closed. */
-    internal inline fun <T> evaluate(callerJob: Job, block: () -> T): T {
+    /**
+     * Evaluates the snippet [block], given the job of the evaluation,
+     * cancelled together with the [callerJob], or when the session is closed.
+     */
+    internal inline fun <T> evaluate(callerJob: Job, block: (Job) -> T): T {
         val evaluation = SnippetEvaluation(callerJob, coroutineContext.job)
-        this.evaluation.set(evaluation)
+        this.evaluation = evaluation
         try {
-            return block()
+            return block(evaluation.job)
         } finally {
-            this.evaluation.remove()
+            this.evaluation = null
             evaluation.end()
         }
     }

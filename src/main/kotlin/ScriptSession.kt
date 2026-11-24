@@ -36,11 +36,11 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
 import org.intellij.lang.annotations.Language
+import com.xemantic.kotlin.script.compiler.suspendSnippetPluginRoots
 import org.jetbrains.kotlin.com.intellij.openapi.Disposable
 import org.jetbrains.kotlin.com.intellij.openapi.util.Disposer
 import org.jetbrains.kotlin.config.JvmTarget
 import org.jetbrains.kotlin.scripting.compiler.plugin.impl.K2ReplCompiler
-import org.jetbrains.kotlin.scripting.compiler.plugin.impl.K2ReplEvaluator
 import org.jetbrains.kotlin.scripting.compiler.plugin.impl.ScriptDiagnosticsMessageCollector
 import java.util.concurrent.Executor
 import java.util.concurrent.ExecutorService
@@ -65,6 +65,7 @@ import kotlin.script.experimental.api.ScriptCompilationConfiguration
 import kotlin.script.experimental.api.repl
 import kotlin.script.experimental.host.ScriptingHostConfiguration
 import kotlin.script.experimental.jvm.defaultJvmScriptingHostConfiguration
+import org.jetbrains.kotlin.scripting.compiler.plugin.services.FirReplHistoryProviderImpl
 import org.jetbrains.kotlin.scripting.compiler.plugin.services.firReplHistoryProvider
 import org.jetbrains.kotlin.scripting.compiler.plugin.services.isReplSnippetSource
 import kotlin.script.experimental.api.ScriptDiagnostic
@@ -110,8 +111,8 @@ internal const val SESSION_THREAD_STACK_SIZE: Long = 16L * 1024 * 1024
  * stay visible to the snippets executed after it.
  *
  * Each snippet is a regular Kotlin script, compiled by the K2 REPL compiler,
- * with a [ScriptScope] implicit receiver, which lets the snippet launch coroutines living as long as the session,
- * and call suspending functions with [ScriptScope.await].
+ * with a suspending body, so it calls a suspend function directly,
+ * and a [ScriptScope] implicit receiver, which lets the snippet launch coroutines living as long as the session.
  * All the snippets of a session are compiled and evaluated on its own thread, one after another,
  * so a snippet can use an API bound to the thread which created it.
  * The thread is given a 16 MB stack, larger than the default one,
@@ -137,12 +138,13 @@ public interface ScriptSession : AutoCloseable {
     /**
      * Executes the [snippet] after the previous ones, waiting for the snippets executed concurrently.
      *
-     * When the caller is cancelled, or the session is [closed][close], while the snippet is evaluated,
-     * the thread of the session is interrupted, and the coroutines of [ScriptScope.await] are cancelled,
-     * so a blocking call of the snippet, like `Thread.sleep`, throws an [InterruptedException], and its `await` a [kotlinx.coroutines.CancellationException],
-     * which fail the snippet with an [ExecutionPhase.EVALUATION] error, returned to a caller which is not cancelled, unless the snippet catches them,
-     * and ends without blocking, or awaiting, again, as its evaluation stays cancelled,
-     * while a snippet which neither blocks interruptibly, nor awaits, runs to its end.
+     * The snippet runs in the coroutine of the caller, suspended while the snippet suspends, on the thread of the session.
+     * When the caller is cancelled, or the session is [closed][close], while the snippet is evaluated, the evaluation is cancelled,
+     * which the snippet sees at its next suspension point, as a [kotlinx.coroutines.CancellationException],
+     * and by `isActive` and `ensureActive()` of the [ScriptScope],
+     * failing the snippet with an [ExecutionPhase.EVALUATION] error, returned to a caller which is not cancelled, unless the snippet catches it,
+     * while a snippet which neither suspends, nor checks `isActive`, runs to its end,
+     * as the thread of the session is never interrupted, so a blocking call, like `Thread.sleep`, runs until it returns.
      * A caller without a [Job] in its context, like `suspend fun main`, cannot cancel the evaluation, only closing the session can.
      * The caller resumes where its dispatcher resumes it, like the main thread for `Dispatchers.Main.immediate`,
      * or from [Dispatchers.Default], if it would resume in place, on the thread of the session,
@@ -197,16 +199,20 @@ public fun ScriptSession(
     dispatcher: CoroutineDispatcher = Dispatchers.Default
 ): ScriptSession = DefaultScriptSession(properties, dispatcher)
 
-/** The path of the jar of the Kotlin serialization compiler plugin, a dependency of this library. */
-private val serializationPlugin: String by lazy {
-    java.io.File(
+/**
+ * The paths of the compiler plugins of the snippets, dependencies of this library:
+ * the one making the body of a snippet suspending, see [SnippetEvaluator],
+ * and the Kotlin serialization one, so that a `@Serializable` class of a snippet gets its serializer.
+ */
+private val compilerPlugins: List<String> by lazy {
+    suspendSnippetPluginRoots.map { it.path } + java.io.File(
         org.jetbrains.kotlinx.serialization.compiler.extensions.SerializationComponentRegistrar::class.java
             .protectionDomain.codeSource.location.toURI()
     ).path
 }
 
-/** The names of the members of the [ScriptScope], which the properties would shadow. */
-private val reservedNames = setOf("coroutineContext", "await")
+/** The names of the properties of the [ScriptScope], which the properties of the session would shadow. */
+private val reservedNames = setOf("coroutineContext", "isActive")
 
 /**
  * The [ScriptSession], with the thread of its snippets run by the single thread [executor] created with the given thread factory,
@@ -323,8 +329,8 @@ internal class DefaultScriptSession(
                 // the default 1.8 target cannot inline functions of the classpath
                 jvmTarget(scriptJvmTarget(System.getProperty("java.specification.version")))
             }
-            // the serialization plugin, so that a @Serializable class of a snippet gets its serializer
-            compilerOptions("-Xplugin=$serializationPlugin")
+            // the plugins of the snippets, listed, as the compiler would load every plugin of the classpath otherwise
+            compilerOptions("-Xplugin=${compilerPlugins.joinToString(",")}")
             implicitReceivers(ScriptScope::class)
             // the snippets can launch coroutines, and declare dependencies, without imports
             defaultImports(DependsOn::class, Repository::class)
@@ -341,8 +347,6 @@ internal class DefaultScriptSession(
             implicitReceivers(scope)
         }
 
-        val history = ReplHistory()
-
         /** Collects the warnings, which the compilation does not return with the compiled snippet. */
         val messageCollector = ScriptDiagnosticsMessageCollector(null)
 
@@ -353,7 +357,8 @@ internal class DefaultScriptSession(
                 compilationConfiguration,
                 ScriptingHostConfiguration(defaultJvmScriptingHostConfiguration) {
                     repl {
-                        firReplHistoryProvider(history)
+                        // rolls back a snippet which failed to compile itself, so the next snippets do not see its declarations
+                        firReplHistoryProvider(FirReplHistoryProviderImpl())
                         isReplSnippetSource { _, _ -> true }
                     }
                 }
@@ -376,8 +381,8 @@ internal class DefaultScriptSession(
                 )
                 is ResultWithDiagnostics.Success -> {
                     logger.debug { "$name: evaluating" }
-                    val evaluation = scope.evaluate(callerJob) {
-                        evaluator.eval(result.value, evaluationConfiguration)
+                    val evaluation = scope.evaluate(callerJob) { job ->
+                        evaluator.eval(result.value, evaluationConfiguration, job)
                     }
                     evaluation.toScriptResult(compilation, name)
                 }
@@ -385,7 +390,7 @@ internal class DefaultScriptSession(
         }
 
         /**
-         * Compiles the [snippet] of this [name], keeping it in the history of the compiler only if it compiles,
+         * Compiles the [snippet] of this [name], which the compiler keeps in its history only if it compiles,
          * with an internal failure of the compiler, also an [Error], like a [StackOverflowError] on a deeply nested expression,
          * reported as the failure of the compilation,
          * except for a [VirtualMachineError] other than [StackOverflowError], which is thrown.
@@ -398,7 +403,7 @@ internal class DefaultScriptSession(
                 compiler.compile(listOf(snippet.toScriptSource(name)), compilationConfiguration)
             } catch (e: Throwable) {
                 if (e.isFatal) {
-                    // otherwise the next snippet would see the declarations and the dependencies of this one
+                    // otherwise the next snippet would see the dependencies of this one
                     runCatching {
                         conclude(null)
                     }.exceptionOrNull()?.takeIf { it !== e }?.let(e::addSuppressed)
@@ -417,7 +422,7 @@ internal class DefaultScriptSession(
         }
 
         /**
-         * Takes the dependencies of the compiled snippet, and keeps it in the history only if the [result] is a success,
+         * Takes the dependencies of the compiled snippet, reported with the failure of the [result], if any,
          * where a `null` [result] stands for a compilation which threw.
          */
         private fun conclude(
@@ -425,13 +430,11 @@ internal class DefaultScriptSession(
         ): Compilation {
             val dependencies = dependencyResolver.takeDependencies()
             if (result is ResultWithDiagnostics.Success) {
-                history.commit()
                 return Compilation(
                     ResultWithDiagnostics.Success(result.value, messageCollector.diagnostics.toList()),
                     dependencies
                 )
             }
-            history.rollback()
             return Compilation(
                 ResultWithDiagnostics.Failure(
                     if (dependencies.failed) dependencies.diagnostics
@@ -441,7 +444,7 @@ internal class DefaultScriptSession(
             )
         }
 
-        val evaluator = K2ReplEvaluator()
+        val evaluator = SnippetEvaluator()
 
     }
 
@@ -481,13 +484,12 @@ internal class DefaultScriptSession(
      *
      * The block is run by `runBlocking` in the context of the caller, without its job and dispatcher,
      * so a thread context element of the caller, like a thread local as its `asContextElement`, is installed on the thread for the block,
-     * while the caller cancelled does not cancel the block, and the block stays on the thread also if it suspends,
-     * which the compiler and the evaluator, suspending by their API, never do today,
+     * while the caller cancelled does not cancel the block, and the block stays on the thread also when it suspends,
+     * like the evaluation of a snippet suspending, which the event loop of `runBlocking` resumes on the thread,
      * and a session closed meanwhile disposes the compiler only after the block, queued after it on the thread,
      * so no code of the session runs on another thread, or against the disposed compiler.
-     * If the evaluator ever suspended, and the interrupt of [close] arrived while `runBlocking` is parked,
-     * kotlinx.coroutines 1.11 would cancel the blocking coroutine with an [InterruptedException],
-     * so [execute] would throw it instead of returning an [ExecutionPhase.EVALUATION] error.
+     * The thread is never interrupted, as kotlinx.coroutines 1.11 would cancel the blocking coroutine parked by a suspended snippet with an [InterruptedException],
+     * so [execute] would throw it instead of returning an [ExecutionPhase.EVALUATION] error, see [SnippetEvaluation].
      * The caller waits for the block also when it is cancelled after the block started,
      * as a cancelled compilation would leave the compiled snippet to be evaluated before the next one,
      * while a caller cancelled before, while the block waits for the earlier ones, resumes at once, without its block,
