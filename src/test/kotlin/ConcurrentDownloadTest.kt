@@ -74,12 +74,29 @@ class ConcurrentDownloadTest {
     }
 
     @Test
+    fun `should download article by suspend call at top level of snippet`() = runTest {
+        // given
+        session.execute("""
+            val page = client.get(baseUrl + "Article_1").bodyAsText()
+        """.trimIndent())
+
+        // when
+        val result = session.execute("page")
+
+        // then
+        result should {
+            be<ScriptResult.Value>()
+            have(value == "<h1>Article_1</h1><p>The article about Article_1.</p>")
+        }
+    }
+
+    @Test
     fun `should download many articles concurrently and keep them for the next snippet`() = runTest {
         // given
         server.awaitedRequests = titles.size
         session.execute(
             """
-            val articles = await {
+            val articles = coroutineScope {
                 titles.map { title -> async { title to download(title) } }.awaitAll().toMap()
             }
         """.trimIndent())
@@ -104,12 +121,12 @@ class ConcurrentDownloadTest {
 
         // when
         val failure = session.execute("""
-            await {
+            coroutineScope {
                 titles.map { title -> async { download(title) } }.awaitAll()
             }
         """.trimIndent())
         val recovery = session.execute("""
-            val downloaded = await {
+            val downloaded = coroutineScope {
                 titles.map { title -> async { runCatching { download(title) } } }.awaitAll()
             }
             downloaded.count { it.isSuccess }
@@ -137,7 +154,7 @@ class ConcurrentDownloadTest {
             
             val permits = Semaphore(10)
             
-            await {
+            coroutineScope {
                 titles.map { title ->
                     async {
                         permits.withPermit {

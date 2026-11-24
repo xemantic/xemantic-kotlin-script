@@ -45,8 +45,9 @@ public final class com/xemantic/kotlin/script/ScriptResult$Value : com/xemantic/
 }
 
 public final class com/xemantic/kotlin/script/ScriptScope : kotlinx/coroutines/CoroutineScope {
-	public final fun await (Lkotlin/jvm/functions/Function2;)Ljava/lang/Object;
+	public final fun ensureActive ()V
 	public fun getCoroutineContext ()Lkotlin/coroutines/CoroutineContext;
+	public final fun isActive ()Z
 }
 
 public abstract interface class com/xemantic/kotlin/script/ScriptSession : java/lang/AutoCloseable {

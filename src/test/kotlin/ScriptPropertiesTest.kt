@@ -186,7 +186,7 @@ class ScriptPropertiesTest {
     }
 
     @Test
-    fun `should hint declaring the type when property is unresolved in declaration of inferred type`() = runTest {
+    fun `should resolve property in declaration of inferred type`() = runTest {
         ScriptSession {
             "base" provides 10
         }.use { session ->
@@ -198,13 +198,8 @@ class ScriptPropertiesTest {
 
             // then
             result should {
-                be<ScriptResult.Error>()
-                have(phase == ExecutionPhase.COMPILATION)
-                message sameAs """
-                    snippet1.kts:1:17: error: Unresolved reference 'base'.
-                      | fun doubled() = <error>base</error> * 2
-                      hint: 'base' is declared in an earlier snippet, which the K2 REPL compiler does not resolve within a declaration of an inferred type used in the same snippet, like `fun f() = base.toString()` - declare the type, like `fun f(): String = base.toString()`.
-                """.trimIndent()
+                be<ScriptResult.Value>()
+                have(value == 20)
             }
         }
     }
@@ -746,14 +741,14 @@ class ScriptPropertiesTest {
     @Test
     fun `should reject property names of the members of the script scope`() {
         // when
-        val exceptions = listOf("coroutineContext", "await").map { name ->
+        val exceptions = listOf("coroutineContext", "isActive").map { name ->
             assertFailsWith<IllegalArgumentException> {
                 ScriptSession(listOf(property(name, 1)))
             }
         }
 
         // then
-        assert(exceptions.map { it.message } == listOf("coroutineContext", "await").map {
+        assert(exceptions.map { it.message } == listOf("coroutineContext", "isActive").map {
             "Reserved property name: $it - it is a member of the ScriptScope receiving the snippets"
         })
     }
@@ -1642,7 +1637,7 @@ class ScriptPropertiesTest {
         ScriptSession(properties).use { session ->
             // when
             val result = session.execute(
-                "await { 1.add(2) + twice!!(3) + answer() + lengths.first()(\"ab\") + answer.callSuspend() }"
+                "1.add(2) + twice!!(3) + answer() + lengths.first()(\"ab\") + answer.callSuspend()"
             )
 
             // then
@@ -1691,7 +1686,7 @@ class ScriptPropertiesTest {
     fun `should provide property of suspend function reference`() = runTest {
         ScriptSession(listOf(property("f", ::suspendTwice))).use { session ->
             // when
-            val result = session.execute("""f.name + " " + f.isSuspend + " " + await { f("ab") }""")
+            val result = session.execute("""f.name + " " + f.isSuspend + " " + f("ab")""")
 
             // then
             result should {
@@ -1771,7 +1766,7 @@ class ScriptPropertiesTest {
             property("hex", Integer::toHexString)
         )).use { session ->
             // when
-            val result = session.execute("""(f("ab") + await { g("ab") }).toString() + " " + hex(255)""")
+            val result = session.execute("""(f("ab") + g("ab")).toString() + " " + hex(255)""")
 
             // then
             result should {
@@ -1794,7 +1789,7 @@ class ScriptPropertiesTest {
             property("i", bound)
         )).use { session ->
             // when
-            val result = session.execute("""(f() + await { g() } + h()).toString() + i()""")
+            val result = session.execute("""(f() + g() + h()).toString() + i()""")
 
             // then
             result should {
@@ -1815,7 +1810,7 @@ class ScriptPropertiesTest {
         suspend fun local(): Int = 7
         ScriptSession(listOf(property("f", ::local))).use { session ->
             // when
-            val result = session.execute("await { f() }")
+            val result = session.execute("f()")
 
             // then
             result should {
@@ -1839,7 +1834,7 @@ class ScriptPropertiesTest {
             property<KFunction<Int>>("g", suspendFunction as KFunction<Int>)
         )).use { session ->
             // when
-            val result = session.execute("f() + await { g() }")
+            val result = session.execute("f() + g()")
 
             // then
             result should {

@@ -27,11 +27,11 @@ import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.launch
 
 /**
- * The evaluation of a snippet on the current thread, cancelled when the job of its caller is cancelled,
- * or the session of the [sessionJob] is closed.
+ * The evaluation of a snippet, cancelled when the job of its caller is cancelled, or the session of the [sessionJob] is closed.
  *
- * The cancellation of the [job] interrupts the thread, also when it is cancelled already, so a blocking call of the snippet fails immediately,
- * unless it is [uninterruptible], like waiting in [ScriptScope.await], which the cancellation of the job reaches anyway.
+ * The cancellation is cooperative only: the snippet sees the cancellation of the [job] at its next suspension point,
+ * and by `isActive` and `ensureActive()` of the [ScriptScope],
+ * while the thread of the session is never interrupted, so a snippet blocked in a call which does not suspend runs until the call returns.
  */
 internal class SnippetEvaluation(
     callerJob: Job,
@@ -44,61 +44,21 @@ internal class SnippetEvaluation(
      */
     val job = Job(callerJob)
 
-    private val thread = Thread.currentThread()
-
-    private var running = true
-
-    private var uninterruptible = 0
-
-    // resumed, and so completed, by the cancellation of the job, in the cancelling thread
-    private val watcher = CoroutineScope(job + Dispatchers.Unconfined).launch {
-        awaitCancellation()
-    }
-
     // completed by closing the session, also when it is closed already, and by the end of the evaluation
     private val sessionWatcher = CoroutineScope(sessionJob + Dispatchers.Unconfined).launch {
         awaitCancellation()
     }
 
     init {
-        watcher.invokeOnCompletion {
-            interruptIfCancelled()
-        }
         sessionWatcher.invokeOnCompletion {
             job.cancel(CancellationException("The session is closed"))
         }
     }
 
-    private fun interruptIfCancelled() {
-        synchronized(this) {
-            if (running && uninterruptible == 0 && job.isCancelled) thread.interrupt()
-        }
-    }
-
-    /**
-     * Runs the [block] without interrupting it, like the `runBlocking` of [ScriptScope.await],
-     * where the interruption is redundant, as the cancellation of the job reaches its coroutines anyway.
-     * The thread is interrupted after it, if the job was cancelled meanwhile.
-     */
-    inline fun <T> uninterruptible(block: () -> T): T {
-        synchronized(this) { uninterruptible++ }
-        try {
-            return block()
-        } finally {
-            synchronized(this) { uninterruptible-- }
-            interruptIfCancelled()
-        }
-    }
-
-    /** Ends the evaluation, clearing the interruption, if any, so it does not affect the next snippet. */
+    /** Ends the evaluation. */
     fun end() {
-        synchronized(this) {
-            running = false
-        }
         sessionWatcher.cancel()
         job.cancel()
-        watcher.cancel()
-        Thread.interrupted()
     }
 
 }

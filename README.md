@@ -131,24 +131,37 @@ ScriptSession {
   which resumes it as above.
   So does a caller cancelled already when it calls `execute`, so `withTimeout` bounds the wait,
   unless no other snippet is executed, or waiting, then: such a caller executes its snippet, cancelled.
-* The snippets are received by the `ScriptScope`, a `CoroutineScope` living as long as the session,
-  with `kotlinx.coroutines.*` imported by default:
-  * `await { ... }` runs suspending code, like the requests of a ktor client,
-    blocking the snippet until it completes, on the thread of the session, e.g.
-    `val pages = await { urls.map { async { client.get(it).bodyAsText() } }.awaitAll() }`;
+* The body of a snippet is suspending, so it calls a suspend function directly,
+  like a request of a ktor client, `val page = client.get(url).bodyAsText()`,
+  or the suspend functions provided by the host, with `kotlinx.coroutines.*` imported by default,
+  so `coroutineScope { urls.map { async { client.get(it).bodyAsText() } }.awaitAll() }` downloads the pages concurrently.
+  It runs in the coroutine of the caller of `execute`, on the thread of the session,
+  which it returns to after switching the dispatcher, like after `withContext(Dispatchers.IO) { ... }`,
+  so a thread-bound API stays on its thread across the suspensions.
+  A function declared by a snippet is not suspending, unless declared `suspend`, like in any Kotlin code,
+  and neither is a lambda which is not inlined, like `lazy { }`, or `Runnable { }`, nor a call within `synchronized`,
+  which the compiler reports.
+  The body is made suspending by the compiler plugin of `xemantic-kotlin-script-compiler-plugin`, a dependency of this library,
+  see [the design](docs/suspend-snippets.md).
+* The snippets are received by the `ScriptScope`, a `CoroutineScope` living as long as the session, with a supervisor job:
   * `launch { ... }` starts a coroutine which keeps running after the snippet,
     on `Dispatchers.Default`, or the `dispatcher` given to `ScriptSession`,
-    until it completes, or the session is closed.
-* Cancelling the caller of `execute` cancels the coroutines of `await`,
-  and interrupts the thread of the session, so a blocking call like `Thread.sleep` fails,
-  while a snippet which neither blocks interruptibly, nor awaits, runs to its end.
+    until it completes, or the session is closed, and its failure fails neither the snippet, nor the session;
+  * `isActive` and `ensureActive()` tell about the snippet being evaluated, like the ones of a coroutine,
+    so `while (isActive) step()` stops once its caller is cancelled,
+    while within `launch { ... }`, or another coroutine builder, they are the ones of that coroutine,
+    and `currentCoroutineContext()` is the context of the snippet, while `coroutineContext` is the one of the session.
+* Cancelling the caller of `execute` cancels the snippet being evaluated, at its next suspension point,
+  and tells it by `isActive` and `ensureActive()`, while a snippet which neither suspends, nor checks them, runs to its end.
+  The thread of the session is never interrupted, so a blocking call, like `Thread.sleep`, runs until it returns —
+  call a suspend function, like `delay`, instead.
   A snippet being compiled when the caller is cancelled is compiled and evaluated nevertheless,
   as the compiler cannot be interrupted, and would evaluate it before the next snippet anyway.
+  A snippet cancelled keeps its declarations, also the ones it did not initialize, like a snippet throwing an exception.
 * Closing the session cancels the coroutines launched by its snippets,
   and the snippet being evaluated, like cancelling its caller does, also a caller which cannot be cancelled, like `suspend fun main`,
   so its `execute` returns an evaluation error,
-  unless the snippet runs to its end, as above, or catches the `InterruptedException`, or the `CancellationException` of `await`,
-  and ends without blocking, or awaiting, again, as its evaluation stays cancelled.
+  unless the snippet runs to its end, as above, or catches the `CancellationException`, and ends without suspending again, as its evaluation stays cancelled.
   Then it releases its compiler, thread, and the values of its properties, once that snippet ends,
   while the snippets and coroutines still running keep reading the properties from the fields of their scripts, unaffected by the release.
 * Properties of the given name and type are provided to the snippets of the session, like `"greeting" provides "Hello"`.
@@ -169,7 +182,7 @@ ScriptSession {
   A property list built dynamically can be passed instead, as `ScriptSession(listOf(property("greeting", "Hello")))`.
   Invalid properties are rejected with `IllegalArgumentException`:
   a name which is not a Kotlin identifier, a duplicate name, a value which is not of the type,
-  a name of a member of the `ScriptScope`, like `await` or `coroutineContext`,
+  a name of a property of the `ScriptScope`, `coroutineContext` or `isActive`,
   or a type which the snippets cannot refer to, like a private or a local class,
   or a `KType` implemented by hand whose classifier is not a class, or whose type arguments do not match the type parameters of its class.
   A property which passes this validation might still fail to be declared,
@@ -244,9 +257,6 @@ ScriptSession {
 
 The K2 REPL compiler is still experimental, and these of its bugs are reported to the LLM with a hint how to avoid them:
 
-* A class declared in an earlier snippet is unresolved within a declaration of an inferred type calling it in the same snippet,
-  like `fun isPlain(x: Any) = x is Plain` followed by `isPlain(1)`,
-  while it resolves with the type declared, `fun isPlain(x: Any): Boolean = x is Plain`.
 * A property, or a function, of a value class type, like `Duration` or `UInt`, declared in an earlier snippet,
   fails with `NoSuchMethodError` when called from another snippet,
   as the compiler calls it by its mangled name, like `getTimeout-UwyO8pc`, while it declares it without mangling.
@@ -262,16 +272,18 @@ The K2 REPL compiler is still experimental, and these of its bugs are reported t
   and the ones holding a lambda calling it, like `val f = { secret() }`.
   The hint names the declarations and the classes on the stack trace as examples only, as it cannot tell all of them.
   The code referring to an `object` declaring it, or calling it, and the values holding the `object`, keep the old one, so they are declared, and created, again as well.
-* A `const val` declared in an earlier snippet cannot be read from another snippet:
-  it is unresolved within a declaration of an inferred type, and crashes the compiler wherever else it is read,
-  also in a top-level expression, or in a property initializer.
-  It works once declared again public, without `const`, as an `internal` one fails like any `internal` property.
-  A `const val` of an `object` declared in an earlier snippet crashes the compiler as well, without a hint.
+* A `const val` declared in an earlier snippet, also one of an `object` declared there, cannot be read from another snippet:
+  it fails with `NoSuchMethodError`, as the compiler reads it by a getter, like `getLIMIT`, which it is not compiled with.
+  It works once declared again public, without `const`, together with the code reading it, directly or not, declared again,
+  and with the values depending on it created again, like for an `internal` member.
 * A `@JvmField` property declared in an earlier snippet cannot be accessed from another snippet:
-  it is unresolved within a declaration of an inferred type, and fails with `IncompatibleClassChangeError` wherever else it is accessed,
+  it fails with `IncompatibleClassChangeError`,
   as the compiler accesses it as an instance field, while it is static.
   It works once declared again public, without `@JvmField`, together with the code accessing it, directly or not, declared again,
   and with the values depending on it created again, like for an `internal` member.
+* A reference to a function declared in an earlier snippet, like `listOf("a").map(::shout)`, fails with a `ClassCastException` when called,
+  also with the type declared, as Kotlin 2.5.0-RC binds it to the class of that snippet wrongly — a regression, as 2.4 called it.
+  Calling the function from a lambda instead works, like `listOf("a").map { shout(it) }`.
 * An `inline` function, or property, declared in an earlier snippet cannot be called from another snippet,
   and the one referring to the `ScriptScope`, like `coroutineContext`, cannot be compiled at all,
   reported as an internal failure of the compiler.

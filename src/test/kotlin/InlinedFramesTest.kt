@@ -390,7 +390,7 @@ class InlinedFramesTest {
             suspend inline fun inner(): Nothing { delay(1); throw IllegalStateException("inner") }
             suspend inline fun outer(): Nothing { delay(1); inner() }
             suspend fun suspendingFrame(): StackTraceElement = try { outer() } catch (e: IllegalStateException) { e.stackTrace[0] }
-            val awaited = await { suspendingFrame() }
+            val awaited = suspendingFrame()
             fun frame(): StackTraceElement = awaited
         """.trimIndent())
 
@@ -417,7 +417,7 @@ class InlinedFramesTest {
                 inner()
             }
             suspend fun suspendingFrame(): StackTraceElement = try { outer() } catch (e: IllegalStateException) { e.stackTrace[0] }
-            val awaited = await { suspendingFrame() }
+            val awaited = suspendingFrame()
             fun frame(): StackTraceElement = awaited
         """.trimIndent())
 
@@ -439,7 +439,7 @@ class InlinedFramesTest {
             suspend inline fun mid(x: Int) { delay(1); inner(x) }
             suspend inline fun outer() { mid(1); delay(1); mid(2) }
             suspend fun suspendingFrame(): StackTraceElement = try { outer(); error("not thrown") } catch (e: IllegalStateException) { e.stackTrace[0] }
-            val awaited = await { suspendingFrame() }
+            val awaited = suspendingFrame()
             fun frame(): StackTraceElement = awaited
         """.trimIndent())
 
@@ -466,7 +466,7 @@ class InlinedFramesTest {
                 inner(x)
             }
             suspend fun suspendingFrame(): StackTraceElement = try { outer(1); outer(2); error("not thrown") } catch (e: IllegalStateException) { e.stackTrace[0] }
-            val awaited = await { suspendingFrame() }
+            val awaited = suspendingFrame()
             fun frame(): StackTraceElement = awaited
             """.trimIndent(),
             method = "suspendingFrame"
@@ -705,7 +705,7 @@ class InlinedFramesTest {
             } catch (e: IllegalStateException) {
                 e.stackTrace[0]
             }
-            val awaited = await { suspendingFrame() }
+            val awaited = suspendingFrame()
             fun frame(): StackTraceElement = awaited
         """.trimIndent())
 
@@ -738,7 +738,7 @@ class InlinedFramesTest {
             } catch (e: IllegalStateException) {
                 e.stackTrace[0]
             }
-            val awaited = await { suspendingFrame() }
+            val awaited = suspendingFrame()
             fun frame(): StackTraceElement = awaited
         """.trimIndent())
 
@@ -792,7 +792,7 @@ class InlinedFramesTest {
             } catch (e: IllegalStateException) {
                 e.stackTrace[0]
             }
-            val awaited = await { suspendingFrame() }
+            val awaited = suspendingFrame()
             fun frame(): StackTraceElement = awaited
         """.trimIndent())
 
@@ -818,7 +818,7 @@ class InlinedFramesTest {
                 }
             }
             suspend fun suspendingFrame(): StackTraceElement = try { outer(); error("not thrown") } catch (e: IllegalStateException) { e.stackTrace[0] }
-            val awaited = await { suspendingFrame() }
+            val awaited = suspendingFrame()
             fun frame(): StackTraceElement = awaited
         """.trimIndent())
 
@@ -970,7 +970,7 @@ class InlinedFramesTest {
                 }
                 error("not thrown")
             }
-            val awaited = await { suspendingFrame() }
+            val awaited = suspendingFrame()
             fun frame(): StackTraceElement = awaited
         """.trimIndent())
 

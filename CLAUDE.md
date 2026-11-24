@@ -78,32 +78,36 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 
 - `K2ReplCompiler.createCompilationState` must get a host configuration with `repl { firReplHistoryProvider(...); isReplSnippetSource { _, _ -> true } }` —
   passing the plain `defaultJvmScriptingHostConfiguration` crashes the first snippet with an NPE in `Fir2IrReplSnippetConfiguratorExtensionImpl`.
-- Its own history provider keeps the snippets which failed to compile, so the next snippet resolves their declarations, and fails at runtime — see `ReplHistory`.
+- Since Kotlin 2.5 `compile` removes a snippet which failed to compile, or threw, from the history provider itself (`removeSnippets`), so the default `FirReplHistoryProviderImpl` is enough —
+  before, the next snippet resolved the declarations of the failed one, and failed at runtime.
+- Without `-Xplugin`, the compiler loads every `CompilerPluginRegistrar` of the classpath of the host (`loadPluginsFromClassloader`), with it only the given ones —
+  so the session lists all of its plugins, and a test without a plugin gives `-Xplugin` an empty directory.
 - `compile` drops the warnings of a successful snippet (`asSuccess()` without reports), they are read from the message collector instead.
 - `compile` may throw instead of returning a failure, e.g. on a backend crash, also an `Error`, like a `StackOverflowError` of the parser on deeply nested parentheses.
-  The history provider gets the snippet only after its FIR resolution, so an overflow of the parser or of the resolution does not put it there.
 - `providedProperties` are not resolved by the K2 REPL — the dependencies are declared by a generated first snippet instead.
 - The snippet classes carry no nullability annotations (`@NotNull`), unlike regular Kotlin classes, so the nullability of a property has to be read by kotlin-reflect — see `UninitializedProperties.keep`.
-- Never read the visibility of a snippet member by kotlin-reflect — see `SnippetDeclarations.isAccessibleByLaterSnippet` for why.
+- Never read the visibility of a snippet member by kotlin-reflect — see `SnippetDeclarations.visibilityToLaterSnippet` for why.
 - The evaluator evaluates every compiled snippet not evaluated yet before the given one, so a compiled snippet is always evaluated, even if the caller was cancelled meanwhile.
-- Never interrupt the thread while compiling: an interrupt closes any interruptible NIO channel in use (JDK behaviour), which the compiler's JAR reading might rely on — a precaution, not reproduced.
-  An interrupted `runBlocking` (kotlinx.coroutines 1.11) does not throw at once: it runs its pending events first, then cancels its coroutine and waits for it to complete —
-  so a thread already interrupted still evaluates the snippet, see `should evaluate compiled snippet of caller cancelled before the evaluation`.
+- Never interrupt the thread of the session, the cancellation of a snippet is cooperative only, see `SnippetEvaluation`:
+  an interrupt closes any interruptible NIO channel in use (JDK behaviour), which the compiler's JAR reading might rely on — a precaution, not reproduced —
+  and an interrupted `runBlocking` (kotlinx.coroutines 1.11), parked by a suspended snippet, cancels its coroutine with an `InterruptedException`, which `execute` would throw instead of an evaluation error.
+- The body of a snippet is made suspending by `xemantic-kotlin-script-compiler-plugin`, and evaluated by `SnippetEvaluator` instead of the `K2ReplEvaluator`, which calls it without a continuation —
+  see [docs/suspend-snippets.md](docs/suspend-snippets.md) for the design, and why it is not done by rewriting the source, nor the IR.
 - A configuration refinement, like resolving `@file:DependsOn`, runs twice per snippet, and its failure does not stop the compilation:
   it continues without the refined configuration, also without the default imports, and the failure is reported without its code and end, like any warning of a refinement —
   see `SnippetDependencyResolver.takeDependencies`.
   The classpath added by a refinement stays with the compiler even if the snippet fails to compile.
-- Known compiler bugs, each with a test pinning the hint: a class of an earlier snippet is unresolved in a declaration of an inferred type calling it,
-  and so is a property (also a provided one), a function, or an extension (reported `on receiver of type`, but on an integer literal, like `1.tagged()`, or on an implicit receiver, where it reads the same as no receiver in scope at all) of an earlier snippet, but only when that declaration is used in the same snippet, while a property with an initializer, like `val x = name.length`, resolves it,
-  while a declaration of a snippet which failed to compile stays unresolved even with the type declared, so it gets no hint,
-  an `internal` property or function of an earlier snippet is called by a name it is not compiled to, failing with a `NoSuchMethodError` even with the type declared, so it gets a hint at declaring it public instead,
-  a `const val` of an earlier snippet, unresolved in a declaration of an inferred type, crashes the backend wherever else a later snippet reads it (`InterpreterMethodNotFoundError`), also at the top level,
-  and a `@JvmField` property is accessed as an instance field, while it is static, failing with an `IncompatibleClassChangeError` —
-  so both get a hint at declaring it again without `const` / `@JvmField`, while a `const val` of an `object` of an earlier snippet crashes as well (`Unknown function: X(O)`), without a hint,
+- Known compiler bugs, each with a test pinning the hint:
+  an `internal` property or function of an earlier snippet is called by a name it is not compiled to, failing with a `NoSuchMethodError`,
+  a `const val` of an earlier snippet, also of an `object`, is read by a getter it is not compiled with, failing with a `NoSuchMethodError`,
+  and a `@JvmField` property is accessed as an instance field, while it is static, failing with an `IncompatibleClassChangeError`,
   a value class property or function of an earlier snippet is called by a mangled name, which is not declared (the provided properties work around it with `@get:JvmName`),
+  a reference to a function of an earlier snippet, like `map(::shout)`, fails with a `ClassCastException` to `Void` when called, also with the type declared — a regression of Kotlin 2.5.0-RC, which 2.4 called,
   an `inline` declaration cannot be called across snippets,
   the backend crashes on `val context: Int inline get() = coroutineContext.hashCode()`, which stands in for an internal failure of the compiler in `should report internal failure of the compiler and continue the session`.
   Re-probe them after every Kotlin upgrade — the workarounds and hints might become obsolete, and the crash might stop testing anything.
+- Kotlin 2.5 fixed a declaration of an earlier snippet being unresolved in a declaration of an inferred type using it in the same snippet, like `fun f() = limit + 1`,
+  which needed a hint at declaring the type — the `should resolve … in declaration of inferred type` tests pin the fix.
 
 ### The inlined frames (`InlinedFrames`)
 
@@ -139,7 +143,7 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   see `Turn.watch`.
 - A hand-made continuation resumed in place of the caller's must implement `CoroutineStackFrame`,
   or kotlinx.coroutines leaks a thread context element of an undispatched `withContext` past it — see `Turn.callerFrame`.
-- A test of cancellation must signal "started" from within the block to be cancelled, like inside `await { }`, not before it —
+- A test of cancellation must signal "started" from within the block to be cancelled, like inside the `try` of the snippet, not before it —
   otherwise the cancellation can arrive before the block starts, so its `finally` never runs, and the test is flaky.
 - Never give a private helper the name of a public method taking the turn of the session, like an `execute` of `Repl` next to `ScriptSession.execute` —
   a slip like `execute(source)` compiles, queues its snippet on the session thread behind the one calling it, and deadlocks.
